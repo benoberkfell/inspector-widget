@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Backgrounds for the contrast scenarios (always over pure white). -->
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- GOOD contrast: ~16:1 on white. -->
+    <color name="text_good_contrast">#FF1A1A1A</color>
+    <!-- BAD contrast: ~1.6:1 on white → fails WCAG AA (4.5:1). -->
+    <color name="text_bad_contrast">#FFBFBFBF</color>
+
+    <color name="accent_good">#FF3366CC</color>
+    <color name="accent_bad">#FFCC3366</color>
+</resources>

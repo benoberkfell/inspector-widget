@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">A11yProbe</string>
+    <string name="view_screen_title">Classic View screen</string>
+
+    <!-- View scenario labels (GOOD variants reference these; BAD variants omit them). -->
+    <string name="like">Like this photo</string>
+    <string name="avatar">Profile photo of Ada Lovelace</string>
+    <string name="submit">Submit</string>
+    <string name="notifications">Notifications</string>
+    <string name="wifi">Wi-Fi</string>
+    <string name="account_heading">Account</string>
+    <string name="account_body">Manage your account settings.</string>
+    <string name="email_label">Email address</string>
+    <string name="email_hint">name@example.com</string>
+    <string name="rate_label">Rate this item</string>
+    <string name="play">Play</string>
+
+    <!-- Section dividers in the View screen. -->
+    <string name="view_section_image_button">1. ImageButton contentDescription</string>
+    <string name="view_section_touch_target">2. Touch target size</string>
+    <string name="view_section_contrast">3. Text contrast</string>
+    <string name="view_section_switch">4. Switch stateDescription</string>
+    <string name="view_section_image">5. ImageView label / decorative</string>
+    <string name="view_section_custom">6. Custom clickable role</string>
+    <string name="view_section_heading">7. Heading semantics</string>
+    <string name="view_section_form">8. EditText label (labelFor)</string>
+
+    <string name="label_good">GOOD</string>
+    <string name="label_bad">BAD</string>
+</resources>

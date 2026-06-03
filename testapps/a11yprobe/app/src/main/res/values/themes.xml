@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      Theme.Material3.DayNight.NoActionBar (from com.google.android.material)
+      satisfies BOTH:
+        * AppCompatActivity (ViewScenarioActivity) — avoids the
+          "You need to use a Theme.AppCompat theme" crash, and
+        * the Compose MainActivity (which only needs a valid app theme).
+      (testapps.md §5.)
+    -->
+    <style name="Theme.A11yProbe" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
+    </style>
+
+</resources>

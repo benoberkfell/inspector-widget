@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inspector-widget"
+version = "0.1.0"
+description = "Inspector Widget — a standalone, agent-driven Android view/Compose/accessibility inspector (host driver, CLI, and MCP server)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ben Oberkfell" }]
+keywords = ["android", "accessibility", "inspector", "compose", "mcp", "adb"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Software Development :: Debuggers",
+]
+
+# Runtime requirement: the generated protobuf bindings
+# (inspector_widget/proto/view_inspection_pb2.py) call
+# ValidateProtobufRuntimeVersion with gencode version 6.33.5, so the installed
+# protobuf runtime must be >= 6.33.5 (and < 7 to stay within the same major).
+# An older runtime (e.g. 5.x) raises at import time. See requirements.txt /
+# PACKAGING.md.
+dependencies = [
+    "protobuf>=6.33.5,<7",
+]
+
+[project.optional-dependencies]
+# Model Context Protocol SDK — enables the real MCP stdio transport in
+# host/mcp_server.py. Without it the server falls back to a built-in
+# JSON-RPC-over-stdio implementation, so this is optional.
+mcp = ["mcp>=1.0"]
+# gRPC client used by inspector_widget.skia_client to talk to the Skia parser
+# service for SKP image decoding. Optional — only the SKP image path needs it.
+images = ["grpcio>=1.60"]
+# Pillow gives a faster/native PNG encoder in inspector_widget.png; the module
+# falls back to a pure-stdlib (zlib+struct) encoder when it is absent. Also used
+# by inspector_widget.overlay for a11y overlay rendering.
+overlay = ["Pillow>=10"]
+# Developer tooling.
+dev = ["pytest", "ruff"]
+# Everything (convenience): mcp + images + overlay + dev.
+all = [
+    "mcp>=1.0",
+    "grpcio>=1.60",
+    "Pillow>=10",
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+# Thin in-package wrappers (inspector_widget/_cli.py, inspector_widget/_mcp.py)
+# import the top-level cli / mcp_server modules and delegate to their main().
+# Those modules are shipped in the wheel via [tool.setuptools] py-modules below,
+# so the entry points resolve after a plain `pip install` (no editable required).
+inspector-widget = "inspector_widget._cli:main"
+inspector-widget-mcp = "inspector_widget._mcp:main"
+
+[tool.setuptools]
+# The package lives directly under host/ (this directory): host/inspector_widget/.
+# host/cli.py and host/mcp_server.py are loose scripts beside the package; ship
+# them as top-level importable modules so the _cli/_mcp wrappers (and therefore
+# the console scripts) resolve after a wheel install. Without this they would
+# raise ModuleNotFoundError once installed away from this checkout.
+packages = ["inspector_widget", "inspector_widget.proto", "inspector_widget.skia_grpc"]
+py-modules = ["cli", "mcp_server"]
+
+[tool.setuptools.package-data]
+# Ship the generated protobuf bindings and gRPC stubs as package data so a wheel
+# install is runnable without re-running protoc. (These .py files are real
+# modules, but listing them as package-data is belt-and-suspenders for sdists
+# and any non-standard layout handling.)
+"inspector_widget.proto" = ["*.py"]
+"inspector_widget.skia_grpc" = ["*.py"]
+
+# NOTE — runtime artifacts are NOT python package data:
+#   build-out/libviewspector.so, build-out/bootstrap.dex, build-out/payload.jar
+# are produced by the Gradle/native build (scripts/build.sh) and located at
+# runtime via the repo path (inspector_widget.inject._REPO_ROOT -> build-out/).
+# They are large binary build outputs that live OUTSIDE the python package and
+# are deliberately excluded from the wheel. See host/PACKAGING.md.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

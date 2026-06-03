@@ -1,0 +1,70 @@
+// ============================================================================
+// app/build.gradle.kts (testapps/a11yprobe)
+// Compose + classic-View test app. Toolchain pinned to match the viewspector
+// host exactly (testapps.md §1): compileSdk 36, minSdk 29, JDK 21, debuggable,
+// Compose BOM 2024.09.00, Kotlin-2.0 compose compiler plugin.
+// ============================================================================
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose") // Kotlin 2.0 → separate compose plugin
+}
+
+android {
+    namespace = "com.oberkfell.a11yprobe"
+    compileSdk = 36
+    buildToolsVersion = "36.1.0"
+
+    defaultConfig {
+        applicationId = "com.oberkfell.a11yprobe"
+        minSdk = 29
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        getByName("debug") {
+            isDebuggable = true
+            isMinifyEnabled = false
+        }
+    }
+
+    buildFeatures {
+        compose = true
+        viewBinding = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+}
+
+kotlin {
+    jvmToolchain(21)
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
+    implementation(composeBom)
+
+    // Compose UI + Material3.
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material3:material3")
+    // Vector icons used by the launcher / scenarios (Favorite, ArrowBack, …).
+    implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
+
+    // classic-View (XML) screen → exercises the AccessibilityNodeInfo path.
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.13.0")
+    implementation("androidx.constraintlayout:constraintlayout:2.1.0")
+    implementation("androidx.core:core-ktx:1.13.1")
+
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}

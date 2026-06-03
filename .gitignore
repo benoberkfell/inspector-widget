@@ -1,0 +1,40 @@
+# ViewSpector — build coherence ignores.
+
+# Gradle / AGP transient build output.
+.gradle/
+build/
+*/build/
+agent/.cxx/
+
+# Native build scratch.
+**/.cxx/
+
+# Final artifacts are produced by scripts/build.sh into build-out/. They are
+# generated, not source — do not track them.
+build-out/
+
+# Python host virtualenv + caches.
+host/.venv/
+**/__pycache__/
+*.pyc
+
+# Python build / packaging / test artifacts (generated, not source).
+*.egg-info/
+.pytest_cache/
+.eggs/
+*.whl
+
+# Kotlin compiler session scratch (root + testapps).
+**/.kotlin/
+
+# OS / editor noise.
+.DS_Store
+*.swp
+.idea/
+*.iml
+
+# Machine-specific SDK location — set sdk.dir here or via the ANDROID_HOME env var.
+local.properties
+
+# NOTE: gradle/wrapper/*.jar IS tracked so the wrapper works without a
+# pre-existing `gradle` on PATH.

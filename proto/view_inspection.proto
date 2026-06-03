@@ -1,0 +1,295 @@
+syntax = "proto3";
+
+// ViewSpector — a standalone, agent-driven Android View Layout Inspector.
+// Lean re-implementation of the semantics of Android Studio's
+// view_layout_inspection.proto (LayoutInspectorViewProtocol), tailored for
+// synchronous request/response use over a single framed socket.
+//
+// String interning: any field documented as a "string-table id" is an int32
+// index into Strings.entries (id 0 == empty/absent). This mirrors the real
+// inspector's StringEntry mechanism to keep large trees compact.
+
+package viewspector.proto;
+option java_package = "com.oberkfell.viewspector.proto";
+option java_outer_classname = "ViewInspection";
+
+// ----------------------------------------------------------------- primitives
+message Rect { int32 x = 1; int32 y = 2; int32 w = 3; int32 h = 4; }
+
+// Four corners in drawing order, used when a view has a rotation/scale/skew
+// transform so the axis-aligned Rect is not enough.
+message Quad {
+  sint32 x0 = 1; sint32 y0 = 2;
+  sint32 x1 = 3; sint32 y1 = 4;
+  sint32 x2 = 5; sint32 y2 = 6;
+  sint32 x3 = 7; sint32 y3 = 8;
+}
+
+message Bounds {
+  Rect layout = 1;          // absolute on-screen axis-aligned bounds (px)
+  Quad render = 2;          // present only when the view is transformed
+}
+
+message StringEntry { int32 id = 1; string str = 2; }
+message Strings { repeated StringEntry entries = 1; }
+
+// A resource reference, e.g. @id/foo or @layout/activity_main.
+message Resource {
+  int32 type = 1;           // string-table id ("id","layout","style",...)
+  int32 namespace = 2;      // string-table id (package)
+  int32 name = 3;           // string-table id
+}
+
+// ----------------------------------------------------------------- properties
+message Property {
+  enum Type {
+    STRING = 0; BOOLEAN = 1; BYTE = 2; CHAR = 3; DOUBLE = 4; FLOAT = 5;
+    INT16 = 6; INT32 = 7; INT64 = 8; OBJECT = 9; COLOR = 10; GRAVITY = 11;
+    INT_ENUM = 12; INT_FLAG = 13; RESOURCE = 14; DRAWABLE = 15; ANIM = 16;
+    ANIMATOR = 17; INTERPOLATOR = 18; DIMENSION = 19;
+  }
+  int32 name = 1;           // string-table id of the attribute name
+  Type type = 2;
+  bool is_layout = 3;       // layout-param attribute vs view attribute
+
+  // exactly one value representation is populated, per type
+  int32 int32_value = 4;
+  int64 int64_value = 5;
+  double double_value = 6;
+  float float_value = 7;
+  int32 str_value = 8;      // string-table id (STRING/OBJECT/INT_ENUM label)
+  Resource resource_value = 9;
+
+  // Resolution stack: where this value came from. source = the file/style that
+  // set it; resolution_stack = the ordered chain of styles/layouts considered.
+  int32 source = 10;                 // string-table id
+  repeated int32 resolution_stack = 11; // string-table ids
+}
+
+message PropertyGroup {
+  int64 view_id = 1;        // uniqueDrawingId of the owning view
+  repeated Property properties = 2;
+}
+
+// ----------------------------------------------------------------- view tree
+message ViewNode {
+  int64 id = 1;             // View.uniqueDrawingId (stable per view instance)
+  int32 class_name = 2;     // string-table id (simple class name)
+  int32 package_name = 3;   // string-table id
+  Bounds bounds = 4;
+  Resource resource = 5;    // the view's own @id, if any
+  Resource layout_resource = 6; // layout file that inflated it, if known
+  int32 view_id_name = 7;   // string-table id, e.g. "my_button" (R.id name)
+  int32 text_value = 8;     // string-table id; best-effort text for TextViews
+  enum Flag { NONE = 0; IS_WEBVIEW = 1; }
+  int32 flags = 9;          // bitmask of Flag
+  repeated ViewNode children = 10;
+}
+
+// ----------------------------------------------------------------- screenshot
+message Screenshot {
+  enum Format { BITMAP = 0; }    // PNG assembled host-side; SKP is future work
+  Format format = 1;
+  int32 width = 2;
+  int32 height = 3;
+  // Raw wire format from the device matches the real inspector:
+  // 9-byte header [width LE int32 @0][height LE int32 @4][BitmapType byte @8]
+  // followed by raw pixels, the whole buffer Deflate(BEST_SPEED)-compressed.
+  // The host inflates and decodes. `type` echoes the BitmapType byte.
+  int32 bitmap_type = 4;         // 1=RGB_565, 2=ABGR_8888, 3=ARGB_8888
+  bytes data = 5;                // deflated [header+pixels]
+  float scale = 6;               // scale applied at capture (<=1.0)
+}
+
+// ----------------------------------------------------------------- commands
+message HelloCommand {}
+message HelloResponse { string agent_version = 1; int32 api_level = 2; string abi = 3; }
+
+message GetWindowsCommand {}
+message GetWindowsResponse { repeated int64 root_ids = 1; Strings strings = 2; }
+
+message DumpTreeCommand {
+  int64 root_id = 1;             // 0 => all roots
+  bool include_properties = 2;   // inline all properties (else use GetProperties)
+  bool include_resolution_stack = 3;
+  bool include_screenshot = 4;
+  float screenshot_scale = 5;    // default 1.0
+}
+message DumpTreeResponse {
+  repeated ViewNode roots = 1;
+  Strings strings = 2;
+  repeated PropertyGroup properties = 3; // populated iff include_properties
+  Screenshot screenshot = 4;             // populated iff include_screenshot
+}
+
+message GetPropertiesCommand {
+  int64 view_id = 1;
+  bool include_resolution_stack = 2;
+}
+message GetPropertiesResponse { PropertyGroup group = 1; Strings strings = 2; }
+
+message ScreenshotCommand { int64 root_id = 1; float scale = 2; }
+message ScreenshotResponse { Screenshot screenshot = 1; }
+
+message ShutdownCommand {}
+message ShutdownResponse {}
+
+// Capture a serialized Skia picture (SKP) of a window's rendering commands, for the
+// per-view-image path (decoded host-side by the skiaparser gRPC server).
+message CaptureSkpCommand { int64 root_id = 1; }   // 0 => first root
+message CaptureSkpResponse {
+  bool supported = 1;   // false if SKP capture isn't available (e.g. API <= 32)
+  bytes skp = 2;        // raw serialized SkPicture ("skiapict" magic + LE version + body)
+  int32 version = 3;    // SKP version int (read from the header), 0 if unknown
+  string error = 4;
+}
+
+// ----------------------------------------------------------------- compose
+// A node in the Compose layer (a semantics node and/or a composable from the
+// slot table). Bounds are absolute on-screen px (window coords). attrs is a
+// generic key/value bag (string-table ids) so it carries both semantics
+// properties (Text, Role, ContentDescription, ...) and slot-table info.
+message ComposeNode {
+  int64 id = 1;             // synthetic stable id (semantics id or anchor hash)
+  int32 name = 2;           // string-table id: best label / composable name
+  Bounds bounds = 3;        // reuse Bounds (Rect layout + optional Quad)
+  message Attr { int32 key = 1; int32 value = 2; } // string-table ids
+  repeated Attr attrs = 4;
+  int32 source = 5;         // string-table id: "File.kt:123" when known
+  enum Kind { COMPOSABLE = 0; SEMANTICS = 1; }
+  Kind kind = 6;
+  repeated ComposeNode children = 7;
+  // RenderNode/layer id of this composable's graphicsLayer, if it has one. This id matches a
+  // draw layer in the SKP, so the skiaparser can cut a per-component image for it. 0 = none.
+  int64 render_node_id = 8;
+}
+
+message DumpComposeCommand {
+  int64 root_view_id = 1;   // 0 => every AndroidComposeView
+  bool include_semantics = 2;
+  bool include_slot_table = 3;
+  // If true and the slot table is not populated, enable Compose inspection
+  // (set isDebugInspectorInfoEnabled, add slot-table storage, hot-reload to
+  // force a fresh composition) before reading. Mirrors the real inspector.
+  bool enable_inspection = 4;
+}
+message DumpComposeResponse {
+  message Window { int64 view_id = 1; ComposeNode root = 2; }
+  repeated Window windows = 1;
+  Strings strings = 2;
+  string diagnostics = 3;   // human note: what was/wasn't reachable
+}
+
+// ----------------------------------------------------------------- accessibility
+// The unified AccessibilityNodeInfo tree as assistive tech (TalkBack/UiAutomator) sees it,
+// covering both classic Views and Compose virtual nodes. All *_str-style int fields are
+// string-table ids (0 = absent).
+message A11yAction { int32 id = 1; int32 label = 2; }  // label = string-table id (custom actions)
+
+message A11yCollectionInfo {
+  int32 row_count = 1; int32 column_count = 2; bool hierarchical = 3;
+  int32 selection_mode = 4; int32 item_count = 5; int32 important_item_count = 6;
+}
+message A11yCollectionItemInfo {
+  int32 row_index = 1; int32 column_index = 2; int32 row_span = 3; int32 column_span = 4;
+  bool heading = 5; bool selected = 6; int32 row_title = 7; int32 column_title = 8;
+}
+message A11yRangeInfo { int32 type = 1; float min = 2; float max = 3; float current = 4; }
+message A11yExtra { int32 key = 1; int32 value = 2; }  // string-table ids
+
+message A11yNode {
+  int64 host_view_id = 1;   // uniqueDrawingId of the backing View (ties to ViewNode.id)
+  int32 virtual_id = 2;     // -1 (HOST_VIEW_ID) for real views; semantics id for Compose/virtual
+  bool is_virtual = 3;
+  int32 provider_class = 4; // string id; set on a provider host (AndroidComposeView/WebView)
+
+  Bounds bounds = 5;        // Bounds.layout = boundsInScreen (screen px)
+
+  int32 text = 6; int32 content_description = 7; int32 hint_text = 8;
+  int32 state_description = 9; int32 error = 10; int32 tooltip_text = 11;
+  int32 pane_title = 12; int32 container_title = 13; int32 supplemental_description = 14;
+  int32 role_description = 15;
+
+  int32 class_name = 16; int32 package_name = 17;
+  int32 view_id_resource_name = 18; int32 unique_id = 19;
+
+  bool clickable = 20; bool long_clickable = 21; bool context_clickable = 22;
+  bool checkable = 23; bool checked = 24; int32 checked_state = 25;
+  bool focusable = 26; bool focused = 27; bool accessibility_focused = 28;
+  bool selected = 29; bool enabled = 30; bool password = 31; bool scrollable = 32;
+  bool visible_to_user = 33; bool heading = 34; bool screen_reader_focusable = 35;
+  bool dismissable = 36; bool editable = 37; bool multi_line = 38;
+  bool content_invalid = 39; bool showing_hint_text = 40; bool text_entry_key = 41;
+  bool text_selectable = 42; bool field_required = 43; bool can_open_popup = 44;
+  bool a11y_data_sensitive = 45; bool request_initial_focus = 46;
+
+  int32 important_for_accessibility = 47; // View ints: 0 AUTO,1 YES,2 NO,4 NO_HIDE_DESCENDANTS
+  int32 live_region = 48; int32 input_type = 49;
+  int32 movement_granularities = 50; int32 max_text_length = 51;
+  int32 expanded_state = 52; int32 drawing_order = 53;
+  int32 text_selection_start = 54; int32 text_selection_end = 55;
+
+  A11yCollectionInfo collection_info = 56;
+  A11yCollectionItemInfo collection_item_info = 57;
+  A11yRangeInfo range_info = 58;
+
+  repeated A11yAction actions = 59;
+  int32 actions_bitmask = 60;
+
+  int64 traversal_before = 61; int64 traversal_after = 62;
+  int64 label_for = 63; int64 labeled_by = 64; repeated int64 labeled_by_list = 65;
+  bool is_traversal_group = 66;
+
+  repeated A11yExtra extras = 67;
+
+  int32 layout_size_w = 68; int32 layout_size_h = 69;
+  float text_size_px = 70; int32 text_size_unit = 71;
+
+  repeated A11yNode children = 80;
+}
+
+message DumpA11yCommand {
+  int64 root_id = 1;               // 0 => all roots
+  bool include_extras = 2;         // iterate getExtras() (default true)
+  bool include_rendering_info = 3; // refreshWithExtraData per node (costly; default false)
+}
+message DumpA11yResponse {
+  message Window { int64 root_view_id = 1; A11yNode root = 2; }
+  repeated Window windows = 1;
+  Strings strings = 2;
+  string diagnostics = 3;
+}
+
+// ----------------------------------------------------------------- envelopes
+message Request {
+  int32 id = 1;             // monotonic, echoed in Response.id
+  oneof command {
+    HelloCommand hello = 2;
+    GetWindowsCommand get_windows = 3;
+    DumpTreeCommand dump_tree = 4;
+    GetPropertiesCommand get_properties = 5;
+    ScreenshotCommand screenshot = 6;
+    ShutdownCommand shutdown = 7;
+    DumpComposeCommand dump_compose = 8;
+    CaptureSkpCommand capture_skp = 9;
+    DumpA11yCommand dump_a11y = 10;
+  }
+}
+
+message Response {
+  int32 id = 1;
+  enum Status { OK = 0; ERROR = 1; }
+  Status status = 2;
+  string error = 3;
+  oneof payload {
+    HelloResponse hello = 4;
+    GetWindowsResponse get_windows = 5;
+    DumpTreeResponse dump_tree = 6;
+    GetPropertiesResponse get_properties = 7;
+    ScreenshotResponse screenshot = 8;
+    ShutdownResponse shutdown = 9;
+    DumpComposeResponse dump_compose = 10;
+    CaptureSkpResponse capture_skp = 11;
+    DumpA11yResponse dump_a11y = 12;
+  }
+}

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ViewSpector agent manifest.
+
+  Deliberately empty: this APK is never installed or launched. It exists only as
+  a build vehicle that produces lib/arm64-v8a/libviewspector.so and the payload
+  dex (CONTRACT §2). No <application> components are declared because the payload
+  is injected via JVMTI attach-agent into a *different* process, not run here.
+
+  The package/namespace is supplied by android.namespace in build.gradle.kts.
+  android:debuggable is forced on by the debug build type (debuggable code
+  carrier), so it is intentionally not set here.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:hasCode="true"
+        android:allowBackup="false"
+        android:label="ViewSpector Agent" />
+
+</manifest>

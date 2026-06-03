@@ -1,0 +1,26 @@
+# Inspector Widget host driver + MCP server dependencies.
+#
+# protobuf: required — decodes the framed view_inspection.proto wire responses.
+#           The runtime MUST be compatible with the protoc gencode that produced
+#           inspector_widget/proto/view_inspection_pb2.py: that gencode calls
+#           ValidateProtobufRuntimeVersion with version 6.33.5, so the runtime
+#           must be >=6.33.5 (and <7 to stay within the same major). An older
+#           runtime (e.g. 5.x) raises at import time.
+# mcp:      preferred — the Model Context Protocol SDK (stdio server). The MCP
+#           server falls back to a built-in JSON-RPC-over-stdio implementation
+#           when this is absent, but installing it is recommended.
+#
+# adb is invoked via subprocess and is NOT a Python dependency.
+#
+# Optional: Pillow gives a faster/native PNG encoder in png.py. The module falls
+# back to a pure-stdlib (zlib+struct) encoder when Pillow is absent, so this is
+# not required.
+# Pillow>=10.0
+
+protobuf>=6.33.5,<7
+mcp>=1.0
+
+# --- test/dev (optional) ---
+# pytest powers the device-free host test suite under host/tests (run via
+# scripts/test.sh). It is NOT needed at runtime, only for `scripts/test.sh`.
+pytest>=8.0
