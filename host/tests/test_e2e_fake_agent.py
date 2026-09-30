@@ -317,7 +317,7 @@ def test_cli_attach_cold(fake_device, run_cli):
     assert (f"attached to {PKG} pid={PID}: agent viewspector-0.1, API 36, abi arm64-v8a"
             in res.out)
     assert "warm" not in res.out and f"socket=@viewspector_{PID}" in res.out
-    assert fake_device.commands() == ["hello", "hello"]
+    assert fake_device.commands() == ["hello"]  # the inject's Hello carries the metadata
     assert cold_injected(fake_device)
     assert fake_device.agent().running  # attach leaves the agent up...
     assert fake_device.forward_names() == []  # ...and removes its forward
@@ -336,7 +336,7 @@ def test_cli_dump_text(fake_device, run_cli):
     assert lines[0] == "DecorView (0,0 360x640) id=1001"
     assert '    TextView @id/title "Hello world" (16,24 328x40) id=1003' in lines
     assert "PopupDecorView (40,560 280x64) id=2001" in lines
-    assert fake_device.commands() == ["hello", "hello", "dump_tree"]
+    assert fake_device.commands() == ["hello", "dump_tree"]
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_screenshot) == (0, False, False)
 
@@ -420,7 +420,7 @@ def test_cli_a11y_overlay_with_lint(fake_device, run_cli, tmp_path):
     out = tmp_path / "a11y.png"
     res = run_cli("a11y", "--overlay", out, "--lint")
     assert res.rc == 0, res
-    assert fake_device.commands()[2:] == ["dump_a11y", "dump_compose", "screenshot", "screenshot"]
+    assert fake_device.commands()[1:] == ["dump_a11y", "dump_compose", "screenshot", "screenshot"]
     assert {"wm density", "settings get system font_scale"} <= set(fake_device.shell_log())
     assert png_size(out) == (360, 640)
     assert not Path(f"{out}.base.png").exists()
@@ -573,7 +573,6 @@ def test_cli_detach_shuts_down_a_running_agent(fake_device, warm_agent, run_cli)
     assert fake_device.forward_names() == []
 
 
-@pytest.mark.xfail(strict=True, reason="E4/H5: detach cold-injects the agent just to shut it down")
 def test_cli_detach_without_an_agent_does_not_inject(fake_device, run_cli):
     assert run_cli("detach").rc == 0
     assert not fake_device.pushed and not cold_injected(fake_device)
@@ -632,8 +631,6 @@ def test_mcp_attach(mcp, fake_device):
     assert mcp_server.SESSIONS.peek(SERIAL, PKG) is not None
 
 
-@pytest.mark.xfail(strict=True, reason="E9: attach returns null api_level/abi/agent_version "
-                   "(inject discards the HelloResponse)")
 def test_mcp_attach_reports_agent_metadata(mcp, fake_device):
     res = mcp("attach")
     assert (res["api_level"], res["abi"], res["agent_version"]) == (36, "arm64-v8a",
@@ -718,10 +715,17 @@ def test_mcp_screenshot(mcp, fake_device):
         assert png_pixel(res["path"], 20, 50) == OK_BUTTON_RGB
 
 
-@pytest.mark.parametrize("scale,wire", [(5, 1.0), (0, 1.0), (0.25, 0.25)])
+@pytest.mark.parametrize("scale,wire", [(0, 1.0), (0.25, 0.25), (1, 1.0)])
 def test_mcp_screenshot_scale_is_clamped(mcp, fake_device, scale, wire):
     assert "error" not in mcp("screenshot", scale=scale)
     assert fake_device.requests("screenshot")[-1].scale == wire
+
+
+def test_mcp_scale_out_of_schema_range_is_rejected_before_touching_the_device(mcp, fake_device):
+    res = mcp("screenshot", scale=5)
+    assert res == {"error": "invalid argument scale: 5 is greater than the maximum of 1.0",
+                   "tool": "screenshot"}
+    assert fake_device.adb_log == [] and fake_device.wire == []
 
 
 def test_mcp_dump_compose(mcp, fake_device):
@@ -864,7 +868,8 @@ def test_mcp_component_image_of_a_compose_layer_tries_skp(mcp, fake_device):
 def test_mcp_detach(mcp, fake_device):
     assert mcp("attach")["attached"]
     agent = fake_device.agent()
-    assert mcp("detach") == {"serial": SERIAL, "package": PKG, "detached": True}
+    assert mcp("detach") == {"serial": SERIAL, "package": PKG, "detached": True,
+                             "agent_stopped": True}
     assert fake_device.commands()[-1] == "shutdown" and not agent.running
     assert fake_device.forward_names() == [] and mcp_server.SESSIONS.peek(SERIAL, PKG) is None
     assert mcp("detach")["detached"] is False
@@ -915,8 +920,6 @@ def test_scenario_agent_drops_clients_then_cli_reconnects(fake_device, warm_agen
     assert not cold_injected(fake_device)
 
 
-@pytest.mark.xfail(strict=True, reason="E2/H2: a cached MCP session never goes stale; after the "
-                   "agent drops the connection every call fails with FramingError/BrokenPipe")
 def test_scenario_agent_drops_clients_then_mcp_recovers(mcp, fake_device):
     assert mcp("attach")["attached"]
     fake_device.kill_clients()
@@ -924,8 +927,6 @@ def test_scenario_agent_drops_clients_then_mcp_recovers(mcp, fake_device):
     assert "error" not in res and res["root_count"] == 2
 
 
-@pytest.mark.xfail(strict=True, reason="E2/H2: after the payload idle watchdog stops the server, "
-                   "the cached MCP session is reused instead of re-injecting")
 def test_scenario_idle_timeout_then_mcp_reattaches(mcp, fake_device):
     assert mcp("attach")["attached"]
     fake_device.idle_timeout()
@@ -934,16 +935,12 @@ def test_scenario_idle_timeout_then_mcp_reattaches(mcp, fake_device):
     assert len(fake_device.attach_calls) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="E2: re-attach after the agent dropped returns "
-                   "attached:true with window_count:null (the get_windows error is swallowed)")
 def test_scenario_mcp_attach_after_the_agent_dropped_is_live(mcp, fake_device):
     assert mcp("attach")["window_count"] == 2
     fake_device.kill_clients()
     assert mcp("attach")["window_count"] == 2
 
 
-@pytest.mark.xfail(strict=True, reason="E2 (pid check): after the app restarts under a new pid, "
-                   "the cached session is not dropped and re-injected")
 def test_scenario_app_restart_then_mcp_reinjects(mcp, fake_device):
     assert mcp("attach")["attached"]
     fake_device.restart_app(new_pid=5353)
@@ -983,8 +980,6 @@ def test_scenario_force_on_a_raw_client_subcommand_reinjects(fake_device, warm_a
     assert [c.get("result") for c in fake_device.attach_calls] == ["already-bound"]
 
 
-@pytest.mark.xfail(strict=True, reason="E4: --force is silently dropped by the Session-based "
-                   "subcommands (iw.attach has no force parameter)")
 def test_scenario_force_on_an_integrated_subcommand_reinjects(fake_device, warm_agent, run_cli,
                                                               tmp_path):
     assert run_cli("screenshot", "--force", "--out", tmp_path / "s.png").rc == 0
@@ -999,8 +994,6 @@ def test_scenario_raw_cli_command_leaves_a_live_mcp_session_alone(mcp, fake_devi
     assert fake_device.agent().generation == 1
 
 
-@pytest.mark.xfail(strict=True, reason="E4/H5: the Session-based CLI subcommands end with "
-                   "Session.detach() == SHUTDOWN, which kills every client incl. a live MCP session")
 def test_scenario_integrated_cli_command_leaves_a_live_mcp_session_alone(mcp, fake_device,
                                                                          run_cli, tmp_path):
     assert mcp("attach")["attached"]
@@ -1031,8 +1024,6 @@ def test_scenario_dump_tree_property_parity_cli_vs_mcp(mcp, fake_device, run_cli
         assert decoded(cli_props[name]) == decoded(mcp_props[name]), name
 
 
-@pytest.mark.xfail(strict=True, reason="H3 (+E2): after a protocol glitch (a duplicated reply) "
-                   "the client never resynchronises: every later call is off by one")
 def test_scenario_duplicate_reply_does_not_desync_forever(mcp, fake_device, warm_agent):
     sent = {"dup": False}
 
@@ -1071,7 +1062,6 @@ def test_scenario_second_window_is_addressable_by_root_id(mcp, fake_device):
     assert find(res["roots"], id=2002)["text"] == "Saved"
 
 
-@pytest.mark.xfail(strict=True, reason="E12: a failed CLI --overlay leaves OUT.png.base.png behind")
 def test_scenario_failed_cli_overlay_leaves_no_base_png(fake_device, run_cli, tmp_path, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("overlay renderer failed")

@@ -209,12 +209,8 @@ _NAMED_RECEIVERS = {
 # resolve is a bug (or belongs in an xfail below with its ledger id).
 _KNOWN_OPTIONAL_PROBES = {
     ("Session", "capture_skp"): "correlate._capture_skp falls back to session.client.capture_skp",
-    ("Session", "closed"): "mcp_server._session_alive compat shim (ledger: unify-ops dead code)",
 }
-_XFAIL_PROBES = {
-    ("Session", "api_level"): "E9", ("Session", "abi"): "E9", ("Session", "agent_version"): "E9",
-    ("Session", "is_alive"): "E2",
-}
+_XFAIL_PROBES: Dict[Tuple[str, str], str] = {}
 
 
 class _Inst:
@@ -562,16 +558,13 @@ def _probe_misses(scans, ledger_id: str) -> List[str]:
             if not ok and _XFAIL_PROBES.get((owner, attr)) == ledger_id]
 
 
-@pytest.mark.xfail(strict=True, reason="E9: mcp_server.tool_attach reads session.api_level / abi "
-                   "/ agent_version, which Session never sets (always null)")
-def test_attach_metadata_probes_resolve(signature_scans) -> None:
-    assert not _probe_misses(signature_scans, "E9")
-
-
-@pytest.mark.xfail(strict=True, reason="E2: mcp_server._session_alive probes session.is_alive, "
-                   "which Session lacks, so every cached session counts as alive")
-def test_session_liveness_probe_resolves(signature_scans) -> None:
-    assert not _probe_misses(signature_scans, "E2")
+def test_attach_metadata_and_liveness_resolve() -> None:
+    """E9 / E2: what tool_attach reports and what the session cache probes exist."""
+    import inspector_widget
+    session_attrs = _instance_attrs(inspector_widget.Session)
+    for attr in ("api_level", "abi", "agent_version", "pid", "warm", "info", "is_alive",
+                 "disconnect", "shutdown"):
+        assert attr in session_attrs, f"Session lacks {attr}"
 
 
 def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> None:
@@ -592,7 +585,7 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
     }
     assert expected <= seen, f"scan no longer checks: {sorted(expected - seen)}"
     probes = {(o, a) for s in signature_scans.values() for o, a, _ok, _l in s.probes}
-    assert ("Session", "api_level") in probes and ("a11y_lint", "lint_a11y") in probes
+    assert ("Session", "capture_skp") in probes and ("a11y_lint", "lint_a11y") in probes
 
 
 def test_signature_scan_catches_seeded_bugs() -> None:

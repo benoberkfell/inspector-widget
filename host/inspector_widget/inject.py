@@ -15,7 +15,7 @@ import os
 import socket
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from . import adb
 from .client import LOGCAT_HINT, AgentTimeoutError, Client, TransportError
@@ -102,8 +102,14 @@ class Injection:
     local_port: int
     sock: socket.socket
     warm: bool  # True if we connected to an already-attached agent
+    hello: Any = None  # the agent's HelloResponse (agent_version / api_level / abi)
+    closed: bool = False
 
     def close(self) -> None:
+        """Close the socket and remove the adb forward. Idempotent; the agent keeps running."""
+        if self.closed:
+            return
+        self.closed = True
         try:
             self.sock.close()
         finally:
@@ -180,6 +186,7 @@ def _try_warm_connect(serial: str, pid: int, package: str = "") -> Optional[Inje
         local_port=local_port,
         sock=sock,
         warm=True,
+        hello=hello,
     )
 
 
@@ -296,7 +303,7 @@ def inject_and_connect(
          to /data/local/tmp
       4. run-as cp into the app private dir (.so 700, dex/jar 444)
       5. cmd activity attach-agent <pkg> <so>=<bootstrap>:<payload>:viewspector_<pid>
-      6. wait for the abstract socket, adb forward, connect, return socket
+      6. wait for the abstract socket, adb forward, connect, Hello
     """
     serial = adb.resolve_serial(serial)
     pid = adb.pidof(serial, package)
@@ -360,7 +367,7 @@ def inject_and_connect(
     # Sanity PING so callers get a live connection or a clear failure.
     client = Client(sock, owns_socket=False)
     try:
-        client.hello()
+        inj.hello = client.hello()
     except Exception as e:
         inj.close()
         raise InjectionError(f"agent attached but Hello failed: {e}") from e

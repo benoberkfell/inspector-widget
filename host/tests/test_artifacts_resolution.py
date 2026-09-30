@@ -184,7 +184,6 @@ _INJECTING = [
     ["component-image", "--view-id", "5"],
     ["screenshot", "--out", "unused.png"],
     ["get-properties", "--view-id", "5"],
-    ["detach"],
 ]
 
 
@@ -206,14 +205,25 @@ def test_cli_without_flag_uses_env(monkeypatch, tmp_path, argv):
 
 
 def test_every_injecting_subcommand_is_covered():
-    """devices/packages never inject; every other subcommand must take --build-out."""
+    """devices/packages/detach never inject; every other subcommand must take --build-out."""
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
-    injecting = {name for name in sub.choices if name not in ("devices", "packages")}
+    never_inject = ("devices", "packages", "detach")
+    injecting = {name for name in sub.choices if name not in never_inject}
     assert injecting == {argv[0] for argv in _INJECTING}
     for name in injecting:
         opts = {o for a in sub.choices[name]._actions for o in a.option_strings}
         assert "--build-out" in opts, f"{name} lacks --build-out"
+    for name in never_inject:
+        opts = {o for a in sub.choices[name]._actions for o in a.option_strings}
+        assert "--build-out" not in opts, f"{name} never injects, so --build-out would be a no-op"
+
+
+def test_cli_detach_never_stages_artifacts(monkeypatch):
+    seen = _stub_cold_inject(monkeypatch)
+    monkeypatch.setattr(inject, "connect_existing", lambda serial, package: None)
+    assert cli.main(["detach"]) == 0
+    assert "build_out" not in seen
 
 
 # --------------------------------------------------------------------------- #

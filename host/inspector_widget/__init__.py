@@ -23,6 +23,7 @@ __all__ = [
     "list_devices",
     "list_processes",
     "attach",
+    "connect_existing",
     "Session",
     "__version__",
 ]
@@ -59,8 +60,12 @@ def list_devices():
     return out
 
 
-def list_processes(serial: str):
-    """[{package, pid, running}] for every debuggable third-party package."""
+def list_processes(serial: str = None):
+    """[{package, pid, running}] for every debuggable third-party package.
+
+    ``serial`` ``None`` picks ``$ANDROID_SERIAL`` or the only attached device.
+    """
+    serial = adb.resolve_serial(serial)
     out = []
     for pkg in adb.list_debuggable_packages(serial):
         pid = None
@@ -79,6 +84,12 @@ class Session:
     server drives, delegating to a :class:`client.Client` and translating the
     keyword names (``include_*`` / ``screenshot_scale`` -> the Client's
     ``properties`` / ``resolution_stack`` / ``scale``).
+
+    Lifecycle: :meth:`disconnect` (also ``close()`` and leaving a ``with``
+    block) drops this connection and leaves the agent running for the next
+    caller; :meth:`shutdown` stops the agent for every client. :meth:`is_alive`
+    says whether the connection is still usable and the app still has the same
+    pid.
     """
 
     def __init__(self, injection):
@@ -87,8 +98,47 @@ class Session:
         self.serial = injection.serial
         self.package = injection.package
         self.pid = injection.pid
+        self.warm = bool(injection.warm)
+        hello = getattr(injection, "hello", None)
+        self.agent_version = hello.agent_version if hello is not None else None
+        self.api_level = hello.api_level if hello is not None else None
+        self.abi = hello.abi if hello is not None else None
         self.client = Client(injection.sock, owns_socket=False)
 
+    # ------------------------------------------------------------------ #
+    # Metadata / health
+    # ------------------------------------------------------------------ #
+    def info(self) -> dict:
+        """What attach reports: device, pid, warm/cold and the agent's Hello."""
+        return {
+            "serial": self.serial,
+            "package": self.package,
+            "pid": self.pid,
+            "warm": self.warm,
+            "agent_version": self.agent_version,
+            "api_level": self.api_level,
+            "abi": self.abi,
+        }
+
+    @property
+    def closed(self) -> bool:
+        return bool(self.injection.closed or self.client.broken)
+
+    def is_alive(self) -> bool:
+        """True while the connection is open and the app still runs under ``pid``.
+
+        Costs one ``adb shell pidof``; a dropped connection is detected locally.
+        """
+        if self.closed or not self.client.is_open():
+            return False
+        try:
+            return adb.pidof(self.serial, self.package) == self.pid
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ #
+    # Commands
+    # ------------------------------------------------------------------ #
     def dump_tree(self, root_id: int = 0, include_properties: bool = False,
                   include_resolution_stack: bool = False,
                   include_screenshot: bool = False, screenshot_scale: float = 1.0):
@@ -122,28 +172,87 @@ class Session:
             root_id=root_id, include_extras=include_extras,
             include_rendering_info=include_rendering_info)
 
+    def capture_skp(self, root_id: int = 0):
+        return self.client.capture_skp(root_id=root_id)
+
     def hello(self):
         return self.client.hello()
 
-    def detach(self):
-        try:
-            self.client.shutdown()
-        except Exception:
-            pass
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+    def disconnect(self) -> None:
+        """Drop this connection (socket + adb forward). The agent keeps running,
+        so the next attach is a cheap warm connect. Idempotent."""
+        self.client.close()
         self.injection.close()
 
-    # Aliases the MCP server may probe for.
-    shutdown = detach
-    close = detach
+    close = disconnect
+
+    def shutdown(self, wait: float = 5.0) -> bool:
+        """Stop the agent for EVERY client (SHUTDOWN), then disconnect.
+
+        If this connection is already dead, a fresh connection to the same pid
+        delivers the SHUTDOWN. Waits up to ``wait`` seconds for the agent's
+        socket to go. Returns True if an agent was told to stop.
+        """
+        from . import inject
+        from .client import TransportError
+        stopped = False
+        if not self.client.broken:
+            try:
+                self.client.shutdown(timeout=wait)
+                stopped = True
+            except TransportError:
+                pass
+        self.disconnect()
+        if not stopped:
+            try:
+                fresh = inject._try_warm_connect(self.serial, self.pid, self.package)
+            except Exception:
+                fresh = None
+            if fresh is None:
+                return False
+            inject.stop_agent(fresh, wait=wait)
+            return True
+        inject._wait_for_socket_gone(self.serial, self.injection.socket_name, wait)
+        return True
+
+    # Old name: detach() always meant "send SHUTDOWN". Prefer shutdown().
+    detach = shutdown
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.disconnect()
 
 
-def attach(serial: str, package: str, build_out=None) -> "Session":
+def attach(serial: str = None, package: str = "com.oberkfell.a11yprobe", build_out=None,
+           force_reinject: bool = False) -> "Session":
     """Inject (or warm-reconnect) the agent into ``package`` and return a Session.
 
+    ``serial`` ``None`` picks ``$ANDROID_SERIAL`` or the only attached device.
     ``build_out`` is the artifacts directory; ``None`` resolves it from
     ``$INSPECTOR_WIDGET_ARTIFACTS`` / ``$VIEWSPECTOR_ARTIFACTS`` / the repo's
     ``build-out/`` (see :func:`inspector_widget.inject.resolve_build_out`).
+    ``force_reinject`` stops a running agent and injects a fresh one.
+
+    Use it as a context manager (or call :meth:`Session.disconnect`) to release
+    the connection while leaving the agent warm; :meth:`Session.shutdown`
+    stops the agent.
     """
     from . import inject
-    injection = inject.inject_and_connect(serial=serial, package=package, build_out=build_out)
+    injection = inject.inject_and_connect(serial=serial, package=package, build_out=build_out,
+                                          force_reinject=force_reinject)
     return Session(injection)
+
+
+def connect_existing(serial: str = None, package: str = "com.oberkfell.a11yprobe"):
+    """A Session on an agent already running in ``package``, or ``None``.
+
+    Never injects: this is how ``detach`` reaches an agent to stop it.
+    """
+    from . import inject
+    injection = inject.connect_existing(serial, package)
+    return Session(injection) if injection is not None else None
