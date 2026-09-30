@@ -78,6 +78,44 @@ object Redaction {
         return false
     }
 
+    private const val PASSWORD_VISUAL_TRANSFORMATION =
+        "androidx.compose.ui.text.input.PasswordVisualTransformation"
+
+    // androidx.compose.ui.text.input.KeyboardType.Password / .NumberPassword (a value class
+    // over Int; the getter is name-mangled, e.g. getKeyboardType-PjHm6EE).
+    private const val KEYBOARD_TYPE_PASSWORD = 7
+    private const val KEYBOARD_TYPE_NUMBER_PASSWORD = 8
+
+    /**
+     * Whether a Compose call parameter marks its composable as a password field: a
+     * PasswordVisualTransformation, or KeyboardOptions with a password keyboard. Matched by
+     * class name (the slot table is only readable when Compose is not renamed anyway).
+     * Never throws; anything unreadable is "no".
+     */
+    fun isComposePasswordParam(v: Any?): Boolean {
+        if (v == null) return false
+        return try {
+            val cls = v.javaClass
+            when (cls.name) {
+                PASSWORD_VISUAL_TRANSFORMATION -> true
+                "androidx.compose.foundation.text.KeyboardOptions" -> {
+                    val getter = cls.methods.firstOrNull {
+                        it.name.startsWith("getKeyboardType") && it.parameterTypes.isEmpty() &&
+                            it.returnType == Int::class.javaPrimitiveType
+                    } ?: return false
+                    val type = getter.invoke(v) as? Int
+                    type == KEYBOARD_TYPE_PASSWORD || type == KEYBOARD_TYPE_NUMBER_PASSWORD
+                }
+                else -> false
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** SecureTextField / OutlinedSecureTextField / BasicSecureTextField (Compose 1.7+). */
+    fun isComposeSecureFieldName(name: String): Boolean = name.endsWith("SecureTextField")
+
     /** Compose semantics keys whose value is the text field's content. */
     private val COMPOSE_SECRET_KEYS = arrayOf("EditableText", "InputText")
 

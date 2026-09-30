@@ -216,7 +216,7 @@ object ComposeInspector {
                     } else {
                         for ((i, g) in groups.withIndex()) {
                             try {
-                                for (n in buildSlotChildren(g, strings, 0, 0, off, 0L, i, ctx)) {
+                                for (n in buildSlotChildren(g, strings, 0, 0, off, 0L, i, emptySet(), ctx)) {
                                     rootNode.addChildren(n); produced = true
                                 }
                             } catch (t: Throwable) {
@@ -807,6 +807,7 @@ object ComposeInspector {
         off: IntArray,
         parentId: Long,
         siblingIndex: Int,
+        secrets: Set<String>,
         ctx: WalkCtx,
     ): List<ViewInspection.ComposeNode> {
         if (rawDepth > SLOT_RAW_MAX_DEPTH) {
@@ -820,6 +821,19 @@ object ComposeInspector {
         }
         val id = if (name != null) ctx.slotIds.mint(group, name, parentId, siblingIndex) else parentId
         val childNamedDepth = if (name != null) namedDepth + 1 else namedDepth
+        // Parameters are read before the children: a password field's text parameters become
+        // secrets its whole subtree masks (BasicTextField, the decoration box... get the value).
+        val params = if (name == null) null else try {
+            slotParameters(group, name)
+        } catch (t: Throwable) {
+            ctx.log("slot-table parameters", t)
+            null
+        }
+        val childSecrets = if (params != null && params.password) {
+            HashSet(secrets).apply { addAll(params.texts) }
+        } else {
+            secrets
+        }
         val childGroups = (invoke(group, "getChildren") as? Collection<*>) ?: emptyList<Any?>()
         val childNodes = ArrayList<ViewInspection.ComposeNode>()
         var index = 0
@@ -827,7 +841,9 @@ object ComposeInspector {
             if (c == null) continue
             try {
                 childNodes.addAll(
-                    buildSlotChildren(c, strings, rawDepth + 1, childNamedDepth, off, id, index++, ctx),
+                    buildSlotChildren(
+                        c, strings, rawDepth + 1, childNamedDepth, off, id, index++, childSecrets, ctx,
+                    ),
                 )
             } catch (t: Throwable) {
                 ctx.slotGroupFailures++
@@ -862,16 +878,12 @@ object ComposeInspector {
         // Render-node (graphicsLayer) id, so the host can cut a per-component SKP image.
         val rnid = try { collectRenderNodeId(group, 0) } catch (t: Throwable) { 0L }
         if (rnid != 0L) b.renderNodeId = rnid
-        val params = try {
-            slotParameters(group)
-        } catch (t: Throwable) {
-            ctx.log("slot-table parameters", t)
-            emptyList()
-        }
-        for (p in params) {
+        for ((key, value) in params?.list.orEmpty()) {
+            // A password field's text, wherever it is passed down in its subtree, goes out masked.
+            val shown = if (value in childSecrets) Redaction.mask(value) else value
             b.addAttrs(
                 ViewInspection.ComposeNode.Attr.newBuilder()
-                    .setKey(strings.intern(p.first)).setValue(strings.intern(p.second)).build()
+                    .setKey(strings.intern(key)).setValue(strings.intern(shown)).build()
             )
         }
         childNodes.forEach { b.addChildren(it) }
@@ -968,16 +980,33 @@ object ComposeInspector {
     }
 
     /** Read a Group's call parameters (ParameterInformation: name, value) as key/value strings. */
-    private fun slotParameters(group: Any): List<Pair<String, String>> {
-        val params = invoke(group, "getParameters") as? List<*> ?: return emptyList()
+    /**
+     * A named group's call parameters, stringified. [password]: the call is a password field
+     * (a PasswordVisualTransformation or a password keyboard among its parameters, or a
+     * *SecureTextField), whose text parameters ([texts], non-empty CharSequences) are secrets.
+     */
+    private class SlotParams(
+        val list: List<Pair<String, String>>,
+        val password: Boolean,
+        val texts: List<String>,
+    )
+
+    private fun slotParameters(group: Any, name: String): SlotParams {
+        val params = invoke(group, "getParameters") as? List<*>
+            ?: return SlotParams(emptyList(), false, emptyList())
         val out = ArrayList<Pair<String, String>>()
+        val texts = ArrayList<String>()
+        var password = Redaction.isComposeSecureFieldName(name)
         for (p in params) {
             if (p == null) continue
             val pn = invoke(p, "getName") as? String ?: continue
             val pv = invoke(p, "getValue")
-            out.add(pn to SafeString.of(pv))
+            if (!password && Redaction.isComposePasswordParam(pv)) password = true
+            val shown = SafeString.of(pv)
+            if (pv is CharSequence && shown.isNotEmpty()) texts.add(shown)
+            out.add(pn to shown)
         }
-        return out
+        return SlotParams(out, password, if (password) texts else emptyList())
     }
 
     /** Group.box is window px (ui-tooling-data boundsOfLayoutNode uses positionInWindow); shift to screen. */
