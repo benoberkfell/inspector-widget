@@ -249,7 +249,7 @@ def fake_device(monkeypatch, tmp_path):
     # exit) belong to this test's fake device only.
     from inspector_widget import adb
     monkeypatch.setattr(adb, "_OWN_FORWARDS", {})
-    monkeypatch.setattr(mcp_server._a11y_lint_context, "_dens", {}, raising=False)
+    monkeypatch.setattr(mcp_server._a11y_device_metrics, "_cache", {}, raising=False)
     try:
         yield dev
     finally:

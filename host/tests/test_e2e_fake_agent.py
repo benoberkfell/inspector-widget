@@ -463,8 +463,9 @@ def test_cli_a11y_json(fake_device, run_cli):
     submit = find([w["root"] for w in data["windows"]], virtual_id=2)
     assert submit["host_view_id"] == 1006 and "is_virtual" in submit["flags"]
     assert submit["extras"] == {"androidx.compose.ui.semantics.id": "2"}
-    stops = [e.get("speakable") for e in data["focus_order"] if e.get("is_focus_stop")]
-    assert stops[:3] == ["Hello world", "OK", "Submit"]
+    stops = [(e["speak"], e["key"]) for e in data["focus_order"]]
+    assert stops[:3] == [("Hello world", "view:1003"), ("OK, button", "view:1004"),
+                         ("Submit, button", "compose:1006:2")]
 
 
 def test_cli_a11y_reading_order_text_and_flags(fake_device, run_cli):
@@ -472,7 +473,7 @@ def test_cli_a11y_reading_order_text_and_flags(fake_device, run_cli):
     assert res.rc == 0, res
     req = fake_device.requests("dump_a11y")[-1]
     assert (req.include_extras, req.include_rendering_info) == (False, True)
-    assert "  3. Submit (16,176 200x56)" in res.out.splitlines()
+    assert "  3. Submit, button  [compose:1006:2]" in res.out.splitlines()
 
 
 @needs_pil
@@ -480,7 +481,9 @@ def test_cli_a11y_overlay_with_lint(fake_device, run_cli, tmp_path):
     out = tmp_path / "a11y.png"
     res = run_cli("a11y", "--overlay", out, "--lint")
     assert res.rc == 0, res
-    assert fake_device.commands()[1:] == ["dump_a11y", "dump_compose", "screenshot", "screenshot"]
+    assert fake_device.commands()[1:] == ["dump_a11y", "dump_compose",
+                                          "screenshot", "screenshot",   # contrast, per window
+                                          "screenshot", "screenshot"]   # overlay composite
     assert {"wm density", "settings get system font_scale"} <= set(fake_device.shell_log())
     assert png_size(out) == (360, 640)
     assert not Path(f"{out}.base.png").exists()
@@ -497,7 +500,7 @@ def test_cli_a11y_lint_json(fake_device, run_cli):
     by_rule = data["summary"]["by_rule"]
     assert by_rule["a11y.touch_target.small"] >= 1 and by_rule["a11y.label.missing"] == 1
     missing = [f for f in data["findings"] if f["rule"] == "a11y.label.missing"]
-    assert [f["node"]["id"] for f in missing] == [6]
+    assert [f["node_key"] for f in missing] == ["compose:1006:6"]
 
 
 def test_cli_a11y_lint_rule_filter_without_contrast(fake_device, run_cli):
@@ -528,7 +531,7 @@ def test_cli_inspect_json(fake_device, run_cli):
     ok = find(data["roots"], node_key="view:1004")
     assert ok["correlation_confidence"] == "exact" and ok["a11y"]["text"] == "OK"
     host = find(data["roots"], node_key="view:1006")
-    submit = find(host["children"], node_key="compose:2")
+    submit = find(host["children"], node_key="compose:1006:2")
     assert submit["a11y"]["virtual_id"] == 2 and submit["correlation_confidence"] == "exact"
 
 
@@ -828,9 +831,11 @@ def test_mcp_dump_accessibility(mcp, fake_device):
 def test_mcp_a11y_lint(mcp, fake_device):
     res = mcp("a11y_lint")
     assert (res["density"], res["font_scale"], res["contrast_sampled"]) == (280, 1.3, True)
-    assert fake_device.commands()[-2:] == ["dump_compose", "screenshot"]
+    assert fake_device.commands()[-4:] == ["dump_a11y", "dump_compose",
+                                           "screenshot", "screenshot"]  # contrast, per window
     assert res["summary"]["by_rule"]["a11y.label.missing"] == 1
-    assert {f["node"]["id"] for f in res["findings"]} >= {2, 5, 6}
+    assert {f["node_key"] for f in res["findings"]} >= {
+        "compose:1006:2", "compose:1006:5", "compose:1006:6"}
 
 
 def test_mcp_a11y_lint_rule_subset_without_contrast(mcp, fake_device):
@@ -850,8 +855,6 @@ def test_mcp_a11y_overlay(mcp, fake_device):
 
 
 @needs_pil
-@pytest.mark.xfail(strict=True, reason="A2: overlay severity colours never show (findings carry "
-                   "semantics ids, the overlay looks nodes up by packed a11y id)")
 def test_mcp_a11y_overlay_colours_the_flagged_nodes(mcp, fake_device):
     res = mcp("a11y_overlay")
     assert res["flagged"] > 0
@@ -862,7 +865,7 @@ def test_mcp_inspect(mcp, fake_device):
     assert fake_device.commands()[1:] == ["dump_tree", "dump_compose", "dump_a11y"]
     assert res["summary"]["nodes"] == 15 and res["sources"]["a11y"] is True
     host = find(res["roots"], node_key="view:1006")
-    assert find(host["children"], node_key="compose:6")["a11y"]["virtual_id"] == 6
+    assert find(host["children"], node_key="compose:1006:6")["a11y"]["virtual_id"] == 6
 
 
 @pytest.mark.xfail(strict=True, reason="A1: the agent on this branch gives every a11y node the "
@@ -898,8 +901,8 @@ def test_mcp_inspect_node(mcp, fake_device):
 
 
 @pytest.mark.parametrize("selector,key", [
-    ({"node_key": "compose:2"}, "compose:2"),
-    ({"semantics_id": 5}, "compose:5"),
+    ({"node_key": "compose:2"}, "compose:1006:2"),
+    ({"semantics_id": 5}, "compose:1006:5"),
     ({"bounds": {"x": 20, "y": 90, "w": 4, "h": 4}}, "view:1004"),
 ])
 def test_mcp_inspect_node_selectors(mcp, fake_device, selector, key):
@@ -910,7 +913,7 @@ def test_mcp_inspect_node_selectors(mcp, fake_device, selector, key):
 def test_mcp_inspect_node_focused_lint(mcp, fake_device):
     res = mcp("inspect_node", node_key="compose:2", include_image=False)
     assert {f["rule"] for f in res["lint"]} == {"a11y.touch_target.small"}
-    assert all(f["node"]["id"] == 2 for f in res["lint"])
+    assert all(f["node_key"] == "compose:1006:2" for f in res["lint"])
 
 
 def test_mcp_inspect_node_needs_a_selector_before_touching_the_device(mcp, fake_device):

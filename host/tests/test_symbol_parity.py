@@ -153,7 +153,7 @@ def test_scan_actually_finds_contract_symbols() -> None:
     expected = {
         ("adb", "display_density"),
         ("adb", "font_scale"),
-        ("a11y_lint", "lint_a11y"),
+        ("a11y_lint", "run_lint"),
         ("overlay", "render_integrated_overlay"),
         ("png", "_decode_to_rgba"),
     }
@@ -581,7 +581,7 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("correlate", "component_image"),
         ("skia_client", "per_component_images"),
         ("overlay", "render_a11y_overlay"),
-        ("a11y_lint", "LintContext"),
+        ("a11y_lint", "run_lint"),          # cli / mcp_server -> the unified lint
     }
     assert expected <= seen, f"scan no longer checks: {sorted(expected - seen)}"
     probes = {(o, a) for s in signature_scans.values() for o, a, _ok, _l in s.probes}

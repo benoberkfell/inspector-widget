@@ -3,29 +3,33 @@
   Classic-View (XML) accessibility corpus (testapps.md §5).
   Each numbered section pairs a GOOD view (id good*) with a BAD view (id bad*)
   so the AccessibilityNodeInfo path can be validated the same way as Compose.
+
+  The BAD views are DELIBERATE defects (the host golden test,
+  host/tests/test_device_a11y_golden.py, asserts each one is flagged). Sections
+  1-6 carry lint expectations and are kept compact so they all fit above the
+  fold of a phone screen without scrolling; 7-8 are dump-only checks.
+  GOOD and BAD labels differ so the duplicate-label rule never pairs them.
 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/white"
-    android:fillViewport="true">
+    android:fillViewport="true"
+    android:fitsSystemWindows="true">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="16dp">
+        android:paddingStart="16dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="16dp">
 
         <!-- ============ 1. ImageButton contentDescription ============ -->
         <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="8dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_image_button"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            style="@style/SectionTitle"
+            android:text="@string/view_section_image_button" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -41,27 +45,20 @@
                 android:contentDescription="@string/like"
                 android:src="@android:drawable/btn_star_big_on" />
 
-            <!-- FIXED: give the clickable ImageButton a contentDescription. -->
+            <!-- BAD (a11y.label.missing): clickable ImageButton with no contentDescription. -->
             <ImageButton
                 android:id="@+id/badImageButton"
                 android:layout_width="48dp"
                 android:layout_height="48dp"
                 android:layout_marginStart="16dp"
                 android:background="@android:color/transparent"
-                android:contentDescription="@string/like"
                 android:src="@android:drawable/btn_star_big_on" />
         </LinearLayout>
 
         <!-- ============ 2. Touch target size ============ -->
         <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_touch_target"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            style="@style/SectionTitle"
+            android:text="@string/view_section_touch_target" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -78,27 +75,24 @@
                 android:minHeight="48dp"
                 android:text="@string/play" />
 
-            <!-- FIXED: 48dp minimum touch target. -->
+            <!-- BAD (a11y.touch_target.small): a 32dp-tall button. -->
             <Button
                 android:id="@+id/badTouchTarget"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_height="32dp"
                 android:layout_marginStart="16dp"
-                android:minWidth="48dp"
-                android:minHeight="48dp"
-                android:text="@string/play" />
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:paddingTop="0dp"
+                android:paddingBottom="0dp"
+                android:text="@string/pause"
+                android:textSize="12sp" />
         </LinearLayout>
 
         <!-- ============ 3. Text contrast ============ -->
         <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_contrast"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            style="@style/SectionTitle"
+            android:text="@string/view_section_contrast" />
 
         <!-- GOOD: #1A1A1A on white (~16:1). -->
         <TextView
@@ -106,123 +100,86 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="@color/white"
-            android:padding="8dp"
+            android:padding="6dp"
             android:text="Readable text (16:1)"
             android:textColor="@color/text_good_contrast"
             android:textSize="16sp" />
 
-        <!-- FIXED: #1A1A1A on white (~16:1) for sufficient contrast. -->
+        <!-- BAD (a11y.contrast.low): #BFBFBF on white (~1.8:1). -->
         <TextView
             android:id="@+id/badContrast"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="@color/white"
-            android:padding="8dp"
+            android:padding="6dp"
             android:text="Hard to read text (1.6:1)"
-            android:textColor="@color/text_good_contrast"
+            android:textColor="@color/text_bad_contrast"
             android:textSize="16sp" />
 
-        <!-- ============ 4. Switch stateDescription ============ -->
+        <!-- ============ 4. ImageView label ============ -->
         <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_switch"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
-
-        <!-- GOOD: stateDescription set programmatically in the Activity. -->
-        <com.google.android.material.switchmaterial.SwitchMaterial
-            android:id="@+id/goodSwitch"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true"
-            android:text="@string/notifications" />
-
-        <!-- BAD: no stateDescription. -->
-        <com.google.android.material.switchmaterial.SwitchMaterial
-            android:id="@+id/badSwitch"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true"
-            android:text="@string/notifications" />
-
-        <!-- ============ 5. ImageView label / decorative ============ -->
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_image"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            style="@style/SectionTitle"
+            android:text="@string/view_section_image" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal">
 
-            <!-- GOOD (meaningful): has contentDescription. -->
+            <!-- GOOD (meaningful, tappable): has contentDescription. -->
             <ImageView
                 android:id="@+id/goodImage"
-                android:layout_width="64dp"
-                android:layout_height="64dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
+                android:clickable="true"
                 android:contentDescription="@string/avatar"
+                android:focusable="true"
                 android:src="@android:drawable/sym_def_app_icon" />
 
-            <!-- FIXED (meaningful): add a contentDescription. -->
+            <!-- BAD (a11y.image.no_description): a tappable avatar with no contentDescription. -->
             <ImageView
                 android:id="@+id/badImage"
-                android:layout_width="64dp"
-                android:layout_height="64dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
                 android:layout_marginStart="16dp"
-                android:contentDescription="@string/avatar"
+                android:clickable="true"
+                android:focusable="true"
                 android:src="@android:drawable/sym_def_app_icon" />
 
             <!-- GOOD (decorative): correctly excluded from accessibility. -->
             <ImageView
                 android:id="@+id/goodDecorativeImage"
-                android:layout_width="64dp"
-                android:layout_height="64dp"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
                 android:layout_marginStart="16dp"
                 android:importantForAccessibility="no"
                 android:src="@android:drawable/divider_horizontal_dark" />
         </LinearLayout>
 
-        <!-- ============ 6. Custom clickable role ============ -->
+        <!-- ============ 5. Custom clickable role ============ -->
         <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_custom"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            style="@style/SectionTitle"
+            android:text="@string/view_section_custom" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal">
 
-            <!-- GOOD: delegate adds roleDescription="Button" + isClickable. -->
+            <!-- GOOD: the Activity's delegate adds roleDescription="Button". -->
             <TextView
                 android:id="@+id/goodCustomClickable"
                 android:layout_width="wrap_content"
                 android:layout_height="48dp"
                 android:background="@color/accent_good"
                 android:clickable="true"
-                android:contentDescription="@string/submit"
                 android:focusable="true"
                 android:gravity="center"
                 android:padding="12dp"
                 android:text="@string/submit"
                 android:textColor="@color/white" />
 
-            <!-- FIXED: clickable view gets a contentDescription. -->
+            <!-- BAD (a11y.role.missing_on_clickable): clickable TextView, no role. -->
             <TextView
                 android:id="@+id/badCustomClickable"
                 android:layout_width="wrap_content"
@@ -230,61 +187,17 @@
                 android:layout_marginStart="16dp"
                 android:background="@color/accent_bad"
                 android:clickable="true"
-                android:contentDescription="@string/submit"
                 android:focusable="true"
                 android:gravity="center"
                 android:padding="12dp"
-                android:text="@string/submit"
+                android:text="@string/send"
                 android:textColor="@color/white" />
         </LinearLayout>
 
-        <!-- ============ 7. Heading semantics ============ -->
+        <!-- ============ 6. EditText label (labelFor) ============ -->
         <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_heading"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
-
-        <!-- GOOD: marked as a heading via ViewCompat.setAccessibilityHeading. -->
-        <TextView
-            android:id="@+id/goodHeading"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/account_heading"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="20sp"
-            android:textStyle="bold" />
-
-        <!-- BAD: large text, NOT a heading. -->
-        <TextView
-            android:id="@+id/badHeading"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/account_heading"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="20sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/account_body"
-            android:textColor="@color/text_good_contrast" />
-
-        <!-- ============ 8. EditText label (labelFor) ============ -->
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:paddingTop="16dp"
-            android:paddingBottom="4dp"
-            android:text="@string/view_section_form"
-            android:textColor="@color/text_good_contrast"
-            android:textSize="16sp"
-            android:textStyle="bold" />
+            style="@style/SectionTitle"
+            android:text="@string/view_section_form" />
 
         <!-- GOOD: label TextView declares labelFor pointing at the EditText. -->
         <TextView
@@ -304,16 +217,67 @@
             android:inputType="textEmailAddress"
             android:minHeight="48dp" />
 
-        <!-- FIXED: give the field a hint so it is announced as labeled. -->
+        <!-- BAD (a11y.label.missing): no label, no hint, no labelFor partner. -->
         <EditText
             android:id="@+id/badEditText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:hint="@string/email_hint"
+            android:layout_marginTop="8dp"
             android:importantForAutofill="no"
             android:inputType="textEmailAddress"
             android:minHeight="48dp" />
+
+        <!-- ============ 7. Switch stateDescription (dump-only) ============ -->
+        <TextView
+            style="@style/SectionTitle"
+            android:text="@string/view_section_switch" />
+
+        <!-- GOOD: stateDescription set programmatically in the Activity. -->
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/goodSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="@string/notifications" />
+
+        <!-- BAD: no stateDescription (the stock checked state is still exposed). -->
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/badSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="@string/email_alerts" />
+
+        <!-- ============ 8. Heading semantics (dump-only) ============ -->
+        <TextView
+            style="@style/SectionTitle"
+            android:text="@string/view_section_heading" />
+
+        <!-- GOOD: marked as a heading via ViewCompat.setAccessibilityHeading. -->
+        <TextView
+            android:id="@+id/goodHeading"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/account_heading"
+            android:textColor="@color/text_good_contrast"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <!-- BAD: large bold text, NOT a heading. -->
+        <TextView
+            android:id="@+id/badHeading"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/security_heading"
+            android:textColor="@color/text_good_contrast"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/account_body"
+            android:textColor="@color/text_good_contrast" />
 
     </LinearLayout>
 </ScrollView>
