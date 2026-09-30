@@ -150,6 +150,13 @@ object AccessibilityInspector {
     ) {
         var count = 0
         val byA11yId = HashMap<Int, View>()
+
+        /**
+         * The window root being walked. A window's root View reports the accessibility view
+         * id ROOT_ITEM_ID (seen live on API 37), and every window's root shares it, so that
+         * id resolves to the current root rather than through the index.
+         */
+        var currentRoot: View? = null
         var indexBuilds = 0
         var unresolvedNodes = 0
         var unresolvedLinks = 0
@@ -213,6 +220,7 @@ object AccessibilityInspector {
         }
 
         for (root in rootViews) {
+            ctx.currentRoot = root
             // The host node on which app-process query mode was enabled; reset on it in finally.
             var enabledNode: AccessibilityNodeInfo? = null
             val countBefore = ctx.count
@@ -295,7 +303,8 @@ object AccessibilityInspector {
         try {
             // getAccessibilityViewId() assigns an id on first use; attached Views already have
             // one (View.onAttachedToWindow registers it with AccessibilityNodeIdManager).
-            (m.invoke(view) as? Int)?.let { ctx.byA11yId[it] = view }
+            // ROOT_ITEM_ID is shared by every window root; viewFor maps it to the current root.
+            (m.invoke(view) as? Int)?.let { if (it != A11yIds.ROOT_ITEM_ID) ctx.byA11yId[it] = view }
         } catch (t: Throwable) {
             ctx.fail("View.getAccessibilityViewId()", t)
         }
@@ -318,7 +327,8 @@ object AccessibilityInspector {
 
     /** The View whose accessibility view id is [aid], or null. */
     private fun viewFor(aid: Int, ctx: Ctx): View? {
-        if (aid == A11yIds.UNDEFINED_ITEM_ID || aid == A11yIds.ROOT_ITEM_ID) return null
+        if (aid == A11yIds.UNDEFINED_ITEM_ID) return null
+        if (aid == A11yIds.ROOT_ITEM_ID) return ctx.currentRoot
         ctx.byA11yId[aid]?.let { return it }
         if (getAccessibilityViewIdM != null && ctx.indexBuilds < MAX_INDEX_BUILDS) {
             buildIndex(ctx)
