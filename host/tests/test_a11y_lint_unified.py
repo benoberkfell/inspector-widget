@@ -918,3 +918,53 @@ def test_r12_flat_lazy_items_in_one_visual_row_are_still_duplicates():
                 collection_info={"row_count": -1, "column_count": 1})
     rep = lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[lazy]))))
     assert sorted(keys(of(rep, "a11y.duplicate.label"))) == ["compose:20:11", "compose:20:12"]
+
+
+# --------------------------------------------------------------------------- #
+# End to end from the wire: DumpA11yResponse -> a11y.a11y_to_dict -> lint.
+# Guards the lint's assumptions about the resolved dict shape.
+# --------------------------------------------------------------------------- #
+def _wire_response():
+    strings: Dict[str, int] = {}
+
+    def s(text):
+        if text not in strings:
+            strings[text] = len(strings) + 1
+        return strings[text]
+
+    def node(hv, vid, cls, x, y, w, h, **kw):
+        n = pb.A11yNode(host_view_id=hv, virtual_id=vid, is_virtual=(vid != -1),
+                        class_name=s(cls), visible_to_user=True, enabled=True, **kw)
+        n.bounds.layout.x, n.bounds.layout.y = x, y
+        n.bounds.layout.w, n.bounds.layout.h = w, h
+        return n
+
+    root = node(1, -1, "android.widget.FrameLayout", 0, 0, 1080, 2400)
+    ib = node(11, -1, "android.widget.ImageButton", 100, 100, 160, 160, clickable=True,
+              focusable=True)
+    ib.actions.add(id=0x10)
+    tv = node(12, -1, "android.widget.TextView", 100, 400, 600, 60, text=s("Fixed"),
+              text_size_px=42.0, text_size_unit=0)
+    acv = node(20, -1, ACV, 0, 600, 1080, 800, provider_class=s(ACV))
+    btn = node(20, 7, "android.widget.Button", 100, 700, 160, 160, clickable=True,
+               focusable=True)
+    btn.actions.add(id=0x10)
+    acv.children.append(btn)
+    root.children.extend([ib, tv, acv])
+    resp = pb.DumpA11yResponse()
+    w = resp.windows.add(root_view_id=1)
+    w.root.CopyFrom(root)
+    for text, sid in strings.items():
+        resp.strings.entries.add(id=sid, str=text)
+    return resp
+
+
+def test_end_to_end_from_the_wire():
+    from inspector_widget import a11y as a11ymod
+    data = a11ymod.a11y_to_dict(_wire_response())
+    rep = lint(data, density=160)
+    assert sorted(keys(of(rep, "a11y.label.missing"))) == ["compose:20:7", "view:11"]
+    f11 = of(rep, "a11y.text.fixed_scaling")
+    assert [(x.node_key, x.evidence["unit"]) for x in f11] == [("view:12", "px")]
+    btn = [x for x in of(rep, "a11y.label.missing") if x.node_key == "compose:20:7"][0]
+    assert btn.node["id"] == L.a11y_node_id(20, 7)
