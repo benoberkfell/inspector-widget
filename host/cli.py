@@ -483,6 +483,9 @@ def cmd_detach(args) -> int:
     session.detach()
     print(f"detached {args.package} on {args.serial}", file=sys.stderr)
     return 0
+def _add_serial_arg(sp):
+    sp.add_argument("--serial", default=None,
+                    help="device serial (default: $ANDROID_SERIAL, else the only attached device)")
 
 
 def _add_build_out_arg(sp):
@@ -516,18 +519,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_devices)
 
     sp = sub.add_parser("packages", help="list debuggable packages")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.set_defaults(func=cmd_packages)
 
     sp = sub.add_parser("attach", help="inject the agent and PING it")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_attach)
 
     sp = sub.add_parser("dump", help="inject + dump the view tree (one shot)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--root-id", type=int, default=0, help="0 == all roots")
     sp.add_argument("--properties", action="store_true", help="inline view properties")
@@ -552,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("compose", help="inject + dump the Compose layer (semantics + slot table)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--overlay", metavar="OUT.png",
                     help="render the Compose tree as labeled boxes over a screenshot")
@@ -571,7 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
     sp = sub.add_parser("a11y", help="dump the unified accessibility tree (Views + Compose) + TalkBack reading order")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the resolved a11y tree as JSON")
     sp.add_argument("--overlay", metavar="OUT.png",
@@ -590,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_a11y)
 
     sp = sub.add_parser("a11y-lint", help="run the accessibility lint (R1..R12) over the Compose semantics tree")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--json", metavar="OUT.json|-", help="emit findings as JSON")
     sp.add_argument("--no-contrast", action="store_true", help="skip the contrast (image) rule")
@@ -606,7 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- integrated inspector subcommands (mirror the MCP tools) ----- #
     sp = sub.add_parser("inspect",
                         help="whole-screen integrated tree (View + Compose + a11y, correlated)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--properties", action="store_true",
                     help="inline full view properties under each node's view.properties")
@@ -620,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("inspect-node",
                         help="full dossier for ONE element (facets + component image + focused lint)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     _add_selector_args(sp)
     sp.add_argument("--no-image", action="store_true", help="skip cutting the component image")
@@ -631,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("component-image",
                         help="cut a per-component image for one element (SKP layer cut else BITMAP crop)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     _add_selector_args(sp)
     sp.add_argument("--out", metavar="OUT.png", help="output PNG path (default: a temp file)")
@@ -641,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_component_image)
 
     sp = sub.add_parser("screenshot", help="capture a screenshot PNG of the app's current UI")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--out", metavar="OUT.png", required=True, help="output PNG path")
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale (<=1.0)")
@@ -650,7 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_screenshot)
 
     sp = sub.add_parser("get-properties", help="fetch the full attribute set for a single view")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--view-id", type=int, required=True,
                     help="the view's uniqueDrawingId (the 'id' field from dump)")
@@ -674,13 +677,19 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if hasattr(args, "serial"):
+            args.serial = adb.resolve_serial(args.serial)
         return args.func(args)
     except Exception as e:  # surface a clean error to the shell
         # Set INSPECTOR_WIDGET_LOG=DEBUG (or =TRACE) to get the full traceback.
-        if os.environ.get("INSPECTOR_WIDGET_LOG", "").upper() in ("DEBUG", "TRACE"):
+        level = os.environ.get("INSPECTOR_WIDGET_LOG") or os.environ.get("VIEWSPECTOR_LOG") or ""
+        if level.upper() in ("DEBUG", "TRACE"):
             import traceback
             traceback.print_exc()
         print(f"error: {e}", file=sys.stderr)
+        hint = getattr(e, "hint", None)
+        if hint:
+            print(f"hint: {hint}", file=sys.stderr)
         return 1
 
 

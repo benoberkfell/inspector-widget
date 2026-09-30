@@ -168,3 +168,48 @@ def test_shutdown_on_a_closed_client_says_nothing_was_sent(agent):
     with pytest.raises(SessionLostError):
         client.shutdown()
     assert agent.running
+
+
+# =========================================================================== #
+# E7 / H9 / H10: devices and serials
+# =========================================================================== #
+@pytest.fixture
+def two_devices(fake_device, monkeypatch, tmp_path):
+    other = fakeagent.default_device(serial="emulator-5556")
+    fakeagent.install(monkeypatch, fake_device, other, build_out=str(tmp_path / "build-out"))
+    yield other
+    other.close()
+
+
+def test_the_only_device_is_used_when_no_serial_is_given(fake_device, run_cli, monkeypatch):
+    monkeypatch.delenv(adb.SERIAL_ENV, raising=False)
+    assert adb.resolve_serial(None) == SERIAL
+    res = run_cli("attach")
+    assert res.rc == 0, res
+
+
+def test_an_offline_or_unauthorized_device_says_so(fake_device, run_cli):
+    fake_device.state = "unauthorized"
+    res = run_cli("attach", "--serial", SERIAL)
+    assert res.rc == 1 and "is unauthorized" in res.err and "Allow USB debugging" in res.err
+    fake_device.state = "offline"
+    assert "is offline" in run_cli("attach", "--serial", SERIAL).err
+
+
+def test_no_device_at_all(fake_device, monkeypatch, tmp_path, run_cli):
+    fakeagent.install(monkeypatch, build_out=str(tmp_path / "build-out"))
+    res = run_cli("screenshot", "--out", tmp_path / "x.png")
+    assert res.rc == 1 and "no Android device attached" in res.err
+
+
+def test_pidof_raises_when_adb_itself_fails(fake_device):
+    with pytest.raises(adb.AdbError, match="not found"):
+        adb.pidof("emulator-9999", PKG)
+    assert adb.pidof(SERIAL, "com.example.idle") is None  # toybox: no match, no stderr
+
+
+def test_socket_exists_ignores_longer_names(fake_device):
+    fake_device.foreign_sockets.append(f"viewspector_{PID}1")
+    assert not adb.socket_exists(SERIAL, f"viewspector_{PID}")
+    fake_device.foreign_sockets.append(f"viewspector_{PID}")
+    assert adb.socket_exists(SERIAL, f"viewspector_{PID}")

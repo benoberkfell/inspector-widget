@@ -139,7 +139,7 @@ def _connect_forward(serial: str, socket_name: str, local_port: int,
     return socket.create_connection(("127.0.0.1", port), timeout=connect_timeout)
 
 
-def _try_warm_connect(serial: str, pid: int) -> Optional[Injection]:
+def _try_warm_connect(serial: str, pid: int, package: str = "") -> Optional[Injection]:
     """Attempt to connect to an already-running agent for ``pid``.
 
     Returns an :class:`Injection` if the abstract socket exists and a Hello
@@ -174,13 +174,62 @@ def _try_warm_connect(serial: str, pid: int) -> Optional[Injection]:
         return None
     return Injection(
         serial=serial,
-        package="",  # filled in by caller
+        package=package,
         pid=pid,
         socket_name=socket_name,
         local_port=local_port,
         sock=sock,
         warm=True,
     )
+
+
+def connect_existing(serial: Optional[str], package: str) -> Optional[Injection]:
+    """Connect to an agent already running in ``package``, never injecting.
+
+    Returns ``None`` when the app isn't running or has no agent. Used by
+    ``detach`` so shutting an agent down never injects one first.
+    """
+    serial = adb.resolve_serial(serial)
+    pid = adb.pidof(serial, package)
+    if pid is None:
+        return None
+    return _try_warm_connect(serial, pid, package)
+
+
+def stop_agent(injection: Injection, wait: float = 5.0) -> bool:
+    """Send SHUTDOWN over ``injection``, close it, and wait for the agent's
+    abstract socket to disappear. Returns True once the socket is gone."""
+    try:
+        Client(injection.sock, owns_socket=False).shutdown(timeout=wait if wait > 0 else None)
+    except TransportError:
+        pass
+    finally:
+        injection.close()
+    return _wait_for_socket_gone(injection.serial, injection.socket_name, wait)
+
+
+def _wait_for_socket_gone(serial: str, socket_name: str, wait: float) -> bool:
+    end = time.monotonic() + wait
+    delay = 0.05
+    while True:
+        if not adb.socket_exists(serial, socket_name):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(delay)
+        delay = min(delay * 2, 0.5)
+
+
+def _check_debuggable(serial: str, package: str) -> None:
+    """``run-as <pkg> true`` before pushing anything: a release build fails here
+    with one clear line instead of after three pushes with a raw adb dump."""
+    ok, said = adb.run_as_probe(serial, package)
+    if not ok:
+        detail = said.splitlines()[0]
+        raise InjectionError(
+            f"package '{package}' is not debuggable, so the agent can't be injected "
+            f"(run-as said: {detail}). Install a debug build (android:debuggable=true)."
+        )
 
 
 def _push_and_stage(serial: str, package: str, build_out: str):
@@ -228,24 +277,28 @@ def _wait_for_socket(serial: str, socket_name: str,
 
 
 def inject_and_connect(
-    serial: str = adb.DEFAULT_SERIAL,
+    serial: Optional[str] = None,
     package: str = "com.oberkfell.a11yprobe",
     build_out: Optional[str] = None,
     force_reinject: bool = False,
 ) -> Injection:
     """Full inject + connect, returning a connected :class:`Injection`.
 
-    ``build_out`` is the artifacts directory; ``None`` resolves it via
-    :func:`resolve_build_out` (env vars, then the repo's ``build-out/``).
+    ``serial`` ``None`` picks ``$ANDROID_SERIAL`` or the only attached device
+    (:func:`adb.resolve_serial`). ``build_out`` is the artifacts directory;
+    ``None`` resolves it via :func:`resolve_build_out` (env vars, then the
+    repo's ``build-out/``).
 
     Sequence (CONTRACT.md section 2):
-      1. resolve pid (app must be running)
+      1. check the device, resolve pid (app must be running)
       2. warm path: if the agent socket already exists and Hello succeeds, reuse it
-      3. push .so + bootstrap.dex + payload.jar to /data/local/tmp
+      3. check the app is debuggable, then push .so + bootstrap.dex + payload.jar
+         to /data/local/tmp
       4. run-as cp into the app private dir (.so 700, dex/jar 444)
       5. cmd activity attach-agent <pkg> <so>=<bootstrap>:<payload>:viewspector_<pid>
       6. wait for the abstract socket, adb forward, connect, return socket
     """
+    serial = adb.resolve_serial(serial)
     pid = adb.pidof(serial, package)
     if pid is None:
         raise InjectionError(
@@ -262,11 +315,11 @@ def inject_and_connect(
         pass
 
     if not force_reinject:
-        warm = _try_warm_connect(serial, pid)
+        warm = _try_warm_connect(serial, pid, package)
         if warm is not None:
-            warm.package = package
             return warm
 
+    _check_debuggable(serial, package)
     app_so, app_boot, app_payload = _push_and_stage(
         serial, package, resolve_build_out(build_out))
 

@@ -1,9 +1,11 @@
 """Thin wrappers over ``adb -s <serial>`` via subprocess.
 
 Every function shells out to the ``adb`` binary on PATH with an explicit serial
-so it works against a specific device (default ``emulator-5554``). Errors from
-adb are captured and re-raised as :class:`AdbError` with the full stderr/stdout
-for debuggability.
+so it works against a specific device. :func:`resolve_serial` picks the device
+when the caller doesn't name one (``$ANDROID_SERIAL``, else the only attached
+device). Errors from adb are captured and re-raised as :class:`AdbError` with
+the full stderr/stdout for debuggability; a missing, offline or unauthorized
+device is reported as a :class:`DeviceError` with a one-line explanation.
 
 This is a clean-room re-implementation of the device-control surface the
 ui-inspector ``InjectionManager`` performs over adblib, expressed in terms of
@@ -12,13 +14,19 @@ the plain ``adb`` CLI.
 
 from __future__ import annotations
 
+import os
 import shlex
 import socket
 import subprocess
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+# Kept for callers that still import it; nothing defaults to it any more. Use
+# resolve_serial(None) to pick $ANDROID_SERIAL or the single attached device.
 DEFAULT_SERIAL = "emulator-5554"
+
+# adb's own variable for "the device to talk to when -s is not given".
+SERIAL_ENV = "ANDROID_SERIAL"
 
 # A generously large default; pushes of a few-MB jar/so finish well within this.
 DEFAULT_TIMEOUT = 60.0
@@ -37,6 +45,11 @@ class AdbError(RuntimeError):
             f"adb command failed (exit {returncode}): {cmd}\n"
             f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         )
+
+
+class DeviceError(RuntimeError):
+    """No usable device: none attached, several and none chosen, the named
+    serial isn't attached, or it is offline / unauthorized."""
 
 
 @dataclass(frozen=True)
@@ -114,8 +127,65 @@ def devices() -> List[Device]:
     return out
 
 
-def wait_for_device(serial: str = DEFAULT_SERIAL, timeout: float = 30.0) -> None:
-    """Block until ``serial`` reaches the ``device`` state."""
+def _describe(devs: Sequence[Device]) -> str:
+    return ", ".join(f"{d.serial} ({d.state})" for d in devs) or "none"
+
+
+_STATE_ADVICE = {
+    "unauthorized": "accept the 'Allow USB debugging' prompt on the device, then retry",
+    "offline": "reconnect it (adb reconnect) or restart the emulator, then retry",
+    "authorizing": "wait for the device to finish authorizing, then retry",
+    "no permissions": "fix the host's USB permissions (udev rules) for this device",
+}
+
+
+def resolve_serial(serial: Optional[str] = None) -> str:
+    """The device serial to use, checked against ``adb devices``.
+
+    ``serial`` wins, then ``$ANDROID_SERIAL``, then the only device in the
+    ``device`` state. Raises :class:`DeviceError` with the attached devices
+    listed when there is none, several, or the chosen one isn't usable.
+    """
+    chosen = serial or os.environ.get(SERIAL_ENV) or None
+    devs = devices()
+    if chosen:
+        ensure_device(chosen, devs)
+        return chosen
+    ready = [d for d in devs if d.state == "device"]
+    if len(ready) == 1:
+        return ready[0].serial
+    if not ready:
+        if devs:
+            raise DeviceError(
+                f"no usable Android device: attached are {_describe(devs)}. "
+                + (_STATE_ADVICE.get(devs[0].state, "") if len(devs) == 1 else "")
+            )
+        raise DeviceError(
+            "no Android device attached (adb devices lists none). Start an emulator "
+            "or connect a device with USB debugging enabled."
+        )
+    raise DeviceError(
+        f"more than one device attached ({_describe(ready)}); choose one with the "
+        f"serial argument (CLI: --serial) or set ${SERIAL_ENV}."
+    )
+
+
+def ensure_device(serial: str, devs: Optional[Sequence[Device]] = None) -> None:
+    """Raise :class:`DeviceError` unless ``serial`` is attached and in the ``device`` state."""
+    devs = devices() if devs is None else devs
+    match = next((d for d in devs if d.serial == serial), None)
+    if match is None:
+        raise DeviceError(
+            f"device '{serial}' not found; attached: {_describe(devs)}. "
+            f"Pick a serial from `adb devices` (CLI: --serial, or set ${SERIAL_ENV})."
+        )
+    if match.state != "device":
+        advice = _STATE_ADVICE.get(match.state, "wait until `adb devices` shows it as 'device'")
+        raise DeviceError(f"device '{serial}' is {match.state}: {advice}.")
+
+
+def wait_for_device(serial: Optional[str] = None, timeout: float = 30.0) -> None:
+    """Block until ``serial`` (or the only device) reaches the ``device`` state."""
     _adb(serial, "wait-for-device", timeout=timeout)
 
 
@@ -149,18 +219,34 @@ def list_debuggable_packages(serial: str) -> List[str]:
         line = line.strip()
         if line.startswith("package:"):
             pkgs.append(line[len("package:"):].strip())
-    debuggable = []
-    for pkg in pkgs:
-        # run-as returns non-zero for non-debuggable apps; suppress the raise.
-        proc = _adb(serial, "shell", f"run-as {shlex.quote(pkg)} true", check=False)
-        if proc.returncode == 0 and "not debuggable" not in (proc.stderr + proc.stdout).lower():
-            debuggable.append(pkg)
-    return debuggable
+    return [pkg for pkg in pkgs if run_as_probe(serial, pkg)[0]]
+
+
+def run_as_probe(serial: str, pkg: str) -> "tuple[bool, str]":
+    """``run-as <pkg> true``: ``(True, "")`` if the app is debuggable (run-as-able),
+    else ``(False, what run-as printed)``."""
+    # run-as returns non-zero for non-debuggable apps; suppress the raise.
+    proc = _adb(serial, "shell", f"run-as {shlex.quote(pkg)} true", check=False)
+    said = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
+    if proc.returncode == 0 and "not debuggable" not in said.lower():
+        return True, ""
+    return False, said or f"exit {proc.returncode}"
 
 
 def pidof(serial: str, pkg: str) -> Optional[int]:
-    """Return the (primary) PID of ``pkg`` if running, else ``None``."""
-    out = shell(serial, f"pidof {shlex.quote(pkg)}", check=False).strip()
+    """Return the (primary) PID of ``pkg`` if running, else ``None``.
+
+    toybox ``pidof`` exits 1 with no output when nothing matches, which is
+    ``None``. Any other failure (the device vanished, adb itself errored) says
+    so on stderr and raises :class:`AdbError`, so a bad serial is never
+    mistaken for "the app isn't running".
+    """
+    argv_cmd = f"pidof {shlex.quote(pkg)}"
+    proc = _adb(serial, "shell", argv_cmd, check=False)
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0 and (proc.stderr or "").strip():
+        raise AdbError(["adb", "-s", serial, "shell", argv_cmd], proc.returncode,
+                       proc.stdout, proc.stderr)
     if not out:
         return None
     # pidof may return several space-separated PIDs for multi-process apps;
@@ -349,10 +435,13 @@ def socket_exists(serial: str, abstract_name: str) -> bool:
     """Return True if an abstract unix socket named ``abstract_name`` is present.
 
     Mirrors ui-inspector's ``waitForAgentSocket`` which greps /proc/net/unix.
+    ``grep`` only narrows the output; the match is exact on the path column
+    (``@viewspector_42`` must not match ``@viewspector_421``).
     """
     out = shell(
         serial,
         f"cat /proc/net/unix | grep {shlex.quote(abstract_name)} || true",
         check=False,
     )
-    return abstract_name in out
+    wanted = "@" + abstract_name
+    return any(line.split()[-1:] == [wanted] for line in out.splitlines())

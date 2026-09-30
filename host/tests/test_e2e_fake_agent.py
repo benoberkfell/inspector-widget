@@ -264,12 +264,10 @@ def test_app_not_running_is_reported(fake_device):
 
 
 def test_non_debuggable_app_is_reported(fake_device):
-    with pytest.raises(adb.AdbError, match="not debuggable"):
+    with pytest.raises(inject.InjectionError, match="not debuggable"):
         inject.inject_and_connect(serial=SERIAL, package="com.example.release")
 
 
-@pytest.mark.xfail(strict=True, reason="NEW-DEBUGGABLE: a non-debuggable app is only detected "
-                   "after all three artifacts are pushed, and the error is a raw quoted adb dump")
 def test_non_debuggable_app_fails_fast_with_a_clear_error(fake_device, run_cli):
     res = run_cli("attach", "--package", "com.example.release")
     assert res.rc == 1
@@ -277,8 +275,6 @@ def test_non_debuggable_app_fails_fast_with_a_clear_error(fake_device, run_cli):
     assert not fake_device.pushed
 
 
-@pytest.mark.xfail(strict=True, reason="H9/E7: a missing device is reported as 'package not "
-                   "running' (pidof runs with check=False)")
 def test_bad_serial_is_reported_as_a_missing_device(fake_device, run_cli):
     res = run_cli("attach", "--serial", "emulator-9999")
     assert res.rc == 1
@@ -286,8 +282,6 @@ def test_bad_serial_is_reported_as_a_missing_device(fake_device, run_cli):
     assert "not found" in res.err or "no device" in res.err.lower()
 
 
-@pytest.mark.xfail(strict=True, reason="H10: socket_exists is a substring match "
-                   "(viewspector_4242 matches another app's @viewspector_42421)")
 def test_socket_exists_is_an_exact_name_match(fake_device):
     fake_device.foreign_sockets.append(f"viewspector_{PID}1")
     assert adb.socket_exists(SERIAL, f"viewspector_{PID}") is False

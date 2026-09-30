@@ -130,9 +130,11 @@ class _Staged(Exception):
 def _stub_cold_inject(monkeypatch):
     """Make inject_and_connect reach _push_and_stage without a device; record build_out."""
     seen = {}
+    monkeypatch.setattr(inject.adb, "resolve_serial", lambda serial=None: serial or "s")
     monkeypatch.setattr(inject.adb, "pidof", lambda serial, package: 4242)
     monkeypatch.setattr(inject.adb, "shell", lambda serial, cmd: "")
-    monkeypatch.setattr(inject, "_try_warm_connect", lambda serial, pid: None)
+    monkeypatch.setattr(inject.adb, "run_as_probe", lambda serial, package: (True, ""))
+    monkeypatch.setattr(inject, "_try_warm_connect", lambda serial, pid, package="": None)
 
     def fake_stage(serial, package, build_out):
         seen["build_out"] = build_out
