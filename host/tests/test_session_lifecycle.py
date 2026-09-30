@@ -228,7 +228,8 @@ def test_session_shutdown_stops_the_agent_for_everyone(fake_device):
     assert second.warm
     assert first.shutdown() is True
     assert fake_device.agent() is None
-    assert not second.is_alive()
+    # The agent's EOF reaches the other client asynchronously.
+    assert _wait_until(lambda: not second.is_alive())
     second.disconnect()
     assert fake_device.forward_names() == []
 
@@ -1104,3 +1105,46 @@ def test_abort_from_another_thread_never_leaves_the_reader_waiting():
         peer.close()
         assert isinstance(got.get("exc"), SessionLostError) and got["elapsed"] < 1.0, got
         assert host.fileno() == -1  # closed by the reader on its way out
+
+
+def test_session_disconnect_never_leaves_a_request_waiting(fake_device):
+    """Session.disconnect goes through Client.abort: a request in flight on
+    another thread fails at once, however the two threads interleave."""
+    for _ in range(30):
+        host, peer = socket.socketpair()
+        session = iw.Session(inject.Injection(serial=SERIAL, package=PKG, pid=PID,
+                                              socket_name=f"viewspector_{PID}", local_port=1,
+                                              sock=host, warm=True))
+        session.client._timeout = 2
+        got = {}
+
+        def run():
+            started = time.monotonic()
+            try:
+                session.hello()
+            except TransportError as exc:
+                got["exc"] = exc
+            got["elapsed"] = time.monotonic() - started
+
+        reader = threading.Thread(target=run, daemon=True)
+        reader.start()
+        fakeagent.framing.read_message(peer)
+        session.disconnect()
+        reader.join(5)
+        peer.close()
+        assert isinstance(got.get("exc"), SessionLostError) and got["elapsed"] < 1.0, got
+
+
+def test_shutdown_over_a_fresh_connection_reports_an_agent_that_did_not_stop(fake_device,
+                                                                              monkeypatch):
+    monkeypatch.setattr(inject, "STOP_WAIT", 0.2)
+    session = iw.attach(SERIAL, PKG)
+    agent = fake_device.agent()
+    agent.kill_clients()
+    with pytest.raises(SessionLostError):
+        session.get_windows()  # this connection can't carry the SHUTDOWN any more
+    agent.behaviour = lambda req: (
+        (0, fakeagent.frame(agent.dispatch(req)))  # replies OK, but never stops
+        if req.WhichOneof("command") == "shutdown" else agent.default_behaviour(req))
+    assert session.shutdown() is False
+    assert agent.running and fake_device.commands().count("shutdown") == 1

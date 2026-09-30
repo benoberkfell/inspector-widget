@@ -176,13 +176,14 @@ class Injection:
         return split_agent_version(getattr(self.hello, "agent_version", None))[1]
 
     def close(self, close_socket: bool = True) -> None:
-        """Shut the socket down, close it, and remove the adb forward.
-        Idempotent; the agent keeps running.
+        """Close the socket and remove the adb forward. Idempotent; the agent
+        keeps running.
 
-        Shutting down first matters: a plain close() doesn't wake a thread
-        blocked reading the socket (a request in flight), which would wait out
-        its whole deadline. ``close_socket=False`` leaves the close to that
-        thread (see ``Client.abort``).
+        Not for a socket a request may be in flight on: closing it under the
+        reading thread can leave that thread waiting out its deadline. End such
+        a connection with ``Client.abort`` (``Session.disconnect`` does), which
+        shuts it down and leaves the close to the reader, then call this with
+        ``close_socket=False`` if the abort couldn't close it.
         """
         if self.closed:
             return
@@ -190,11 +191,6 @@ class Injection:
         try:
             if close_socket:
                 _shutdown_and_close(self.sock)
-            else:
-                try:
-                    self.sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
         finally:
             adb.remove_forward(self.serial, self.local_port)
 
