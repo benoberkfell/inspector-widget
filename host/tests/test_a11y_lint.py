@@ -1,8 +1,9 @@
-"""Tests for inspector_widget.a11y_lint — assert exact rule ids + severities.
+"""Tests for inspector_widget.a11y_lint (legacy Compose-semantics input).
 
 Feeds synthetic *resolved* semantics-node dicts (the shape from
-strings.compose_node_to_dict) to lint_tree and checks the emitted Finding rule ids
-and severities. The one pixel rule (contrast) is driven by a tiny in-memory RGBA
+strings.compose_node_to_dict) to lint_tree -- the legacy input, still accepted via
+an adapter -- and checks the emitted Finding rule ids and severities. The unified
+a11y-tree input (Views + Compose) is covered by test_a11y_lint_unified.py. The one pixel rule (contrast) is driven by a tiny in-memory RGBA
 buffer built so the k-means fg/bg split is deterministic.
 """
 
@@ -84,12 +85,20 @@ def test_touch_target_small_warns_between_32_and_48():
     assert f[0].evidence["min_dp"] == 48
 
 
-def test_touch_target_small_errors_below_32():
-    n = node(attrs={"OnClick": "{}", "Role": "Button", "Text": "X"}, bounds=(0, 0, 24, 24))
+def test_touch_target_small_errors_below_the_24dp_floor():
+    # < 24dp in either dimension is below the WCAG 2.5.8 hard floor -> error.
+    n = node(attrs={"OnClick": "{}", "Role": "Button", "Text": "X"}, bounds=(0, 0, 20, 20))
     findings = L.lint_tree([n], L.LintContext(density=DENSITY_1TO1))
     f = by_rule(findings, "a11y.touch_target.small")
     assert len(f) == 1
     assert f[0].severity == "error"
+
+
+def test_touch_target_at_the_24dp_floor_is_warn():
+    n = node(attrs={"OnClick": "{}", "Role": "Button", "Text": "X"}, bounds=(0, 0, 24, 24))
+    findings = L.lint_tree([n], L.LintContext(density=DENSITY_1TO1))
+    f = by_rule(findings, "a11y.touch_target.small")
+    assert [x.severity for x in f] == ["warn"]
 
 
 def test_touch_target_ok_at_48():
@@ -126,12 +135,21 @@ def test_redundant_label_type_noun_is_warn():
 # --------------------------------------------------------------------------- #
 # R5 — clickable without a role
 # --------------------------------------------------------------------------- #
-def test_role_missing_on_clickable_is_warn():
+def test_role_missing_on_clickable_with_text_is_info():
+    # TalkBack still says "double-tap to activate"; a missing role on a node with
+    # visible text is a quality nudge, not a defect.
     n = node(attrs={"OnClick": "{}", "Text": "Tap"}, bounds=(0, 0, 48, 48))
     findings = L.lint_tree([n], L.LintContext(density=DENSITY_1TO1))
     f = by_rule(findings, "a11y.role.missing_on_clickable")
     assert len(f) == 1
-    assert f[0].severity == "warn"
+    assert f[0].severity == "info"
+
+
+def test_role_missing_skips_text_fields():
+    n = node(attrs={"OnClick": "", "SetText": "", "EditableText": "", "Text": "Email"},
+             bounds=(0, 0, 300, 60))
+    findings = L.lint_tree([n], L.LintContext(density=DENSITY_1TO1))
+    assert by_rule(findings, "a11y.role.missing_on_clickable") == []
 
 
 def test_role_present_no_role_missing():
@@ -206,12 +224,14 @@ def test_image_no_description_warns():
     assert f[0].severity == "warn"
 
 
-def test_clickable_image_no_description_is_error():
+def test_clickable_image_no_description_is_r1_error_not_r6():
+    # An actionable image with no name is the missing-label rule (R1, error); R6 is
+    # for non-actionable images, so the defect is reported exactly once.
     n = node(name="Image", attrs={"Role": "Image", "OnClick": "{}"}, bounds=(0, 0, 48, 48))
     findings = L.lint_tree([n], L.LintContext(density=DENSITY_1TO1))
-    f = by_rule(findings, "a11y.image.no_description")
-    assert len(f) == 1
-    assert f[0].severity == "error"
+    assert by_rule(findings, "a11y.image.no_description") == []
+    f = by_rule(findings, "a11y.label.missing")
+    assert [x.severity for x in f] == ["error"]
 
 
 # --------------------------------------------------------------------------- #
