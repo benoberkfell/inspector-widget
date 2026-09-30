@@ -120,7 +120,8 @@ object AccessibilityInspector {
      */
     private val isTraversalGroupM: Method? = try {
         AccessibilityNodeInfo::class.java.getMethod("isTraversalGroup")
-    } catch (_: Throwable) {
+    } catch (t: Throwable) {
+        Log.i(TAG, "AccessibilityNodeInfo.isTraversalGroup() absent; using Compose IsTraversalGroup")
         null
     }
 
@@ -154,7 +155,14 @@ object AccessibilityInspector {
         var nullChildren = 0
         var unenumerable = 0
         var reflectFailures = 0
+        val loggedFailures = HashSet<String>()
         val composeIndex = HashMap<View, ComposeInspector.SemanticsIndex?>()
+
+        /** Count a failed reflective call; log the first failure of each [kind] per dump. */
+        fun fail(kind: String, t: Throwable) {
+            reflectFailures++
+            if (loggedFailures.add(kind)) Log.w(TAG, "$kind failed (further failures counted only)", t)
+        }
     }
 
     /**
@@ -271,7 +279,7 @@ object AccessibilityInspector {
             // one (View.onAttachedToWindow registers it with AccessibilityNodeIdManager).
             (m.invoke(view) as? Int)?.let { ctx.byA11yId[it] = view }
         } catch (t: Throwable) {
-            if (ctx.reflectFailures++ == 0) Log.w(TAG, "getAccessibilityViewId() failed", t)
+            ctx.fail("View.getAccessibilityViewId()", t)
         }
         if (view is ViewGroup) {
             val n = try {
@@ -303,7 +311,7 @@ object AccessibilityInspector {
         return try {
             (find.invoke(inst, aid) as? View)?.also { ctx.byA11yId[aid] = it }
         } catch (t: Throwable) {
-            if (ctx.reflectFailures++ == 0) Log.w(TAG, "AccessibilityNodeIdManager.findView failed", t)
+            ctx.fail("AccessibilityNodeIdManager.findView", t)
             null
         }
     }
@@ -314,7 +322,7 @@ object AccessibilityInspector {
         return try {
             m.invoke(node) as? Long
         } catch (t: Throwable) {
-            if (ctx.reflectFailures++ == 0) Log.w(TAG, "getSourceNodeId() failed", t)
+            ctx.fail("AccessibilityNodeInfo.getSourceNodeId()", t)
             null
         }
     }
@@ -325,7 +333,7 @@ object AccessibilityInspector {
         return try {
             m.invoke(node, index) as? Long
         } catch (t: Throwable) {
-            if (ctx.reflectFailures++ == 0) Log.w(TAG, "getChildId(int) failed", t)
+            ctx.fail("AccessibilityNodeInfo.getChildId(int)", t)
             null
         }
     }
@@ -712,11 +720,11 @@ object AccessibilityInspector {
         }
 
         // --- traversal / label linkage, in the HOST NODE KEY space ------------
-        b.traversalBefore = hostKeyOf(linkId(node, traversalBeforeF, "getTraversalBefore", ctx), ctx)
-        b.traversalAfter = hostKeyOf(linkId(node, traversalAfterF, "getTraversalAfter", ctx), ctx)
-        b.labelFor = hostKeyOf(linkId(node, labelForF, "getLabelFor", ctx), ctx)
-        b.labeledBy = hostKeyOf(linkId(node, labeledByF, "getLabeledBy", ctx), ctx)
-        for (packed in labeledByIds(node, ctx)) {
+        b.traversalBefore = hostKeyOf(linkId(node, traversalBeforeF, "getTraversalBefore", ctx, local), ctx)
+        b.traversalAfter = hostKeyOf(linkId(node, traversalAfterF, "getTraversalAfter", ctx, local), ctx)
+        b.labelFor = hostKeyOf(linkId(node, labelForF, "getLabelFor", ctx, local), ctx)
+        b.labeledBy = hostKeyOf(linkId(node, labeledByF, "getLabeledBy", ctx, local), ctx)
+        for (packed in labeledByIds(node, ctx, local)) {
             val key = hostKeyOf(packed, ctx)
             if (key != 0L) b.addLabeledByList(key)
         }
@@ -747,24 +755,33 @@ object AccessibilityInspector {
      * unreachable, fall back to the public getter [getterName] (resolves the target node
      * through the connection; query mode only) and read the target's own packed id.
      */
-    private fun linkId(node: AccessibilityNodeInfo, f: Field?, getterName: String, ctx: Ctx): Long? {
+    private fun linkId(
+        node: AccessibilityNodeInfo,
+        f: Field?,
+        getterName: String,
+        ctx: Ctx,
+        local: Boolean,
+    ): Long? {
         if (f != null) {
             try {
                 return f.getLong(node)
             } catch (t: Throwable) {
-                if (ctx.reflectFailures++ == 0) Log.w(TAG, "reading ${f.name} failed", t)
+                ctx.fail("read AccessibilityNodeInfo.${f.name}", t)
             }
         }
+        // The getter needs a connection (query mode); an unsealed local-mode node would throw.
+        if (local) return null
         val target = try {
             AccessibilityNodeInfo::class.java.getMethod(getterName).invoke(node) as? AccessibilityNodeInfo
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            ctx.fail("AccessibilityNodeInfo.$getterName()", t)
             null
         } ?: return null
         return sourceNodeId(target, ctx)
     }
 
     /** The packed ids of the multiple-labeledBy list (API 35+); empty when none / unavailable. */
-    private fun labeledByIds(node: AccessibilityNodeInfo, ctx: Ctx): List<Long> {
+    private fun labeledByIds(node: AccessibilityNodeInfo, ctx: Ctx, local: Boolean): List<Long> {
         val f = labeledByIdsF
         if (f != null) {
             try {
@@ -773,14 +790,17 @@ object AccessibilityInspector {
                 val get = arr.javaClass.getMethod("get", Int::class.javaPrimitiveType)
                 return (0 until size).map { get.invoke(arr, it) as Long }
             } catch (t: Throwable) {
-                if (ctx.reflectFailures++ == 0) Log.w(TAG, "reading mLabeledByIds failed", t)
+                ctx.fail("read AccessibilityNodeInfo.mLabeledByIds", t)
             }
         }
-        // Public getLabeledByList() (API 35+): resolves targets through the connection.
+        // Public getLabeledByList() (API 35+): resolves targets through the connection, so
+        // query mode only.
+        if (local || Build.VERSION.SDK_INT < 35) return emptyList()
         return try {
             val list = AccessibilityNodeInfo::class.java.getMethod("getLabeledByList").invoke(node) as? List<*>
             list?.mapNotNull { (it as? AccessibilityNodeInfo)?.let { t -> sourceNodeId(t, ctx) } } ?: emptyList()
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            ctx.fail("AccessibilityNodeInfo.getLabeledByList()", t)
             emptyList()
         }
     }
@@ -794,7 +814,8 @@ object AccessibilityInspector {
         isTraversalGroupM?.let { m ->
             return try {
                 m.invoke(node) as? Boolean ?: false
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                ctx.fail("AccessibilityNodeInfo.isTraversalGroup()", t)
                 false
             }
         }
