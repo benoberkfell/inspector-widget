@@ -5,8 +5,15 @@ over the app's **unified accessibility tree**: every node TalkBack sees, classic
 Views and Compose alike, in one pass. RecyclerView cells that are ComposeViews,
 AndroidViews inside Compose, Fragments, dialogs and popups (each window is
 linted) are all covered. The Compose semantics tree only adds detail (exact
-`Role`, `testTag`, `source`). One rule (contrast) samples a screenshot of each
-window.
+`Role`, `testTag`). One rule (contrast) samples a screenshot of each window.
+
+The rules judge what TalkBack reads. A View that is not important for
+accessibility (left at `importantForAccessibility="auto"` and not clickable,
+focusable, labelled or otherwise important: layout containers, decorative icons)
+is never seen by TalkBack, so no rule reports it; its children still count. Focus
+stops (R9, R10) are the reading order's stops. A finding on a window under an
+open modal dialog carries `window.covered_by` (the dialog's `root_view_id`):
+still a defect, but TalkBack cannot reach it until the dialog closes.
 
 Every finding looks like:
 
@@ -29,8 +36,9 @@ Every finding looks like:
 - **`node_key`** is the selector for `inspect_node`: `view:<uniqueDrawingId>` for a
   View, `compose:<AndroidComposeView id>:<semantics id>` for a Compose node
   (`virtual:<host>:<id>` for other virtual providers such as WebView). Compose
-  keys are valid until the next recomposition re-mints semantics ids, so
-  re-lint after the UI changes. `node.id` is the a11y node id
+  keys are valid until the next recomposition re-mints semantics ids (the
+  response's `generation` changes then); `inspect_node` re-resolves a key the lint
+  handed out when the match is unambiguous, otherwise re-lint. `node.id` is the a11y node id
   (`host_view_id << 32 ^ virtual_id`), the same id the a11y dump and overlay use.
 - **`bounds`** are the accessibility (touch) bounds in screen px; `bounds_dp` uses
   the device density.
@@ -56,7 +64,9 @@ How labels are computed: like TalkBack, a node's accessible name is its
 `contentDescription`, else its text/stateDescription, else the text of its
 **non-focusable** descendants (a Compose `IconButton` is named by its `Icon`'s
 description), else its `labeledBy` target. A descendant that takes its own focus
-(a separate button) never names its parent.
+(a separate button) never names its parent. Compose puts a merging node's role on
+a synthetic child (class name, or roleDescription for Tab and Switch) and its
+description on another; both are folded into the node.
 
 ---
 
@@ -105,6 +115,9 @@ description), else its `labeledBy` target. A descendant that takes its own focus
 - **Flags:** a visible, enabled, non-password node with its own text whose
   measured contrast is below `4.5:1` (normal) or `3.0:1` (large text, ≥ 24dp ≈
   18pt).
+- **Not flagged:** text of an inactive component (WCAG exempts it): the node is
+  disabled, or its nearest actionable / focusable ancestor is. Compose puts a
+  disabled Button's or TextField's label on a child Text that reports enabled.
 - **Measurement:** the background is the dominant colour (the mode of the node's
   edge pixels, else of the whole crop). The foreground is the most frequent colour
   among the most-contrasting quarter of the remaining "ink" pixels. Anti-aliased
@@ -121,25 +134,29 @@ description), else its `labeledBy` target. A descendant that takes its own focus
 - **Needs an image:** skipped with `include_contrast=false` / `--no-contrast`.
 - **Fix:** darken the text or lighten the background.
 - **Evidence:** `ratio`, `required`, `fg_hex`, `bg_hex`, `sample`
-  (`window:<root_view_id>`), `scale`, `bg_fraction`, `ink_fraction`,
+  (`window:<root_view_id>`, `screenshot` or `component`), `scale`, `bg_fraction`, `ink_fraction`,
   `text_size_class` (`normal|large|unknown`), `text_size_dp`, `low_confidence`.
 
 ### R4 `a11y.label.redundant` — redundant contentDescription  (ATF RedundantDescription)
 - **Flags:** only a **contentDescription** (never visible text), with punctuation
-  normalised:
-  (a) it contains a word naming the node's own role ("Submit button." on a
-  Button, "Delete button" on the Icon inside an IconButton). → `warn`.
+  normalised, judged against the role TalkBack announces with it: the node's own
+  when it is its own focus stop, else its focus owner's.
+  (a) it contains a word naming that role ("Submit button." on a Button, "Delete
+  button" on the Icon inside an IconButton). → `warn`.
   (b) it contains a state word ("checked", "selected") on a checkable or
   selectable node. → `info`.
   (c) it equals the node's own visible text. → `info`.
   "Upload image" on a Button is **not** flagged, because "image" is not a
-  Button's role word.
+  Button's role word. Nor is it on the `Icon` inside an `IconButton`: Compose
+  keeps `Role.Image` in the semantics but does not announce it for an image merged
+  into a larger control (TalkBack says "Upload image, button").
 - **Fix:** describe the purpose only. Use `stateDescription` for custom state
   text. Drop a contentDescription that repeats the text.
 
 ### R5 `a11y.role.missing_on_clickable` — clickable element exposes no role
 - **Flags:** a clickable, labelled node with no role (class, Compose `Role`,
-  or roleDescription). Exempt: text fields, stateful nodes, list rows (a clickable
+  or roleDescription, including the one Compose puts on its synthetic role
+  child). Exempt: text fields, stateful nodes, list rows (a clickable
   row of a RecyclerView/LazyColumn, or a node filling one), and nodes whose
   non-focusable child carries the role.
 - **Severity:** `info` when the node has visible text; `warn` when it is
@@ -154,17 +171,26 @@ description), else its `labeledBy` target. A descendant that takes its own focus
   `Role.Image`) with no contentDescription or labeledBy that is not marked
   decorative and is not part of a labelled control. An *actionable* image with no
   name is R1 (`error`).
-- **Not flagged:** `importantForAccessibility="no"` (or inside a
-  `noHideDescendants` subtree). A Compose `Image(contentDescription = null)` emits
-  no semantics, so it never reaches the tree.
+- **Not flagged:** an image TalkBack never sees: `importantForAccessibility="no"`,
+  inside a `noHideDescendants` subtree, or a plain `ImageView` left at `auto` with
+  no description that is not clickable or focusable (not important for
+  accessibility; ATF skips it too). A Compose `Image(contentDescription = null)`
+  emits no semantics, so it never reaches the tree. So R6 fires on an image that
+  TalkBack does stop on (`importantForAccessibility="yes"`, focusable, or a
+  Compose image with a node of its own) and that has nothing to say.
 - **Severity:** `warn`.
 - **Fix:** add a meaningful description, or mark it decorative
-  (`android:importantForAccessibility="no"` / `contentDescription = null`).
+  (`android:importantForAccessibility="no"` / `contentDescription = null`, or
+  `Modifier.semantics { hideFromAccessibility() }`, which replaces the deprecated
+  `invisibleToUser()` in Compose 1.8+).
 
 ### R7 `a11y.state.not_exposed` — stateful-looking control with no state
 - **Flags:** an actionable node with no checkable, checked, selected,
   stateDescription or range info that:
-  - has a stateful role (Switch, Checkbox, RadioButton, Tab). → `warn`.
+  - has a stateful role (Switch, Checkbox, RadioButton, Tab). → `warn`. A Tab's
+    state is its selection: an unselected tab is fine when it carries
+    CollectionItemInfo or a sibling tab is selected (Material TabLayout,
+    BottomNavigationView, NavigationRailView, Compose `Tab`).
   - has a label ending in a state word ("Wi-Fi off", "Sync enabled"), excluding
     phrasal verbs such as "Sign off" and "Log on". → `warn`.
   - has a label containing "toggle". → `warn`.
@@ -172,7 +198,8 @@ description), else its `labeledBy` target. A descendant that takes its own focus
     "Bookmark"), the usual icon-swap toggle. → `info`, "if this toggles".
 - **Fix:** Compose: `Modifier.toggleable(value = …)` / `selectable(…)`, or
   `semantics { stateDescription = … }`. View: a CompoundButton, or
-  `ViewCompat.setStateDescription`.
+  `ViewCompat.setStateDescription`. For a tab: mark the selected one selected
+  (`setSelected(true)`; `Tab(selected = …)` / `selectable(role = Role.Tab)`).
 
 ### R8 `a11y.node.empty_focusable` — focusable but announces nothing
 - **Flags:** a visible node that is focusable or screen-reader-focusable but not
@@ -192,11 +219,14 @@ description), else its `labeledBy` target. A descendant that takes its own focus
 - **Evidence:** `unit`, `text_size_px`, `text_size_dp`, `font_scale`.
 
 ### R14 `a11y.editable.content_description` — text field has a contentDescription  (ATF EditableContentDesc)
-- **Flags:** an editable node with a contentDescription. TalkBack reads it
-  instead of what the user typed.
-- **Severity:** `error`.
+- **Flags:** an editable node with a contentDescription. TalkBack reads it only
+  while the field is empty, in place of the hint or label, and drops it once text
+  is entered, so the field loses its name when the user reviews what they typed.
+- **Severity:** `error`; `info` for a Compose field whose description is
+  "Search": Material3's `SearchBarDefaults.InputField` sets it itself, so there is
+  nothing to change unless you set it.
 - **Fix:** remove it. Label the field with a hint, `labelFor`, TextInputLayout, or
-  the Compose TextField `label`.
+  the Compose TextField `label` / `placeholder`.
 
 ### R15 `a11y.link.purpose_unclear` — link/action text does not describe its purpose  (ATF LinkPurposeUnclear)
 - **Flags:** link spans (from the compat span extras) or link-role nodes whose
@@ -229,7 +259,9 @@ description), else its `labeledBy` target. A descendant that takes its own focus
 ### R9 `a11y.heading.structure` — headings missing / empty / duplicated
 - **Flags (per window):**
   - A long screen with no heading. → `info`. "Long" means more than 12 text
-    stops, or at least 8 with a scrollable container that can scroll.
+    stops, or at least 8 with a scrollable container that can scroll. Text stops
+    are the reading order's, so the texts inside a (focusable) ScrollView or
+    RecyclerView count.
   - A heading with no label. → `warn`.
   - Duplicate adjacent headings. → `info`.
 - **Fix:** Compose `Modifier.semantics { heading() }`; View
@@ -240,7 +272,9 @@ description), else its `labeledBy` target. A descendant that takes its own focus
   (≤ 60 chars, ≤ 40dp tall) that are each their own TalkBack stop, stacked
   vertically with ≤ 8dp gaps and overlapping horizontally. It needs at least 2
   leaves in a list row, or at least 3 elsewhere. Paragraphs and horizontal chip
-  rows are not flagged.
+  rows are not flagged. The container may be a View that is not important for
+  accessibility (a plain LinearLayout), and it may sit inside a focusable
+  ScrollView or RecyclerView.
 - **Severity:** `info`.
 - **Fix:** Compose `Modifier.semantics(mergeDescendants = true) {}`. View: make the
   container focusable / `screenReaderFocusable`.

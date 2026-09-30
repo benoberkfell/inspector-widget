@@ -9,8 +9,9 @@ description: >-
   Jetpack Compose and classic View UIs. Drives a live device/emulator via the
   Inspector Widget MCP server (codename viewspector): dump the accessibility tree,
   run the a11y lint, render an annotated overlay, open a per-element dossier
-  (Compose source file:line + modifiers + a11y node + component image), propose
-  the concrete Compose/View fix, then re-lint to verify the finding cleared.
+  (a11y node + View/Compose facets + where it lives + its findings + component
+  image), propose the concrete Compose/View fix, then re-lint to verify the
+  finding cleared.
 ---
 
 # Inspector Widget — Android Accessibility Debugging
@@ -23,7 +24,10 @@ fix, and verify accessibility defects.
 You drive a running, **debuggable** app. The MCP injects an inspection agent
 into the process and speaks to it. It can see what TalkBack sees (the unified
 `AccessibilityNodeInfo` tree), the Jetpack Compose semantics + slot table (with
-`file:line` for composables), classic View properties, and the rendered pixels.
+`file:line` for composables once Compose inspection is enabled), classic View
+properties, and the rendered pixels. Views and Compose are one tree, whatever the
+mix: Fragments, RecyclerView cells that are ComposeViews, plain Views or both,
+`AndroidView` inside Compose, dialogs and popups.
 
 ---
 
@@ -45,9 +49,9 @@ it first — the whole playbook depends on it.
 ## 1. The playbook: detect → fix → verify
 
 The loop is always the same. Find the issues with data, *see* them on a
-screenshot, open a dossier per finding so you know exactly what file/line and
-what modifier to change, propose the concrete fix, then re-lint after the rebuild
-to confirm it cleared.
+screenshot, open a dossier per finding so you know exactly which element (window,
+list row, ComposeView, View class / Compose semantics) to change, propose the
+concrete fix, then re-lint after the rebuild to confirm it cleared.
 
 ```
  list_devices ─▶ list_processes ─▶ attach
@@ -59,7 +63,7 @@ to confirm it cleared.
   a11y_overlay                        ← SEE  (boxes + labels + reading order)
         │
         ▼
-  inspect_node  (per finding)         ← LOCATE (file:line + modifiers + image)
+  inspect_node  (per finding)         ← LOCATE (facets + where + findings + image)
         │
         ▼
   propose Compose / View fix          ← FIX  (you write the change)
@@ -98,10 +102,15 @@ Run two tools:
   `[{order, key, speak}]`, one entry per focus stop with what TalkBack
   announces there, e.g. `"Delete, button"` or `"Unlabeled, checkbox, not
   checked"`), built from the accessibility child order plus
-  `traversalBefore`/`traversalAfter` (`reading_order_diagnostics` reports
-  cycles and dangling targets); every node has a `node_key` you can pass to
-  `inspect_node`. Read this to
-  understand what gets announced and in what order.
+  `traversalBefore`/`traversalAfter` over the tree TalkBack actually gets: a View
+  that is not important for accessibility (a ScrollView's plain `LinearLayout`, a
+  decorative `ImageView`) is skipped and its children read in its place (the node
+  carries `ignored`), and while a modal dialog is open the windows under it are
+  unreachable (`windows[i].covered_by`) and have no stops.
+  `reading_order_diagnostics` reports cycles, dangling targets and covered
+  windows. Every node has a `node_key` you can pass to `inspect_node`, and the
+  dump has a `generation` that changes when Compose re-mints its ids. Read this
+  to understand what gets announced and in what order.
 - **`a11y_lint(serial, package)`** — the rule engine (R1..R18). It lints the
   same unified tree as `dump_accessibility`, so classic View screens, Compose,
   RecyclerView cells, AndroidView-in-Compose and dialogs are all covered in one
@@ -109,10 +118,13 @@ Run two tools:
   `severity` (`error` | `warn` | `info`), a typed `node_key`
   (`view:<id>` / `compose:<acvId>:<semId>`), the `node` (label, role, class,
   testTag, source), `bounds` (px) and `bounds_dp` (dp), `window`, `collection`
-  (list/row position), a remediation `message`, and `evidence`. Also a `summary`
-  (counts by severity and by rule) and `diagnostics`: read them before trusting
-  a clean result. By default it screenshots each window to run the one contrast
-  rule; pass `include_contrast=false` to skip it (tree-only rules still run).
+  (list/row position; `window.covered_by` when the window is under an open
+  dialog), a remediation `message`, and `evidence`. Also a `summary` (counts by
+  severity and by rule), the dump's `generation` and `diagnostics`: read them
+  before trusting a clean result. Rules judge what TalkBack reads: Views TalkBack
+  never sees are skipped, and focus stops come from the reading order. By default
+  it screenshots each window to run the one contrast rule; pass
+  `include_contrast=false` to skip it (tree-only rules still run).
 
 Read the lint `summary` first to triage: fix **errors** before **warns** before
 **info**. Group findings by `rule` so you apply one canonical fix pattern across
@@ -137,6 +149,10 @@ accessibility node as a labeled box with its speakable label and the computed
 TalkBack reading-order number, color-coded by lint severity:
 
 - **red** = error, **amber** = warn, **blue** = info, **green** = clean.
+- a **dashed** box (in the severity colour, labelled with the rule) = a finding
+  that maps to no a11y node, drawn at the finding's own bounds.
+- Every window is drawn, a dialog over its activity; the numbers are the
+  reading order, so the activity under an open dialog has none.
 
 It returns the annotated PNG `path` plus the lint `summary`. **Always view this
 image.** It is the single best "show me the a11y problems on screen" view: it
@@ -153,7 +169,9 @@ element dossier. Select the node by whichever id you have from the lint /
 overlay / a11y dump:
 
 - `node_key` — `"view:<uniqueDrawingId>"` or `"compose:<acvId>:<semanticsId>"`
-  (exactly the finding's `node_key`)
+  (exactly the finding's `node_key`; every key `dump_accessibility`, `a11y_lint`
+  and `inspect` hand out resolves, including the Text/Icon children Compose merges
+  into a button, which come back `a11y_only` with their `a11y_parent`)
 - `view_id` — a View's `uniqueDrawingId`
 - `semantics_id` — a Compose node's semantics id
 - `bounds` — `{x, y, w, h}` in screen px (resolves to the deepest covering
@@ -161,23 +179,34 @@ overlay / a11y dump:
 
 `inspect_node` returns a dossier with the facets that exist for that element:
 
-- **`compose`** — the Compose facet, including the **source `file:line`** of the
-  composable (from the slot table) and its modifiers/parameters. *This is how you
-  know exactly which file and line to edit.*
+- **`compose`** — the Compose semantics node (`attrs`: Role, TestTag, Text,
+  ContentDescription, …). Its `source` is **null** in the dossier: `file:line`
+  only exists in the slot table, which `inspect_node` does not fetch. To find the
+  line, run `dump_compose(include_slot_table=true, enable_inspection=true)` (see
+  §5 for the cost) and match the composable to the node by `testTag` or bounds.
 - **`view`** — full View attributes + `properties` (typed: colors as
   `#AARRGGBB`, resources resolved, `is_layout` marked) for classic Views.
 - **`a11y`** — the element's full `AccessibilityNodeInfo` (label, role, state,
   actions) — what TalkBack actually announces for it.
 - **`component_image.path`** — a cropped PNG of *just that element* (SKP cut by
-  the Compose graphicsLayer when available, else a bitmap crop). View it to
-  confirm you are fixing the right thing and to eyeball contrast.
-- **`lint`** — the findings focused to this node, and
-  `correlation_confidence` (`exact` | `overlap` | `none`) telling you how solid
-  the View↔Compose↔a11y correlation is.
+  the Compose graphicsLayer when available, else a bitmap crop of the element's
+  own window, so a dialog element is cut from the dialog). View it to confirm you
+  are fixing the right thing and to eyeball contrast.
+- **`lint`** — exactly the `a11y_lint` findings for this node and the nodes
+  Compose merged into it (same rules, contrast included), with `lint_summary` and
+  `lint_diagnostics` (e.g. contrast not sampled). `correlation_confidence`
+  (`exact` | `overlap` | `none`) says how solid the View↔Compose↔a11y
+  correlation is.
+- **`where` / `context`** — window > list row > ComposeView > AndroidView host.
+- **`resolved_from`** — the key was stale (Compose re-minted ids) and was
+  re-resolved by ComposeView, test tag, label, row and bounds; **`key_note`** —
+  the key still exists but now names other content (a recycled cell).
 
 With the dossier you have everything to write a precise fix: the **what** (the
-rule + the element's current semantics), the **where** (`compose.file:line` or
-the View's resource/layout), and the **picture** (component image).
+rule + the element's current semantics), the **where** (the View's resource id /
+class, or the Compose node's testTag, text and position in its window / list row;
+`file:line` from the slot table when you need the exact line), and the
+**picture** (component image).
 
 If you only need the cropped image (not the whole dossier), call
 `component_image` with the same selectors. For a whole-screen correlated model
@@ -187,7 +216,7 @@ view+compose+a11y and can render the integrated overlay.
 ### Step 5 — FIX: propose the concrete change
 
 Using the rule's canonical remediation (**[rules.md](rules.md)**) and the
-dossier's `file:line`, write the concrete Compose or View change. Be specific —
+dossier's location, write the concrete Compose or View change. Be specific —
 name the modifier, the file, and the line. Common fixes:
 
 - **Missing label** (`a11y.label.missing`, `a11y.image.no_description`): add a
@@ -197,7 +226,9 @@ name the modifier, the file, and the line. Common fixes:
   `contentDescription = "Play"` parameter. For Views: `android:contentDescription`
   / `view.contentDescription = "…"`. A truly decorative image should be
   `contentDescription = null` (and not focusable), or
-  `Modifier.semantics { invisibleToUser() }`.
+  `Modifier.semantics { hideFromAccessibility() }` (Compose 1.8+; it replaces the
+  deprecated `invisibleToUser()`). For Views,
+  `android:importantForAccessibility="no"`.
 - **Small touch target** (`a11y.touch_target.small`): grow the *target*, not just
   the padding — `Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp)` or
   `Modifier.minimumInteractiveComponentSize()`. (Padding does not enlarge the
@@ -282,8 +313,10 @@ Every finding has the same shape:
   warns are likely defects; infos are structure/quality nudges.
 - **`node_key`** is the selector you feed to `inspect_node(node_key=...)`:
   `view:<id>` for a View, `compose:<acvId>:<semId>` for a Compose node. Compose
-  keys go stale when the UI recomposes, so re-lint after the UI changes; the
-  finding's `bounds` also work as a selector. `node.id` is the a11y node id used
+  keys go stale when the UI recomposes (the response's `generation` changes);
+  `inspect_node` re-resolves a key the lint handed out when it can do so
+  unambiguously, otherwise re-lint. The finding's `bounds` also work as a
+  selector. `node.id` is the a11y node id used
   by `dump_accessibility` and the overlay.
 - **`message`** is the canonical remediation for *that* node — it already names
   the modifier/attribute and the corrected value. Use it verbatim as the basis
@@ -314,12 +347,16 @@ in this skill.
   (`--json out.json`, `--overlay out.png`);
 - quick local sanity checks without an MCP client.
 
-The CLI is stateless — each invocation re-injects and tears down — so it is
-slower for iterative work but perfect for a single deterministic command. CLI
-subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a11y` (dump +
-`--overlay`/`--lint` ≈ `dump_accessibility` + `a11y_overlay`), `compose`,
-`dump`. See **[tools.md](tools.md)** for the full MCP↔CLI mapping and exact
-invocations.
+Each CLI invocation is its own process: it connects to the agent (reusing one
+already loaded in the app, else injecting it) and disconnects when it is done.
+Only the Compose key registry outlives it (a small file per app process), so a
+`compose:` key from `a11y-lint` still resolves in a later `inspect-node`. That
+makes it slower for iterative work but perfect for a single deterministic
+command. The 13 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a11y`
+(dump + `--overlay`/`--lint` ≈ `dump_accessibility` + `a11y_overlay`),
+`inspect-node`, `component-image`, `inspect`, `compose`, `dump`,
+`get-properties`, `screenshot`, `devices`, `packages`, `attach`, `detach`. See
+**[tools.md](tools.md)** for the full MCP↔CLI mapping and exact invocations.
 
 ---
 
@@ -333,14 +370,17 @@ invocations.
       • a11y.label.missing  compose:1234:42  (play/pause IconButton)
       • a11y.contrast.low   compose:1234:51  (caption, 2.9:1)
 5.  a11y_overlay(serial, package)                   → view PNG: that box is RED
-6.  inspect_node(serial, package, node_key="compose:1234:42") → compose.file = Player.kt:88,
-      a11y label empty, component_image shows a bare ▶ glyph
-7.  PROPOSE: in Player.kt:88, add contentDescription = if (playing) "Pause" else "Play"
+6.  inspect_node(serial, package, node_key="compose:1234:42") → compose.attrs:
+      Role=Button, TestTag=play_pause; a11y label empty; where: … > compose:1234:42
+      Button; component_image shows a bare ▶ glyph
+7.  (optional) dump_compose(include_slot_table=true, enable_inspection=true) and find
+      the composable with testTag play_pause → source Player.kt:88
+8.  PROPOSE: in Player.kt:88, add contentDescription = if (playing) "Pause" else "Play"
       to the IconButton's Icon (or Modifier.semantics { contentDescription = … }).
    (developer rebuilds + redeploys)
-8.  a11y_lint(serial, package, rules=["a11y.label.missing"]) → 0 findings ✓
-9.  a11y_overlay(serial, package)                   → that box is now GREEN ✓
-10. detach(serial, package)                         → free the device session
+9.  a11y_lint(serial, package, rules=["a11y.label.missing"]) → 0 findings ✓
+10. a11y_overlay(serial, package)                   → that box is now GREEN ✓
+11. detach(serial, package)                         → free the device session
 ```
 
 ---
@@ -363,12 +403,28 @@ invocations.
   the user → no meaningful touch target or pixels). A row cut off at a scroll edge
   gets an `info` touch-target finding saying it is probably clipped. Scroll the
   content into view, then re-lint.
-- **Compose `file:line` comes from the slot table**, which is empty until Compose
-  inspection is enabled: `dump_compose(enable_inspection=true)` (CLI
+- **Compose `file:line` comes from the slot table** (`dump_compose` with
+  `include_slot_table=true`), never from `inspect_node` or the lint (their
+  `source` is null). The slot table is empty until Compose inspection is
+  enabled: `dump_compose(enable_inspection=true)` (CLI
   `compose --enable-inspection`). That hot-reloads every composition and **resets
   `remember{}` state** (open dialogs, typed text, scroll, toggles) and re-mints
   Compose node ids, so enable it before reproducing a state-dependent bug, then
-  re-dump. If sources are still missing, the app may be a minified/release build.
+  re-dump. If the slot table is still empty after that, the app may be a
+  minified/release build.
+- **Compose keys go stale.** Recomposition, list recycling and navigation re-mint
+  semantics ids; the `generation` of each dump says when. `inspect_node`
+  re-resolves a key it (or `dump_accessibility` / `a11y_lint`) saw before, and
+  refuses to guess on a weak or tied match: re-run the lint and use the fresh key,
+  or pass the finding's `bounds` too.
+- **Views TalkBack never sees are skipped.** A View left at
+  `importantForAccessibility="auto"` that is not clickable/focusable and has no
+  text or description (layout containers, decorative icons) is not important for
+  accessibility; the dump marks it `ignored` and neither the reading order nor
+  the lint count it. Its children still count.
+- **Dialogs.** While a modal dialog is open TalkBack cannot reach the activity
+  under it: its window has `covered_by`, no reading order, and its findings carry
+  `window.covered_by` (still real defects, reachable once the dialog closes).
 - **Material 48dp vs WCAG 44dp.** Default touch-target floor is Material 48dp;
   pass `wcag_mode=true` for the WCAG 2.5.8 44dp target (24dp is the hard floor).
 - **`detach` when done** to free device resources. It is safe to call even if
@@ -389,7 +445,7 @@ The accessibility-focused tools (full list + the View/Compose tools in
 | `dump_accessibility` | read the unified a11y tree + TalkBack reading order |
 | `a11y_lint` | get rule findings (DETECT / VERIFY) |
 | `a11y_overlay` | see findings + reading order on the screenshot |
-| `inspect_node` | per-element dossier: `file:line` + modifiers + a11y + image |
+| `inspect_node` | per-element dossier: facets + where + its findings + image |
 | `component_image` | just the cropped image of one element |
 | `inspect` | whole-screen merged view+compose+a11y model |
 | `compose_overlay` | see on-screen Compose text/role boxes |

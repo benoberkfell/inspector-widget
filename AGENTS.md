@@ -104,7 +104,7 @@ python3 -m venv host/.venv && host/.venv/bin/pip install -r host/requirements.tx
 host/cli.py devices
 host/cli.py inspect      --serial emulator-5554 --package com.oberkfell.a11yprobe --json -
 host/cli.py a11y-lint    --serial emulator-5554 --package com.oberkfell.a11yprobe
-host/cli.py component-image --serial ... --node-key compose:569 --out comp.png
+host/cli.py component-image --serial ... --node-key compose:<acvId>:<semanticsId> --out comp.png
 ```
 Artifacts are read from `--build-out DIR`, else `$INSPECTOR_WIDGET_ARTIFACTS`, else the legacy
 `$VIEWSPECTOR_ARTIFACTS`, else the checkout's `build-out/`. A wheel install has no checkout to fall
@@ -143,11 +143,16 @@ adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.InteropActivity
 ```
 `host/tests/test_device_a11y_golden.py` (marked `device`) launches each scenario that way and
 asserts the golden answers: every BAD node flagged with its rule id, GOOD nodes not flagged,
-unique a11y node keys, one Compose window per ComposeView, and a known reading order. It runs
-only when `ANDROID_SERIAL` names the device:
+unique a11y node keys, one Compose window per ComposeView, and known reading orders (the
+Compose traversal screen, the classic-View ScrollView screen read item by item, only the
+dialog readable while D1/D2 are open). It runs only when `ANDROID_SERIAL` names the device:
 ```bash
 cd host && ANDROID_SERIAL=<serial> .venv/bin/python -m pytest tests/test_device_a11y_golden.py -q -m device
 ```
+The default build uses Compose BOM 2024.09.00 (ui 1.7.0); `scripts/install-a11yprobe.sh <serial>
+--compose-bom 2025.06.00` builds it on ui 1.8.2, which takes the agent's other Compose traversal
+code path (1.8 to 1.12). `tests/test_device_compose_order_under_talkback.py` turns TalkBack on for
+a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 
 ---
 
@@ -188,6 +193,12 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
 **Conventions:**
 - `.java` files live under `agent/src/main/java/...`, **not** `src/main/kotlin` — Kotlin
   resolves them but `javac` never compiles them there → `NoClassDefFoundError` at runtime.
+- a11y model: the reading order and the lint judge the tree TalkBack gets, not the raw dump.
+  Views that are not important for accessibility (`important_for_accessibility` AUTO on a real
+  View, see CONTRACT.md §9) are skipped with their children hoisted (`ignored`), and windows
+  under a modal dialog are `covered_by` it. Node keys are `view:<id>` /
+  `compose:<acvId>:<semanticsId>`; a dump's `generation` changes when Compose re-mints ids, and
+  `correlate.record_a11y` / the per-app-process key registry let `inspect_node` re-resolve keys.
 - Units: a11y lint density is **device DPI (e.g. 420)**, not a px/dp ratio. `LintContext.density`
   is DPI; `adb.display_density()` returns DPI; `mcp_server._device_density()` returns DPI.
 - Overlays: node bounds are full-resolution; a screenshot captured at `scale < 1` is smaller.
