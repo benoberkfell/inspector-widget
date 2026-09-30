@@ -297,7 +297,10 @@ Not retried: a timeout (it would only wait again), `attach`/`detach` (they
 manage the session themselves), `dump_compose` with `enable_inspection=true`
 unless the request provably never left the host (the hot reload must not run
 twice), a call whose app a concurrent `detach` stopped (the retry would inject
-the agent again), and anything once the server is exiting. Errors are returned as
+the agent again), and anything once the server is exiting. Every tool that
+used a session carries that session's warning as `note` (e.g. its agent runs
+another build than the local payload.jar), as the CLI prints it for every
+subcommand. Errors are returned as
 `{"error": "...", "hint"?: "..."}` text content with the call flagged as an
 error, so the agent can read and recover; `hint` is the next step for that
 error (launch the app, install a debug build, bring a frozen app to the
@@ -320,5 +323,5 @@ one just to stop it (it exits 1 if the agent didn't stop). `--force` (every
 injecting subcommand) and MCP `attach(force=true)` stop a running agent and
 inject a fresh one. An agent running another build than the local payload.jar
 is replaced on attach, unless other clients are connected to it: then it is
-kept, the CLI prints a warning and MCP `attach` a `note`, and `--force` /
-`force=true` replaces it.
+kept, the CLI prints a warning and every MCP tool using the session a `note`,
+and `--force` / `force=true` replaces it.

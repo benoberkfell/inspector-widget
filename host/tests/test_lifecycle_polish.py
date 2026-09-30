@@ -1,5 +1,6 @@
 """Lifecycle polish, offline: no retry during exit cleanup or after a detach,
-retries only for calls that are safe to repeat.
+retries only for calls that are safe to repeat, the session note on every
+session tool (CLI parity).
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
@@ -14,10 +15,14 @@ import pytest
 from fakeagent import DEFAULT_PACKAGE as PKG
 from fakeagent import DEFAULT_SERIAL as SERIAL
 
+import inspector_widget as iw
 import mcp_server
-from inspector_widget import adb, client as clientmod
+from inspector_widget import adb, client as clientmod, inject
 from inspector_widget.client import NotSentError, SessionLostError
 from inspector_widget.proto import view_inspection_pb2 as pb
+
+needs_pil = pytest.mark.skipif(
+    __import__("importlib").util.find_spec("PIL") is None, reason="Pillow not installed")
 
 
 def _wait_until(predicate, timeout=3.0):
@@ -235,3 +240,83 @@ def test_retry_policy_table():
     # Every tool is classified: read-only, or one that is not simply repeated.
     unlisted = set(mcp_server.TOOLS) - mcp_server._READ_ONLY_TOOLS - mcp_server._NO_RETRY
     assert unlisted == {"dump_compose"}
+
+
+# =========================================================================== #
+# 3. Every session tool carries the session's note, as the CLI prints it
+# =========================================================================== #
+_SESSION_TOOLS = [
+    ("attach", {}),
+    ("dump_tree", {}),
+    ("get_properties", {"view_id": 1003}),
+    ("screenshot", {}),
+    ("dump_compose", {"include_slot_table": False}),
+    pytest.param("compose_overlay", {}, marks=needs_pil),
+    ("dump_accessibility", {}),
+    ("a11y_lint", {"include_contrast": False}),
+    pytest.param("a11y_overlay", {"include_contrast": False}, marks=needs_pil),
+    ("inspect", {}),
+    ("inspect_node", {"view_id": 1004, "include_image": False}),
+    pytest.param("component_image", {"view_id": 1004}, marks=needs_pil),
+]
+
+
+@pytest.mark.parametrize("tool,args", _SESSION_TOOLS)
+def test_every_session_tool_notes_a_stale_build_agent(mcp, fake_device, tool, args):
+    fake_device.start_agent(PKG, build_id="0" * 64)
+    other = iw.connect_existing(SERIAL, PKG)  # kept: another client uses it
+    try:
+        res = mcp(tool, **args)
+        assert "error" not in res, res
+        assert "other client(s)" in res["note"] and "force=true" in res["note"]
+    finally:
+        other.disconnect()
+
+
+@pytest.mark.parametrize("tool,args", _SESSION_TOOLS)
+def test_every_session_tool_notes_a_payload_rebuilt_since_attach(mcp, fake_device, tmp_path,
+                                                                 tool, args):
+    assert "note" not in mcp("attach")
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).write_bytes(b"payload, rebuilt")
+    res = mcp(tool, **args)
+    assert "error" not in res, res
+    assert "different build" in res["note"] and "force=true" in res["note"]
+
+
+def test_the_session_note_follows_a_tools_own_note(mcp, fake_device):
+    fake_device.start_agent(PKG, build_id="0" * 64)
+    other = iw.connect_existing(SERIAL, PKG)
+    try:
+        res = mcp("dump_compose")  # slot table not populated: a note of its own
+        own, _, session = res["note"].partition(" Also: ")
+        assert "slot table not populated" in own and "other client(s)" in session
+    finally:
+        other.disconnect()
+
+
+def test_an_error_after_attach_carries_the_session_note(mcp, fake_device):
+    fake_device.start_agent(PKG, build_id="0" * 64)
+    other = iw.connect_existing(SERIAL, PKG)
+    try:
+        res = mcp("inspect_node", view_id=999, include_image=False)
+        assert "no matching element" in res["error"] and "other client(s)" in res["note"]
+    finally:
+        other.disconnect()
+
+
+def test_detach_and_the_device_tools_carry_no_session_note(mcp, fake_device, tmp_path):
+    assert mcp("attach")["attached"]
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).write_bytes(b"payload, rebuilt")
+    assert "note" not in mcp("list_devices")
+    assert "note" not in mcp("detach")  # as the CLI's detach prints none
+
+
+def test_cli_and_mcp_print_the_same_note(mcp, fake_device, run_cli):
+    fake_device.start_agent(PKG, build_id="0" * 64)
+    other = iw.connect_existing(SERIAL, PKG)
+    try:
+        res = run_cli("dump", "--json", "-")  # first: each sees one other client
+        note = mcp("dump_tree")["note"]
+        assert res.rc == 0 and f"warning: {note}\n" in res.err
+    finally:
+        other.disconnect()

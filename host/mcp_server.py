@@ -205,18 +205,20 @@ HOST = HostFacade()
 # re-attach behind it and leave a session or an adb forward nobody removes.
 #
 # _CALL holds the state of the tool call running on this thread (_run_tool
-# sets it): the detach count it first saw per app, so its retry never
-# re-injects an agent that a concurrent detach just stopped.
+# sets it): the sessions it used, for the stale-build note, and the detach
+# count it first saw per app, so its retry never re-injects an agent that a
+# concurrent detach just stopped.
 # --------------------------------------------------------------------------- #
 _closing = threading.Event()
 _CALL = threading.local()
 
 
 class _CallState:
-    """What one tool call touched: for each (serial, package), the stop count
-    it saw first (see SessionCache.detaching)."""
+    """What one tool call touched: the sessions it got, and for each (serial,
+    package) the stop count it saw first (see SessionCache.detaching)."""
 
     def __init__(self) -> None:
+        self.sessions: List[Any] = []
         self.stops_seen: Dict[Tuple[str, str], int] = {}
 
 
@@ -254,7 +256,7 @@ class SessionCache:
             with self._lock:
                 session = self._sessions.get(key)
             if session is not None and not force and _session_alive(session):
-                return session
+                return _note_used(session)
             if session is not None:
                 # Dead (agent idled out, app restarted, stream broke) or forced:
                 # release it before attaching afresh.
@@ -264,7 +266,7 @@ class SessionCache:
             with self._lock:
                 if not _closing.is_set():
                     self._sessions[key] = session
-                    return session
+                    return _note_used(session)
             # Exit cleanup began while this attach ran and has emptied the
             # cache already: release the new session (and its forward) here.
             _disconnect(session)
@@ -333,6 +335,14 @@ class SessionCache:
 SESSIONS = SessionCache()
 
 _CLOSING_MESSAGE = "the MCP server is shutting down; not attaching"
+
+
+def _note_used(session: Any) -> Any:
+    """Record ``session`` as used by the current tool call; returns it."""
+    call = _current_call()
+    if call is not None:
+        call.sessions.append(session)
+    return session
 
 
 def _session_alive(session: Any) -> bool:
@@ -792,10 +802,37 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
         "root_ids": root_ids,
         "session": f"{serial}/{package}",
     }
-    note = getattr(session, "note", None) or _stale_build_note(info.get("build_id"))
+    note = _session_note(session)
     if note:
         result["note"] = note
     return result
+
+
+def _session_note(session: Any) -> Optional[str]:
+    """The warning a session carries, as the CLI prints it for every subcommand:
+    the attach's own note (e.g. a stale-build agent kept for other clients), else
+    whether a cached session's agent runs another build than the local payload.jar."""
+    note = getattr(session, "note", None)
+    if note:
+        return str(note)
+    if not hasattr(session, "build_id"):
+        return None  # not a host Session (a test double): nothing to compare
+    return _stale_build_note(session.build_id)
+
+
+def _add_session_note(result: Any, call: _CallState) -> None:
+    """Add the note of the session ``call`` used last to ``result`` (a tool's
+    dict, an error included), after any note the tool gave itself."""
+    if not isinstance(result, dict) or not call.sessions:
+        return
+    note = _session_note(call.sessions[-1])
+    if not note:
+        return
+    own = result.get("note")
+    if not own:
+        result["note"] = note
+    elif note not in str(own):
+        result["note"] = f"{str(own).rstrip()} Also: {note}"
 
 
 def _stale_build_note(agent_build: Optional[str]) -> Optional[str]:
@@ -1930,7 +1967,8 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     Arguments are validated against the tool's inputSchema first, the same way
     for every transport. If the agent drops the session mid-call (idle timeout,
     app restart), a read-only call is retried once on a fresh attach (see
-    _retry_refusal for when it isn't).
+    _retry_refusal for when it isn't). A result from a tool that used a session
+    carries that session's warning as "note", as the CLI prints it.
     """
     entry = TOOLS.get(name)
     if entry is None:
@@ -1945,6 +1983,7 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         result = _run_tool_call(name, entry, args, call)
     finally:
         _CALL.state = outer
+    _add_session_note(result, call)
     return result
 
 
