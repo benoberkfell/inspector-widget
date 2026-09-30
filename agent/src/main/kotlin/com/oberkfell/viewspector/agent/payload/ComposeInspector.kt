@@ -42,7 +42,12 @@
  * (== Window.view_id); that number lives in a different space from semantics ids and can equal
  * one, so the host must key the root as composeview:<acvId>, never as compose:<id>. Semantics ids
  * are re-minted on recomposition (e.g. the hot reload enable_inspection triggers), so a key is
- * only valid for the dump that produced it.
+ * only valid for the dump that produced it. A SLOT-TABLE node (kind COMPOSABLE) has no semantics
+ * id; it carries a negative id (<= -2, so it never meets a semantics id, the synthetic root's
+ * positive id, or -1 = the host View) derived from the hash of its group's slot-table identity
+ * (an anchor the slot table keeps for as long as the group lives), so the id is stable across
+ * dumps of an unchanged composition (the same idea as Android Studio's anchor-hash ids). It is
+ * unique within its Window, and the host keys it compose:<acvId>:<id> like a semantics node.
  *
  * DETECTION: an AndroidComposeView is recognised by class name, or structurally when R8 renamed
  * the class: Compose tags every AndroidComposeView with its WrappedComposition under the resource
@@ -65,8 +70,10 @@
  *       root_unreachable | error=<Throwable>   (no semantics tree for that ComposeView)
  *   semantics_partial: view#<acvId> nodes_failed=N values_failed=M   (the tree is there; N nodes
  *       lost a part, M attribute values read "<error:...>")
+ *   semantics_truncated: view#<acvId> depth>80 subtrees=N
  *   slot_failed: view#<acvId> error=<Throwable>
  *   slot_partial: view#<acvId> groups_failed=N
+ *   slot_truncated: view#<acvId> depth>80 subtrees=N   (named-composable nesting; or raw>512)
  *   slot table empty (inspection_slot_table_set not populated) for N/M view(s)
  *   view#<acvId>[,view#<acvId>...] produced no compose nodes
  */
@@ -84,7 +91,19 @@ object ComposeInspector {
     private const val TAG = "ViewSpector"
     private const val ANDROID_COMPOSE_VIEW = "androidx.compose.ui.platform.AndroidComposeView"
 
+    // Walk cap for the unmerged semantics index (no proto is built from it).
     private const val MAX_DEPTH = 400
+
+    // Nesting caps for what goes on the wire: Response > DumpComposeResponse > Window > root node
+    // > 80 levels > Bounds > Rect stays under the ~100-message nesting limit of the host's
+    // protobuf parser (a deeper tree makes the WHOLE response unparseable). Deeper subtrees are
+    // cut and counted (semantics_truncated / slot_truncated).
+    private const val SEM_EMIT_MAX_DEPTH = 80
+    private const val SLOT_MAX_DEPTH = 80
+
+    // Raw slot-table groups nest far deeper than the named composables emitted from them; this
+    // only guards the recursion.
+    private const val SLOT_RAW_MAX_DEPTH = 512
 
     // Entries read from one SemanticsConfiguration (a real one holds a few dozen).
     private const val MAX_CONFIG_ENTRIES = 256
@@ -95,7 +114,10 @@ object ComposeInspector {
     private class WalkCtx {
         var semNodeFailures = 0
         var semValueFailures = 0
+        var semTruncated = 0
         var slotGroupFailures = 0
+        var slotTruncated = 0
+        val slotIds = SlotIds()
         private val logged = HashSet<String>()
 
         /** Log the first failure of each [kind] (per ComposeView), without a second failure. */
@@ -175,6 +197,9 @@ object ComposeInspector {
                             "values_failed=${ctx.semValueFailures}",
                     )
                 }
+                if (ctx.semTruncated > 0) {
+                    tokens.add("semantics_truncated: view#$acvId depth>$SEM_EMIT_MAX_DEPTH subtrees=${ctx.semTruncated}")
+                }
             }
             if (includeSlotTable) {
                 try {
@@ -182,9 +207,9 @@ object ComposeInspector {
                     if (groups.isEmpty()) {
                         slotEmpty.add(acvId)
                     } else {
-                        for (g in groups) {
+                        for ((i, g) in groups.withIndex()) {
                             try {
-                                for (n in buildSlotChildren(g, strings, 0, off, ctx)) {
+                                for (n in buildSlotChildren(g, strings, 0, 0, off, 0L, i, ctx)) {
                                     rootNode.addChildren(n); produced = true
                                 }
                             } catch (t: Throwable) {
@@ -199,6 +224,9 @@ object ComposeInspector {
                 }
                 if (ctx.slotGroupFailures > 0) {
                     tokens.add("slot_partial: view#$acvId groups_failed=${ctx.slotGroupFailures}")
+                }
+                if (ctx.slotTruncated > 0) {
+                    tokens.add("slot_truncated: view#$acvId depth>$SLOT_MAX_DEPTH subtrees=${ctx.slotTruncated}")
                 }
             }
 
@@ -518,7 +546,7 @@ object ComposeInspector {
     /**
      * One SemanticsNode and its subtree. Each part (id, bounds, attributes, each child) is guarded
      * on its own: a failure costs that part and is counted in [ctx], never the node's siblings or
-     * the ComposeView. Children deeper than [MAX_DEPTH] are dropped.
+     * the ComposeView. Children deeper than [SEM_EMIT_MAX_DEPTH] are cut and counted.
      */
     private fun buildSemanticsNode(
         node: Any,
@@ -572,7 +600,10 @@ object ComposeInspector {
         if (children != null) {
             for (child in children) {
                 if (child == null) continue
-                if (depth + 1 > MAX_DEPTH) continue
+                if (depth + 1 >= SEM_EMIT_MAX_DEPTH) {
+                    ctx.semTruncated++
+                    continue
+                }
                 try {
                     b.addChildren(buildSemanticsNode(child, strings, depth + 1, off, ctx))
                 } catch (t: Throwable) {
@@ -703,32 +734,77 @@ object ComposeInspector {
     private fun meaningfulName(group: Any): String? =
         (invoke(group, "getName") as? String)?.takeIf { it.isNotBlank() && !isStructuralName(it) }
 
-    // Slot-table depth cap: keep nesting well under protobuf's 100-level parse limit.
-    private const val SLOT_MAX_DEPTH = 60
+    /**
+     * Ids for the named slot-table nodes of one Window: negative (<= -2), unique within the
+     * Window, and stable across dumps while the group lives (see the header, IDS). The base is the
+     * hash of Group.identity: the group's slot-table anchor, which the slot table keeps for the
+     * group's lifetime (identity hash), or for a group inside inline source information a
+     * data-class path from such an anchor (same hash on every read; ui-tooling-data sets identity
+     * on named groups with a non-empty box only). Without one, a hash of the parent id, the name,
+     * an Int group key and the sibling index. A collision takes the next free id.
+     */
+    private class SlotIds {
+        private val used = HashSet<Long>()
+
+        fun mint(group: Any, name: String, parentId: Long, siblingIndex: Int): Long {
+            // identity is a Compose runtime object (GapAnchor / LinkAnchor / path), never app code.
+            val h = invoke(group, "getIdentity")?.let {
+                try { it.hashCode() } catch (_: Throwable) { null }
+            } ?: run {
+                // Only an Int key is hashed: any other key may be an app object (key(x) { }).
+                val key = invoke(group, "getKey") as? Int ?: 0
+                ((parentId.hashCode() * 31 + name.hashCode()) * 31 + key) * 31 + siblingIndex
+            }
+            var id = -2L - (h.toLong() and 0x7FFFFFFFL)
+            while (!used.add(id)) id = if (id <= MIN_ID) -2L else id - 1
+            return id
+        }
+
+        companion object {
+            private const val MIN_ID = -2L - 0x7FFFFFFFL
+        }
+    }
 
     /**
-     * Returns the list of NAMED-composable nodes contributed by [group] and its descendants.
-     * Anonymous/structural groups (no name) are collapsed: their named children are hoisted to
-     * the caller, which both flattens the very deep slot tree (avoiding the proto recursion limit)
-     * and yields a readable composable hierarchy. Each named node carries bounds, file:line, and
-     * its call parameters. A child group that throws is counted in [ctx] (slot_partial) and its
-     * siblings still come through.
+     * The NAMED-composable nodes contributed by [group] and its descendants. Anonymous/structural
+     * groups (no name) are collapsed: their named children are hoisted to the caller, which both
+     * flattens the very deep slot tree and yields a readable composable hierarchy. Each named node
+     * carries an id ([SlotIds]), bounds, file:line, and its call parameters. [namedDepth] counts
+     * the named ancestors (the nesting that goes on the wire, capped at [SLOT_MAX_DEPTH]);
+     * [rawDepth] the raw groups (capped at [SLOT_RAW_MAX_DEPTH] as a recursion guard). A cut
+     * subtree is counted in [ctx] (slot_truncated); a child group that throws is counted
+     * (slot_partial) and its siblings still come through.
      */
     private fun buildSlotChildren(
         group: Any,
         strings: StringTable,
-        depth: Int,
+        rawDepth: Int,
+        namedDepth: Int,
         off: IntArray,
+        parentId: Long,
+        siblingIndex: Int,
         ctx: WalkCtx,
     ): List<ViewInspection.ComposeNode> {
-        if (depth > SLOT_MAX_DEPTH) return emptyList()
+        if (rawDepth > SLOT_RAW_MAX_DEPTH) {
+            ctx.slotTruncated++
+            return emptyList()
+        }
         val name = meaningfulName(group)
+        if (name != null && namedDepth >= SLOT_MAX_DEPTH) {
+            ctx.slotTruncated++
+            return emptyList()
+        }
+        val id = if (name != null) ctx.slotIds.mint(group, name, parentId, siblingIndex) else parentId
+        val childNamedDepth = if (name != null) namedDepth + 1 else namedDepth
         val childGroups = (invoke(group, "getChildren") as? Collection<*>) ?: emptyList<Any?>()
         val childNodes = ArrayList<ViewInspection.ComposeNode>()
+        var index = 0
         for (c in childGroups) {
             if (c == null) continue
             try {
-                childNodes.addAll(buildSlotChildren(c, strings, depth + 1, off, ctx))
+                childNodes.addAll(
+                    buildSlotChildren(c, strings, rawDepth + 1, childNamedDepth, off, id, index++, ctx),
+                )
             } catch (t: Throwable) {
                 ctx.slotGroupFailures++
                 ctx.log("slot-table group", t)
@@ -739,6 +815,7 @@ object ComposeInspector {
 
         val b = ViewInspection.ComposeNode.newBuilder()
         b.kind = ViewInspection.ComposeNode.Kind.COMPOSABLE
+        b.id = id
         b.name = strings.intern(name)
         slotBox(group, off)?.let { b.bounds = it }
         slotLocation(group)?.let { b.source = strings.intern(it) }
