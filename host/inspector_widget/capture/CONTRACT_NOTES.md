@@ -75,6 +75,85 @@ with every consumer.
   The builder's `sel` is a stand-in (`@tag` or `#rid` when unique, else the ref).
   The real `sel` is computed in C4.
 
+## Store (C2, `capture/store.py`)
+
+- **Constructor.** `CaptureStore(root=None, persist=None, clock=time.time, *, env,
+  ttl_s, max_captures, max_mb, max_bytes, lineage_cap, max_pinned, mem_indexes,
+  mem_bytes, durable, gc_on_publish, rebuild, new_id)`.
+  - `persist=None` (the section 10 default was `True`) reads
+    `INSPECTOR_WIDGET_CAPTURE_PERSIST`. An explicit `True` or `False` wins.
+  - In memory-only mode `root` is a private temp directory. `close()` removes
+    it, and so does exit. `configured_root` still names the configured one.
+  - The keyword-only arguments override the environment and the spec defaults.
+    Tests use them; production code should not need them.
+  - The TTL is at least 60 s. A bare number in `INSPECTOR_WIDGET_CAPTURE_TTL`
+    means seconds; `s`, `m`, `h` and `d` suffixes also work.
+- **Locking.** `refs_lock()` is `store.lock`: an flock that is re-entrant for
+  the thread holding it. S1 holds it across `next_refs`, `refs.assign` and
+  `publish`. `publish` and `save_lineage_state` take it themselves as well. The
+  GC that a publish requests runs when the outermost `refs_lock` is released. It
+  is best-effort and never fails the publish.
+- **`publish(raw, ix, refmap, *, tomb=None) -> id`.**
+  - It mutates `raw.meta`: `id`, `created_at` (when 0) and `prev` (when None; it
+    becomes the lineage's latest).
+  - It applies `meta.label`, moving it silently from another capture of the
+    lineage. Call `label()` after publishing to learn `moved_from`.
+  - It honours `meta.pinned`: `bad_args` when 20 are pinned already.
+  - It merges `tomb` updates. Refs present in `refmap` leave the tomb, which is
+    capped at 5,000 with the oldest dropped first.
+  - It sets the default session and caches the index in memory.
+  - If the id was taken between staging and rename, it re-ids and rewrites
+    meta.json and the index.
+- **Sources of truth.** Labels live in the lineage file (a capture has at most
+  one) and pins in a `.pinned` marker. `meta.json` is written once. `load()` and
+  `list()` overlay the current `label` and `pinned`. `latest` and `prev` are
+  reserved and can never be labels.
+- **Lineage files** also carry `serial` and `package`, because file names are
+  sanitized. `lineage_state()` remembers its lineage, so
+  `save_lineage_state(st)` needs no arguments. `save_lineage_state(st, serial,
+  package)` also works. Save before `publish`, or re-read after it, because
+  publish rewrites `latest` and `history`.
+- **`resolve(spec, lineage)`.**
+  - `latest`, `prev` and `latest~N` walk the lineage's `history`, then any older
+    captures of the lineage (such as pinned ones past the 50-entry history) by
+    `created_at`. Without a lineage they walk the whole store by `created_at`.
+  - A lineage that has no captures gives `capture_not_found`. There is no
+    store-wide fallback, so another app's capture is never returned.
+  - Labels resolve as in spec 4.2. `ambiguous` candidates read `"<id>
+    <serial>/<package>"`.
+  - An empty or None spec means `latest`.
+- **`load(cid)`** takes ids only (case-insensitive). Anything else is
+  `bad_args`: resolve it first. A load counts as a use and touches `.used` at
+  most once a minute.
+- **`LoadedCapture`** has:
+  - `id`, `path`, `meta`, `exists()`, `stripped`;
+  - `index()`, `raw(name)`, `shot(root)`, `shot_roots()`, `skp(root)`,
+    `skp_roots()`, `refmap()`, `raw_capture()`;
+  - `derived(name)`, `put_derived(name, bytes) -> path`, `derived_path(name)`;
+  - `nbytes()`, `node_count()`, `age_s()`.
+
+  Reads after a deletion raise `capture_not_found`. A facet that was never
+  captured reads as None.
+  - Derived names are `derived/<f>`, `img/<f>` or `out/<f>`. A bare name means
+    `derived/<f>`.
+  - `index()` rebuilds an unreadable or old-schema index through
+    `rebuild(raw, refmap) -> Index`, then saves it. The default rebuild is C4's
+    `apply_refs(build_index(raw), refmap)`. S1 should pass one that also runs
+    the analyzers.
+- **Retention.** Caps count pinned captures but never evict them, and never
+  evict `gc(keep=...)`. The eviction order is unlabeled first, then least
+  recently used. The byte cap strips `img/`, `out/`, `derived/` and
+  `raw/skp_*.bin` in that order before it deletes whole captures, and marks
+  stripped captures `.stripped`.
+  - `gc()` returns `{removed:[{id, why}], stripped, staging_purged,
+    trash_purged, spill_purged, incomplete_purged, captures, bytes}`, where
+    `why` is one of `expired`, `lineage_cap`, `count_cap` or `bytes`.
+  - It returns `{"skipped": ...}` while another gc runs.
+  - `gc(all=True)` returns `{all, removed, note}`.
+- **Known gap.** Refs of a lineage's *latest* capture get no tombstone when that
+  capture is dropped or evicted, because no later capture was matched against
+  it. Refs are still never reused: the counter is global.
+
 ## Output layer (P0-1, `output.py`, `normalize.py`, `normalize_defaults.py`)
 
 - **Call order at the boundary**: `slim(tool, result, args)` then
