@@ -317,35 +317,46 @@ object Capture {
     class SkpResult(val supported: Boolean, val skp: ByteString?, val error: String?)
 
     /**
-     * The SKP sink: a ByteArrayOutputStream that refuses to grow past [limit] (the write fails
-     * with an IOException; ViewDebug then drops that frame) and hands its bytes to protobuf
-     * without a copy. It is written once (one frame) and never reused, so wrapping is safe.
+     * The SKP sink: a ByteArrayOutputStream that stops growing at [limit] and hands its bytes
+     * to protobuf without a copy. It is written once (one frame) and never reused, so wrapping
+     * is safe.
+     *
+     * Past the limit it sets [overflowed] and DISCARDS every further write rather than
+     * throwing: Picture.writeToStream serializes through hwui's Java OutputStream adaptor in
+     * 16 KB chunks, and that adaptor answers a Java exception with ExceptionDescribe() (a stack
+     * trace in the app's System.err) and ExceptionClear(), then carries on with the next chunk,
+     * so a throwing sink would print one trace per remaining chunk of a 60 MB picture.
+     * [captureSkp] reports the overflow from [overflowed].
      */
     private class SkpBuffer(private val limit: Long) : ByteArrayOutputStream(256 * 1024) {
         @Volatile var overflowed = false
             private set
 
-        private fun ensure(extra: Int) {
-            if (overflowed || count.toLong() + extra > limit) {
+        /** Whether [extra] more bytes fit; false (and [overflowed]) once they do not. */
+        private fun fits(extra: Int): Boolean {
+            if (overflowed) return false
+            if (count.toLong() + extra > limit) {
                 overflowed = true
-                throw java.io.IOException("SKP larger than $limit bytes")
+                return false
             }
+            return true
         }
 
-        @Synchronized override fun write(b: Int) { ensure(1); super.write(b) }
+        @Synchronized override fun write(b: Int) { if (fits(1)) super.write(b) }
 
-        @Synchronized override fun write(b: ByteArray, off: Int, len: Int) { ensure(len); super.write(b, off, len) }
+        @Synchronized override fun write(b: ByteArray, off: Int, len: Int) { if (fits(len)) super.write(b, off, len) }
 
         @Synchronized fun toByteString(): ByteString = UnsafeByteOperations.unsafeWrap(buf, 0, count)
     }
 
     /**
-     * The largest SKP this capture may hold. It all lives in the APP's heap: ViewDebug has
-     * already serialized the frame into its own byte array when it hands it over, and the
-     * picture is then held about three times over (that array, our buffer, the serialized
-     * reply). So it gets a quarter of the heap still free, and never more than
-     * [MAX_SKP_BYTES]. Past that the capture fails cleanly (the host falls back to a BITMAP
-     * crop) instead of pushing the app's own allocations into an OutOfMemoryError.
+     * The largest SKP this capture may hold. It all lives in the APP's heap: ViewDebug hands
+     * over the frame as a Picture (native memory) and serializes it straight into our buffer,
+     * which holds the bytes up to twice over while it grows (the old array and its doubled
+     * copy), and the reply is serialized once more on the way out. So it gets a quarter of
+     * the heap still free, and never more than [MAX_SKP_BYTES]. Past that the capture fails
+     * cleanly (the host falls back to a BITMAP crop) instead of pushing the app's own
+     * allocations into an OutOfMemoryError.
      */
     private fun skpLimit(): Long {
         val rt = Runtime.getRuntime()
