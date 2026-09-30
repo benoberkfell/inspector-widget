@@ -234,6 +234,21 @@ def test_focus_taken_back_before_a_press_settles_is_stolen_too(probe):
     assert "tb.trap" in codes and "tb.revisit" not in codes
 
 
+def test_focus_taken_back_just_before_a_press_is_stolen_then_the_press_moves_on(probe):
+    def press(tb, action):
+        if action != "next" or len(tb.presses) != 5:
+            return False
+        tb.set_focus(tb_item(0))  # the app's timer, a moment before the press lands
+        tb.set_focus(tb.order[tb.order.index(tb.focus) + 1])
+        return True
+
+    probe.talkback.on_press = press
+    rec = saved(walk(probe, until="edge"))
+    moves = [(s["via"], s["key"]) for s in rec["steps"][:7]]
+    assert moves[5:7] == [("stolen", "view:1020"), ("next", "view:1021")], moves
+    assert "model.mismatch" not in [f["code"] for f in rec["findings"]]
+
+
 def test_dump_reader_records_stolen_focus_too(probe, monkeypatch):
     # With a 30ms poll and a 20ms settle, a step's wait reads exactly twice after
     # its press, so the third read after press 3 is the next step's pre-check.

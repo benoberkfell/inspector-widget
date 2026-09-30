@@ -339,3 +339,11 @@ def test_a_merged_row_read_out_of_screen_order_is_a_wrong_announcement():
     assert "clearAndSetSemantics" in f["fix"]
     row["speak"] = "Socks. $5"  # the same row read in screen order
     assert "tb.wrong_announcement" not in codes(diff.analyze(record([head, row])))
+
+
+def test_a_model_stop_talkback_scrolls_into_view_first_is_not_judged_a_ghost():
+    head = step(0, "compose:11:4", (39, 175, 900, 69), "Products", via="start")
+    clipped = step(1, "compose:11:43", (0, 2066, 2076, 86), "", speak="Unlabelled", flags=["clickable"])
+    assert "tb.ghost_stop" in codes(diff.analyze(record([head, clipped], ended="autoscroll")))
+    clipped["show_on_screen"] = True  # static_walk: TalkBack shows it (and its clipped text) first
+    assert "tb.ghost_stop" not in codes(diff.analyze(record([head, clipped], ended="autoscroll")))

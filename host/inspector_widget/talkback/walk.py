@@ -1130,8 +1130,13 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                 cur, prev_idx = pre, pre.index
             t_sent, _send_ms = drv.press(direction)
             w = drv.wait(cur.key, t_sent)
-            new = _press_target(w.snap, direction)
-            if new is not w.snap:
+            stolen, new = _press_target(w.snap, cur.key, direction)
+            if stolen is not None:
+                steps.append(Step(len(steps), stolen.key, via="stolen", node=stolen.focus, t=t_sent,
+                                  index=stolen.index))
+                cur, prev_idx = stolen, stolen.index
+                w = replace(w, moved=new.key != cur.key)
+            elif new is not w.snap:
                 w = replace(w, snap=new, moved=new.key != cur.key, lost=False)
             if w.moved and direction == "next":
                 drv.inj.mark_proven()  # type: ignore[union-attr]
@@ -1309,24 +1314,34 @@ def _act_focus(drv: Driver, cur: Snapshot, start: str) -> Optional[Snapshot]:
     return None
 
 
-def _press_target(snap: Snapshot, direction: str) -> Snapshot:
-    """Where the press itself took focus. When focus moved again before the wait
-    settled, back against the walk (TalkBack focused A, then the app pulled focus
-    back to B), the press's move is A; the next guard read reports B as stolen."""
+def _press_target(snap: Snapshot, cur_key: Optional[str],
+                  direction: str) -> Tuple[Optional[Snapshot], Snapshot]:
+    """(a steal, where the press took focus) when the app moved focus inside the
+    press's wait. TalkBack focused A and then focus went back against the walk to
+    B: the press's move is A, and the next guard read reports B as stolen. Or the
+    app took focus back to A just before the press, which then moved on from A:
+    A is the steal, and the press's move goes from A to where focus is now."""
     focused = [e["node_key"] for e in snap.events
                if e.get("type") == "VIEW_ACCESSIBILITY_FOCUSED" and e.get("node_key")]
     last = snap.focus
     if len(focused) < 2 or last is None:
-        return snap
-    first = snap.index.nodes.get(focused[0])
+        return None, snap
     order = snap.index.order
+    first = snap.index.nodes.get(focused[0])
+    prev = snap.index.nodes.get(cur_key) if cur_key else None
     if first is None or first.key == last.key or first not in order or last not in order:
-        return snap
-    a, b = order.index(first), order.index(last)
-    if (b < a) if direction == "next" else (b > a):
-        return Snapshot(snap.index, snap.t, snap.resp, focus_node=first, events=snap.events,
+        return None, snap
+
+    def behind(a: Node, b: Node) -> bool:
+        return order.index(a) < order.index(b) if direction == "next" else order.index(a) > order.index(b)
+
+    at_first = Snapshot(snap.index, snap.t, snap.resp, focus_node=first, events=snap.events,
                         uptime_ms=snap.uptime_ms)
-    return snap
+    if behind(last, first):
+        return None, at_first
+    if prev is not None and prev in order and behind(first, prev):
+        return at_first, snap
+    return None, snap
 
 
 def _edge_info(idx: DumpIndex, n: Node, direction: str) -> Optional[Dict[str, Any]]:

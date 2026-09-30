@@ -288,6 +288,10 @@ def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
+    if s.get("show_on_screen"):
+        # A model stop TalkBack first scrolls fully into view: what it shows and says
+        # (its clipped text) is known only after the scroll.
+        return []
     reasons = []
     speak = (s.get("speak") or "").strip()
     # TalkBack 17 says just the role ("Button") for an unlabelled control, 16.2 "Unlabelled".
@@ -295,7 +299,7 @@ def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
     if _UNLABELLED.search(speak) or (not (s.get("label") or "").strip() and not words_beyond_role):
         reasons.append("unlabelled")
     r = _rect(s)
-    if r is not None and not s.get("show_on_screen"):  # else TalkBack scrolls it into view first
+    if r is not None:
         x, y, w, h = r
         win = s.get("window_rect")
         if w <= 0 or h <= 0 or (win and not _intersects(r, tuple(win))):  # type: ignore[arg-type]
