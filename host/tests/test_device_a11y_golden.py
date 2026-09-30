@@ -31,7 +31,8 @@ with a current A11yProbe build installed and the agent artifacts in build-out/::
         tests/test_device_a11y_golden.py -q -m device
 
 The flawed list rows all sit in the first six rows, so a phone-sized display
-(at least ~700dp tall) shows every expected node without scrolling.
+(at least ~700dp tall) shows every expected node without scrolling. The View screen's
+section-title check only expects the titles that are on screen.
 """
 
 from __future__ import annotations
@@ -516,7 +517,13 @@ def check_view_reading_order(cap: Capture) -> None:
     glued = [x for x in speak if sum(t in x for t in VIEW_SECTION_TITLES) > 1]
     assert not glued, f"several section titles read as one stop: {glued[:2]}"
     titles = [x for x in speak if x in VIEW_SECTION_TITLES]
-    assert titles == VIEW_SECTION_TITLES, f"section titles as stops: {titles}\n  order: {speak}"
+    # Only titles on screen can be stops: the screen isn't scrolled, and on a short display
+    # (e.g. the Fold emulator, ~883dp) the last section starts below the window.
+    on_screen = [t for t in VIEW_SECTION_TITLES
+                 if any(n.get("text") == t and "visible_to_user" in (n.get("flags") or [])
+                        for n in cap.nodes)]
+    assert len(on_screen) >= 6, f"too few section titles on screen to check: {on_screen}"
+    assert titles == on_screen, f"section titles as stops: {titles}\n  on screen: {on_screen}\n  order: {speak}"
     assert "Account, heading" in speak, speak
     deco = _node(cap, "goodDecorativeImage")  # importantForAccessibility="no"
     assert deco.get("ignored") and not _is_stop(cap, deco), describe(deco)
