@@ -12,13 +12,15 @@ keeps a logcat and a clock and can script an agent's start-up failure.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from fakeagent import DEFAULT_PACKAGE as PKG
 from fakeagent import DEFAULT_PID as PID
 from fakeagent import DEFAULT_SERIAL as SERIAL
 
-from inspector_widget import adb
+from inspector_widget import adb, inject
 
 
 # =========================================================================== #
@@ -85,3 +87,297 @@ def test_process_bitness_reads_the_exe_link_as_the_app(fake_device):
     assert adb.process_bitness(SERIAL, PKG, PID) is None
     assert adb.process_bitness(SERIAL, "com.example.release", 5151) is None  # not debuggable
     assert f"run-as {PKG} readlink /proc/{PID}/exe" in fake_device.shell_log()
+
+
+# =========================================================================== #
+# Fail fast: the agent's start-up error, read from logcat while waiting
+# =========================================================================== #
+# What NiA's R8-shrunk (not renamed) release build logged 12 ms after attach
+# (real-app run, emulator-5554, API 37).
+NIA_APK = ("/data/app/~~G9JleUeu_3P0lWHxM1JKRw==/com.google.samples.apps.nowinandroid.demo-"
+           "78xCzPsN9ay4UIKlMPHQpQ==/base.apk!2")
+R8_SHADOWED_KOTLIN = [("E", "ViewSpector", "\n".join([
+    "initialize: error invoking com.oberkfell.viewspector.agent.payload.Payload.start",
+    "java.lang.reflect.InvocationTargetException",
+    "\tat java.lang.reflect.Method.invoke(Native Method)",
+    "\tat com.oberkfell.viewspector.agent.Bootstrap$1.run(Bootstrap.java:137)",
+    "\tat java.lang.Thread.run(Thread.java:1571)",
+    "Caused by: java.lang.NoSuchMethodError: No static method checkNotNullParameter("
+    "Ljava/lang/Object;Ljava/lang/String;)V in class Lkotlin/jvm/internal/Intrinsics; or its "
+    f"super classes (declaration of 'kotlin.jvm.internal.Intrinsics' appears in {NIA_APK})",
+    "\tat com.oberkfell.viewspector.agent.payload.Payload.start(Payload.kt:2)",
+    "\t... 3 more",
+]))]
+
+
+def _inject():
+    return inject.inject_and_connect(serial=SERIAL, package=PKG)
+
+
+def _pushes(dev):
+    return sum(1 for argv in dev.adb_log if argv[:1] == ["push"])
+
+
+def test_shadowed_kotlin_fails_fast_with_the_cause(fake_device):
+    fake_device.apps[PKG].startup_error = R8_SHADOWED_KOTLIN
+    started = time.monotonic()
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert time.monotonic() - started < 1.0  # not the 13 s socket timeout
+    e = err.value
+    assert (e.kind, e.cacheable, e.cached) == ("classpath_shadowing", True, False)
+    assert e.cause.startswith("java.lang.NoSuchMethodError: No static method checkNotNullParameter")
+    msg = str(e)
+    assert msg.startswith(f"the agent payload failed to start in '{PKG}' (pid {PID}): "
+                          "java.lang.NoSuchMethodError: No static method checkNotNullParameter")
+    assert "kotlin.jvm.internal.Intrinsics resolved to the app's own copy (in its base.apk)" in msg
+    assert "R8/ProGuard shrank" in msg and "minified Kotlin classes" in msg
+    assert "declaration of" not in msg  # restated, not dumped
+    assert "isMinifyEnabled = false" in e.hint and "--force" in e.hint
+    assert e.log[0].startswith("initialize: error invoking")
+    assert fake_device.agent() is None and fake_device.forward_names() == []
+    assert not fake_device.unexpected
+
+
+def test_a_retry_reports_the_remembered_failure_without_injecting(fake_device, mcp, run_cli):
+    fake_device.apps[PKG].startup_error = R8_SHADOWED_KOTLIN
+    first = mcp("attach")
+    assert "NoSuchMethodError" in first["error"] and "isMinifyEnabled" in first["hint"]
+    pushes = _pushes(fake_device)
+    started = time.monotonic()
+    again = mcp("attach")
+    assert time.monotonic() - started < 0.5
+    assert again["error"].startswith(first["error"])
+    assert f"[not re-injected: this app process (pid {PID}) failed this way" in again["error"]
+    assert again["hint"] == first["hint"]
+    assert len(fake_device.attach_calls) == 1 and _pushes(fake_device) == pushes
+    res = mcp("dump_tree")  # every tool attaches the same way
+    assert "not re-injected" in res["error"] and len(fake_device.attach_calls) == 1
+    cached = inject.failed_injection(SERIAL, PKG, PID, inject.local_build_id())
+    assert cached is not None and cached.kind == "classpath_shadowing"
+
+
+def test_the_cli_prints_the_cause_and_the_hint(fake_device, run_cli):
+    fake_device.apps[PKG].startup_error = R8_SHADOWED_KOTLIN
+    res = run_cli("attach", "--serial", SERIAL, "--package", PKG)
+    assert res.rc == 1
+    assert "java.lang.NoSuchMethodError" in res.err and "timed out" not in res.err
+    assert "\nhint: Inspect a build of the app without code shrinking" in res.err
+
+
+def test_a_new_pid_a_new_build_or_force_injects_again(fake_device, tmp_path):
+    app = fake_device.apps[PKG]
+    app.startup_error = R8_SHADOWED_KOTLIN
+    with pytest.raises(inject.AgentStartupError):
+        _inject()
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert err.value.cached and len(fake_device.attach_calls) == 1
+    # --force (MCP force=true) injects anyway, and fails the same way.
+    with pytest.raises(inject.AgentStartupError) as err:
+        inject.inject_and_connect(serial=SERIAL, package=PKG, force_reinject=True)
+    assert not err.value.cached and len(fake_device.attach_calls) == 2
+    # A rebuilt agent is another build: injected.
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).write_bytes(b"payload, rebuilt")
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert not err.value.cached and len(fake_device.attach_calls) == 3
+    # A restarted app is another process: injected; with a fixed app it works.
+    fake_device.restart_app(PKG, new_pid=PID + 1)
+    app.startup_error = None
+    inj = _inject()
+    try:
+        assert not inj.warm and inj.pid == PID + 1 and len(fake_device.attach_calls) == 4
+    finally:
+        inj.close()
+    assert inject._FAILED == {}  # the dead pid's failures were dropped, the live one never failed
+
+
+def test_a_successful_forced_attach_forgets_the_failure(fake_device):
+    app = fake_device.apps[PKG]
+    app.startup_error = R8_SHADOWED_KOTLIN
+    with pytest.raises(inject.AgentStartupError):
+        _inject()
+    app.startup_error = None
+    inj = inject.inject_and_connect(serial=SERIAL, package=PKG, force_reinject=True)
+    inj.close()
+    assert inject.failed_injection(SERIAL, PKG, PID, inject.local_build_id()) is None
+    inj = _inject()  # warm, no cached error in the way
+    try:
+        assert inj.warm
+    finally:
+        inj.close()
+
+
+def test_errors_logged_before_this_attach_are_not_blamed_on_it(fake_device):
+    now = fake_device.clock()
+    for level, tag, message in R8_SHADOWED_KOTLIN:  # an earlier attempt into this pid
+        fake_device.log(PID, level, tag, message, at=now - 30)
+    fake_device.log(PID + 7, "E", "ViewSpector", "initialize: error invoking x")  # another app
+    inj = _inject()
+    try:
+        assert not inj.warm and inj.hello is not None
+    finally:
+        inj.close()
+
+
+def test_an_app_crash_during_the_start_is_reported_at_once(fake_device):
+    fake_device.apps[PKG].startup_error = [("E", "AndroidRuntime", "\n".join([
+        "FATAL EXCEPTION: ViewSpectorLaunch",
+        f"Process: {PKG}, PID: {PID}",
+        "java.lang.IllegalStateException: boom",
+        "\tat com.oberkfell.viewspector.agent.payload.Server.run(Server.kt:90)",
+    ]))]
+    started = time.monotonic()
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert time.monotonic() - started < 1.0
+    e = err.value
+    assert e.kind == "crash" and not e.cacheable
+    assert str(e) == (f"'{PKG}' (pid {PID}) crashed while the agent was starting: "
+                      "java.lang.IllegalStateException: boom. The stack trace runs through the "
+                      "agent (com.oberkfell.viewspector).")
+    assert "logcat -b crash" in e.hint and "monkey -p" in e.hint
+    assert inject.failed_injection(SERIAL, PKG, PID, inject.local_build_id()) is None
+
+
+def test_an_agent_library_the_app_cannot_load_is_reported(fake_device):
+    spec = f"/data/user/0/{PKG}/{inject.NATIVE_SO_NAME}=..."
+    reason = ('java.io.IOException: Unable to dlopen libviewspector.so: dlopen failed: '
+              '"/data/user/0/p/libviewspector.so" is 64-bit instead of 32-bit')
+    fake_device.apps[PKG].startup_error = [
+        ("E", "ActivityThread", f"Attaching agent with {spec} failed: {reason}"),
+        ("E", "ActivityThread", f"Attaching agent with {spec} failed: {reason}"),
+    ]
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    e = err.value
+    assert e.kind == "library_load" and e.cacheable and e.cause == reason
+    assert str(e) == f"'{PKG}' (pid {PID}) could not load the agent library: {reason}"
+
+
+def test_an_unrecognised_agent_error_fails_after_a_grace(fake_device, monkeypatch):
+    monkeypatch.setattr(inject, "UNKNOWN_ERROR_GRACE", 0.2)
+    fake_device.apps[PKG].startup_error = [("E", "ViewSpector", "something new went wrong")]
+    started = time.monotonic()
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert time.monotonic() - started < 2.0
+    e = err.value
+    assert e.kind == "unknown" and not e.cacheable
+    assert "something new went wrong" in str(e) and f"@viewspector_{PID}" in str(e)
+    assert "adb logcat -s ViewSpector" in e.hint
+    with pytest.raises(inject.AgentStartupError):
+        _inject()
+    assert len(fake_device.attach_calls) == 2  # not remembered: retried
+
+
+def test_an_attach_that_never_runs_says_so_at_the_timeout(fake_device, fast_sleep):
+    fake_device.apps[PKG].attach_stalls = True
+    with pytest.raises(inject.InjectionError) as err:
+        _inject()
+    e = err.value
+    assert not isinstance(e, inject.AgentStartupError)
+    assert "the agent never started" in str(e) and "main thread" in str(e)
+    assert "adb logcat -s ViewSpector" in e.hint and "force-stop" in e.hint
+
+
+def test_a_timeout_quotes_the_agents_last_log_lines(fake_device, fast_sleep):
+    fake_device.apps[PKG].startup_error = [
+        ("I", "ViewSpector", "Payload.start: launching ViewSpector server (build abc)"),
+        ("E", "SomeAppTag", "the app's own error"),
+    ]
+    with pytest.raises(inject.InjectionError) as err:
+        _inject()
+    msg = str(err.value)
+    assert msg.startswith(f"timed out waiting for agent socket 'viewspector_{PID}' in '{PKG}'")
+    assert "I/ViewSpector: Payload.start: launching ViewSpector server (build abc)" in msg
+    assert "E/SomeAppTag: the app's own error" in msg
+    assert "adb logcat -s ViewSpector" in err.value.hint
+
+
+def test_an_app_that_exits_during_the_wait_is_reported(fake_device, fast_sleep, monkeypatch):
+    fake_device.apps[PKG].attach_stalls = True
+    attach = adb.attach_agent
+
+    def attach_then_die(*args, **kwargs):
+        out = attach(*args, **kwargs)
+        fake_device.apps[PKG].pid = None
+        return out
+
+    monkeypatch.setattr(adb, "attach_agent", attach_then_die)
+    with pytest.raises(inject.InjectionError) as err:
+        _inject()
+    assert f"'{PKG}' (pid {PID}) exited while the agent was starting." in str(err.value)
+    assert "logcat -b crash" in err.value.hint
+
+
+# =========================================================================== #
+# The diagnosis itself
+# =========================================================================== #
+def _entries(*records, pid=PID, t=100.0):
+    out = []
+    for i, (level, tag, message) in enumerate(records):
+        for line in message.split("\n"):
+            out.append(adb.LogEntry(t + i, pid, pid, level, tag, line))
+    return out
+
+
+def _diagnose(*records):
+    return inject._diagnose(_entries(*records), SERIAL, PKG, PID, f"viewspector_{PID}")
+
+
+def test_diagnosis_kinds():
+    assert _diagnose() is None
+    assert _diagnose(("E", "SomeAppTag", "unrelated")) is None
+    bind = _diagnose(("E", "ViewSpector", "Cannot bind @viewspector_4242: another ViewSpector "
+                                          "server still holds it\njava.io.IOException: x"))
+    assert bind.fatal and bind.error.kind == "bind" and not bind.error.cacheable
+    assert "force-stop" in bind.error.hint
+    native = _diagnose(("E", "ViewSpector", "Pending JNI exception during FindClass(Bootstrap)"),
+                       ("E", "ViewSpector", "Could not find class x/Bootstrap"))
+    assert native.fatal and native.error.kind == "native"
+    assert "Pending JNI exception during FindClass(Bootstrap)" in str(native.error)
+    boot = _diagnose(("E", "ViewSpector", "initialize: failed to bootstrap ViewSpector payload\n"
+                                          "java.lang.ClassNotFoundException: x.Payload"))
+    assert boot.error.kind == "bootstrap" and boot.error.cacheable
+    assert "(java.lang.ClassNotFoundException: x.Payload)" in str(boot.error)
+    early = _diagnose(("E", "ViewSpector", "initialize: could not locate an application "
+                                           "ClassLoader; aborting bootstrap"))
+    assert early.error.kind == "bootstrap" and not early.error.cacheable  # may be too early
+    plain = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
+                                           "java.lang.reflect.InvocationTargetException\n"
+                                           "Caused by: java.lang.IllegalStateException: boom"))
+    assert plain.error.kind == "payload_start" and plain.error.cacheable
+    assert str(plain.error).endswith("java.lang.IllegalStateException: boom.")
+    one_load = _diagnose(("E", "ActivityThread", "Attaching agent with /x/libviewspector.so=y "
+                                                 "failed: java.io.IOException: nope"))
+    assert not one_load.fatal  # the second attempt (no class loader) may still work
+    others_so = _diagnose(("E", "ActivityThread", "Attaching agent with /x/libother.so failed: z"))
+    assert others_so is None
+
+
+def test_diagnosis_prefers_a_fatal_record_over_an_unknown_one():
+    found = _diagnose(("E", "ViewSpector", "something odd"), *R8_SHADOWED_KOTLIN)
+    assert found.fatal and found.error.kind == "classpath_shadowing"
+
+
+def test_shadowing_without_the_declaring_apk_is_only_probable():
+    shadow = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
+                                            "java.lang.reflect.InvocationTargetException\n"
+                                            "Caused by: java.lang.NoClassDefFoundError: Failed "
+                                            "resolution of: Lcom/google/protobuf/"
+                                            "GeneratedMessageLite;"))
+    e = shadow.error
+    assert e.kind == "classpath_shadowing"
+    assert ("com.google.protobuf.GeneratedMessageLite probably resolved to the app's own copy, "
+            "which R8/ProGuard shrank: the app's minified protobuf classes") in str(e)
+
+
+def test_a_linkage_error_in_an_unrelated_class_is_not_called_shadowing():
+    found = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
+                                           "Caused by: java.lang.NoSuchMethodError: No virtual "
+                                           "method foo()V in class Lcom/example/Bar; or its super "
+                                           "classes (declaration of 'com.example.Bar' appears in "
+                                           "/system/framework/framework.jar)"))
+    assert found.error.kind == "payload_start"

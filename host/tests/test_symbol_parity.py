@@ -249,17 +249,22 @@ def _instance_attrs(cls) -> Set[str]:
         names |= set(cls.DESCRIPTOR.fields_by_name)
     if dataclasses.is_dataclass(cls):
         names |= {f.name for f in dataclasses.fields(cls)}
-    names |= set(getattr(cls, "__annotations__", {}))
-    try:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(cls)))
-    except (OSError, TypeError, SyntaxError):
-        tree = None
-    for node in ast.walk(tree) if tree else ():
-        targets = node.targets if isinstance(node, ast.Assign) else (
-            [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
-        for t in targets:
-            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self":
-                names.add(t.attr)
+    # Attributes a base class's methods set on self are the subclass's too.
+    for klass in getattr(cls, "__mro__", (cls,)):
+        if klass is object or klass.__module__ == "builtins":
+            continue
+        names |= set(vars(klass).get("__annotations__", {}))
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(klass)))
+        except (OSError, TypeError, SyntaxError):
+            tree = None
+        for node in ast.walk(tree) if tree else ():
+            targets = node.targets if isinstance(node, ast.Assign) else (
+                [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+            for t in targets:
+                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
+                        and t.value.id == "self":
+                    names.add(t.attr)
     _ATTRS_CACHE[cls] = names
     return names
 

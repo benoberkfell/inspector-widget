@@ -302,6 +302,22 @@ including on SIGTERM, it disconnects its sessions, removes every adb forward it
 made and deletes its PNGs, and leaves the agents running, so the next start
 re-attaches warm.
 
+When an injected agent can't start, the app logs why within milliseconds, and
+the host reads that (`adb logcat --pid <pid>`, tags `ViewSpector`,
+`AndroidRuntime`, `ActivityThread`) while it waits for the agent's socket: the
+attach fails at once with the cause (`inject.AgentStartupError`, carrying
+`kind`, `cause` and the log lines) instead of timing out after ~13 s. The usual
+case is an app shrunk by R8/ProGuard: its own trimmed copy of a Kotlin or
+protobuf class stands in for the one the payload was built against, and
+`Payload.start` dies with a `NoSuchMethodError` (`kind:
+"classpath_shadowing"`; inspect a build without code shrinking). Such a failure
+recurs on every retry into the same process with the same agent build, so a
+long-lived host (the MCP server, a Python caller) remembers it per `(serial,
+package, pid, build)` and reports it again without re-injecting until the app
+restarts or build-out changes; `force` injects anyway. A socket timeout with no
+such error says what the app did log since the attach, or that the attach never
+ran (the app's main thread runs it).
+
 ### Session lifecycle (CLI and Python API)
 
 `inspector_widget.attach(serial=None, package, build_out=None,
