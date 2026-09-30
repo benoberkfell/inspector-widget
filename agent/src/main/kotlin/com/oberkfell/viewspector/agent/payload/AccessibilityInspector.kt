@@ -60,6 +60,7 @@ import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
 import com.oberkfell.viewspector.proto.ViewInspection
@@ -155,9 +156,11 @@ object AccessibilityInspector {
         val byA11yId = HashMap<Int, View>()
 
         /**
-         * The window root being walked. A window's root View reports the accessibility view
-         * id ROOT_ITEM_ID (seen live on API 37), and every window's root shares it, so that
-         * id resolves to the current root rather than through the index.
+         * The window root being walked. On API 37 (observed live) a window's root View reports
+         * the accessibility view id ROOT_ITEM_ID, shared by every window root, so that id
+         * resolves to the current root rather than through the index. On API <= 36 a root has
+         * an ordinary counter id (View.getAccessibilityViewId) and resolves through the index;
+         * both cases are handled.
          */
         var currentRoot: View? = null
 
@@ -242,6 +245,7 @@ object AccessibilityInspector {
             var enabledNode: AccessibilityNodeInfo? = null
             val countBefore = ctx.count
             // Compose's reading order (traversal_before/after) for this window, service or not.
+            windowToken(root)?.let { diag.append("; root#${idOf(root)} $it") }
             val traversal = ComposeTraversal.prime(root)
             traversal.token()?.let { diag.append("; root#${idOf(root)} $it") }
             try {
@@ -331,6 +335,21 @@ object AccessibilityInspector {
             ctx.fail("a11y window-offset probe", t)
             0 to 0
         }
+    }
+
+    /**
+     * "window type=T flags=0xF" for a window root: its WindowManager.LayoutParams type and flags.
+     * The host decides from them which window is modal (neither FLAG_NOT_TOUCH_MODAL nor
+     * FLAG_NOT_FOCUSABLE): the system reports no window below a modal one to accessibility
+     * services, so TalkBack cannot reach the activity under an open dialog.
+     */
+    private fun windowToken(root: View): String? {
+        val lp = try {
+            root.layoutParams as? WindowManager.LayoutParams
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        return "window type=${lp.type} flags=0x${Integer.toHexString(lp.flags)}"
     }
 
     private fun resetQueryMode(node: AccessibilityNodeInfo?, root: View) {
@@ -714,14 +733,27 @@ object AccessibilityInspector {
             b.layoutSizeH = h
         }
 
-        // importantForAccessibility — from the backing View for a real View node; for a
-        // virtual node (no View of its own) fall back to the ANI predicate.
+        // importantForAccessibility. A real View reports its mode, except that AUTO is reported
+        // as YES when the View resolves to important (node.isImportantForAccessibility, set from
+        // View.isImportantForAccessibility(): actionable, listeners, an accessibility delegate,
+        // a provider, a live region, a pane title or a heading). So AUTO on a real View means
+        // "left at auto and NOT important": TalkBack, which does not request not-important
+        // Views, never sees it and reads its children in its place. The in-process connection
+        // fetches not-important Views too (DirectAccessibilityConnection), so the host needs
+        // this to model what TalkBack sees. A virtual node (no View of its own) reports the ANI
+        // predicate the same way: YES or AUTO.
         val view = ident.view
+        val important = bool { node.isImportantForAccessibility }
         b.importantForAccessibility =
             if (view != null && !b.isVirtual) {
-                safeInt { view.importantForAccessibility }
+                val mode = safeInt { view.importantForAccessibility }
+                if (mode == View.IMPORTANT_FOR_ACCESSIBILITY_AUTO && important) {
+                    View.IMPORTANT_FOR_ACCESSIBILITY_YES
+                } else {
+                    mode
+                }
             } else {
-                if (bool { node.isImportantForAccessibility }) View.IMPORTANT_FOR_ACCESSIBILITY_YES
+                if (important) View.IMPORTANT_FOR_ACCESSIBILITY_YES
                 else View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
             }
 
