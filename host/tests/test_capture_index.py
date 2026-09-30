@@ -697,3 +697,33 @@ def test_selector_atoms_and_reference_matcher(mixed):
     assert anchors.match_sel(mixed, "w:100") == ["view:100"]
     assert anchors.match_sel(mixed, "n99999") == []
     assert anchors.quote('a"b\\c') == '"a\\"b\\\\c"'
+
+
+# --------------------------------------------------------------------------- integration
+def test_a11y_facet_flags_use_the_node_vocabulary(default_like, launcher):
+    """The a11y facet's flags are UNode flag words (C6 folds them into the node's
+    flags, C7 reads ``hidden``); other booleans worth keeping go under ``more``."""
+    for ix in (default_like, launcher):
+        for n in ix.nodes.values():
+            fa = n.facets.get("a11y") or {}
+            assert set(fa.get("flags") or ()) <= set(FLAGS), (n.key, fa.get("flags"))
+    wifi = default_like.nodes["sem:1006:5"].facets["a11y"]
+    assert wifi["flags"] == ["click", "focus", "checkable", "checked"]
+    heading = next(n for n in launcher.nodes.values() if n.tag == "launch_heading")
+    assert heading.facets["a11y"]["flags"] == ["click", "focus"]
+    assert "more" not in heading.facets["a11y"]  # screen_reader_focusable is noise
+
+
+def test_a11y_unique_id_is_kept_as_the_carry_over_locator():
+    windows = cs.default_like_windows()
+    ok = next(v for v in cs.all_views(windows) if v.rid == "ok")
+    ok.a11y = {**ok.a11y, "unique_id": "ok-button"}
+    ix = cx.build_index(cs.encode(windows))
+    assert ix.nodes["view:1004"].facets["a11y"]["unique_id"] == "ok-button"
+
+
+def test_view_a11y_rect_is_not_repeated_in_its_facet(wide, mixed):
+    for ix in (wide, mixed):
+        for n in ix.nodes.values():
+            fa = n.facets.get("a11y") or {}
+            assert "b" not in fa or fa["b"] != n.b, n.key

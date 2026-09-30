@@ -883,3 +883,81 @@ with every consumer.
   max_boxes=20)`: `refs` (for example the changed refs from `diff()`) chooses
   which boxes are drawn. Otherwise it boxes the deepest nodes whose pixels
   changed.
+
+## Integration (improve/capture-core)
+
+The module branches were merged onto improve/capture-base and run end to end in
+`tests/test_capture_pipeline_offline.py` (fetch -> build_index -> under
+`refs_lock`: `refs.assign`, `apply_refs`, `analyze`, `publish` -> `load`, then every
+query, lint, image and diff call). Where two modules disagreed, this is what now
+holds:
+
+- **Test helpers.** C4 and C5 both added `tests/capture_scenes.py`. C4's protobuf
+  scene builder keeps the name; C5's key-space builder is
+  `tests/capture_keyscenes.py`.
+- **Props accessor (C6 <- C2/C4).** `LoadedCapture.props(view_udid)` returns
+  `{name: normalized value}` through `LoadedCapture.facet_reader()`, a C4
+  `FacetReader` over the capture's raw files (read on first use, one
+  PropertyGroup decoded per view). `query.node(..., props=...)` finds it without a
+  `props_fn`; the ops layer can still pass one.
+- **`since` (C5 -> C2).** `refs.assign` cannot name a capture that has no id yet,
+  so a node minted in this capture has `since=None` until `publish`, which sets it
+  to the new id (on every id retry) for every node whose `match` is `new`.
+- **Default rebuild (C2 -> C4, C7).** An unreadable index is rebuilt with
+  `build_index` + `apply_refs` and then `analyze(ix, raw, lint=meta.options.lint)`,
+  so issues, stops and `reading` come back. `match`/`since`/`rebound_of` are not
+  in the refmap and are not restored.
+- **a11y facet flags (C4 -> C6, C7).** `facets.a11y.flags` use the UNode
+  vocabulary (`click`, `longclick`, `focus`, `focused`, `scroll`, `checkable`,
+  `checked`, `partial`, `selected`, `disabled`, `heading`, `edit`, `password`,
+  `hidden`, `live`, `tgroup`). `focus` stays beside `click` there (the facet says
+  what the framework reported). Booleans with no word that still matter are
+  under `facets.a11y.more` (`context_clickable`, `accessibility_focused`,
+  `dismissable`, `content_invalid`, `field_required`, `can_open_popup`,
+  `a11y_data_sensitive`, `request_initial_focus`); the rest are dropped.
+  `facets.a11y.unique_id` carries the a11y uniqueId (C5's locator).
+  `facets.a11y.b` is left out once the View's `b` became that same rect.
+- **Reading order on main's a11y.py (C7).** `a11y.compute_traversal_order` counts
+  every text node as a stop, including Text that a clickable Compose row speaks as
+  part of its own stop (RO1). When `a11y.reading_order` is missing, the analyzer
+  drops a stop that has no focus of its own (`clickable`, `long_clickable`,
+  `focusable`, `screen_reader_focusable`, `checkable`, `editable`) and sits under
+  a visible `clickable`/`long_clickable`/`screen_reader_focusable` ancestor, and
+  renumbers. A focusable-only container (a ScrollView) does not merge. On the
+  launcher replay this gives the title plus the 12 rows (13 stops, was 35).
+- **Outline (C6).** In `detail="semantic"`, an a11y-only leaf with no rid, tag,
+  issue, stop or action of its own, under a clickable/long-clickable parent that
+  has a label, collapses (counted in `hidden.collapsed`): it is Text the row
+  already speaks. `outline(root=@launcher_list)` is the spec's 13 lines again.
+- **node() trims (C6).** `since` is left out when it is the capture itself;
+  `a11y.res` is left out when it only repeats the rid; `Focused=false` is left
+  out of `compose.sem`; brief slot lines leave out params that are Compose
+  defaults (`softWrap=true`, `maxLines=inf`, `minLines=1`, `overflow=Clip`,
+  `enabled=true`, zero elevations), content lambdas and bare theme `colors`
+  objects (`params="raw"` and `+params:` still show them).
+- **Non-default props for rare classes (normalize, C6).** `nondefault_props(...,
+  groups=)` takes an optional fallback peer group per view: a view whose class has
+  fewer than 3 instances uses the majority of its group. C6 passes
+  `normalize.family_group(class_family(...))` (the widest family under View, e.g.
+  TextView for a Switch) over at most 200 peers, so theme-wide values (hint and
+  highlight colours, autofill flags) do not read as customised. Phase-0 callers
+  pass no groups and are unchanged.
+- **Measured with the pipeline** (compact bytes; target in parentheses):
+  - launcher: capture stand-in 1,063 (2,500); `outline()` 2,064 (2,500);
+    `outline(root=@launcher_list)` 1,667 (2,000); `outline(view="slots")` 3,979
+    (6,000); `outline(view="reading")` 1,631 (2,000); `find(text="state",
+    flags=click)` 400 (600); `node(@launch_heading)` 1,378 (1,500); `lint()` 1,028
+    (1,200); crop 231 (400); captures list stand-in 166 (400).
+  - View screen: `outline()` 2,540 (3,000; 38 Views on lines, 2 ViewStubs
+    hidden); `node(#badSwitch, props="nondefault")` 1,098 (1,200).
+  - wide: capture stand-in 2,035 (3,000); outline pages <= 5,503 (6,000), 4 pages
+    holding exactly the 259 Views; `find(text="Label 4", limit=20)` 1,327 (3,000);
+    `node(#view_47, props="nondefault")` 592 (1,500); `outline(root, depth=1)` 483.
+- **Known gaps found at integration** (owned elsewhere):
+  - The lint adapter reads Compose semantics only, so the View screen has 0
+    findings until the unified a11y lint (L1) lands.
+  - The recorded View screen reports action `0x01020036` on most Views, which
+    looks like `android.R.id.accessibilityActionShowOnScreen`. main's `a11y.py`
+    table starts `SHOW_ON_SCREEN` at `0x0102003D`, so the action shows as
+    `CUSTOM_0x01020036` (the R.id block there may be offset; worth checking
+    against the SDK by the a11y owners).

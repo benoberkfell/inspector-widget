@@ -780,7 +780,9 @@ def _ordered_stops(roots: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any
                                                     res.get("_nodes") or [])
                 if e.get("order") is not None]
     by_layout: dict[int, dict[str, Any]] = {}
+    merged: set[int] = set()
     for r in roots:
+        _mark_merged(r, False, merged)
         for n, _ in _iter_dicts(r):
             lay = (n.get("bounds") or {}).get("layout")
             if lay is not None:
@@ -789,8 +791,34 @@ def _ordered_stops(roots: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any
     for e in a11y.compute_traversal_order(roots):
         if e.get("order") is None:
             continue
-        out.append((e["order"], by_layout.get(id(e.get("bounds")))))
+        n = by_layout.get(id(e.get("bounds")))
+        if n is not None and id(n) in merged:
+            continue
+        out.append((len(out) + 1, n))
     return out
+
+
+#: Flags that make an a11y node a TalkBack stop of its own (it takes focus).
+_OWN_FOCUS = frozenset({"clickable", "long_clickable", "focusable", "screen_reader_focusable",
+                        "checkable", "editable"})
+#: Flags of a container that speaks its non-focusable descendants as one stop
+#: (a clickable row, or Compose ``mergeDescendants``).
+_MERGING = frozenset({"clickable", "long_clickable", "screen_reader_focusable"})
+
+
+def _mark_merged(n: dict[str, Any], under_merging: bool, out: set[int]) -> None:
+    """Collect (by ``id()``) the content-only nodes that sit under a merging
+    ancestor. TalkBack reads them as part of that ancestor's stop (RO1), but
+    main's ``a11y.compute_traversal_order`` counts each as a stop of its own; the
+    newer ``a11y.reading_order`` applies the rule itself."""
+    stack = [(n, under_merging)]
+    while stack:
+        node, under = stack.pop()
+        flags = set(node.get("flags") or ())
+        if under and not (flags & _OWN_FOCUS):
+            out.add(id(node))
+        merging = under or bool(flags & _MERGING and "visible_to_user" in flags)
+        stack.extend((c, merging) for c in node.get("children") or ())
 
 
 def reading_order(ix: Index, loaded: Any) -> tuple[list[tuple[int, str]], list[str]] | None:

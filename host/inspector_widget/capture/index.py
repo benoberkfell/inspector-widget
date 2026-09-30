@@ -114,6 +114,21 @@ _A11Y_TEXTS = (
 _A11Y_FACET_TEXTS = (("hint_text", "hint"), ("error", "error"), ("tooltip_text", "tooltip"),
                      ("pane_title", "pane"), ("container_title", "container"),
                      ("supplemental_description", "supplemental"))
+#: AccessibilityNodeInfo booleans -> the UNode flag vocabulary (model.FLAGS). The
+#: a11y facet's ``flags`` use these words, so they compare with ``UNode.flags``.
+_A11Y_VOCAB = (
+    ("clickable", "click"), ("long_clickable", "longclick"), ("focusable", "focus"),
+    ("focused", "focused"), ("scrollable", "scroll"), ("checkable", "checkable"),
+    ("checked", "checked"), ("selected", "selected"), ("heading", "heading"),
+    ("editable", "edit"), ("password", "password"), ("is_traversal_group", "tgroup"),
+)
+#: Booleans with no vocabulary word that still matter when debugging a node; kept
+#: under the facet's ``more``. The rest (screen_reader_focusable, multi_line,
+#: text_entry_key, text_selectable, showing_hint_text, ...) are left out as noise.
+_A11Y_MORE = (
+    "context_clickable", "accessibility_focused", "dismissable", "content_invalid",
+    "field_required", "can_open_popup", "a11y_data_sensitive", "request_initial_focus",
+)
 _LIVE = {1: "polite", 2: "assertive"}
 _RANGE_TYPES = {0: "int", 1: "float", 2: "percent", 3: "indeterminate"}
 _FLAG_PROPS = ("visibility", "enabled", "clickable", "longClickable")
@@ -1046,14 +1061,23 @@ class _Builder:
         role = a.txt.get("role_description")
         if role:
             f["role"] = role
-        flags = [x for x in _A11Y_BOOLS if x in a.bools and x not in
-                 ("enabled", "visible_to_user", "is_virtual")]
+        fs = {word for raw_name, word in _A11Y_VOCAB if raw_name in a.bools}
+        if n.checked_state == 1:
+            fs.add("checked")
+        if n.checked_state == 2:
+            fs.add("partial")
         if "enabled" not in a.bools:
-            flags.append("disabled")
+            fs.add("disabled")
         if "visible_to_user" not in a.bools:
-            flags.append("hidden")
+            fs.add("hidden")
+        if n.live_region:
+            fs.add("live")
+        flags = [x for x in FLAGS if x in fs]  # as reported: focus stays beside click
         if flags:
             f["flags"] = flags
+        more = [x for x in _A11Y_MORE if x in a.bools]
+        if more:
+            f["more"] = more
         acts = []
         for act in n.actions:
             label = a.res.opt(act.label)
@@ -1110,6 +1134,8 @@ class _Builder:
             f["package"] = pkg
         if a.txt.get("provider_class"):
             f["provider"] = a.txt["provider_class"]
+        if a.txt.get("unique_id"):
+            f["unique_id"] = a.txt["unique_id"]  # the carry-over locator (refs.py)
         if node.b != a.rect:
             f["b"] = list(a.rect)
         extras = {}
@@ -1221,6 +1247,9 @@ class _Builder:
                 if _contains(declared, a.rect):
                     node.b = list(a.rect)
                     node.declared_b = None if a.rect == declared else declared
+                    fa = node.facets.get("a11y")
+                    if fa and fa.get("b") == node.b:
+                        del fa["b"]  # the facet's own rect is now the node's
             attrs = self.sem_raw.get(key) if node.kind == "compose" else None
             primary = self.slots[self.primary[key]] if key in self.primary else None
             self._derive_type(node, a, attrs, primary)

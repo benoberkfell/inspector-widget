@@ -67,6 +67,8 @@ NODE_BATCH_MAX = 10
 NEXT_MAX = 3
 NEXT_MAX_BYTES = 200
 VALUE_MAX = 120
+#: Views decoded at most for the family-group majority of a rare class (props).
+_FAMILY_PEERS_MAX = 200
 
 OUTLINE_VIEWS = ("ui", "views", "compose", "slots", "a11y", "reading")
 DETAILS = ("semantic", "all")
@@ -88,6 +90,8 @@ SEVERITY_ORDER = {"error": 0, "warn": 1, "info": 2}
 
 #: Flags that make a node worth a line on their own (spec 6.3).
 ACTIONABLE = frozenset({"click", "longclick", "edit", "checkable", "scroll"})
+#: A parent with one of these speaks its non-focusable text children as one stop.
+_MERGING_FLAGS = frozenset({"click", "longclick"})
 STUB_TYPES = frozenset({"ViewStub", "ViewStubCompat"})
 SLOTS_NOT_CAPTURED = ('not captured: capture(slots="enable") recomposes once and resets '
                       'remember{} state')
@@ -906,6 +910,8 @@ class _Outline:
                 s = (n.origin == "app") if origin_app else True
             elif not semantic:
                 s = True
+            elif self._merged(n, kids):
+                s = False
             else:
                 s = bool(n.z is not None or n.label or n.rid or n.tag or n.issues
                          or n.stop is not None or not kids
@@ -917,6 +923,18 @@ class _Outline:
             for c in kids:
                 sz += size[c]
             size[nid] = sz
+
+    def _merged(self, n: UNode, kids: Sequence[str]) -> bool:
+        """An a11y-only text leaf that its clickable, labelled parent speaks as part
+        of one TalkBack stop (a Compose row's merged Text children): it collapses
+        into the parent's ``+N`` instead of taking a line. Anything with its own
+        identity, action, stop or issue keeps its line."""
+        if n.kind != "a11y" or kids or n.rid or n.tag or n.issues or n.stop is not None:
+            return False
+        if not ACTIONABLE.isdisjoint(n.flags) or "focus" in n.flags:
+            return False
+        p = self.nodes.get(n.parent) if n.parent else None
+        return p is not None and bool(p.label) and not _MERGING_FLAGS.isdisjoint(p.flags)
 
     def _subtree_count(self, nid: str) -> int:
         count = 0
@@ -1602,9 +1620,30 @@ def _slot_line(ix: Index, s: UNode, raw: bool) -> Any:
         if params:
             out["params"] = _cap(params)
         return {k: v for k, v in out.items() if v is not None}
-    names = tuple(k for k in params if k != "text")[:6]
+    names = tuple(k for k, v in params.items()
+                  if k != "text" and not _default_param(k, L.brief_param(k, v)))[:6]
     f = Fields(line=("ref", "type", "label", "bounds"), tail=("src",), params=names)
     return render_line(ix, s, f)
+
+
+#: Brief slot-parameter values that are Compose's own defaults, left out of the
+#: one-line slot summaries in node() (``params="raw"`` and ``+params:`` show them).
+_PARAM_DEFAULTS = {
+    "softWrap": "true", "maxLines": "inf", "minLines": "1", "tonalElevation": "0.0",
+    "shadowElevation": "0.0", "enabled": "true", "overflow": "Clip",
+}
+
+
+def _default_param(key: str, brief: str | None) -> bool:
+    """True for a parameter not worth a slot line: dropped by normalization, a
+    known default, a content lambda (the children show it) or a theme object."""
+    if brief is None:
+        return True
+    if _PARAM_DEFAULTS.get(key) == brief:
+        return True
+    if brief == nz.LAMBDA and not key.startswith("on"):
+        return True
+    return key == "colors" and "(" not in brief and brief[:1].isupper()
 
 
 def _a11y_facet(ix: Index, n: UNode) -> Any:
@@ -1634,6 +1673,8 @@ def _a11y_facet(ix: Index, n: UNode) -> Any:
             acts = [x for x in v if x not in nz.BOILERPLATE_ACTIONS]
             if acts:
                 out[k] = acts
+        elif k == "res" and n.rid and str(v).rsplit("/", 1)[-1] == n.rid:
+            continue  # viewIdResourceName that only repeats the rid
         else:
             out[k] = _cap(v)
     if n.stop is not None:
@@ -1686,7 +1727,12 @@ def _compose_facet(ix: Index, n: UNode, raw: bool) -> Any:
     out = {}
     attrs = c.get("attrs")
     if attrs:
-        out["sem"] = _cap(dict(attrs))
+        # Focused=false is the resting state of every focusable node (and is left
+        # out of the fingerprint); Focused=true stays.
+        shown = {k: v for k, v in attrs.items()
+                 if not (k == "Focused" and str(v).strip().lower() == "false")}
+        if shown:
+            out["sem"] = _cap(shown)
     if c.get("actions"):
         out["actions"] = list(c["actions"])
     links = c.get("slots") or []
@@ -1731,23 +1777,39 @@ def _props_facet(ix: Index, n: UNode, mode: Any, props_fn: PropsFn | None) -> An
     else:
         label = "nondefault"
         cls = _view_class(n) or ""
-        peers = [m for m in ix.nodes.values()
-                 if m.kind == "view" and "view" in m.ids and _view_class(m) == cls]
+        views = [m for m in ix.nodes.values() if m.kind == "view" and "view" in m.ids]
+        peers = [m for m in views if _view_class(m) == cls]
         vid = int(n.ids["view"])
         props = {vid: values}
         classes = {vid: cls}
         bounds = {vid: list(n.declared_b or n.b or [0, 0, 0, 0])}
-        if len(peers) >= 3:
-            for m in peers:
-                mid = int(m.ids["view"])
-                if mid == vid:
+        groups: dict[int, str] | None = None
+        if len(peers) < 3:
+            # A rare class: fall back to the majority of its family group (every
+            # TextView-like view, every ViewGroup), bounded to keep this cheap.
+            group = nz.family_group(nz.class_family(cls, values))
+            groups = {vid: group}
+            peers = []
+            for m in views:
+                if len(peers) >= _FAMILY_PEERS_MAX:
+                    break
+                if int(m.ids["view"]) == vid:
                     continue
                 pv = props_fn(m)
-                if pv is not None:
-                    props[mid] = pv
-                    classes[mid] = cls
-                    bounds[mid] = list(m.declared_b or m.b or [0, 0, 0, 0])
-        kept_all, _omitted = nz.nondefault_props(props, classes, bounds=bounds)
+                if pv is not None and nz.family_group(
+                        nz.class_family(_view_class(m), pv)) == group:
+                    peers.append(m)
+                    groups[int(m.ids["view"])] = group
+        for m in peers:
+            mid = int(m.ids["view"])
+            if mid == vid:
+                continue
+            pv = props_fn(m)
+            if pv is not None:
+                props[mid] = pv
+                classes[mid] = _view_class(m) or ""
+                bounds[mid] = list(m.declared_b or m.b or [0, 0, 0, 0])
+        kept_all, _omitted = nz.nondefault_props(props, classes, bounds=bounds, groups=groups)
         kept = kept_all.get(vid, {})
     if label in ("key", "nondefault") and n.rid and "id" in kept:
         idv = L.plain_value(kept["id"])
@@ -1827,7 +1889,7 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
         extra.append(("conf", dict(n.conf)))
     for k in ("match", "since", "rebound_of"):
         v = getattr(n, k)
-        if v:
+        if v and not (k == "since" and v == _cid(ix)):  # new in this capture: match says so
             extra.append((k, v))
     parent = ix.nodes.get(n.parent) if n.parent else None
     extra.append(("parent", crumb(parent) if parent is not None else None))

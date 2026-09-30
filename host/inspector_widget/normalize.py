@@ -587,6 +587,14 @@ def _family_chain(family: str) -> list[str]:
     return chain
 
 
+def family_group(family: str) -> str:
+    """The widest defaults family below ``View`` that ``family`` belongs to
+    (CompoundButton -> TextView, ScrollView -> ViewGroup): the peer group for a
+    per-capture majority when a class alone is too rare to have one."""
+    chain = _family_chain(family)
+    return chain[-2] if len(chain) >= 2 else chain[0]
+
+
 def static_default(family: str, name: str) -> tuple[bool, Any]:
     """``(found, default)`` for property ``name`` in ``family`` (walks parents)."""
     for fam in _family_chain(family):
@@ -684,9 +692,26 @@ def _vkey(v: Any) -> str:
     return json.dumps(_plain(v), sort_keys=True, default=str)
 
 
+def _majorities(props: Mapping[int, Mapping[str, Any]], members: Mapping[str, list[int]],
+                majority_min: int) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for group, vids in members.items():
+        if len(vids) < majority_min:
+            continue
+        per_name: dict[str, Counter] = {}
+        for vid in vids:
+            for name, v in props[vid].items():
+                if name not in MAJORITY_EXEMPT:
+                    per_name.setdefault(name, Counter())[_vkey(v)] += 1
+        out[group] = {name: c.most_common(1)[0][0] for name, c in per_name.items()
+                      if c.most_common(1)[0][1] * 2 > len(vids)}
+    return out
+
+
 def nondefault_props(props: Mapping[int, Mapping[str, Any]], classes: Mapping[int, str], *,
                      bounds: Mapping[int, list[int]] | None = None,
-                     majority_min: int = 3) -> tuple[dict, dict]:
+                     majority_min: int = 3,
+                     groups: Mapping[int, str] | None = None) -> tuple[dict, dict]:
     """Keep only non-default property values, per view.
 
     ``props`` is ``{view_id: {name: normalized value}}`` (see :func:`props_to_map`)
@@ -696,6 +721,12 @@ def nondefault_props(props: Mapping[int, Mapping[str, Any]], classes: Mapping[in
     class and more than half of them hold that value, unless the property is in
     ``MAJORITY_EXEMPT``.
 
+    ``groups`` (optional, ``{view_id: group}``, e.g. :func:`family_group` of each
+    view's family) is the fallback peer group: a view whose class has fewer than
+    ``majority_min`` views uses the majority of its group instead, so values the
+    theme gives every text view (hint and highlight colours, autofill flags) do
+    not make a rare widget look customised. Without ``groups`` nothing changes.
+
     Returns ``(values, omitted)``: ``{view_id: {name: value}}`` and
     ``{view_id: number of dropped properties}``.
     """
@@ -703,23 +734,22 @@ def nondefault_props(props: Mapping[int, Mapping[str, Any]], classes: Mapping[in
     by_class: dict[str, list[int]] = {}
     for vid in props:
         by_class.setdefault(classes.get(vid) or "", []).append(vid)
-    majority: dict[str, dict[str, str]] = {}
-    for cls, vids in by_class.items():
-        if len(vids) < majority_min:
-            continue
-        per_name: dict[str, Counter] = {}
-        for vid in vids:
-            for name, v in props[vid].items():
-                if name not in MAJORITY_EXEMPT:
-                    per_name.setdefault(name, Counter())[_vkey(v)] += 1
-        majority[cls] = {name: c.most_common(1)[0][0] for name, c in per_name.items()
-                         if c.most_common(1)[0][1] * 2 > len(vids)}
+    majority = _majorities(props, by_class, majority_min)
+    group_majority: dict[str, dict[str, str]] = {}
+    if groups:
+        by_group: dict[str, list[int]] = {}
+        for vid in props:
+            if groups.get(vid):
+                by_group.setdefault(groups[vid], []).append(vid)
+        group_majority = _majorities(props, by_group, majority_min)
     values: dict = {}
     omitted: dict = {}
     for vid, pmap in props.items():
         cls = classes.get(vid) or ""
         family = class_family(cls, pmap.keys())
-        maj = majority.get(cls, {})
+        maj = majority.get(cls)
+        if maj is None:
+            maj = group_majority.get((groups or {}).get(vid) or "", {})
         kept: dict[str, Any] = {}
         dropped = 0
         for name, v in pmap.items():
@@ -746,6 +776,7 @@ __all__ = [
     "color_hex",
     "compose_attrs_brief",
     "compose_value",
+    "family_group",
     "is_action_attr",
     "is_library_source",
     "is_static_default",

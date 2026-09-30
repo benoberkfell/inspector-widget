@@ -743,7 +743,7 @@ def test_node_facet_priority_and_omitted(launcher):
     assert not any(k in d for k in ("layout", "compose", "text", "ancestors"))
     assert [x.split("(")[0].split(":")[0] for x in d["omitted"]] == [
         "issues", "layout", "compose", "text", "ancestors"]
-    roomy = q.node(launcher, None, ["n22"], facets="all", ancestors=True, max_bytes=1500)
+    roomy = q.node(launcher, None, ["n22"], facets="all", ancestors=True, max_bytes=1300)
     assert roomy["omitted"] == ['compose: node("n22",facets="compose")']
     assert roomy["next"][-1] == 'node("n22",facets="compose")'
     big_budget = q.node(launcher, None, ["n22"], facets="all", ancestors=True)
@@ -1085,3 +1085,57 @@ def test_workflow_sizes(launcher, wide, viewscreen):
     assert len(lines) == 259 and len(set(refs_of(lines))) == 259
     total = sum(v[0] for k, v in sizes.items() if k.startswith(("W1", "W2", "W6")))
     assert total / 3.5 < 2500  # the spec's ~2.4k-token W6 walk and ~1k-token W1/W2
+
+
+# --------------------------------------------------------------------------- integration
+def _row_screen() -> Any:
+    """A clickable Compose row whose two Text children are a11y-only nodes (how the
+    index builder keeps text that Compose merged into the row), plus a plain text."""
+    b = IndexBuilder("crow00", screen=(1080, 800), dpi=420)
+    w = b.window("n1", "DecorView", (0, 0, 1080, 800), udid=1)
+    acv = b.view(w, "n2", "AndroidComposeView", (0, 0, 1080, 800), udid=2,
+                 cls="AndroidComposeView")
+    row = b.compose(acv, "n3", sem_id=5, b=(0, 0, 1080, 200), type="ListItem",
+                    label="Title, Subtitle", flags=["click"],
+                    attrs={"Focused": "false", "TestTag": "row"})
+    b.a11y(row, "n4", host=2, virt=6, b=(40, 20, 400, 60), label="Title")
+    b.a11y(row, "n5", host=2, virt=7, b=(40, 90, 400, 50), label="Subtitle")
+    b.a11y(acv, "n6", host=2, virt=8, b=(40, 300, 400, 50), label="Footer")
+    b.a11y_facet("n3", host=2, virt=5, flags=["click", "focus"],
+                 res="com.example:id/row_view")
+    slot = b.slot(None, "n7", name="Text", src="Row.kt:12", b=(40, 20, 400, 60),
+                  params={"text": "Title", "softWrap": "true", "maxLines": "2147483647",
+                          "minLines": "1", "overflow": "2",
+                          "content": "androidx.compose.runtime.internal.ComposableLambdaImpl@3b2c1a"})
+    b.link_slots("n3", [slot])
+    return b.build()
+
+
+def test_outline_folds_merged_a11y_text_into_its_clickable_row() -> None:
+    ix = _row_screen()
+    out = q.outline(ix)
+    refs = [line.split()[0] for line in out["lines"]]
+    assert "n3" in refs and "n4" not in refs and "n5" not in refs
+    assert "n6" in refs  # not under a clickable parent: its own line
+    assert out["hidden"]["collapsed"] >= 2
+    everything = q.outline(ix, detail="all")
+    assert {"n4", "n5"} <= {line.split()[0] for line in everything["lines"]}
+
+
+def test_node_leaves_out_what_other_fields_already_say() -> None:
+    ix = _row_screen()
+    ix.nodes["n3"].since = "crow00"  # minted in this capture: match="new" says so
+    ix.nodes["n3"].match = "new"
+    d = q.node(ix, None, ["n3"])
+    assert d["match"] == "new" and "since" not in d
+    assert "Focused" not in d["compose"]["sem"] and d["compose"]["sem"]["TestTag"] == "row"
+    (slot_line,) = d["compose"]["slots"]
+    assert slot_line.endswith("src=Row.kt:12 overflow=Ellipsis")  # defaults left out
+    ix.nodes["n3"].since = "cother"
+    assert q.node(ix, None, ["n3"])["since"] == "cother"
+    ix.nodes["n3"].rid = "row_view"
+    assert "res" not in q.node(ix, None, ["n3"])["a11y"]  # it only repeats the rid
+    ix.nodes["n3"].rid = "other"
+    assert q.node(ix, None, ["n3"])["a11y"]["res"] == "com.example:id/row_view"
+    ix.nodes["n3"].facets["compose"]["attrs"]["Focused"] = "true"
+    assert q.node(ix, None, ["n3"])["compose"]["sem"]["Focused"] == "true"

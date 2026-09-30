@@ -376,6 +376,40 @@ def test_reading_order_maps_talkback_stops_to_refs():
     assert [ix.get(r).stop for r in ix.reading] == list(range(1, 14))
 
 
+def test_merged_row_text_is_not_a_stop_of_its_own():
+    """TalkBack reads a clickable row's non-focusable text as part of the row's stop
+    (RO1); a focusable-only container (a ScrollView) does not merge its children."""
+    def a11y(text=None, flags=(), kids=(), y=0):
+        d = {"host_view_id": 1, "virtual_id": -1, "flags": ["visible_to_user", *flags],
+             "bounds": {"layout": {"x": 0, "y": y, "w": 100, "h": 40}},
+             "children": list(kids)}
+        if text:
+            d["text"] = text
+        return d
+
+    row = a11y(flags=("clickable", "focusable"), y=0,
+               kids=[a11y("Title", y=0), a11y("Subtitle", y=20)])
+    scroll = a11y(flags=("focusable", "scrollable"), y=100,
+                  kids=[a11y("One", y=100), a11y("Two", y=140)])
+    stops = an._ordered_stops([a11y(kids=[row, scroll], y=0)])
+    assert [n.get("text") or "row" for _, n in stops] == ["row", "One", "Two"]
+    assert [o for o, _ in stops] == [1, 2, 3]
+
+
+def test_real_launcher_reading_order_has_one_stop_per_row():
+    import capture_scenes as cs
+
+    from inspector_widget.capture import index as cx
+
+    raw = cs.raw_from_scene(fs.replay_scene("launcher"))
+    ix = cx.build_index(raw)
+    an.analyze(ix, raw, lint="none")
+    stops = [ix.nodes[r] for r in ix.reading]
+    assert len(stops) == 13  # the title, then the 12 rows (their Text is merged)
+    assert stops[0].label == "A11yProbe"
+    assert all(n.type == "ListItem" and "click" in n.flags for n in stops[1:])
+
+
 def test_reading_order_never_guesses_duplicate_pre_id1_ids():
     ix = cb.launcher_index()
     real = fs.a11y_to_pb(fs._strip_mcp_keys(lf.load("launcher", "a11y"))).SerializeToString()

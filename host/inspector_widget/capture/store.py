@@ -438,6 +438,7 @@ class LoadedCapture:
         self.id = cid
         self.path = path
         self.meta = meta
+        self._reader: Any = None
 
     def __repr__(self) -> str:
         return f"LoadedCapture({self.id!r}, {self.meta.serial}/{self.meta.package})"
@@ -493,6 +494,23 @@ class LoadedCapture:
     def stripped(self) -> bool:
         """True when GC stripped heavy files (img/, out/, derived/, SKPs) to save space."""
         return os.path.exists(os.path.join(self.path, STRIPPED_MARKER))
+
+    def facet_reader(self) -> Any:
+        """C4's lazy decoder (``index.FacetReader``) over this capture's raw facets.
+
+        Raw files are read on first use and kept for the life of this object;
+        ``props(udid)``, ``prop_list(udid)``, ``slot_params(path)`` and
+        ``sem_attrs(acv, id)`` decode one group at a time."""
+        if self._reader is None:
+            from .index import FacetReader  # lazy: keeps protobuf out of store imports
+
+            self._reader = FacetReader(_LazyRaw(self))
+        return self._reader
+
+    def props(self, view_udid: int) -> dict[str, Any] | None:
+        """``{name: normalized value}`` for one View (None when the capture has no
+        properties for it). The props accessor the query layer (C6) reads."""
+        return self.facet_reader().props(int(view_udid))
 
     def refmap(self) -> dict[str, str]:
         data = self._read(REFMAP_FILE)
@@ -581,6 +599,36 @@ class LoadedCapture:
     def age_s(self, now: float | None = None) -> float:
         now = self.store.clock() if now is None else now
         return max(0.0, now - float(self.meta.created_at or 0.0))
+
+
+class _LazyRaw:
+    """The RawCapture attributes FacetReader reads, fetched from disk on first use."""
+
+    def __init__(self, loaded: LoadedCapture) -> None:
+        self._loaded = loaded
+        self._cache: dict[str, bytes | None] = {}
+        self.meta = loaded.meta
+
+    def _get(self, name: str) -> bytes | None:
+        if name not in self._cache:
+            self._cache[name] = self._loaded.raw(name)
+        return self._cache[name]
+
+    @property
+    def views(self) -> bytes:
+        return self._get("views") or b""
+
+    @property
+    def compose_sem(self) -> bytes:
+        return self._get("compose_sem") or b""
+
+    @property
+    def slots(self) -> bytes | None:
+        return self._get("slots")
+
+    @property
+    def a11y(self) -> bytes:
+        return self._get("a11y") or b""
 
 
 def _derived_rel(name: str) -> str:
@@ -970,6 +1018,12 @@ class CaptureStore:
 
     def _write_id_files(self, staging: str, raw: RawCapture, ix: Index) -> None:
         meta = raw.meta
+        # A node whose ref was minted for this capture (match "new") has been
+        # there since this capture; refs.assign could not name it before the id
+        # existed. Rewritten on every id retry, so it always names the final id.
+        for n in ix.nodes.values():
+            if n.match == "new":
+                n.since = meta.id
         _write_new(os.path.join(staging, META_FILE), meta.to_json(), self.durable)
         _write_new(os.path.join(staging, INDEX_FILE),
                    index_to_jsonl(dataclasses.replace(ix, meta=meta), compress=True),
@@ -1467,12 +1521,23 @@ class CaptureStore:
 
 
 def _default_rebuild(raw: RawCapture, refmap: dict) -> Index:
-    """build_index + apply_refs from capture/index.py (C4)."""
+    """build_index + apply_refs from capture/index.py (C4), then analyze() from
+    capture/analyzers.py (C7) with the capture's own lint option, so a rebuilt
+    index carries the same issues, stops and reading order as the published one.
+    Carry-over provenance (match, since, rebound_of) is not in the refmap and is
+    not restored."""
     try:
         from .index import apply_refs, build_index
     except ImportError as exc:
         raise RuntimeError("no index builder (inspector_widget.capture.index) available") from exc
-    return apply_refs(build_index(raw), refmap)
+    ix = apply_refs(build_index(raw), refmap)
+    try:
+        from .analyzers import analyze
+    except ImportError:  # pragma: no cover - analyzers ship with the index builder
+        return ix
+    lint = getattr(getattr(raw.meta, "options", None), "lint", "tree") or "tree"
+    analyze(ix, raw, lint=lint)
+    return ix
 
 
 __all__ = [

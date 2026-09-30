@@ -1071,3 +1071,62 @@ def test_importing_the_store_stays_light():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          cwd=HOST_DIR, timeout=60)
     assert out.stdout.strip() == "False"
+
+
+# --------------------------------------------------------------------------- integration
+def _real_capture(serial: str = SERIAL):
+    """A fetched and indexed capture of the recorded View screen (C3 + C4)."""
+    sys.path.insert(0, os.path.join(HOST_DIR, "tests"))
+    import fakescenes as fs
+
+    from inspector_widget.capture import fetch, index, refs
+
+    session = fs.replay_scene("viewscreen").session(serial=serial, package=APP)
+    raw = fetch.fetch(session, sleep=lambda _s: None)
+    ix = index.build_index(raw)
+    return raw, ix, index, refs
+
+
+def test_loaded_capture_reads_view_properties_lazily(tmp_path):
+    raw, ix, index, refs = _real_capture()
+    store = make_store(tmp_path)
+    with store.refs_lock():
+        refmap, tomb = refs.assign(ix, None, same_pid=False, same_generation=False,
+                                   alloc=store.next_refs)
+        cid = store.publish(raw, index.apply_refs(ix, refmap), refmap, tomb=tomb)
+    lc = CaptureStore(root=store.root, persist=True).load(cid)
+    switch = next(n for n in lc.index().nodes.values() if n.rid == "badSwitch")
+    props = lc.props(int(switch.ids["view"]))
+    assert props["checked"] is True and props["text"] == "Notifications"
+    assert lc.facet_reader().decoded == 1  # one PropertyGroup decoded, on demand
+    assert lc.props(987654) is None
+
+
+def test_publish_names_the_capture_that_minted_a_ref(tmp_path):
+    raw, ix, index, refs = _real_capture()
+    store = make_store(tmp_path)
+    with store.refs_lock():
+        refmap, tomb = refs.assign(ix, None, same_pid=False, same_generation=False,
+                                   alloc=store.next_refs)
+        assert {n.since for n in ix.nodes.values()} == {None}  # no id before publish
+        cid = store.publish(raw, index.apply_refs(ix, refmap), refmap, tomb=tomb)
+    cold = CaptureStore(root=store.root, persist=True).load(cid).index()
+    assert {n.since for n in cold.nodes.values()} == {cid}
+
+
+def test_default_rebuild_runs_the_analyzers(tmp_path):
+    raw, ix, index, refs = _real_capture()
+    from inspector_widget.capture import analyzers
+
+    store = make_store(tmp_path)
+    with store.refs_lock():
+        refmap, tomb = refs.assign(ix, None, same_pid=False, same_generation=False,
+                                   alloc=store.next_refs)
+        ix = index.apply_refs(ix, refmap)
+        analyzers.analyze(ix, raw)
+        cid = store.publish(raw, ix, refmap, tomb=tomb)
+    os.remove(os.path.join(store.capture_dir(cid), "index.jsonl.gz"))
+    rebuilt = CaptureStore(root=store.root, persist=True).load(cid).index()
+    assert rebuilt.reading == ix.reading and rebuilt.reading
+    assert {k: n.issues for k, n in rebuilt.nodes.items()} == \
+        {k: n.issues for k, n in ix.nodes.items()}

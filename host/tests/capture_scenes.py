@@ -146,7 +146,7 @@ def _shift(b: Box, dx: int, dy: int) -> Box:
 
 _A11Y_TEXT = ("text", "content_description", "hint_text", "state_description", "class_name",
               "package_name", "view_id_resource_name", "provider_class", "role_description",
-              "pane_title")
+              "pane_title", "unique_id")
 _A11Y_BOOL = {f.name for f in pb.A11yNode.DESCRIPTOR.fields if f.type == f.TYPE_BOOL}
 
 

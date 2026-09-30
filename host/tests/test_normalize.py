@@ -349,6 +349,24 @@ def test_nondefault_props_static_and_majority():
     assert v3 == {5: {}} and o3 == {5: 1}
 
 
+def test_nondefault_props_family_group_majority_for_rare_classes():
+    tv = {"textSize": 14.0, "textColorHint": "#611D1B20", "importantForAutofill": "yes"}
+    props = {1: {**tv, "text": "a"}, 2: {**tv, "text": "b"}, 3: {**tv, "text": "c"},
+             7: {**tv, "text": "Notifications", "checked": True, "textSize": 42.0}}
+    classes = {1: "MaterialTextView", 2: "MaterialTextView", 3: "MaterialTextView",
+               7: "SwitchMaterial"}
+    groups = {v: nz.family_group(nz.class_family(classes[v], props[v])) for v in props}
+    assert groups == {1: "TextView", 2: "TextView", 3: "TextView", 7: "TextView"}
+    assert nz.family_group("ScrollView") == "ViewGroup" and nz.family_group("View") == "View"
+    alone, _ = nz.nondefault_props(props, classes)
+    assert "textColorHint" in alone[7]  # 1 SwitchMaterial: no class majority
+    values, omitted = nz.nondefault_props(props, classes, groups=groups)
+    # the group's majority hides the theme colour and autofill flag, not the switch's own
+    assert values[7] == {"text": "Notifications", "checked": True, "textSize": 42.0}
+    assert omitted[7] == 2
+    assert values[1] == alone[1]  # a class with its own majority is unaffected
+
+
 def test_nondefault_on_the_real_view_screen_keeps_what_matters():
     data = lf.load("viewscreen", "views_props")
     classes, bounds = {}, {}
