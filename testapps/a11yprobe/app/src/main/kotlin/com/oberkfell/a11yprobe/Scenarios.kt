@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
@@ -74,6 +75,8 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.traversalIndex
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -765,5 +768,45 @@ private fun Knob(on: Boolean) {
             .size(width = 40.dp, height = 24.dp)
             .clip(CircleShape)
             .background(if (on) MaterialTheme.colorScheme.primary else Color(0xFF9E9E9E))
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 21. PasswordField — a masked password field vs one that shows its secret.
+// Dump-only (no lint rule): the GOOD field carries Compose's Password semantics,
+// so the agent must never send its secret (EditableText / InputText are masked).
+// BAD shows and speaks the secret; there is no Password semantics to redact by.
+// ---------------------------------------------------------------------------
+const val COMPOSE_PASSWORD_SECRET = "hunter2-compose-secret"
+
+@Composable
+fun PasswordFieldScenario() {
+    var g by remember { mutableStateOf(COMPOSE_PASSWORD_SECRET) }
+    var b by remember { mutableStateOf("shown-on-screen") }
+    Section(
+        "Password field",
+        good = {
+            OutlinedTextField(
+                value = g,
+                onValueChange = { g = it },
+                label = { Text("Password") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("good_password")
+            )
+        },
+        bad = {
+            OutlinedTextField(
+                value = b,
+                onValueChange = { b = it },
+                label = { Text("Password (shown)") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("bad_password")
+            )
+        },
     )
 }

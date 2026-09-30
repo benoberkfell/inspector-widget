@@ -505,7 +505,7 @@ def check_label_for(cap: Capture) -> None:
 VIEW_SECTION_TITLES = [
     "1. ImageButton contentDescription", "2. Touch target size", "3. Text contrast",
     "4. ImageView label", "5. Custom clickable role", "6. EditText label (labelFor)",
-    "7. Switch stateDescription", "8. Heading semantics",
+    "7. Switch stateDescription", "8. Heading semantics", "9. Password fields",
 ]
 
 
@@ -521,6 +521,53 @@ def check_view_reading_order(cap: Capture) -> None:
     deco = _node(cap, "goodDecorativeImage")  # importantForAccessibility="no"
     assert deco.get("ignored") and not _is_stop(cap, deco), describe(deco)
     assert "4. ImageView label" in speak, "the decorative image must add nothing to its section"
+
+
+# The secrets A11yProbe types into its password fields (ViewScenarioActivity.kt,
+# Scenarios.kt PasswordFieldScenario); no dump may carry them in plain text.
+VIEW_PASSWORD_SECRETS = {"passwordField": "hunter2-view-secret", "pinField": "271828"}
+COMPOSE_PASSWORD_SECRET = "hunter2-compose-secret"
+
+
+def _leaked(secrets: Iterable[str], **dumps: Any) -> List[str]:
+    import json
+    return [f"{name}: {sec!r}" for name, data in dumps.items()
+            for sec in secrets if sec in json.dumps(data, default=str)]
+
+
+def _view_nodes(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out, stack = [], list(tree.get("roots") or [])
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        stack.extend(n.get("children") or [])
+    return out
+
+
+def check_view_password_redaction(cap: Capture) -> None:
+    """Password EditTexts: the View tree and the a11y text are one bullet per character
+    and the tree flags the node TEXT_REDACTED; the secret appears in no dump."""
+    leaked = _leaked(VIEW_PASSWORD_SECRETS.values(), tree=cap.tree, a11y=cap.a11y, lint=cap.lint)
+    assert not leaked, f"password text sent in plain text: {leaked}"
+    views = _view_nodes(cap.tree)
+    for name, secret in VIEW_PASSWORD_SECRETS.items():
+        v = next((n for n in views if str(n.get("view_id_name") or "").endswith(name)), None)
+        assert v is not None, f"no View named {name} in the tree"
+        assert "TEXT_REDACTED" in (v.get("flags") or []), f"{name} not flagged TEXT_REDACTED: {v}"
+        assert v.get("text") == "\u2022" * len(secret), f"{name} text: {v.get('text')!r}"
+        a = _node(cap, name)
+        assert a.get("text") == "\u2022" * len(secret), f"{name} a11y text: {describe(a)} {a.get('text')!r}"
+
+
+def check_compose_password_redaction(cap: Capture) -> None:
+    """A Compose field with Password semantics: its secret appears in no dump."""
+    leaked = _leaked([COMPOSE_PASSWORD_SECRET], compose=cap.compose, tree=cap.tree,
+                     a11y=cap.a11y, lint=cap.lint)
+    assert not leaked, f"Compose password text sent in plain text: {leaked}"
+    node = _compose_node_by_tag(cap, "good_password")
+    assert node is not None, "no Compose semantics node tagged good_password"
+    attrs = node.get("attrs") or {}
+    assert "Password" in attrs, f"good_password has no Password semantics: {sorted(attrs)}"
 
 
 def check_dialog_reading_order(cap: Capture) -> None:
@@ -616,6 +663,7 @@ COMPOSE_GOLDENS = [
                      bad=(E("bad_merged_inner", R1, DUPLICATE_BOUNDS),), good=(E("good_merged", *GOOD_BASE),)),
     compose_scenario("custom_toggle", "good_custom_toggle",
                      bad=(E("bad_custom_toggle", R7),), good=(E("good_custom_toggle", R1, R2, R7),)),
+    compose_scenario("password_field", "good_password", checks=(check_compose_password_redaction,)),
 ]
 
 VIEW_GOLDEN = Golden(
@@ -625,7 +673,7 @@ VIEW_GOLDEN = Golden(
     good=(E("goodImageButton", R1, R6), E("goodTouchTarget", R1, R2), E("goodContrast", R3),
           E("goodImage", R1, R6), E("goodCustomClickable", R1, R2, R5),
           E("goodEditText", R1, FORM_LABEL)),
-    checks=(check_label_for, check_view_reading_order),
+    checks=(check_label_for, check_view_reading_order, check_view_password_redaction),
 )
 
 # --- interop: mirrors InteropFragment.kt / InteropCells.kt ------------------ #
