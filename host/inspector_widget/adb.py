@@ -1,9 +1,11 @@
 """Thin wrappers over ``adb -s <serial>`` via subprocess.
 
 Every function shells out to the ``adb`` binary on PATH with an explicit serial
-so it works against a specific device (default ``emulator-5554``). Errors from
-adb are captured and re-raised as :class:`AdbError` with the full stderr/stdout
-for debuggability.
+so it works against a specific device. :func:`resolve_serial` picks the device
+when the caller doesn't name one (``$ANDROID_SERIAL``, else the only attached
+device). Errors from adb are captured and re-raised as :class:`AdbError` with
+the full stderr/stdout for debuggability; a missing, offline or unauthorized
+device is reported as a :class:`DeviceError` with a one-line explanation.
 
 This is a clean-room re-implementation of the device-control surface the
 ui-inspector ``InjectionManager`` performs over adblib, expressed in terms of
@@ -12,13 +14,20 @@ the plain ``adb`` CLI.
 
 from __future__ import annotations
 
+import os
 import shlex
 import socket
 import subprocess
+import threading
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
+# Kept for callers that still import it; nothing defaults to it any more. Use
+# resolve_serial(None) to pick $ANDROID_SERIAL or the single attached device.
 DEFAULT_SERIAL = "emulator-5554"
+
+# adb's own variable for "the device to talk to when -s is not given".
+SERIAL_ENV = "ANDROID_SERIAL"
 
 # A generously large default; pushes of a few-MB jar/so finish well within this.
 DEFAULT_TIMEOUT = 60.0
@@ -37,6 +46,11 @@ class AdbError(RuntimeError):
             f"adb command failed (exit {returncode}): {cmd}\n"
             f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         )
+
+
+class DeviceError(RuntimeError):
+    """No usable device: none attached, several and none chosen, the named
+    serial isn't attached, or it is offline / unauthorized."""
 
 
 @dataclass(frozen=True)
@@ -114,8 +128,65 @@ def devices() -> List[Device]:
     return out
 
 
-def wait_for_device(serial: str = DEFAULT_SERIAL, timeout: float = 30.0) -> None:
-    """Block until ``serial`` reaches the ``device`` state."""
+def _describe(devs: Sequence[Device]) -> str:
+    return ", ".join(f"{d.serial} ({d.state})" for d in devs) or "none"
+
+
+_STATE_ADVICE = {
+    "unauthorized": "accept the 'Allow USB debugging' prompt on the device, then retry",
+    "offline": "reconnect it (adb reconnect) or restart the emulator, then retry",
+    "authorizing": "wait for the device to finish authorizing, then retry",
+    "no permissions": "fix the host's USB permissions (udev rules) for this device",
+}
+
+
+def resolve_serial(serial: Optional[str] = None) -> str:
+    """The device serial to use, checked against ``adb devices``.
+
+    ``serial`` wins, then ``$ANDROID_SERIAL``, then the only device in the
+    ``device`` state. Raises :class:`DeviceError` with the attached devices
+    listed when there is none, several, or the chosen one isn't usable.
+    """
+    chosen = serial or os.environ.get(SERIAL_ENV) or None
+    devs = devices()
+    if chosen:
+        ensure_device(chosen, devs)
+        return chosen
+    ready = [d for d in devs if d.state == "device"]
+    if len(ready) == 1:
+        return ready[0].serial
+    if not ready:
+        if devs:
+            raise DeviceError(
+                f"no usable Android device: attached are {_describe(devs)}. "
+                + (_STATE_ADVICE.get(devs[0].state, "") if len(devs) == 1 else "")
+            )
+        raise DeviceError(
+            "no Android device attached (adb devices lists none). Start an emulator "
+            "or connect a device with USB debugging enabled."
+        )
+    raise DeviceError(
+        f"more than one device attached ({_describe(ready)}); choose one with the "
+        f"serial argument (CLI: --serial) or set ${SERIAL_ENV}."
+    )
+
+
+def ensure_device(serial: str, devs: Optional[Sequence[Device]] = None) -> None:
+    """Raise :class:`DeviceError` unless ``serial`` is attached and in the ``device`` state."""
+    devs = devices() if devs is None else devs
+    match = next((d for d in devs if d.serial == serial), None)
+    if match is None:
+        raise DeviceError(
+            f"device '{serial}' not found; attached: {_describe(devs)}. "
+            f"Pick a serial from `adb devices` (CLI: --serial, or set ${SERIAL_ENV})."
+        )
+    if match.state != "device":
+        advice = _STATE_ADVICE.get(match.state, "wait until `adb devices` shows it as 'device'")
+        raise DeviceError(f"device '{serial}' is {match.state}: {advice}.")
+
+
+def wait_for_device(serial: Optional[str] = None, timeout: float = 30.0) -> None:
+    """Block until ``serial`` (or the only device) reaches the ``device`` state."""
     _adb(serial, "wait-for-device", timeout=timeout)
 
 
@@ -149,18 +220,34 @@ def list_debuggable_packages(serial: str) -> List[str]:
         line = line.strip()
         if line.startswith("package:"):
             pkgs.append(line[len("package:"):].strip())
-    debuggable = []
-    for pkg in pkgs:
-        # run-as returns non-zero for non-debuggable apps; suppress the raise.
-        proc = _adb(serial, "shell", f"run-as {shlex.quote(pkg)} true", check=False)
-        if proc.returncode == 0 and "not debuggable" not in (proc.stderr + proc.stdout).lower():
-            debuggable.append(pkg)
-    return debuggable
+    return [pkg for pkg in pkgs if run_as_probe(serial, pkg)[0]]
+
+
+def run_as_probe(serial: str, pkg: str) -> "tuple[bool, str]":
+    """``run-as <pkg> true``: ``(True, "")`` if the app is debuggable (run-as-able),
+    else ``(False, what run-as printed)``."""
+    # run-as returns non-zero for non-debuggable apps; suppress the raise.
+    proc = _adb(serial, "shell", f"run-as {shlex.quote(pkg)} true", check=False)
+    said = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
+    if proc.returncode == 0 and "not debuggable" not in said.lower():
+        return True, ""
+    return False, said or f"exit {proc.returncode}"
 
 
 def pidof(serial: str, pkg: str) -> Optional[int]:
-    """Return the (primary) PID of ``pkg`` if running, else ``None``."""
-    out = shell(serial, f"pidof {shlex.quote(pkg)}", check=False).strip()
+    """Return the (primary) PID of ``pkg`` if running, else ``None``.
+
+    toybox ``pidof`` exits 1 with no output when nothing matches, which is
+    ``None``. Any other failure (the device vanished, adb itself errored) says
+    so on stderr and raises :class:`AdbError`, so a bad serial is never
+    mistaken for "the app isn't running".
+    """
+    argv_cmd = f"pidof {shlex.quote(pkg)}"
+    proc = _adb(serial, "shell", argv_cmd, check=False)
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0 and (proc.stderr or "").strip():
+        raise AdbError(["adb", "-s", serial, "shell", argv_cmd], proc.returncode,
+                       proc.stdout, proc.stderr)
     if not out:
         return None
     # pidof may return several space-separated PIDs for multi-process apps;
@@ -295,18 +382,28 @@ def run_as_cp(serial: str, pkg: str, src: str, dst_name: str, mode: Optional[str
 # --------------------------------------------------------------------------- #
 # Port forwarding
 # --------------------------------------------------------------------------- #
+# Forwards this process created and has not removed yet: (serial, port) -> name.
+# remove_own_forwards() clears whatever is left at exit, including a forward made
+# by an attach that a signal or Ctrl-C interrupted before it returned a session.
+_OWN_FORWARDS: Dict[Tuple[str, int], str] = {}
+_FORWARDS_LOCK = threading.Lock()
+
+
 def forward(serial: str, local_port: int, abstract_name: str) -> int:
     """Forward ``tcp:<local_port>`` to ``localabstract:<abstract_name>``.
 
-    If ``local_port`` is 0, adb picks a free port and we parse+return it.
+    If ``local_port`` is 0, adb picks a free port and we parse+return it. Asking
+    adb for the port avoids the race of picking one on the host first, where
+    another forward can take it in between.
     """
     local_spec = f"tcp:{local_port}"
     remote_spec = f"localabstract:{abstract_name}"
     proc = _adb(serial, "forward", local_spec, remote_spec)
+    port = local_port
     if local_port == 0:
         out = proc.stdout.strip()
         try:
-            return int(out)
+            port = int(out)
         except ValueError as e:
             raise AdbError(
                 ["adb", "forward", local_spec, remote_spec],
@@ -314,12 +411,29 @@ def forward(serial: str, local_port: int, abstract_name: str) -> int:
                 proc.stdout,
                 f"could not parse allocated port from adb forward output: {out!r}",
             ) from e
-    return local_port
+    with _FORWARDS_LOCK:
+        _OWN_FORWARDS[(serial, port)] = abstract_name
+    return port
 
 
 def remove_forward(serial: str, local_port: int) -> None:
     """Remove a single tcp forward (``adb forward --remove tcp:<port>``)."""
+    with _FORWARDS_LOCK:
+        _OWN_FORWARDS.pop((serial, local_port), None)
     _adb(serial, "forward", "--remove", f"tcp:{local_port}", check=False)
+
+
+def remove_own_forwards() -> int:
+    """Remove every forward this process created and still holds. For exit
+    cleanup; returns how many were removed."""
+    with _FORWARDS_LOCK:
+        leftover = list(_OWN_FORWARDS)
+    for serial, port in leftover:
+        try:
+            remove_forward(serial, port)
+        except Exception:  # noqa: BLE001 - best-effort at exit
+            pass
+    return len(leftover)
 
 
 def attach_agent(serial: str, pkg: str, so_path: str, options: str) -> str:
@@ -336,7 +450,11 @@ def attach_agent(serial: str, pkg: str, so_path: str, options: str) -> str:
 
 
 def free_local_port() -> int:
-    """Pick a free TCP port on the host by binding to port 0 and reading it back."""
+    """Pick a free TCP port on the host by binding to port 0 and reading it back.
+
+    Racy (the port is free only until someone else binds it); prefer
+    ``forward(serial, 0, name)``, which lets adb pick the port.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", 0))
@@ -345,14 +463,72 @@ def free_local_port() -> int:
         s.close()
 
 
-def socket_exists(serial: str, abstract_name: str) -> bool:
-    """Return True if an abstract unix socket named ``abstract_name`` is present.
+# /proc/net/unix columns: Num RefCount Protocol Flags Type St Inode Path. A
+# listening socket has __SO_ACCEPTCON in Flags. A connection accepted from it
+# (or still queued for accept) shows the same @name with Flags 0, and it stays
+# listed for as long as either end keeps it open, even after the listener has
+# gone, so only the listening entry says an agent is there.
+_SO_ACCEPTCON = 0x00010000
 
-    Mirrors ui-inspector's ``waitForAgentSocket`` which greps /proc/net/unix.
-    """
+
+def _unix_socket_entries(serial: str, abstract_name: str) -> List[Tuple[int, int]]:
+    """``(flags, state)`` for each /proc/net/unix entry whose path is exactly
+    ``@abstract_name``."""
     out = shell(
         serial,
         f"cat /proc/net/unix | grep {shlex.quote(abstract_name)} || true",
         check=False,
     )
-    return abstract_name in out
+    wanted = "@" + abstract_name
+    entries = []
+    for line in out.splitlines():
+        parts = line.split()
+        # grep only narrows the output; the match is exact on the path column
+        # (@viewspector_42 must not match @viewspector_421).
+        if len(parts) < 8 or parts[-1] != wanted:
+            continue
+        try:
+            entries.append((int(parts[3], 16), int(parts[5], 16)))
+        except ValueError:
+            continue
+    return entries
+
+
+def socket_exists(serial: str, abstract_name: str) -> bool:
+    """Return True if something LISTENS on the abstract unix socket ``abstract_name``.
+
+    Mirrors ui-inspector's ``waitForAgentSocket`` which greps /proc/net/unix.
+    Connections to the name don't count: another client's connection outlives
+    a stopped agent, and must not look like an agent still holding the name.
+    """
+    return any(flags & _SO_ACCEPTCON for flags, _state in _unix_socket_entries(serial, abstract_name))
+
+
+def socket_connections(serial: str, abstract_name: str) -> int:
+    """How many connections to ``abstract_name`` exist (accepted or queued).
+
+    The agent's end of every client connection is listed under its name, so
+    this counts the clients connected to the agent, including the caller's own.
+    """
+    return sum(1 for flags, _state in _unix_socket_entries(serial, abstract_name)
+               if not flags & _SO_ACCEPTCON)
+
+
+def process_frozen(serial: str, pid: int) -> Optional[bool]:
+    """Whether Android's cached-apps freezer has frozen ``pid`` (cgroup v2
+    ``cgroup.events``: ``frozen 1``). ``None`` when the state can't be read.
+
+    A frozen app runs nothing, including a queued ``attach-agent``, until it is
+    brought back to the foreground.
+    """
+    cmd = (f"cat /sys/fs/cgroup$(sed -n 's/^0:://p' /proc/{int(pid)}/cgroup)/cgroup.events "
+           f"2>/dev/null || true")
+    try:
+        out = shell(serial, cmd, check=False)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return None
+    for line in out.splitlines():
+        key, _, value = line.strip().partition(" ")
+        if key == "frozen" and value.strip() in ("0", "1"):
+            return value.strip() == "1"
+    return None

@@ -88,13 +88,15 @@ def test_compose_grafted_under_host_view():
     compose_windows = [{"view_id": 200, "root": croot}]
     merged = correlate.build_integrated_tree([host], compose_windows, [])
     root = merged["roots"][0]
-    # The compose root is grafted as a child of the host view node.
+    # The compose root is grafted as a child of the host view node; keys are
+    # composite (compose:<acvId>:<semanticsId>) because semantics ids repeat per window.
     compose_child = root["children"][0]
-    assert compose_child["node_key"] == "compose:1"
+    assert compose_child["node_key"] == "compose:200:1"
     assert compose_child["compose"]["name"] == "Column"
+    assert compose_child["compose"]["acv"] == 200
     # render_node_id becomes an SKP image_ref on the leaf.
     leaf = compose_child["children"][0]
-    assert leaf["node_key"] == "compose:2"
+    assert leaf["node_key"] == "compose:200:2"
     assert leaf["image_ref"] == {"source": "skp", "layer_id": 555}
 
 
@@ -107,7 +109,7 @@ def test_compose_a11y_matched_by_semantics_id():
                   content_description="Save", clickable=True)
     merged = correlate.build_integrated_tree([host], compose_windows, [a])
     compose_child = merged["roots"][0]["children"][0]
-    assert compose_child["node_key"] == "compose:42"
+    assert compose_child["node_key"] == "compose:200:42"
     assert compose_child["correlation_confidence"] == "exact"
     assert compose_child["a11y"]["speakable"] == "Save"
 
@@ -116,12 +118,11 @@ def test_compose_a11y_matched_by_semantics_id():
 # a11y overlap (IoU) fallback.
 # --------------------------------------------------------------------------- #
 def test_a11y_overlap_fallback():
-    # View id 9 has no id-matched a11y node, but an a11y node with no usable id
-    # overlaps its bounds heavily -> matched by IoU as "overlap".
+    # View 9 has no id-matched a11y node (e.g. the a11y dump saw a recycled View whose
+    # id, 99, is not in the view dump). That orphan a11y node, in the same window,
+    # overlaps view 9 heavily -> matched by IoU as "overlap".
     v = view(9, "android.widget.TextView", (0, 0, 100, 100))
-    # virtual_id 0 + no is_virtual -> _a11y_view_key returns int(vid). Use a
-    # different host id so the id key does NOT match view 9, forcing IoU.
-    a = a11y_node(0, 0, (1, 1, 99, 99), text="Overlap me")
+    a = a11y_node(99, -1, (1, 1, 99, 99), text="Overlap me")
     merged = correlate.build_integrated_tree([v], [], [a])
     root = merged["roots"][0]
     assert root["correlation_confidence"] == "overlap"
@@ -196,3 +197,32 @@ def test_shaped_a11y_proto_feeds_build_integrated_tree(strings_builder):
     root = merged["roots"][0]
     assert root["correlation_confidence"] == "exact"
     assert root["a11y"]["speakable"] == "Tap"
+
+
+# --------------------------------------------------------------------------- #
+# A lost session is passed up, never read as "this facet is absent".
+# --------------------------------------------------------------------------- #
+import pytest  # noqa: E402
+
+from inspector_widget.client import SessionLostError  # noqa: E402
+
+
+class _LostSession:
+    """Every command fails the way a dropped connection does."""
+
+    def __getattr__(self, name):
+        def lost(*_args, **_kwargs):
+            raise SessionLostError("agent session lost: the agent closed the connection")
+        return lost
+
+
+@pytest.mark.parametrize("fetch", [
+    lambda s, tmp: correlate._shaped_compose(s),
+    lambda s, tmp: correlate._shaped_a11y(s),
+    lambda s, tmp: correlate._fetch_properties(s, 1004),
+    lambda s, tmp: correlate._full_screenshot_png(s, str(tmp / "shot.png")),
+    lambda s, tmp: correlate._capture_skp(s),
+], ids=["compose", "a11y", "properties", "screenshot", "skp"])
+def test_a_lost_session_is_raised_not_read_as_a_missing_facet(fetch, tmp_path):
+    with pytest.raises(SessionLostError):
+        fetch(_LostSession(), tmp_path)

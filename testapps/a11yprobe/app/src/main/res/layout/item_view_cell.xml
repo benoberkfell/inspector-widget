@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Classic-View list row (RecyclerView cell, or an AndroidView item inside a
+  LazyColumn). bindViewCell() (InteropCells.kt) fills it in and plants the
+  row's deliberate defects:
+    delete  UNLABELED    -> no contentDescription           (a11y.label.missing)
+    info    SMALL_TARGET -> shrunk to 24dp                  (a11y.touch_target.small)
+    notify  STATELESS    -> announces "Switch", no on/off   (a11y.state.not_exposed)
+  Every other row's buttons are labeled "Delete" / "More info" / "Notify":
+  repeated per-row labels, which are legitimate duplicates.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/view_cell_root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="?android:attr/selectableItemBackground"
+    android:gravity="center_vertical"
+    android:minHeight="64dp"
+    android:orientation="horizontal"
+    android:paddingStart="16dp"
+    android:paddingEnd="8dp">
+
+    <TextView
+        android:id="@+id/title"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:textSize="16sp" />
+
+    <CheckBox
+        android:id="@+id/check"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Done" />
+
+    <ImageButton
+        android:id="@+id/notify"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:scaleType="fitCenter"
+        android:padding="12dp"
+        android:src="@android:drawable/ic_popup_reminder" />
+
+    <ImageButton
+        android:id="@+id/info"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:scaleType="fitCenter"
+        android:padding="12dp"
+        android:src="@android:drawable/ic_dialog_info" />
+
+    <ImageButton
+        android:id="@+id/delete"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:scaleType="fitCenter"
+        android:padding="12dp"
+        android:src="@android:drawable/ic_menu_delete" />
+</LinearLayout>

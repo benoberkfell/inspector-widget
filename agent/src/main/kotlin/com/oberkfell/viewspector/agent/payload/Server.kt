@@ -20,6 +20,7 @@ package com.oberkfell.viewspector.agent.payload
 
 import android.net.LocalServerSocket
 import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.util.Log
 import com.oberkfell.viewspector.proto.ViewInspection
 import java.io.IOException
@@ -39,8 +40,9 @@ class Server(private val socketName: String) {
     private companion object {
         const val TAG = "ViewSpector"
 
-        // CONTRACT.md §2 / ui-inspector Server.kt:40 — close an idle server after
-        // 5 minutes so an abandoned injection does not linger forever.
+        // CONTRACT.md §2 / ui-inspector Server.kt:40 — close the server after 5
+        // minutes with no client connected, so an abandoned injection does not
+        // linger forever (a connected client is never idle; see the watchdog).
         val IDLE_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(5)
 
         // Granularity of the idle watchdog's wakeups.
@@ -56,7 +58,8 @@ class Server(private val socketName: String) {
     private var serverSocket: LocalServerSocket? = null
 
     // Timestamp (uptime millis via System.nanoTime) of the last accepted
-    // connection or completed request, used by the idle watchdog.
+    // connection, completed request or disconnect, used by the idle watchdog
+    // (which never fires while a client is connected).
     @Volatile
     private var lastActivityNanos: Long = System.nanoTime()
 
@@ -65,10 +68,11 @@ class Server(private val socketName: String) {
     private val terminated = CountDownLatch(1)
 
     // Serializes device work so concurrent client connections never interleave
-    // (they queue rather than wedge) — one request is handled at a time.
+    // (they queue rather than wedge) — one request is handled at a time. HELLO
+    // and SHUTDOWN don't take it (see serveConnection).
     private val handleLock = Any()
 
-    // Live client sockets, so stop() can close them to unblock their reads.
+    // Live client sockets, so stop() can shut them down to unblock their reads.
     private val activeClients =
         java.util.Collections.synchronizedSet(java.util.HashSet<LocalSocket>())
 
@@ -78,18 +82,28 @@ class Server(private val socketName: String) {
      * this from a dedicated background thread, so it is fine to block here.
      */
     fun run() {
-        // The Dispatcher gets a handle to request server shutdown when it
-        // processes a SHUTDOWN command.
-        val dispatcher = Dispatcher(onShutdown = ::stop)
+        // SHUTDOWN is carried out by serveConnection, after the reply is written.
+        val dispatcher = Dispatcher()
 
         val socket =
             try {
                 LocalServerSocket(socketName)
             } catch (e: IOException) {
-                // Most commonly "Address already in use": a server is already
-                // bound to this name (double injection). Treat as benign.
+                // "Address already in use" means an earlier injection's server
+                // still owns the name. That is NOT benign: this (possibly newer)
+                // payload will not serve, and the host would keep talking to the
+                // old one. The host stops the old agent (SHUTDOWN) before
+                // re-injecting and checks the build id in Hello, so this only
+                // happens when the old agent could not be reached.
                 if (e.message?.contains("already in use", ignoreCase = true) == true) {
-                    Log.i(TAG, "Server already running on @$socketName; not starting another")
+                    Log.e(
+                        TAG,
+                        "Cannot bind @$socketName: another ViewSpector server (an earlier " +
+                            "injection) still holds it, so this payload (build ${Payload.buildId}) " +
+                            "will not serve. Stop the old agent (detach / SHUTDOWN) or restart " +
+                            "the app, then inject again.",
+                        e,
+                    )
                 } else {
                     Log.e(TAG, "Failed to bind LocalServerSocket @$socketName", e)
                 }
@@ -127,20 +141,42 @@ class Server(private val socketName: String) {
         }
 
     /**
-     * Requests an orderly shutdown: flags stopped and closes the server socket,
-     * which unblocks any in-progress [LocalServerSocket.accept] with an
-     * IOException so the accept loop exits. Idempotent.
+     * Requests an orderly shutdown: flags stopped, closes the server socket and
+     * wakes the accept loop so it exits and the abstract name is released, and
+     * disconnects every client. Idempotent.
      */
     fun stop() {
         if (stopped.compareAndSet(false, true)) {
             Log.i(TAG, "ViewSpector server shutdown requested")
             closeQuietly(serverSocket)
-            // Close any live client sockets so their serve-threads unblock and exit.
+            // LocalServerSocket.close() does NOT wake a thread blocked in
+            // accept(), and that blocked call keeps the socket (and its name in
+            // /proc/net/unix) alive, so a new injection could not bind it.
+            // Connect once: accept() returns, the loop sees `stopped`, exits.
+            wakeAcceptLoop()
+            // Disconnect every client. close() alone is not enough, for the same
+            // reason: it doesn't wake a serve thread blocked reading the socket,
+            // so that client would stay connected, never see EOF, and only find
+            // out on its next request. shutdown() wakes the read (the thread
+            // exits) and sends EOF to the client at once.
             synchronized(activeClients) {
-                for (c in ArrayList(activeClients)) closeQuietly(c)
+                for (c in ArrayList(activeClients)) disconnect(c)
                 activeClients.clear()
             }
         }
+    }
+
+    private fun disconnect(client: LocalSocket) {
+        try {
+            client.shutdownInput()
+        } catch (t: Throwable) {
+            // Already closed or never connected: nothing to wake.
+        }
+        try {
+            client.shutdownOutput()
+        } catch (t: Throwable) {
+        }
+        closeQuietly(client)
     }
 
     /**
@@ -224,24 +260,48 @@ class Server(private val socketName: String) {
                     continue
                 }
 
-            // Serialize device work across concurrent connections.
+            val isShutdown =
+                request.commandCase == ViewInspection.Request.CommandCase.SHUTDOWN
+            // Serialize device work across concurrent connections. HELLO and
+            // SHUTDOWN touch no UI, so they are answered at once: a client must
+            // not wait behind another client's long request (an SKP capture, a
+            // big a11y dump) and conclude the app is frozen, and SHUTDOWN must
+            // not wait for work it is about to abandon.
             val response: ViewInspection.Response =
-                synchronized(handleLock) { dispatcher.handle(request) }
+                if (isShutdown ||
+                    request.commandCase == ViewInspection.Request.CommandCase.HELLO
+                ) {
+                    dispatcher.handle(request)
+                } else {
+                    synchronized(handleLock) { dispatcher.handle(request) }
+                }
 
             try {
                 writeResponse(output, response)
             } catch (e: IOException) {
                 Log.i(TAG, "Connection lost while writing response: ${e.message}")
+                if (isShutdown) stop()
                 return
             }
             touchActivity()
 
-            // A SHUTDOWN reply has been written and stop() invoked by the
-            // dispatcher; end the session so the accept loop can exit.
-            if (request.commandCase == ViewInspection.Request.CommandCase.SHUTDOWN) {
-                Log.i(TAG, "SHUTDOWN handled; closing session")
+            // SHUTDOWN: the reply is on its way to the requester; now stop the
+            // server, which disconnects every client (this one included).
+            if (isShutdown) {
+                Log.i(TAG, "SHUTDOWN handled; stopping the server")
+                stop()
                 return
             }
+        }
+    }
+
+    private fun wakeAcceptLoop() {
+        try {
+            LocalSocket().use { it.connect(LocalSocketAddress(socketName)) }
+        } catch (e: IOException) {
+            // Nothing listening any more: the accept loop has already exited.
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not wake the accept loop on @$socketName", t)
         }
     }
 
@@ -258,8 +318,11 @@ class Server(private val socketName: String) {
             .build()
 
     /**
-     * Spawns a daemon watchdog that closes the server if no activity occurs for
-     * [IDLE_TIMEOUT_MS]. Mirrors the inactivity timeout in Server.kt:62-76.
+     * Spawns a daemon watchdog that closes the server after [IDLE_TIMEOUT_MS]
+     * with no client connected and no activity. A connected client counts as
+     * activity, so a long-lived host session (the MCP server) is never cut off
+     * mid-use; an abandoned injection with nobody connected still goes away.
+     * Mirrors the inactivity timeout in ui-inspector Server.kt:62-76.
      */
     private fun startIdleWatchdog(): Thread {
         val watchdog =
@@ -270,6 +333,11 @@ class Server(private val socketName: String) {
                     } catch (ie: InterruptedException) {
                         // stop() or run()'s finally interrupted us: exit.
                         return@Thread
+                    }
+                    if (activeClients.isNotEmpty()) {
+                        // Someone is connected: not idle. The disconnect itself
+                        // touches the activity clock, so the timeout restarts then.
+                        continue
                     }
                     val idleMs = (System.nanoTime() - lastActivityNanos) / 1_000_000L
                     if (idleMs >= IDLE_TIMEOUT_MS) {

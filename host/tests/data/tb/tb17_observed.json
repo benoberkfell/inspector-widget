@@ -1,0 +1,539 @@
+{
+ "source": "TalkBack 17.0.0 on emulator-5554 (API 37, 1280x2856, status bar 0-156), a11yprobe with the a11y-core agent: scratchpad/tb-spike/p6 walk_*.json (focus read from the agent) and logcat_*.txt (ttsOutput, verbose log).",
+ "window_titles": {
+  "S1": "S1: RecyclerView of ComposeView cells",
+  "S4": "S4: LazyColumn with AndroidView rows",
+  "D1": "D1: DialogFragment over a View screen",
+  "D2": "D2: Compose Dialog over a Compose screen"
+ },
+ "walks": {
+  "S1": [
+   {
+    "key": "view:10",
+    "label": "S1: RecyclerView of ComposeView cells"
+   },
+   {
+    "key": "compose:14:3",
+    "label": null
+   },
+   {
+    "key": "compose:14:5",
+    "label": "Done"
+   },
+   {
+    "key": "compose:14:6",
+    "label": null
+   },
+   {
+    "key": "compose:14:8",
+    "label": null
+   },
+   {
+    "key": "compose:14:10",
+    "label": null
+   },
+   {
+    "key": "compose:19:14",
+    "label": null
+   },
+   {
+    "key": "compose:19:16",
+    "label": "Done"
+   },
+   {
+    "key": "compose:19:17",
+    "label": null
+   },
+   {
+    "key": "compose:19:19",
+    "label": null
+   },
+   {
+    "key": "compose:19:21",
+    "label": null
+   },
+   {
+    "key": "compose:24:25",
+    "label": null
+   },
+   {
+    "key": "compose:24:27",
+    "label": "Done"
+   },
+   {
+    "key": "compose:24:28",
+    "label": null
+   },
+   {
+    "key": "compose:24:30",
+    "label": null
+   },
+   {
+    "key": "compose:24:32",
+    "label": null
+   },
+   {
+    "key": "compose:29:36",
+    "label": null
+   },
+   {
+    "key": "compose:29:38",
+    "label": "Done"
+   },
+   {
+    "key": "compose:29:39",
+    "label": null
+   },
+   {
+    "key": "compose:29:41",
+    "label": null
+   },
+   {
+    "key": "compose:29:43",
+    "label": null
+   },
+   {
+    "key": "compose:34:47",
+    "label": null
+   },
+   {
+    "key": "compose:34:49",
+    "label": "Done"
+   },
+   {
+    "key": "compose:34:50",
+    "label": null
+   },
+   {
+    "key": "compose:34:52",
+    "label": null
+   },
+   {
+    "key": "compose:34:54",
+    "label": null
+   },
+   {
+    "key": "compose:39:58",
+    "label": null
+   }
+  ],
+  "S4": [
+   {
+    "key": "compose:11:5",
+    "label": "S4: LazyColumn with AndroidView rows"
+   },
+   {
+    "key": "compose:11:7",
+    "label": null
+   },
+   {
+    "key": "compose:11:9",
+    "label": "Done"
+   },
+   {
+    "key": "compose:11:10",
+    "label": null
+   },
+   {
+    "key": "compose:11:12",
+    "label": null
+   },
+   {
+    "key": "compose:11:14",
+    "label": null
+   },
+   {
+    "key": "view:12",
+    "label": null
+   },
+   {
+    "key": "view:14",
+    "label": "Done"
+   },
+   {
+    "key": "view:15",
+    "label": "Notify"
+   },
+   {
+    "key": "view:16",
+    "label": "More info"
+   },
+   {
+    "key": "view:17",
+    "label": null
+   },
+   {
+    "key": "compose:11:19",
+    "label": null
+   },
+   {
+    "key": "compose:11:21",
+    "label": "Done"
+   },
+   {
+    "key": "compose:11:22",
+    "label": null
+   },
+   {
+    "key": "compose:11:24",
+    "label": null
+   },
+   {
+    "key": "compose:11:26",
+    "label": null
+   },
+   {
+    "key": "view:20",
+    "label": null
+   },
+   {
+    "key": "view:22",
+    "label": "Done"
+   },
+   {
+    "key": "view:23",
+    "label": "Notify"
+   },
+   {
+    "key": "view:24",
+    "label": "More info"
+   },
+   {
+    "key": "view:25",
+    "label": "Delete"
+   },
+   {
+    "key": "compose:11:31",
+    "label": null
+   },
+   {
+    "key": "compose:11:33",
+    "label": "Done"
+   },
+   {
+    "key": "compose:11:34",
+    "label": null
+   },
+   {
+    "key": "compose:11:36",
+    "label": null
+   },
+   {
+    "key": "compose:11:38",
+    "label": null
+   },
+   {
+    "key": "view:27",
+    "label": null
+   }
+  ],
+  "D1": [
+   {
+    "key": "compose:26:4",
+    "label": null
+   },
+   {
+    "key": "compose:26:6",
+    "label": null
+   },
+   {
+    "key": "view:17",
+    "label": null
+   },
+   {
+    "key": "view:18",
+    "label": "Edit"
+   },
+   {
+    "key": "view:19",
+    "label": "Close"
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "view:14",
+    "label": "Share item"
+   },
+   {
+    "key": "compose:26:4",
+    "label": null
+   },
+   {
+    "key": "compose:26:6",
+    "label": null
+   },
+   {
+    "key": "view:17",
+    "label": null
+   },
+   {
+    "key": "view:18",
+    "label": "Edit"
+   },
+   {
+    "key": "view:19",
+    "label": "Close"
+   },
+   {
+    "edge": true
+   }
+  ],
+  "D2": [
+   {
+    "key": "compose:17:14",
+    "label": "Share item"
+   },
+   {
+    "key": "compose:17:16",
+    "label": null
+   },
+   {
+    "key": "compose:17:18",
+    "label": null
+   },
+   {
+    "key": "compose:17:20",
+    "label": null
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "compose:17:14",
+    "label": "Share item"
+   },
+   {
+    "key": "compose:17:16",
+    "label": null
+   },
+   {
+    "key": "compose:17:18",
+    "label": null
+   },
+   {
+    "key": "compose:17:20",
+    "label": null
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "compose:17:14",
+    "label": "Share item"
+   },
+   {
+    "key": "compose:17:16",
+    "label": null
+   },
+   {
+    "key": "compose:17:18",
+    "label": null
+   }
+  ],
+  "view_xml": [
+   {
+    "key": "view:3",
+    "label": "1. ImageButton contentDescription"
+   },
+   {
+    "key": "view:5",
+    "label": "Like this photo"
+   },
+   {
+    "key": "view:6",
+    "label": null
+   },
+   {
+    "key": "view:7",
+    "label": "2. Touch target size"
+   },
+   {
+    "key": "view:9",
+    "label": "Play"
+   },
+   {
+    "key": "view:10",
+    "label": "Pause"
+   },
+   {
+    "key": "view:11",
+    "label": "3. Text contrast"
+   },
+   {
+    "key": "view:12",
+    "label": "Readable text (16:1)"
+   },
+   {
+    "key": "view:13",
+    "label": "Hard to read text (1.6:1)"
+   },
+   {
+    "key": "view:14",
+    "label": "4. ImageView label"
+   },
+   {
+    "key": "view:16",
+    "label": "Profile photo of Ada Lovelace"
+   },
+   {
+    "key": "view:17",
+    "label": null
+   },
+   {
+    "key": "view:19",
+    "label": "5. Custom clickable role"
+   },
+   {
+    "key": "view:21",
+    "label": "Submit"
+   },
+   {
+    "key": "view:22",
+    "label": "Send"
+   },
+   {
+    "key": "view:23",
+    "label": "6. EditText label (labelFor)"
+   },
+   {
+    "key": "view:24",
+    "label": "Email address"
+   },
+   {
+    "key": "view:25",
+    "label": "name@example.com"
+   },
+   {
+    "key": "view:26",
+    "label": null
+   },
+   {
+    "key": "view:27",
+    "label": "7. Switch stateDescription"
+   },
+   {
+    "key": "view:28",
+    "label": "Notifications"
+   },
+   {
+    "key": "view:29",
+    "label": "Email alerts"
+   },
+   {
+    "key": "view:30",
+    "label": "8. Heading semantics"
+   },
+   {
+    "key": "view:31",
+    "label": "Account"
+   },
+   {
+    "key": "view:32",
+    "label": "Security"
+   },
+   {
+    "key": "view:33",
+    "label": "Manage your account settings."
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "view:3",
+    "label": "1. ImageButton contentDescription"
+   },
+   {
+    "key": "view:5",
+    "label": "Like this photo"
+   },
+   {
+    "key": "view:6",
+    "label": null
+   },
+   {
+    "key": "view:7",
+    "label": "2. Touch target size"
+   }
+  ]
+ },
+ "initial_focus": {
+  "S1": "Item 0 (compose). In list",
+  "S4": "S4: LazyColumn with AndroidView rows. Heading. In list",
+  "D1": "Button. Out of list",
+  "D2": "Share item. Heading"
+ },
+ "utterances": {
+  "S1": [
+   "Item 0 (compose). In list",
+   "checked. Done. Check box",
+   "On. Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 1 (compose)",
+   "Done. Check box",
+   "Off. Notify. Switch",
+   "More info. Button",
+   "Button",
+   "Item 2 (compose)",
+   "checked. Done. Check box",
+   "Off. Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 3 (compose)",
+   "Done. Check box",
+   "Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 4 (compose)",
+   "checked. Done. Check box",
+   "Off. Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 5 (compose)"
+  ],
+  "S4": [
+   "S4: LazyColumn with AndroidView rows. Heading. In list",
+   "Item 0 (compose)",
+   "checked. Done. Check box",
+   "On. Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 1 (view)",
+   "Done. Check box",
+   "off. Notify. Switch",
+   "More info. Button",
+   "Button",
+   "Item 2 (compose)",
+   "checked. Done. Check box",
+   "Off. Notify. Switch",
+   "More info. Button",
+   "Button",
+   "Item 3 (view)",
+   "Done. Check box",
+   "off. Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 4 (compose)",
+   "checked. Done. Check box",
+   "Notify. Switch",
+   "More info. Button",
+   "Delete. Button",
+   "Item 5 (view)"
+  ],
+  "D1": [
+   "Button. Out of list",
+   "Add to favorites. Button",
+   "Button",
+   "Edit. Button",
+   "Close. Button",
+   "Share item. Heading"
+  ],
+  "D2": [
+   "Share item. Heading",
+   "Button",
+   "Add to favorites. Button",
+   "Close. Button"
+  ]
+ }
+}

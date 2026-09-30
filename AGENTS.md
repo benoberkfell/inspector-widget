@@ -68,13 +68,13 @@ host/                         Python host driver + entry points
                               proto/, skia_grpc/, _cli.py/_mcp.py console-script wrappers)
   cli.py                      CLI entry point (13 subcommands)
   mcp_server.py               MCP server (15 tools) + `--self-check`
-  tests/                      device-free pytest suite (+ one @device smoke test)
+  tests/                      device-free pytest suite (+ @device smoke and a11y golden tests)
   pyproject.toml              packaging (wheel ships cli.py + mcp_server.py as py-modules)
   README.md  PACKAGING.md     host driver + packaging docs
 scripts/                      build.sh, run.sh, test.sh, install-a11yprobe.sh
-testapps/a11yprobe/           Compose app with deliberate a11y mistakes (lint corpus)
+testapps/a11yprobe/           GOOD/BAD a11y corpus: Compose, classic View, mixed View/Compose, dialogs
 skill/inspector-widget-a11y/  the a11y debugging Skill (SKILL.md, tools.md, rules.md)
-build-out/                    generated artifacts (gitignored): libviewspector.so, bootstrap.dex, payload.jar
+build-out/                    generated artifacts (gitignored): libviewspector.so, bootstrap.dex, payload.jar, BUILD_ID
 ```
 
 ---
@@ -83,8 +83,14 @@ build-out/                    generated artifacts (gitignored): libviewspector.s
 
 **Build the on-device artifacts** (one command):
 ```bash
-./scripts/build.sh        # -> build-out/{libviewspector.so, bootstrap.dex, payload.jar}
+./scripts/build.sh        # -> build-out/{libviewspector.so, bootstrap.dex, payload.jar, BUILD_ID}
 ```
+`BUILD_ID` is the sha256 of `payload.jar`; the agent reports the same hash in Hello
+(`viewspector-0.1+<sha256>`), and the host replaces a running agent whose build differs, so a
+rebuild takes effect on the next attach without restarting the app. The exception: while
+another client (an MCP server, say) is connected to that agent, it is kept and the attach warns
+instead (`--force` / `force=true` replaces it anyway), so two checkouts with different builds
+don't evict each other's agent on every call.
 Pinned for reproducibility (in `settings.gradle.kts` / `agent/build.gradle.kts`): AGP 8.7.2,
 Kotlin 2.0.21, protobuf-plugin 0.9.4, NDK `27.1.12297006`, build-tools `36.1.0`, compileSdk/targetSdk 36.
 The real requirements are looser: **any JDK 17–23** to run Gradle (`build.sh` honours an in-range
@@ -104,11 +110,28 @@ python3 -m venv host/.venv && host/.venv/bin/pip install -r host/requirements.tx
 host/cli.py devices
 host/cli.py inspect      --serial emulator-5554 --package com.oberkfell.a11yprobe --json -
 host/cli.py a11y-lint    --serial emulator-5554 --package com.oberkfell.a11yprobe
-host/cli.py component-image --serial ... --node-key compose:569 --out comp.png
+host/cli.py component-image --serial ... --node-key compose:<acvId>:<semanticsId> --out comp.png
 ```
 Artifacts are read from `--build-out DIR`, else `$INSPECTOR_WIDGET_ARTIFACTS`, else the legacy
 `$VIEWSPECTOR_ARTIFACTS`, else the checkout's `build-out/`. A wheel install has no checkout to fall
 back on, so set the env var there (the MCP server honours it too; `--self-check` shows what it found).
+`--serial` (MCP: `serial`) defaults to `$ANDROID_SERIAL`, else the only attached device; with two
+emulators up, pass it or set `ANDROID_SERIAL`.
+
+**Session lifecycle.** Every subcommand except `detach` disconnects when it finishes and leaves the
+agent running (the next run is a warm connect, and a concurrent MCP session is untouched); `detach`
+sends SHUTDOWN, which stops the agent for every client (each one sees EOF at once), and never
+injects one first; it reports the agent stopped only once nothing listens on its socket (exit 1,
+MCP `agent_stopped: false`, otherwise). `--force` (MCP `attach(force=true)`) stops a running agent
+and injects afresh. The MCP server re-attaches a cached session that died (idle timeout, app
+restart, another client's SHUTDOWN) and retries a call once if the connection drops mid-way; a
+timeout is reported, not retried. Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`,
+default 30s, 4x for screenshots/Compose/a11y dumps; `0` disables it), so a frozen app returns an
+error, not a hang. An app in the background can be frozen by Android (the cached-apps freezer);
+attach then says so rather than queuing an injection, and asks for the app in the foreground.
+In `/proc/net/unix` only the listening entry means an agent is there: every client connection is
+listed under the same `@viewspector_<pid>` for as long as it is open (`adb.socket_exists` vs
+`adb.socket_connections`).
 
 **Run (MCP)**:
 ```bash
@@ -126,6 +149,34 @@ cd host && .venv/bin/python -m pytest tests -q -m "not device"
 cd host && .venv/bin/python -m pytest tests -q -m device   # live emulator smoke (needs adb)
 ```
 
+**A11yProbe test corpus** (`testapps/a11yprobe`, package `com.oberkfell.a11yprobe`). Every
+scenario pairs a GOOD variant with a BAD one; the BAD ones are deliberate defects, so never
+"fix" them. Install with `scripts/install-a11yprobe.sh <serial>` (add `--scenario <id>` to open
+one), then launch any scenario directly by intent extra:
+```bash
+# Compose GOOD/BAD pairs (ids in ScenarioRegistry.kt, e.g. icon_button, traversal; "all" stacks every one)
+adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.MainActivity --es scenario icon_button
+# Classic-View GOOD/BAD pairs (XML)
+adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.ViewScenarioActivity
+# Mixed View/Compose hierarchies and dialog windows (ids in InteropFragment.kt):
+#   S1 RecyclerView of ComposeView cells   S2 of View cells   S3 mixed + View-containing-ComposeView cells
+#   S4 LazyColumn with AndroidView rows    S5 ComposeView > AndroidView > RecyclerView > cells
+#   S6 RecyclerView grid                   D1 DialogFragment (Views + ComposeView)   D2 Compose Dialog
+adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S3
+```
+`host/tests/test_device_a11y_golden.py` (marked `device`) launches each scenario that way and
+asserts the golden answers: every BAD node flagged with its rule id, GOOD nodes not flagged,
+unique a11y node keys, one Compose window per ComposeView, and known reading orders (the
+Compose traversal screen, the classic-View ScrollView screen read item by item, only the
+dialog readable while D1/D2 are open). It runs only when `ANDROID_SERIAL` names the device:
+```bash
+cd host && ANDROID_SERIAL=<serial> .venv/bin/python -m pytest tests/test_device_a11y_golden.py -q -m device
+```
+The default build uses Compose BOM 2024.09.00 (ui 1.7.0); `scripts/install-a11yprobe.sh <serial>
+--compose-bom 2025.06.00` builds it on ui 1.8.2, which takes the agent's other Compose traversal
+code path (1.8 to 1.12). `tests/test_device_compose_order_under_talkback.py` turns TalkBack on for
+a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
+
 ---
 
 ## 5. Capabilities (CLI ↔ MCP parity)
@@ -140,8 +191,9 @@ cd host && .venv/bin/python -m pytest tests -q -m device   # live emulator smoke
 | Accessibility | `dump_accessibility`, `a11y_lint`, `a11y_overlay` | `a11y` (+`--lint`/`--overlay`), `a11y-lint` |
 | Integrated | `inspect`, `inspect_node`, `component_image` | `inspect`, `inspect-node`, `component-image` |
 
-The integrated subcommands route through `inspector_widget.attach() -> Session` (the same
-facade the MCP uses); the older subcommands still use a raw `Client` (works; not yet unified).
+Every subcommand routes through `inspector_widget.attach() -> Session` (the same facade the MCP
+uses); the older ones then drive `session.client` directly (works; their bodies are not yet shared
+with the MCP tools).
 
 ---
 
@@ -153,18 +205,42 @@ not exist, has the wrong signature, or the wrong unit. This has bitten the proje
 (`adb.display_density`, `a11y.lint_a11y`, `overlay.render_integrated_overlay`, a dpi-vs-ratio
 density, an ARGB red/blue swap). Defend against it on **every** change:
 
-1. **Symbol-parity test** — `host/tests/test_symbol_parity.py` AST-scans `cli.py` and
-   `mcp_server.py` and asserts every `adb.*` / `a11y.*` / `a11y_lint.*` / `overlay.*` / `png.*`
-   / `correlate.*` access resolves. Run it; if you add a cross-module call, it must pass.
-2. **Live-verify on the emulator**, not just pytest. Launch the test app
+1. **Symbol-parity test** — `host/tests/test_symbol_parity.py` AST-scans `cli.py`,
+   `mcp_server.py` and the device-path package modules. It asserts every `adb.*` / `a11y.*` /
+   `a11y_lint.*` / `overlay.*` / `png.*` / `correlate.*` / `inject.*` / `client.*` access resolves,
+   and it binds every resolvable call into `inspector_widget` against the real signature
+   (kwargs, arity, Session/Client/Injection methods, proto fields, `getattr` probes). Run it;
+   if you add a cross-module call, it must pass.
+2. **Offline end-to-end harness** — `host/tests/test_e2e_fake_agent.py` runs every CLI
+   subcommand and MCP tool against `host/tests/fakeagent.py`. Only the adb subprocess is faked
+   (`adb._run`), so the real inject/Session/Client/framing code talks VWSPCT01 over TCP to a
+   fake agent that encodes replies the way the Kotlin payload does. Use the conftest fixtures
+   (`fake_device`, `warm_agent`, `run_cli`, `mcp`) and assert on both the wire
+   (`fake_device.requests("dump_tree")`) and the output. Add an e2e test with every new
+   subcommand or tool; the coverage guards fail otherwise. Open ledger bugs are strict xfails
+   carrying the ledger id: fixing one flips it to XPASS, so remove the marker in the same change.
+   If you change the agent's wire behaviour, update the fake to match (it also models older
+   agents: `build_id=None`, `reply_to_shutdown=False`, `linger_after_stop=True`,
+   `close_clients_on_stop=False`, `hello_waits_for_other_clients=True`). Its a11y ids are the
+   A1-fixed agent's; `legacy_a11y_ids=True` reproduces what the agent on this branch sends.
+   Session-lifecycle behaviour (deadlines, poisoning, re-attach, detach, serials, the build
+   handshake) is covered in `host/tests/test_session_lifecycle.py`.
+3. **Live-verify on the emulator**, not just pytest. Launch the test app
    (`adb shell am start -n com.oberkfell.a11yprobe/.MainActivity`) and actually run the CLI /
-   MCP paths you touched. Offline-green ≠ works-on-device.
-3. **Keep CLI ↔ MCP ↔ Session at parity.** A capability reachable one way but not the other is
+   MCP paths you touched. Offline-green ≠ works-on-device: the fake encodes what we *believe*
+   the agent sends.
+4. **Keep CLI ↔ MCP ↔ Session at parity.** A capability reachable one way but not the other is
    a bug. If you add an MCP tool, add the CLI subcommand (and vice versa).
 
 **Conventions:**
 - `.java` files live under `agent/src/main/java/...`, **not** `src/main/kotlin` — Kotlin
   resolves them but `javac` never compiles them there → `NoClassDefFoundError` at runtime.
+- a11y model: the reading order and the lint judge the tree TalkBack gets, not the raw dump.
+  Views that are not important for accessibility (`important_for_accessibility` AUTO on a real
+  View, see CONTRACT.md §9) are skipped with their children hoisted (`ignored`), and windows
+  under a modal dialog are `covered_by` it. Node keys are `view:<id>` /
+  `compose:<acvId>:<semanticsId>`; a dump's `generation` changes when Compose re-mints ids, and
+  `correlate.record_a11y` / the per-app-process key registry let `inspect_node` re-resolve keys.
 - Units: a11y lint density is **device DPI (e.g. 420)**, not a px/dp ratio. `LintContext.density`
   is DPI; `adb.display_density()` returns DPI; `mcp_server._device_density()` returns DPI.
 - Overlays: node bounds are full-resolution; a screenshot captured at `scale < 1` is smaller.
@@ -189,5 +265,5 @@ the device-only regressions the offline suite and code review miss.
 - `README.md` — product overview + quickstart.
 - `host/README.md` — host driver internals and the full tool surface.
 - `host/PACKAGING.md` — wheel/console-script packaging.
-- `skill/inspector-widget-a11y/` — the accessibility debugging Skill (rules R1..R12).
+- `skill/inspector-widget-a11y/` — the accessibility debugging Skill (rules R1..R18).
 - `../docs/` — the original reverse-engineering spec this tool was built from.

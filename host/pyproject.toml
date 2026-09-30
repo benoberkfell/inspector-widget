@@ -77,6 +77,7 @@ packages = [
     "inspector_widget.capture",
     "inspector_widget.proto",
     "inspector_widget.skia_grpc",
+    "inspector_widget.talkback",
 ]
 py-modules = ["cli", "mcp_server"]
 

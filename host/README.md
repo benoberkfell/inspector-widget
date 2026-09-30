@@ -29,7 +29,10 @@ scripts/build.sh
 ```
 
 `scripts/build.sh` builds `libviewspector.so`, `bootstrap.dex` and
-`payload.jar` into `build-out/`.
+`payload.jar` into `build-out/`, plus `BUILD_ID` (the sha256 of `payload.jar`).
+A running agent reports the same hash in Hello (`agent_version` is
+`viewspector-0.1+<sha256>`); when it differs from the local `payload.jar`
+(you rebuilt), the host stops the old agent and injects the new one.
 
 The Python protobuf bindings (`host/inspector_widget/proto/view_inspection_pb2.py`,
 imported via `from .proto import view_inspection_pb2`) are checked in. After
@@ -78,6 +81,7 @@ Inspector Widget MCP server — self check
     libviewspector.so: OK
     bootstrap.dex: OK
     payload.jar: OK
+    build id: 0ba5e3f7633ef8fc14c17052bda5321d21b1f1b858210bfdbd443dd05aba3b24
 ```
 
 ---
@@ -105,6 +109,14 @@ Useful flags / env:
   Defaults to the checkout's `build-out/`; **required after a wheel install**,
   where the package lives in site-packages. The CLI's `--build-out DIR` is the
   per-command equivalent.
+- `ANDROID_SERIAL=SERIAL` — the device to use when a tool gets no `serial` (the
+  CLI: no `--serial`). Without it, the only attached device is used; with
+  several, the call fails and lists them.
+- `INSPECTOR_WIDGET_TIMEOUT=SECONDS` — per-request deadline for the agent
+  (default 30; screenshots, SKP capture, Compose/a11y dumps and `dump_tree`
+  with properties or a screenshot get 4x). A call that runs out returns an
+  error with a `hint` instead of hanging on a frozen app. `0` disables it (for
+  an app paused at a breakpoint). Legacy `VIEWSPECTOR_TIMEOUT` still works.
 
 Prerequisites at runtime:
 
@@ -176,25 +188,62 @@ claude mcp list          # shows "inspector-widget"
 
 All tools return JSON. String-table ids from the wire are resolved to text, so
 trees and properties are directly readable. Screenshots are written to temp PNG
-files and the **path** is returned (the image is not inlined).
+files and the **path** is returned (the image is not inlined). The PNGs live in
+one `inspector-widget-<pid>-*` directory under `$TMPDIR`, deleted when the
+server exits; copy a file elsewhere to keep it.
+
+`serial` is optional on every tool: it defaults to `$ANDROID_SERIAL`, else the
+only attached device. Arguments are checked against each tool's `inputSchema`
+before anything touches the device, the same way on every transport.
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
 | `list_devices` | — | `{devices:[{serial, api, abi, model, state}], count}` |
-| `list_processes` | `serial` | `{serial, processes:[{package, pid, running}], count}` — debuggable packages only; running apps first |
-| `attach` | `serial`, `package` | `{attached, api_level, abi, agent_version, window_count, session}` — injects if needed (idempotent); app must be running |
+| `list_processes` | `serial?` | `{serial, processes:[{package, pid, running}], count}` — debuggable packages only; running apps first |
+| `attach` | `serial?`, `package`, `force=false` | `{attached, pid, warm, reused, api_level, abi, agent_version, build_id, window_count, root_ids, session, note?}` — injects if needed (idempotent); app must be running. `warm`: the agent was already running; `reused`: this server's cached session was reused; `note` when that session runs an older build. `force=true` stops any running agent and injects a fresh one |
 | `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0` | `{roots:[ViewNode…], root_count, properties?, screenshot?}` — auto-attaches |
 | `get_properties` | `serial`, `package`, `view_id`, `include_resolution_stack=false` | `{view_id, group:{view_id, properties:[{name,type,value,is_layout?,source?,resolution_stack?}]}}` |
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
 | `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
 | `compose_overlay` | `serial`, `package`, `scale=1.0`, `all_boxes=false` | `{path, boxes, …}` — screenshot with every on-screen Compose element boxed (text/role + bounds) + a flat on-screen text list |
-| `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` |
-| `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]` | `{summary, findings:[{rule, severity, node, bounds, bounds_dp, message, evidence}], density, font_scale, …}` — the detect/verify engine; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
-| `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — screenshot with every a11y node boxed + speakable label + reading-order number, colored by severity |
-| `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation; can render the integrated overlay |
-| `inspect_node` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, view?, compose?, a11y?, component_image{path}, lint[]}` — `compose` carries source `file:line` + modifiers, `view` typed properties, `lint` the element-focused findings |
-| `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source}` — cropped PNG of one element (`source`: `skp` \| `bitmap_crop`) |
-| `detach` | `serial`, `package` | `{detached}` — shuts down the agent session, drops the cache |
+| `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` and a `generation`; nodes TalkBack never sees carry `ignored`, windows under a modal dialog `covered_by` |
+| `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]`, `include_rendering_info=true` | `{summary, findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window, collection, message, evidence}], diagnostics, stats, density, font_scale, generation, …}` — the detect/verify engine (R1..R18) over the unified a11y tree (Views + Compose), judging what TalkBack reads; `rules` takes ids, `R#` aliases or ATF names; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
+| `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — every window composited (a dialog over its activity), every a11y node boxed + what TalkBack says + reading-order number; red error, amber warn, blue info, green clean, dashed = a finding with no a11y node, drawn at its bounds |
+| `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation and `summary.generation`; can render the integrated overlay (all windows; green exact, amber overlap, grey none) |
+| `inspect_node` | `serial`, `package`, one of `node_key` (`view:<id>` \| `compose:<acvId>:<semanticsId>` \| `composeview:<acvId>`) \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, generation, where, context, view?, compose?, a11y?, list_item?, a11y_only?, a11y_parent?, resolved_from?, key_note?, component_image{path}, lint[], lint_summary, lint_diagnostics}` — `compose` carries the semantics attrs (`source` is null: `file:line` needs `dump_compose` with the slot table), `view` typed properties, `lint` exactly the `a11y_lint` findings for the element and the nodes merged into it |
+| `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source, window?}` — cropped PNG of one element, cut from its own window (`source`: `skp` \| `bitmap_crop`) |
+| `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped, note?}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach, or one in the app's new process after a restart; never injects one to stop it); `agent_stopped` is true only once nothing listens on the agent's socket; `shutdown=false` only drops this server's cached connection |
+
+### Node keys and reading order
+
+- Node keys: `view:<uniqueDrawingId>` for Views, `compose:<acvId>:<semanticsId>` for
+  Compose nodes (every AndroidComposeView — each RecyclerView cell, each ComposeView
+  nested in an AndroidView — is its own id space), `composeview:<acvId>` for a Compose
+  window's root, `virtual:<hostId>:<virtualId>` for other providers' virtual nodes.
+  `inspect` / `dump_accessibility` / `a11y_lint` hand them out; `inspect_node` /
+  `component_image` take them, and every one of them resolves (the a11y nodes Compose
+  serves for children merged into a focusable parent, and its synthetic role /
+  description nodes, are grafted as `a11y_only` with their `a11y_parent`). A bare
+  `compose:<semanticsId>` (or `semantics_id`) is accepted only when one ComposeView has
+  that id. Compose re-mints ids on recomposition: the `generation` of each dump (the same
+  value from `dump_accessibility`, `a11y_lint` and `inspect` for one UI state) changes
+  when that happens, and a key any of them handed out earlier is re-resolved by
+  ComposeView, test tag, label, list row and bounds (the dossier then carries
+  `resolved_from`; a weak or tied match is an error, never a guess). A key that still
+  exists but now names other content (a recycled cell) gets a `key_note`. The key
+  registry lives per app process in `$INSPECTOR_WIDGET_KEY_CACHE` (default
+  `<tmp>/inspector-widget-keys`, `0` = memory only), so separate CLI runs share it.
+- `dump_accessibility` gives every node a `node_key` and returns `focus_order` as
+  `[{order, key, id, speak}]`: one entry per TalkBack focus stop with what TalkBack
+  announces there (`"Delete, button"`, `"Unlabeled, checkbox, not checked"`), built
+  from the accessibility child order plus `traversal_before`/`traversal_after` applied
+  across the whole tree. It walks the tree TalkBack gets: a View that is not important
+  for accessibility is replaced by its children (`ignored: not_important`), a
+  noHideDescendants subtree is dropped (`ignored: hidden`), and the windows under the
+  topmost modal window (no `FLAG_NOT_TOUCH_MODAL` / `FLAG_NOT_FOCUSABLE`, from the
+  agent's `window type=… flags=…` token) are `covered_by` it and have no stops.
+  `reading_order_diagnostics` reports constraint cycles, targets missing from the dump,
+  linkage ids in the wrong key space and covered windows.
 
 ### Node shape (`dump_tree`)
 
@@ -240,5 +289,32 @@ ANIMATOR, INTERPOLATOR, DIMENSION`. Decoding:
 7. `detach(serial, package)` when done.
 
 Sessions are cached per `(serial, package)`; repeated calls reuse the live
-agent. Errors are returned as `{"error": "..."}` text content with the call
-flagged as an error, so the agent can read and recover.
+agent. A cached session is checked before each use (the connection is still
+open and the app still has the same pid); a dead one (the agent idled out, the
+app restarted, another client sent SHUTDOWN) is dropped and re-attached, and a
+call whose connection drops mid-way is retried once on a fresh attach (a
+timeout is not retried: it would only wait again). Errors are returned as
+`{"error": "...", "hint"?: "..."}` text content with the call flagged as an
+error, so the agent can read and recover; `hint` is the next step for that
+error (launch the app, install a debug build, bring a frozen app to the
+foreground, raise the timeout, read the agent's logcat). When the server exits,
+including on SIGTERM, it disconnects its sessions, removes every adb forward it
+made and deletes its PNGs, and leaves the agents running, so the next start
+re-attaches warm.
+
+### Session lifecycle (CLI and Python API)
+
+`inspector_widget.attach(serial=None, package, build_out=None,
+force_reinject=False)` returns a `Session`. `session.disconnect()` (also
+`close()` and leaving a `with` block) drops the connection and keeps the agent
+running; `session.shutdown()` stops the agent for every client;
+`session.is_alive()` says whether the session is still usable;
+`session.info()` has the pid, warm/cold and the agent's Hello. Every CLI
+subcommand disconnects when it finishes, so a CLI run never disturbs an MCP
+session on the same app; only `detach` stops the agent, and it never injects
+one just to stop it (it exits 1 if the agent didn't stop). `--force` (every
+injecting subcommand) and MCP `attach(force=true)` stop a running agent and
+inject a fresh one. An agent running another build than the local payload.jar
+is replaced on attach, unless other clients are connected to it: then it is
+kept, the CLI prints a warning and MCP `attach` a `note`, and `--force` /
+`force=true` replaces it.

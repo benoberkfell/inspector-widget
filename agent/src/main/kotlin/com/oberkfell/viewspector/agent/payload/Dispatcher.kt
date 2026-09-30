@@ -13,7 +13,7 @@
  *                     PropertyGroup per visited view and/or a screenshot
  *   GET_PROPERTIES -> find view by id (walk roots) + Properties.forView
  *   SCREENSHOT     -> Capture.screenshot
- *   SHUTDOWN       -> ShutdownResponse, then signal the server to stop
+ *   SHUTDOWN       -> ShutdownResponse; the Server stops after writing it
  *
  * The reference SessionHandler (ui-inspector SessionHandler.kt:96-160) is the
  * model for the "every command must produce exactly one response, exceptions
@@ -29,18 +29,20 @@ import com.oberkfell.viewspector.proto.ViewInspection
 
 /**
  * Handles one [ViewInspection.Request] at a time and returns its
- * [ViewInspection.Response]. Stateless aside from the [onShutdown] callback.
+ * [ViewInspection.Response]. Stateless.
  *
- * @param onShutdown invoked AFTER the ShutdownResponse has been assembled (the
- *   caller writes the response, then the server tears down). Lets the
- *   [Server] stop its accept loop in response to a SHUTDOWN command.
+ * SHUTDOWN only builds the reply: the [Server] writes it and then stops.
+ * (Stopping here, before the write, closed the requester's socket first, so
+ * the host never saw the ShutdownResponse.)
  */
-class Dispatcher(private val onShutdown: () -> Unit) {
+class Dispatcher {
 
     private companion object {
         const val TAG = "ViewSpector"
 
-        // CONTRACT.md §3 / module spec: HELLO advertises this agent version.
+        // CONTRACT.md §3 / module spec: HELLO advertises this agent version,
+        // plus "+<build id>" (Payload.buildId: sha256 of the loaded payload.jar)
+        // so the host can tell a stale agent from the build it would inject.
         const val AGENT_VERSION = "viewspector-0.1"
 
         // Default screenshot scale when a DumpTreeCommand leaves it unset (0f).
@@ -84,7 +86,7 @@ class Dispatcher(private val onShutdown: () -> Unit) {
     private fun handleHello(id: Int): ViewInspection.Response {
         val hello =
             ViewInspection.HelloResponse.newBuilder()
-                .setAgentVersion(AGENT_VERSION)
+                .setAgentVersion("$AGENT_VERSION+${Payload.buildId}")
                 .setApiLevel(Build.VERSION.SDK_INT)
                 .setAbi(primaryAbi())
                 .build()
@@ -355,18 +357,9 @@ class Dispatcher(private val onShutdown: () -> Unit) {
 
     // ---------------------------------------------------------------- SHUTDOWN
 
-    private fun handleShutdown(id: Int): ViewInspection.Response {
-        val response =
-            ok(id).setShutdown(ViewInspection.ShutdownResponse.getDefaultInstance()).build()
-        // Signal the server to stop AFTER the response has been built. The
-        // server writes this response before closing the session/socket.
-        try {
-            onShutdown()
-        } catch (t: Throwable) {
-            Log.w(TAG, "onShutdown callback threw", t)
-        }
-        return response
-    }
+    private fun handleShutdown(id: Int): ViewInspection.Response =
+        // Server.serveConnection writes this reply, then stops the server.
+        ok(id).setShutdown(ViewInspection.ShutdownResponse.getDefaultInstance()).build()
 
     // ----------------------------------------------------------------- helpers
 

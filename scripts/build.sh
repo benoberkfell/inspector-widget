@@ -4,6 +4,8 @@
 #   libviewspector.so   (JVMTI native agent, arm64-v8a)
 #   bootstrap.dex       (the FindClass target; d8'd from bootstrap.jar)
 #   payload.jar         (dex-in-jar: Kotlin payload + generated proto, for DexClassLoader)
+#   BUILD_ID            (sha256 of payload.jar; a running agent reports the same
+#                        value in Hello, so the host can spot and replace a stale one)
 #
 # Pipeline (CONTRACT §2/§7):
 #   1. ./gradlew :agent:assembleDebug :bootstrap:jar
@@ -114,6 +116,18 @@ rm -f "$PAYLOAD_JAR"
 ) || die "Failed to build payload.jar."
 ok "-> $PAYLOAD_JAR ($(unzip -Z1 "$PAYLOAD_JAR" | tr '\n' ' '))"
 
+# BUILD_ID: the payload hashes the jar it was loaded from and reports it in
+# Hello; the host compares that with payload.jar (this file is for people and
+# scripts: `cat build-out/BUILD_ID`).
+if command -v sha256sum >/dev/null 2>&1; then
+    BUILD_ID="$(sha256sum "$PAYLOAD_JAR" | cut -d' ' -f1)"
+else
+    BUILD_ID="$(shasum -a 256 "$PAYLOAD_JAR" | cut -d' ' -f1)"
+fi
+[ -n "$BUILD_ID" ] || die "could not hash payload.jar for BUILD_ID."
+printf '%s\n' "$BUILD_ID" > "$OUT_DIR/BUILD_ID"
+ok "-> $OUT_DIR/BUILD_ID ($BUILD_ID)"
+
 # (3) bootstrap.dex: d8 the bootstrap jar (Java 11 bytecode) into a single dex.
 log "Dexing bootstrap.jar -> bootstrap.dex ..."
 D8_OUT="$WORK_DIR/bootstrap-dex"
@@ -130,6 +144,6 @@ ok "-> $OUT_DIR/bootstrap.dex"
 
 # ------------------------------------------------------------------- summary
 log "Artifacts in $OUT_DIR:"
-ls -l "$OUT_DIR/libviewspector.so" "$OUT_DIR/bootstrap.dex" "$OUT_DIR/payload.jar" \
+ls -l "$OUT_DIR/libviewspector.so" "$OUT_DIR/bootstrap.dex" "$OUT_DIR/payload.jar" "$OUT_DIR/BUILD_ID" \
     | sed 's/^/    /'
 ok "Inspector Widget build complete."

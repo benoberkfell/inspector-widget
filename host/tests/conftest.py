@@ -210,3 +210,115 @@ def device_present(serial: str = "emulator-5554") -> bool:
         if len(parts) >= 2 and parts[0] == serial and parts[1] == "device":
             return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Offline end-to-end harness (tests/fakeagent.py).
+#
+# ``fake_device`` routes every adb subprocess to an in-process FakeDevice whose
+# agents speak the real VWSPCT01 protocol over real TCP, so the REAL
+# inject_and_connect / _try_warm_connect / Injection / Session / Client /
+# correlate / overlay code runs. Everything is monkeypatch-scoped: the adb
+# patch, the build-out default, tempfile's directory (tool PNGs land in the
+# test's tmp dir), and mcp_server's module-level session + density caches.
+# --------------------------------------------------------------------------- #
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+FAKE_SERIAL = "emulator-5554"
+FAKE_PACKAGE = "com.oberkfell.a11yprobe"
+
+
+@pytest.fixture
+def fake_device(monkeypatch, tmp_path):
+    """A FakeDevice with com.oberkfell.a11yprobe running (pid 4242), no agent yet."""
+    import tempfile
+
+    import fakeagent
+    import mcp_server
+
+    dev = fakeagent.default_device()
+    dev.fake_adb = fakeagent.install(monkeypatch, dev, build_out=str(tmp_path / "build-out"))
+    dev.tmpdir = tmp_path / "tmp"
+    dev.tmpdir.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(dev.tmpdir))
+    cache = mcp_server.SessionCache()
+    monkeypatch.setattr(mcp_server, "SESSIONS", cache)
+    # Forwards this process "made" (adb.remove_own_forwards cleans them up at
+    # exit) belong to this test's fake device only.
+    from inspector_widget import adb
+    monkeypatch.setattr(adb, "_OWN_FORWARDS", {})
+    monkeypatch.setattr(mcp_server._a11y_device_metrics, "_cache", {}, raising=False)
+    try:
+        yield dev
+    finally:
+        for session in cache.all():  # close host sockets without sending SHUTDOWN
+            injection = getattr(session, "injection", None)
+            try:
+                if injection is not None:
+                    injection.close()
+            except Exception:
+                pass
+        dev.close()
+
+
+@pytest.fixture
+def warm_agent(fake_device):
+    """An agent already injected into the probe app (as if by an earlier run)."""
+    return fake_device.start_agent(FAKE_PACKAGE)
+
+
+@pytest.fixture
+def fast_sleep(monkeypatch):
+    """Make inject's socket-wait / connect-retry backoff instant."""
+    import time
+    import types
+
+    from inspector_widget import inject
+
+    proxy = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("_")})
+    proxy.sleep = lambda _s: None
+    monkeypatch.setattr(inject, "time", proxy)
+
+
+class CliRun:
+    def __init__(self, rc, out, err):
+        self.rc, self.out, self.err = rc, out, err
+
+    def json(self):
+        import json
+        return json.loads(self.out)
+
+    def __repr__(self):
+        return f"CliRun(rc={self.rc}, out={self.out[:300]!r}, err={self.err[-300:]!r})"
+
+
+@pytest.fixture
+def run_cli(capsys):
+    """Run ``cli.main(argv)`` in-process; returns CliRun(rc, out, err)."""
+    import cli
+
+    def _run(*argv):
+        capsys.readouterr()
+        rc = cli.main([str(a) for a in argv])
+        cap = capsys.readouterr()
+        return CliRun(rc, cap.out, cap.err)
+
+    return _run
+
+
+@pytest.fixture
+def mcp(fake_device):
+    """Call an MCP tool through mcp_server._run_tool (serial/package default in)."""
+    import mcp_server
+
+    def _call(tool, **args):
+        if tool not in ("list_devices", "list_processes"):
+            args.setdefault("serial", FAKE_SERIAL)
+            args.setdefault("package", FAKE_PACKAGE)
+        elif tool == "list_processes":
+            args.setdefault("serial", FAKE_SERIAL)
+        return mcp_server._run_tool(tool, args)
+
+    return _call
