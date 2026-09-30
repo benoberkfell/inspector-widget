@@ -2,37 +2,52 @@
  * ViewSpector — payload :: accessibility (AccessibilityNodeInfo) tree extraction.
  *
  * In-process extraction of the unified accessibility tree — classic Views AND
- * Compose virtual semantics nodes — exactly as Assistive Technology (TalkBack /
- * UiAutomator) observe it. See /tmp/a11y_design/extraction.md for the verified
- * API facts and rationale. The whole dump runs on the MAIN THREAD (caller hops
- * via MainThread.run), since every getter touches live View / ANI state.
+ * virtual nodes served by an AccessibilityNodeProvider (Compose semantics, WebView,
+ * ExploreByTouchHelper) — as Assistive Technology (TalkBack / UiAutomator) observes
+ * it. The whole dump runs on the MAIN THREAD (the caller hops via MainThread.run),
+ * since every getter touches live View / ANI state.
  *
- * Strategy (design §1):
- *   1. Per root, call root.setQueryFromAppProcessEnabled(root, true) — the public
- *      API-34+ switch that makes AccessibilityNodeInfo.getChild()/getParent()
- *      resolve against the live in-process hierarchy (no AccessibilityService
- *      connection needed). Reset to false in a finally (design §8).
- *   2. node = root.createAccessibilityNodeInfo() — the node AS COMPOSED by the
- *      View's AccessibilityDelegate / provider, i.e. what AT actually sees.
- *   3. Recurse via node.getChildCount() / node.getChild(i). Because getChild()
- *      dispatches through the AccessibilityNodeProvider for virtual nodes, this
- *      single recursion TRANSPARENTLY covers Compose semantics children — no
- *      separate Compose branch is needed for the a11y tree (design §1).
+ * WALK
+ *   Query mode (API 34+, preferred):
+ *     1. node = root.createAccessibilityNodeInfo() — the node AS COMPOSED by the
+ *        View's AccessibilityDelegate / provider, i.e. what AT sees.
+ *     2. node.setQueryFromAppProcessEnabled(root, true) — the public API-34 switch
+ *        that gives the node a direct in-process connection, so getChild() resolves
+ *        through the window's AccessibilityInteractionController exactly as for AT.
+ *        Reset to false in a finally.
+ *     3. Recurse via getChildCount() / getChild(i); getChild dispatches through the
+ *        provider for virtual children, so one recursion covers Views and Compose.
+ *   Local mode (API < 34, or when query mode is unavailable / throws):
+ *     The same recursion, but each packed child id (hidden getChildId(i)) is resolved
+ *     locally the way AccessibilityInteractionController does it: View id -> View,
+ *     then View.createAccessibilityNodeInfo() for a real View or
+ *     provider.createAccessibilityNodeInfo(virtualId) for a virtual one. Compose and
+ *     other provider content therefore survive the fallback. If getChildId is not
+ *     reachable, real ViewGroups fall back to the public addChildrenForAccessibility.
+ *     The diagnostics string names the mode used for every root.
  *
- * Fallback (design §4): when setQueryFromAppProcessEnabled is unavailable or
- * throws (older OEM build / API < 34), walk the View hierarchy structurally and
- * switch to the provider path (provider.createAccessibilityNodeInfo) for
- * AndroidComposeView / WebView, whose locally-built nodes carry child linkage
- * even without query-from-app-process.
+ * IDENTITY (the host's ID contract; see A11yIds for the bit layout)
+ *   host_view_id = uniqueDrawingId of the node's OWN backing View: the real View for
+ *                  a View node, the provider host (e.g. that AndroidComposeView) for a
+ *                  virtual node. 0 = could not be resolved (counted in diagnostics).
+ *   virtual_id   = -1 for a real View, else the virtual descendant id (HIGH 32 bits of
+ *                  the packed node id; for Compose it is the SemanticsNode id).
+ *   is_virtual   = virtual_id != -1.
+ *   provider_class = on a provider host only: the host View's class name
+ *                  (e.g. androidx.compose.ui.platform.AndroidComposeView, android.webkit.WebView).
+ *   Each node's identity is decoded from its own packed source id (getSourceNodeId):
+ *   LOW 32 bits = View.getAccessibilityViewId(), mapped to the View through an index
+ *   of every View under the roots built before the walk; HIGH 32 bits = virtual id.
+ *   traversal_before / traversal_after / label_for / labeled_by / labeled_by_list are
+ *   decoded the same way and emitted as HOST NODE KEYS,
+ *   (host_view_id << 32) ^ (virtual_id & 0xFFFFFFFF), 0 = none.
  *
- * Recycling (design §8, §0 "Recycling caveat"): AccessibilityNodeInfo.recycle()
- * is a deprecated no-op since API 33 and double-recycle is a latent crash. On
- * API 34+ we do NOT call recycle() at all — references are dropped at the end of
- * the single MainThread.run block and GC reclaims them.
+ * Recycling: AccessibilityNodeInfo.recycle() is a deprecated no-op since API 33 and a
+ * double recycle is a latent crash, so nothing here recycles; references are dropped
+ * at the end of the MainThread.run block.
  *
- * Bounds: getBoundsInScreen() yields ABSOLUTE screen px, matching
- * ViewNode.bounds.layout, so the host can correlate a11y node ↔ view node ↔
- * screenshot pixel region directly (design §2 "Bounds").
+ * Bounds: getBoundsInScreen() — absolute screen px, the same space as ViewNode.bounds
+ * and ComposeNode.bounds.
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -43,42 +58,103 @@ import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.accessibility.AccessibilityNodeProvider
 import com.oberkfell.viewspector.proto.ViewInspection
+import java.lang.reflect.Field
 import java.lang.reflect.Method
 
 object AccessibilityInspector {
 
     private const val TAG = "ViewSpector"
 
-    // Loop / fan-out guards (design §1 "Loop / fan-out guards").
+    // Loop / fan-out guards.
     private const val MAX_DEPTH = 250
     private const val MAX_NODES = 5000
+    private const val VIEW_MAX_DEPTH = 400
 
-    // AccessibilityNodeProvider.HOST_VIEW_ID (== -1): the virtualId of a real
-    // (non-virtual) host node. Read reflectively to tolerate odd stub shapes.
-    private const val HOST_VIEW_ID = -1
+    // How many times one dump may rebuild the accessibility-id -> View index after a miss
+    // (Views attached mid-walk, e.g. a RecyclerView laying out a new cell).
+    private const val MAX_INDEX_BUILDS = 3
 
-    // Cap on emitted extras per node, and skip very large stringified values
-    // (Parcelables etc.) — design §2 "Extras".
+    private const val HOST_VIEW_ID = A11yIds.HOST_VIEW_ID
+
+    // Cap on emitted extras per node, and skip very large stringified values (Parcelables).
     private const val MAX_EXTRAS = 64
     private const val MAX_EXTRA_VALUE_LEN = 512
 
-    // Well-known extras key TalkBack reads for the spoken role (design §2).
+    // Well-known extras key TalkBack reads for the spoken role.
     private const val ROLE_DESC_KEY = "AccessibilityNodeInfo.roleDescription"
 
-    // Compose / framework traversal-group flag, read by literal key and tolerated
-    // when absent (design §2 "Traversal ordering").
-    private const val TRAVERSAL_GROUP_KEY = "android.view.accessibility.extra.IS_TRAVERSAL_GROUP"
+    // ------------------------------------------------------------ reflective handles
+    // Resolved once (the object initializes on first use, on the main thread). Every
+    // failure is logged once here and degrades the dependent feature, never the dump.
 
-    // @hide ViewGroup.getChildrenForAccessibility(): the a11y-ordered,
-    // importantForAccessibility-filtered child Views used by the fallback path
-    // (design §4). Resolved once; null when unavailable.
-    private val getChildrenForA11y: Method? = try {
-        ViewGroup::class.java.getDeclaredMethod("getChildrenForAccessibility")
-            .also { it.isAccessible = true }
-    } catch (t: Throwable) {
+    /** @hide View.getAccessibilityViewId(): the LOW half of a packed node id (@UnsupportedAppUsage). */
+    private val getAccessibilityViewIdM: Method? =
+        method(View::class.java, "getAccessibilityViewId")
+
+    /** @hide AccessibilityNodeInfo.getSourceNodeId(): the node's own packed id (@UnsupportedAppUsage @TestApi). */
+    private val getSourceNodeIdM: Method? =
+        method(AccessibilityNodeInfo::class.java, "getSourceNodeId")
+
+    /** @hide AccessibilityNodeInfo.getChildId(int): the packed id of child i. */
+    private val getChildIdM: Method? =
+        method(AccessibilityNodeInfo::class.java, "getChildId", Int::class.javaPrimitiveType!!)
+
+    // The packed linkage ids, read straight from the node. The public getters
+    // (getTraversalBefore() ...) resolve the target through the connection, which
+    // costs a query and fails outright on an unsealed local-mode node; they are only
+    // used when a field is unreachable.
+    private val traversalBeforeF: Field? = field(AccessibilityNodeInfo::class.java, "mTraversalBefore")
+    private val traversalAfterF: Field? = field(AccessibilityNodeInfo::class.java, "mTraversalAfter")
+    private val labelForF: Field? = field(AccessibilityNodeInfo::class.java, "mLabelForId")
+    private val labeledByF: Field? = field(AccessibilityNodeInfo::class.java, "mLabeledById")
+
+    /** android.util.LongArray mLabeledByIds (API 35+, the multiple-labeledBy list); absent before. */
+    private val labeledByIdsF: Field? =
+        field(AccessibilityNodeInfo::class.java, "mLabeledByIds", logMissing = Build.VERSION.SDK_INT >= 35)
+
+    /**
+     * AccessibilityNodeInfo has no traversal-group accessor through API 37 (checked against the
+     * android-36.1 and android-37.0 platform jars). Probe for one so a future platform is picked
+     * up; until then is_traversal_group comes from the Compose semantics (IsTraversalGroup).
+     */
+    private val isTraversalGroupM: Method? = try {
+        AccessibilityNodeInfo::class.java.getMethod("isTraversalGroup")
+    } catch (_: Throwable) {
         null
+    }
+
+    /** @hide android.view.accessibility.AccessibilityNodeIdManager, the framework's own id -> View map. */
+    private val idManager: Pair<Any, Method>? = try {
+        val cls = Class.forName("android.view.accessibility.AccessibilityNodeIdManager")
+        val inst = cls.getMethod("getInstance").invoke(null)
+        val find = cls.getMethod("findView", Int::class.javaPrimitiveType)
+        if (inst != null) inst to find else null
+    } catch (t: Throwable) {
+        Log.i(TAG, "AccessibilityNodeIdManager not reachable; relying on the local View index", t)
+        null
+    }
+
+    // ------------------------------------------------------------ per-dump state
+
+    /** The resolved identity of one node: its backing View (null = unresolved) and virtual id. */
+    private class Ident(val view: View?, val virtualId: Int)
+
+    private class Ctx(
+        val roots: List<View>,
+        val strings: StringTable,
+        val includeExtras: Boolean,
+        val includeRenderingInfo: Boolean,
+    ) {
+        var count = 0
+        val byA11yId = HashMap<Int, View>()
+        var indexBuilds = 0
+        var unresolvedNodes = 0
+        var unresolvedLinks = 0
+        var nullChildren = 0
+        var unenumerable = 0
+        var reflectFailures = 0
+        val composeIndex = HashMap<View, ComposeInspector.SemanticsIndex?>()
     }
 
     /**
@@ -88,9 +164,9 @@ object AccessibilityInspector {
      * @param rootViews z-sorted window roots (RootsDetector.rootViews()).
      * @param strings shared interner; every CharSequence is .toString()-ed and
      *   interned (id 0 = absent).
-     * @param includeExtras iterate getExtras() per node (design default true).
+     * @param includeExtras iterate getExtras() per node.
      * @param includeRenderingInfo refreshWithExtraData + getExtraRenderingInfo per
-     *   node (costly extra round-trip; design default false).
+     *   node (query mode only; costly extra round-trip).
      */
     fun dump(
         rootViews: List<View>,
@@ -98,77 +174,78 @@ object AccessibilityInspector {
         includeExtras: Boolean,
         includeRenderingInfo: Boolean,
     ): Pair<List<ViewInspection.DumpA11yResponse.Window>, String> {
-        val diag = StringBuilder("roots=${rootViews.size}; api=${Build.VERSION.SDK_INT}")
+        val ctx = Ctx(rootViews, strings, includeExtras, includeRenderingInfo)
+        val diag = StringBuilder("roots=${rootViews.size}; api=${Build.VERSION.SDK_INT}; ids=host-key")
         val windows = ArrayList<ViewInspection.DumpA11yResponse.Window>()
-        // Shared emitted-node counter across all roots (belt-and-suspenders cap).
-        val count = intArrayOf(0)
+
+        buildIndex(ctx)
+        if (getAccessibilityViewIdM == null) {
+            diag.append("; WARN View.getAccessibilityViewId unreachable: host_view_id cannot be resolved")
+        }
+        if (getSourceNodeIdM == null) {
+            diag.append("; WARN AccessibilityNodeInfo.getSourceNodeId unreachable: identity from child ids only")
+        }
 
         for (root in rootViews) {
-            // The host node on which app-process query mode was enabled; reset on
-            // it (not the View) in finally (design §8). setQueryFromAppProcessEnabled
-            // is an instance method on AccessibilityNodeInfo(View source, boolean).
+            // The host node on which app-process query mode was enabled; reset on it in finally.
             var enabledNode: AccessibilityNodeInfo? = null
+            val countBefore = ctx.count
             try {
-                val node: ViewInspection.A11yNode? =
-                    if (Build.VERSION.SDK_INT >= 34) {
-                        try {
-                            // Build the AT-visible host node, then flip it into
-                            // app-process query mode so getChild()/getParent()
-                            // resolve in-process (no AccessibilityService).
-                            val hostNode = root.createAccessibilityNodeInfo()
-                            if (hostNode != null) {
-                                hostNode.setQueryFromAppProcessEnabled(root, true)
-                                enabledNode = hostNode
-                                diag.append("; root#${idOf(root)} query-from-app-process")
-                                walk(
-                                    hostNode, root, HOST_VIEW_ID, strings, 0, count,
-                                    includeExtras, includeRenderingInfo,
-                                )
-                            } else {
-                                diag.append("; root#${idOf(root)} null host node, fallback")
-                                walkFallback(root, strings, 0, count, includeExtras)
-                            }
-                        } catch (t: Throwable) {
-                            // Older OEM build / disabled path: fall back to the
-                            // structural View walk (design §4).
-                            Log.w(TAG, "query-from-app-process failed; falling back", t)
-                            diag.append(
-                                "; root#${idOf(root)} query-from-app-process failed " +
-                                    "(${t.javaClass.simpleName}), fallback",
-                            )
-                            // Reset before the fallback re-reads the hierarchy.
-                            enabledNode?.let {
-                                try {
-                                    it.setQueryFromAppProcessEnabled(root, false)
-                                } catch (_: Throwable) {
-                                }
-                            }
-                            enabledNode = null
-                            walkFallback(root, strings, 0, count, includeExtras)
+                var node: ViewInspection.A11yNode? = null
+                if (Build.VERSION.SDK_INT >= 34) {
+                    try {
+                        val hostNode = root.createAccessibilityNodeInfo()
+                        if (hostNode != null) {
+                            hostNode.setQueryFromAppProcessEnabled(root, true)
+                            enabledNode = hostNode
+                            node = walk(hostNode, identify(hostNode, null, ctx), ctx, 0, local = false)
+                            diag.append("; root#${idOf(root)} query-from-app-process")
+                        } else {
+                            diag.append("; root#${idOf(root)} null host node")
                         }
-                    } else {
-                        diag.append("; root#${idOf(root)} pre-34 fallback")
-                        walkFallback(root, strings, 0, count, includeExtras)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "query-from-app-process failed; falling back to the local walk", t)
+                        diag.append(
+                            "; root#${idOf(root)} query-from-app-process failed (${t.javaClass.simpleName})",
+                        )
+                        resetQueryMode(enabledNode, root)
+                        enabledNode = null
+                        ctx.count = countBefore
+                        node = null
                     }
-
-                if (node != null) {
-                    windows.add(window(root, node))
                 }
+                if (node == null) {
+                    node = walkLocalRoot(root, ctx)
+                    diag.append(
+                        "; root#${idOf(root)} local-fallback" +
+                            if (Build.VERSION.SDK_INT < 34) " (api<34)" else "",
+                    )
+                }
+                if (node != null) windows.add(window(root, node))
             } catch (t: Throwable) {
                 Log.w(TAG, "a11y dump failed for root", t)
                 diag.append("; root#${idOf(root)} error ${t.javaClass.simpleName}")
             } finally {
-                enabledNode?.let {
-                    try {
-                        it.setQueryFromAppProcessEnabled(root, false)
-                    } catch (_: Throwable) {
-                    }
-                }
+                resetQueryMode(enabledNode, root)
             }
         }
 
-        diag.append("; nodes=${count[0]}")
+        diag.append("; nodes=${ctx.count}; views-indexed=${ctx.byA11yId.size}")
+        if (ctx.unresolvedNodes > 0) diag.append("; unresolved-nodes=${ctx.unresolvedNodes}")
+        if (ctx.unresolvedLinks > 0) diag.append("; unresolved-links=${ctx.unresolvedLinks}")
+        if (ctx.nullChildren > 0) diag.append("; null-children=${ctx.nullChildren}")
+        if (ctx.unenumerable > 0) diag.append("; provider-children-unreachable=${ctx.unenumerable}")
+        if (ctx.reflectFailures > 0) diag.append("; reflect-failures=${ctx.reflectFailures}")
         return windows to diag.toString()
+    }
+
+    private fun resetQueryMode(node: AccessibilityNodeInfo?, root: View) {
+        if (node == null) return
+        try {
+            node.setQueryFromAppProcessEnabled(root, false)
+        } catch (t: Throwable) {
+            Log.w(TAG, "setQueryFromAppProcessEnabled(false) failed", t)
+        }
     }
 
     private fun window(root: View, node: ViewInspection.A11yNode): ViewInspection.DumpA11yResponse.Window =
@@ -177,75 +254,277 @@ object AccessibilityInspector {
             .setRoot(node)
             .build()
 
-    // ------------------------------------------------------------ unified walk
+    // ------------------------------------------------------------ identity
+
+    /** Index every View under the roots by its accessibility view id (process-unique). */
+    private fun buildIndex(ctx: Ctx) {
+        ctx.indexBuilds++
+        val m = getAccessibilityViewIdM ?: return
+        ctx.byA11yId.clear()
+        for (root in ctx.roots) indexViews(root, m, ctx, 0)
+    }
+
+    private fun indexViews(view: View, m: Method, ctx: Ctx, depth: Int) {
+        if (depth > VIEW_MAX_DEPTH) return
+        try {
+            // getAccessibilityViewId() assigns an id on first use; attached Views already have
+            // one (View.onAttachedToWindow registers it with AccessibilityNodeIdManager).
+            (m.invoke(view) as? Int)?.let { ctx.byA11yId[it] = view }
+        } catch (t: Throwable) {
+            if (ctx.reflectFailures++ == 0) Log.w(TAG, "getAccessibilityViewId() failed", t)
+        }
+        if (view is ViewGroup) {
+            val n = try {
+                view.childCount
+            } catch (_: Throwable) {
+                0
+            }
+            for (i in 0 until n) {
+                val child = try {
+                    view.getChildAt(i)
+                } catch (_: Throwable) {
+                    null
+                } ?: continue
+                indexViews(child, m, ctx, depth + 1)
+            }
+        }
+    }
+
+    /** The View whose accessibility view id is [aid], or null. */
+    private fun viewFor(aid: Int, ctx: Ctx): View? {
+        if (aid == A11yIds.UNDEFINED_ITEM_ID || aid == A11yIds.ROOT_ITEM_ID) return null
+        ctx.byA11yId[aid]?.let { return it }
+        if (getAccessibilityViewIdM != null && ctx.indexBuilds < MAX_INDEX_BUILDS) {
+            buildIndex(ctx)
+            ctx.byA11yId[aid]?.let { return it }
+        }
+        // Last resort: the framework's own registry (only returns includeForAccessibility Views).
+        val (inst, find) = idManager ?: return null
+        return try {
+            (find.invoke(inst, aid) as? View)?.also { ctx.byA11yId[aid] = it }
+        } catch (t: Throwable) {
+            if (ctx.reflectFailures++ == 0) Log.w(TAG, "AccessibilityNodeIdManager.findView failed", t)
+            null
+        }
+    }
+
+    /** The node's own packed id (low = accessibility view id, high = virtual id), or null. */
+    private fun sourceNodeId(node: AccessibilityNodeInfo, ctx: Ctx): Long? {
+        val m = getSourceNodeIdM ?: return null
+        return try {
+            m.invoke(node) as? Long
+        } catch (t: Throwable) {
+            if (ctx.reflectFailures++ == 0) Log.w(TAG, "getSourceNodeId() failed", t)
+            null
+        }
+    }
+
+    /** The packed id of child [index] of [node], or null when unreachable. */
+    private fun childIdAt(node: AccessibilityNodeInfo, index: Int, ctx: Ctx): Long? {
+        val m = getChildIdM ?: return null
+        return try {
+            m.invoke(node, index) as? Long
+        } catch (t: Throwable) {
+            if (ctx.reflectFailures++ == 0) Log.w(TAG, "getChildId(int) failed", t)
+            null
+        }
+    }
 
     /**
-     * Primary recursion. [node] is the ANI for the element; [sourceView] is the
-     * backing host View when known (real host node OR the provider host for any
-     * virtual descendant), and [virtualId] is HOST_VIEW_ID for real host nodes or
-     * a non-host sentinel for virtual descendants.
-     *
-     * getChild() dispatches through the provider for virtual nodes, so a single
-     * loop enumerates BOTH real-view children and Compose semantics children
-     * (design §1).
+     * Resolve [node]'s identity from its own packed source id, else from the packed id its
+     * parent listed for it ([childIdFromParent]). Never guesses: an id whose View can't be
+     * found yields host_view_id 0 (and is counted), not a neighbour's id.
+     */
+    private fun identify(node: AccessibilityNodeInfo, childIdFromParent: Long?, ctx: Ctx): Ident {
+        var firstVid: Int? = null
+        for (packed in arrayOf(sourceNodeId(node, ctx), childIdFromParent)) {
+            if (packed == null || A11yIds.isUndefined(packed)) continue
+            val vid = A11yIds.virtualIdOf(packed)
+            if (firstVid == null) firstVid = vid
+            val view = viewFor(A11yIds.accessibilityViewIdOf(packed), ctx) ?: continue
+            return Ident(view, vid)
+        }
+        ctx.unresolvedNodes++
+        return Ident(null, firstVid ?: HOST_VIEW_ID)
+    }
+
+    /** Convert a packed linkage id into the host node-key space; 0 = none / unresolvable. */
+    private fun hostKeyOf(packed: Long?, ctx: Ctx): Long {
+        if (packed == null || A11yIds.isUndefined(packed)) return 0L
+        val view = viewFor(A11yIds.accessibilityViewIdOf(packed), ctx)
+        val hostViewId = view?.let { idOf(it) } ?: 0L
+        if (hostViewId == 0L) {
+            ctx.unresolvedLinks++
+            return 0L
+        }
+        return A11yIds.hostKey(hostViewId, A11yIds.virtualIdOf(packed))
+    }
+
+    private fun idOf(view: View): Long = try {
+        view.uniqueDrawingId
+    } catch (t: Throwable) {
+        Log.w(TAG, "getUniqueDrawingId() failed", t)
+        0L
+    }
+
+    /** On a provider host: the host View's class name; null for a View without a provider. */
+    private fun providerHostClass(view: View): String? {
+        val provider = try {
+            view.accessibilityNodeProvider
+        } catch (_: Throwable) {
+            null
+        }
+        return if (provider != null) view.javaClass.name else null
+    }
+
+    // ------------------------------------------------------------ the walk
+
+    /** Local-mode root: the root's own node, resolved and walked without a connection. */
+    private fun walkLocalRoot(root: View, ctx: Ctx): ViewInspection.A11yNode? {
+        val node = try {
+            root.createAccessibilityNodeInfo()
+        } catch (t: Throwable) {
+            Log.w(TAG, "createAccessibilityNodeInfo() failed on root", t)
+            null
+        } ?: return null
+        return walk(node, identify(node, null, ctx), ctx, 0, local = true)
+    }
+
+    /**
+     * Resolve a packed child id without a connection, mirroring AOSP
+     * AccessibilityInteractionController (findAccessibilityNodeInfoByAccessibilityIdUiThread +
+     * populateAccessibilityNodeInfoForView): find the View, skip it unless shown, then ask its
+     * provider for the virtual id (HOST_VIEW_ID included) or, with no provider, the View itself.
+     */
+    private fun resolveLocal(packed: Long, ctx: Ctx): AccessibilityNodeInfo? {
+        if (A11yIds.isUndefined(packed)) return null
+        val view = viewFor(A11yIds.accessibilityViewIdOf(packed), ctx) ?: return null
+        val shown = try {
+            view.windowVisibility == View.VISIBLE && view.isShown
+        } catch (_: Throwable) {
+            false
+        }
+        if (!shown) return null
+        val vid = A11yIds.virtualIdOf(packed)
+        return try {
+            val provider = view.accessibilityNodeProvider
+            if (provider != null) {
+                provider.createAccessibilityNodeInfo(vid)
+            } else {
+                view.createAccessibilityNodeInfo()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "local node resolution failed for virtual id $vid", t)
+            null
+        }
+    }
+
+    /**
+     * Emit [node] (identity [ident]) and recurse. In query mode children come from
+     * getChild(i); in local mode from [resolveLocal] on the packed child ids. Either way
+     * each child's identity is decoded from its own packed id, never inherited.
      */
     private fun walk(
         node: AccessibilityNodeInfo,
-        sourceView: View?,
-        virtualId: Int,
-        strings: StringTable,
+        ident: Ident,
+        ctx: Ctx,
         depth: Int,
-        count: IntArray,
-        includeExtras: Boolean,
-        includeRenderingInfo: Boolean,
+        local: Boolean,
     ): ViewInspection.A11yNode {
         val b = ViewInspection.A11yNode.newBuilder()
-        if (sourceView != null) b.hostViewId = idOf(sourceView)
-        b.virtualId = virtualId
-        b.isVirtual = virtualId != HOST_VIEW_ID
-        // Mark the provider host (AndroidComposeView / WebView) so the host can
-        // badge Compose-origin subtrees (design §2 "provider_class").
-        if (!b.isVirtual && sourceView != null) {
-            try {
-                sourceView.accessibilityNodeProvider?.let {
-                    b.providerClass = strings.intern(it.javaClass.simpleName)
-                }
-            } catch (_: Throwable) {
-            }
+        val view = ident.view
+        b.hostViewId = view?.let { idOf(it) } ?: 0L
+        b.virtualId = ident.virtualId
+        b.isVirtual = ident.virtualId != HOST_VIEW_ID
+        if (!b.isVirtual && view != null) {
+            providerHostClass(view)?.let { b.providerClass = ctx.strings.intern(it) }
         }
 
-        mapNode(node, sourceView, b, strings, includeExtras, includeRenderingInfo)
+        mapNode(node, ident, b, ctx, local)
 
-        if (depth < MAX_DEPTH && count[0] < MAX_NODES) {
+        if (depth < MAX_DEPTH && ctx.count < MAX_NODES) {
             val n = safeInt { node.childCount }
+            val childIds = LongArray(n)
+            var haveIds = true
             for (i in 0 until n) {
-                if (count[0] >= MAX_NODES) break
-                val child = try {
-                    node.getChild(i)
-                } catch (t: Throwable) {
-                    // A throwing / transiently-detached child is skipped; traversal
-                    // continues (design §1, mirrors TreeBuilder defensive style).
-                    null
-                } ?: continue
-                count[0]++
-                // Virtual children share the same backing host View as their
-                // provider host; flag them virtual via a non-host sentinel.
-                b.addChildren(
-                    walk(
-                        child, sourceView, virtualIdOf(node, i),
-                        strings, depth + 1, count, includeExtras, includeRenderingInfo,
-                    ),
-                )
+                val id = childIdAt(node, i, ctx)
+                if (id == null) haveIds = false else childIds[i] = id
+            }
+            if (n > 0 && local && !haveIds) {
+                walkLocalChildrenWithoutIds(ident, b, ctx, depth)
+            } else {
+                for (i in 0 until n) {
+                    if (ctx.count >= MAX_NODES) break
+                    val childId: Long? = if (haveIds) childIds[i] else null
+                    val child: AccessibilityNodeInfo? =
+                        if (local) {
+                            resolveLocal(childIds[i], ctx)
+                        } else {
+                            try {
+                                node.getChild(i)
+                            } catch (t: Throwable) {
+                                // A throwing / transiently-detached child is skipped.
+                                null
+                            }
+                        }
+                    if (child == null) {
+                        ctx.nullChildren++
+                        continue
+                    }
+                    ctx.count++
+                    b.addChildren(walk(child, identify(child, childId, ctx), ctx, depth + 1, local))
+                }
             }
         }
         return b.build()
     }
 
+    /**
+     * Local mode without the hidden getChildId: a real, provider-less ViewGroup can still list
+     * its accessibility children through the public View.addChildrenForAccessibility (the same
+     * call ViewGroup.onInitializeAccessibilityNodeInfoInternal uses to fill the child ids).
+     * Virtual children of a provider can't be enumerated this way; they are counted.
+     */
+    private fun walkLocalChildrenWithoutIds(
+        ident: Ident,
+        b: ViewInspection.A11yNode.Builder,
+        ctx: Ctx,
+        depth: Int,
+    ) {
+        val view = ident.view
+        val hasProvider = view != null && providerHostClass(view) != null
+        if (view == null || ident.virtualId != HOST_VIEW_ID || hasProvider || view !is ViewGroup) {
+            ctx.unenumerable++
+            return
+        }
+        val kids = ArrayList<View>()
+        try {
+            view.addChildrenForAccessibility(kids)
+        } catch (t: Throwable) {
+            Log.w(TAG, "addChildrenForAccessibility failed", t)
+            return
+        }
+        for (child in kids) {
+            if (ctx.count >= MAX_NODES) break
+            val ani = try {
+                child.createAccessibilityNodeInfo()
+            } catch (t: Throwable) {
+                null
+            }
+            if (ani == null) {
+                ctx.nullChildren++
+                continue
+            }
+            ctx.count++
+            b.addChildren(walk(ani, Ident(child, HOST_VIEW_ID), ctx, depth + 1, local = true))
+        }
+    }
+
     // ------------------------------------------------------------ node mapping
 
     /**
-     * Emit EVERY [ViewInspection.A11yNode] field from [node] (design §2). Each
-     * getter is individually guarded; one failing field never aborts the node.
+     * Emit EVERY [ViewInspection.A11yNode] field from [node]. Each getter is individually
+     * guarded; one failing field never aborts the node.
      *
      * DEPRECATION is suppressed because several accessors we MUST surface to fill
      * the proto are deprecated-but-still-canonical: AccessibilityNodeInfo.isChecked
@@ -256,12 +535,12 @@ object AccessibilityInspector {
     @Suppress("DEPRECATION")
     private fun mapNode(
         node: AccessibilityNodeInfo,
-        sourceView: View?,
+        ident: Ident,
         b: ViewInspection.A11yNode.Builder,
-        strings: StringTable,
-        includeExtras: Boolean,
-        includeRenderingInfo: Boolean,
+        ctx: Ctx,
+        local: Boolean,
     ) {
+        val strings = ctx.strings
         fun s(cs: CharSequence?): Int = strings.intern(cs?.toString())
 
         // --- text & description ------------------------------------------------
@@ -303,7 +582,7 @@ object AccessibilityInspector {
         b.contextClickable = bool { node.isContextClickable }
         b.checkable = bool { node.isCheckable }
         b.checked = bool { node.isChecked }
-        // tri-state getChecked(): CHECKED_STATE_FALSE/PARTIAL/TRUE (API 34+).
+        // tri-state getChecked(): CHECKED_STATE_FALSE/PARTIAL/TRUE (API 36+).
         b.checkedState = safeInt { node.checked }
         b.focusable = bool { node.isFocusable }
         b.focused = bool { node.isFocused }
@@ -324,15 +603,17 @@ object AccessibilityInspector {
         b.textSelectable = bool { node.isTextSelectable }
         b.fieldRequired = bool { node.isFieldRequired }
         b.canOpenPopup = bool { node.canOpenPopup() }
-        // API 34+; safe{} swallows NoSuchMethodError on older runtimes.
+        // API 34+; bool{} swallows NoSuchMethodError on older runtimes.
         b.a11YDataSensitive = bool { node.isAccessibilityDataSensitive }
         b.requestInitialFocus = bool { node.hasRequestInitialAccessibilityFocus() }
+        b.isTraversalGroup = traversalGroup(node, ident, ctx)
 
-        // importantForAccessibility — preferred from the View (design §2); for
-        // virtual nodes (no backing View) fall back to the ANI predicate.
+        // importantForAccessibility — from the backing View for a real View node; for a
+        // virtual node (no View of its own) fall back to the ANI predicate.
+        val view = ident.view
         b.importantForAccessibility =
-            if (sourceView != null && !b.isVirtual) {
-                safeInt { sourceView.importantForAccessibility }
+            if (view != null && !b.isVirtual) {
+                safeInt { view.importantForAccessibility }
             } else {
                 if (bool { node.isImportantForAccessibility }) View.IMPORTANT_FOR_ACCESSIBILITY_YES
                 else View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
@@ -345,7 +626,6 @@ object AccessibilityInspector {
         b.maxTextLength = safeInt { node.maxTextLength }
         b.expandedState = safeInt { node.expandedState }
         b.drawingOrder = safeInt { node.drawingOrder }
-        @Suppress("DEPRECATION")
         b.actionsBitmask = safeInt { node.actions }
 
         // --- collections & ranges ---------------------------------------------
@@ -355,7 +635,8 @@ object AccessibilityInspector {
             cb.columnCount = safeInt { ci.columnCount }
             cb.hierarchical = bool { ci.isHierarchical }
             cb.selectionMode = safeInt { ci.selectionMode }
-            // getItemCount / getImportantForAccessibilityItemCount are API 34+.
+            // getItemCount / getImportantForAccessibilityItemCount are newer APIs; safeInt
+            // swallows the NoSuchMethodError on older runtimes.
             cb.itemCount = safeInt { ci.itemCount }
             cb.importantItemCount = safeInt { ci.importantForAccessibilityItemCount }
             b.collectionInfo = cb.build()
@@ -395,17 +676,15 @@ object AccessibilityInspector {
         } catch (_: Throwable) {
         }
 
-        // --- extras (roleDescription, traversal group, compose testTag/id …) --
+        // --- extras (roleDescription, compose testTag/id …) -------------------
         val extras: Bundle? = safe { node.extras }
         if (extras != null) {
-            // roleDescription: the spoken role TalkBack reads (design §2).
+            // roleDescription: the spoken role TalkBack reads.
             safe { extras.getCharSequence(ROLE_DESC_KEY) }?.let {
                 b.roleDescription = strings.intern(it.toString())
             }
-            // isTraversalGroup: read by literal key, tolerate absence (design §2).
-            b.isTraversalGroup = bool { extras.getBoolean(TRAVERSAL_GROUP_KEY, false) }
 
-            if (includeExtras) {
+            if (ctx.includeExtras) {
                 var c = 0
                 val keys = try {
                     extras.keySet()
@@ -420,7 +699,7 @@ object AccessibilityInspector {
                     } catch (_: Throwable) {
                         null
                     }
-                    // Skip large stringified Parcelables (design §2 "Extras").
+                    // Skip large stringified Parcelables.
                     val v = if (raw != null && raw.length > MAX_EXTRA_VALUE_LEN) null else raw
                     b.addExtras(
                         ViewInspection.A11yExtra.newBuilder()
@@ -432,19 +711,18 @@ object AccessibilityInspector {
             }
         }
 
-        // --- traversal / label linkage ----------------------------------------
-        // getTraversalBefore/After/getLabelFor/getLabeledBy resolve to a target
-        // ANI only under query-from-app-process; when present we emit the target's
-        // packed id (host_view_id<<32 | virtual_id). The host computes final
-        // TalkBack order from these inputs (design §3).
-        linkPackedId(node, "getTraversalBefore")?.let { b.traversalBefore = it }
-        linkPackedId(node, "getTraversalAfter")?.let { b.traversalAfter = it }
-        linkPackedId(node, "getLabelFor")?.let { b.labelFor = it }
-        linkPackedId(node, "getLabeledBy")?.let { b.labeledBy = it }
-        linkedByList(node).forEach { b.addLabeledByList(it) }
+        // --- traversal / label linkage, in the HOST NODE KEY space ------------
+        b.traversalBefore = hostKeyOf(linkId(node, traversalBeforeF, "getTraversalBefore", ctx), ctx)
+        b.traversalAfter = hostKeyOf(linkId(node, traversalAfterF, "getTraversalAfter", ctx), ctx)
+        b.labelFor = hostKeyOf(linkId(node, labelForF, "getLabelFor", ctx), ctx)
+        b.labeledBy = hostKeyOf(linkId(node, labeledByF, "getLabeledBy", ctx), ctx)
+        for (packed in labeledByIds(node, ctx)) {
+            val key = hostKeyOf(packed, ctx)
+            if (key != 0L) b.addLabeledByList(key)
+        }
 
-        // --- ExtraRenderingInfo (opt-in; extra refreshWithExtraData round-trip) -
-        if (includeRenderingInfo) {
+        // --- ExtraRenderingInfo (opt-in; needs the query-mode connection) -----
+        if (ctx.includeRenderingInfo && !local) {
             try {
                 node.refreshWithExtraData(
                     AccessibilityNodeInfo.EXTRA_DATA_RENDERING_INFO_KEY, Bundle(),
@@ -462,176 +740,98 @@ object AccessibilityInspector {
         }
     }
 
-    // ------------------------------------------------------------ fallback walk
+    // ------------------------------------------------------------ linkage helpers
 
     /**
-     * Structural View-walk fallback used when query-from-app-process is
-     * unavailable (design §4). Still merges Compose by switching to the provider
-     * path for any View whose getAccessibilityNodeProvider() is non-null — those
-     * provider-built nodes carry child linkage locally.
+     * The packed id stored in linkage field [f] of [node]. When the field itself is
+     * unreachable, fall back to the public getter [getterName] (resolves the target node
+     * through the connection; query mode only) and read the target's own packed id.
      */
-    private fun walkFallback(
-        view: View,
-        strings: StringTable,
-        depth: Int,
-        count: IntArray,
-        includeExtras: Boolean,
-    ): ViewInspection.A11yNode {
-        val b = ViewInspection.A11yNode.newBuilder()
-        b.hostViewId = idOf(view)
-        b.virtualId = HOST_VIEW_ID
-        b.isVirtual = false
-
-        val node = try {
-            view.createAccessibilityNodeInfo()
-        } catch (t: Throwable) {
-            null
-        }
-        val provider: AccessibilityNodeProvider? = try {
-            view.accessibilityNodeProvider
-        } catch (_: Throwable) {
-            null
-        }
-        provider?.let { b.providerClass = strings.intern(it.javaClass.simpleName) }
-
-        if (node != null) {
-            mapNode(node, view, b, strings, includeExtras, false)
-        }
-
-        if (depth < MAX_DEPTH && count[0] < MAX_NODES) {
-            if (provider != null && node != null) {
-                // Provider host: its locally-built nodes carry child linkage even
-                // without query-from-app-process. Enumerate virtual children via
-                // the host node and recurse through the unified walk.
-                val n = safeInt { node.childCount }
-                for (i in 0 until n) {
-                    if (count[0] >= MAX_NODES) break
-                    val child = try {
-                        node.getChild(i)
-                    } catch (_: Throwable) {
-                        null
-                    } ?: continue
-                    count[0]++
-                    b.addChildren(
-                        walk(
-                            child, view, virtualIdOf(node, i),
-                            strings, depth + 1, count, includeExtras, false,
-                        ),
-                    )
-                }
-            } else if (view is ViewGroup) {
-                for (child in childrenForA11y(view)) {
-                    if (count[0] >= MAX_NODES) break
-                    count[0]++
-                    b.addChildren(walkFallback(child, strings, depth + 1, count, includeExtras))
-                }
-            }
-        }
-        return b.build()
-    }
-
-    /**
-     * The a11y-ordered, importantForAccessibility-filtered child Views (design
-     * §4). Prefers the @hide ViewGroup.getChildrenForAccessibility(); falls back
-     * to raw getChildAt order.
-     */
-    private fun childrenForA11y(vg: ViewGroup): List<View> {
-        getChildrenForA11y?.let { m ->
+    private fun linkId(node: AccessibilityNodeInfo, f: Field?, getterName: String, ctx: Ctx): Long? {
+        if (f != null) {
             try {
-                @Suppress("UNCHECKED_CAST")
-                val list = m.invoke(vg) as? List<View>
-                if (list != null) return list.filterNotNull()
-            } catch (_: Throwable) {
+                return f.getLong(node)
+            } catch (t: Throwable) {
+                if (ctx.reflectFailures++ == 0) Log.w(TAG, "reading ${f.name} failed", t)
             }
         }
-        return (0 until vg.childCount).mapNotNull {
-            try {
-                vg.getChildAt(it)
-            } catch (_: Throwable) {
-                null
-            }
-        }
-    }
-
-    // ------------------------------------------------------------ id helpers
-
-    private fun idOf(view: View): Long = ViewReflect.uniqueDrawingId(view)
-
-    /**
-     * A non-host virtual id sentinel for a child enumerated by index. The exact
-     * provider virtual id is not exposed without @hide reflection; what matters
-     * downstream is the is_virtual flag and the (host_view_id, is_virtual) pairing
-     * back to the View/Compose node — so we encode the child's ordinal in a
-     * negative, never-HOST_VIEW_ID space.
-     */
-    private fun virtualIdOf(parent: AccessibilityNodeInfo, index: Int): Int {
-        // Try the @hide AccessibilityNodeInfo.getChildId(int) -> packed long, from
-        // which the low 32 bits are the virtual descendant id. Best-effort.
-        try {
-            val m = AccessibilityNodeInfo::class.java
-                .getDeclaredMethod("getChildId", Int::class.javaPrimitiveType)
-            m.isAccessible = true
-            val packed = m.invoke(parent, index) as? Long
-            if (packed != null) {
-                val vid = (packed and 0xffffffffL).toInt()
-                if (vid != HOST_VIEW_ID) return vid
-            }
-        } catch (_: Throwable) {
-        }
-        // Fallback sentinel: a stable, non-host marker. -2 - index keeps it
-        // negative and distinct from HOST_VIEW_ID (-1).
-        return -2 - index
-    }
-
-    /**
-     * Resolve a target-ANI-returning linkage getter ([getterName], e.g.
-     * getTraversalBefore) to the target's packed id
-     * (host_view_id<<32 | virtual_id) when resolvable, else 0. The target ANI's
-     * source View id is not directly exposed, so we pack its window-relative
-     * source-node id via the @hide getSourceNodeId(), falling back to 0.
-     */
-    private fun linkPackedId(node: AccessibilityNodeInfo, getterName: String): Long? {
         val target = try {
-            val m = AccessibilityNodeInfo::class.java.getMethod(getterName)
-            m.invoke(node) as? AccessibilityNodeInfo
+            AccessibilityNodeInfo::class.java.getMethod(getterName).invoke(node) as? AccessibilityNodeInfo
         } catch (_: Throwable) {
             null
         } ?: return null
-        val packed = sourceNodeId(target)
-        return if (packed != 0L) packed else null
+        return sourceNodeId(target, ctx)
     }
 
-    private fun linkedByList(node: AccessibilityNodeInfo): List<Long> {
-        val out = ArrayList<Long>()
-        try {
-            // getLabeledByList() is API 34+; call reflectively to avoid a
-            // NoSuchMethodError on older runtimes. The list may carry nulls.
-            val m = AccessibilityNodeInfo::class.java.getMethod("getLabeledByList")
-            val list = m.invoke(node) as? List<*>
-            list?.forEach { t ->
-                val target = t as? AccessibilityNodeInfo ?: return@forEach
-                val packed = sourceNodeId(target)
-                if (packed != 0L) out.add(packed)
+    /** The packed ids of the multiple-labeledBy list (API 35+); empty when none / unavailable. */
+    private fun labeledByIds(node: AccessibilityNodeInfo, ctx: Ctx): List<Long> {
+        val f = labeledByIdsF
+        if (f != null) {
+            try {
+                val arr = f.get(node) ?: return emptyList()
+                val size = arr.javaClass.getMethod("size").invoke(arr) as Int
+                val get = arr.javaClass.getMethod("get", Int::class.javaPrimitiveType)
+                return (0 until size).map { get.invoke(arr, it) as Long }
+            } catch (t: Throwable) {
+                if (ctx.reflectFailures++ == 0) Log.w(TAG, "reading mLabeledByIds failed", t)
             }
-        } catch (_: Throwable) {
         }
-        return out
+        // Public getLabeledByList() (API 35+): resolves targets through the connection.
+        return try {
+            val list = AccessibilityNodeInfo::class.java.getMethod("getLabeledByList").invoke(node) as? List<*>
+            list?.mapNotNull { (it as? AccessibilityNodeInfo)?.let { t -> sourceNodeId(t, ctx) } } ?: emptyList()
+        } catch (_: Throwable) {
+            emptyList()
+        }
     }
 
     /**
-     * The @hide AccessibilityNodeInfo.getSourceNodeId():long — a packed
-     * (accessibilityViewId<<32 | virtualDescendantId). Used only to express
-     * traversal/label linkage targets; 0 when unavailable.
+     * is_traversal_group: the framework accessor when a platform has one; otherwise, for a node
+     * served by an AndroidComposeView, the IsTraversalGroup flag of its SemanticsNode (the host
+     * node itself stands for the unmerged root SemanticsNode). Views have no such concept.
      */
-    private fun sourceNodeId(node: AccessibilityNodeInfo): Long {
-        return try {
-            val m = AccessibilityNodeInfo::class.java.getDeclaredMethod("getSourceNodeId")
-            m.isAccessible = true
-            (m.invoke(node) as? Long) ?: 0L
-        } catch (_: Throwable) {
-            0L
+    private fun traversalGroup(node: AccessibilityNodeInfo, ident: Ident, ctx: Ctx): Boolean {
+        isTraversalGroupM?.let { m ->
+            return try {
+                m.invoke(node) as? Boolean ?: false
+            } catch (_: Throwable) {
+                false
+            }
         }
+        val view = ident.view ?: return false
+        if (!ComposeInspector.isAndroidComposeView(view)) return false
+        val index = if (ctx.composeIndex.containsKey(view)) {
+            ctx.composeIndex[view]
+        } else {
+            ComposeInspector.semanticsIndex(view).also { ctx.composeIndex[view] = it }
+        } ?: return false
+        val semId = if (ident.virtualId == HOST_VIEW_ID) index.rootSemanticsId else ident.virtualId
+        return semId in index.traversalGroups
     }
+
+    // ------------------------------------------------------------ reflection helpers
+
+    private fun method(cls: Class<*>, name: String, vararg params: Class<*>): Method? =
+        try {
+            (
+                try {
+                    cls.getDeclaredMethod(name, *params)
+                } catch (_: NoSuchMethodException) {
+                    cls.getMethod(name, *params)
+                }
+                ).also { it.isAccessible = true }
+        } catch (t: Throwable) {
+            Log.w(TAG, "${cls.simpleName}.$name not reachable via reflection", t)
+            null
+        }
+
+    private fun field(cls: Class<*>, name: String, logMissing: Boolean = true): Field? =
+        try {
+            cls.getDeclaredField(name).also { it.isAccessible = true }
+        } catch (t: Throwable) {
+            if (logMissing) Log.w(TAG, "${cls.simpleName}.$name not reachable via reflection", t)
+            null
+        }
 
     // ------------------------------------------------------------ guard helpers
 
