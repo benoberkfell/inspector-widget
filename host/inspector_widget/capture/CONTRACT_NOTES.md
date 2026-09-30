@@ -81,7 +81,8 @@ with every consumer.
   - `slim` returns the input object itself for `detail="full"`, for error dicts,
     for the compact-only tools and for unknown tools. Otherwise it builds a new
     dict and never mutates its input.
-  - An unknown or ambiguous `root` returns `{"error", "tool", "hint",
+  - An unknown or ambiguous `root`, or an invalid parameter value (a bad enum,
+    a non-integer `max_depth`), returns `{"error", "tool", "hint"?,
     "candidates"?}` instead of raising, so callers mark it `isError` like any
     other error dict.
 - **`finalize` extras**: it adds the keyword-only arguments `pretty=False` and
@@ -115,7 +116,8 @@ with every consumer.
   `omitted_defaults: {view_id: n}` (dump_tree) or `view.omitted_defaults`
   (inspect, inspect_node).
 - **`max_depth` counts levels**: 1 keeps the roots only, which is how
-  `dump_tree(max_depth=1)` lists windows. `root` takes the forms below. Accepted
+  `dump_tree(max_depth=1)` lists windows. Values below 1 count as 1. `root` takes
+  the forms below. Accepted
   prefixes are stripped, and a bare id that matches two nodes is ambiguous (for
   example `82` in inspect is both `view:82` and `compose:82`).
   - dump_tree: `82`, `view:82`, `w:82`
@@ -163,7 +165,8 @@ with every consumer.
   - The legacy `resource.ref` is dropped, and so is `view_id_name` when it
     repeats the resource name.
   - `layout_resource` is shown only where it differs from the parent's; children
-    inherit it.
+    inherit it. `null` marks a view that was not inflated from its parent's
+    layout.
   - The `id` property is dropped when it repeats the node's resource, and counted
     as `duplicates`.
 - **Library code** (`normalize.is_library_source`): a source file listed in

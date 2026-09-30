@@ -274,7 +274,9 @@ def test_dump_tree_brief_node_shape_from_both_legacy_shapes():
     ll = next(n for n in lnodes if n["id"] == 78)
     assert ll["layout_resource"] == {"namespace": "android", "type": "layout",
                                      "name": "screen_simple"}
-    assert all("layout_resource" not in n for n in lnodes if n["id"] in (79, 80))  # inherited
+    by_id = {n["id"]: n for n in lnodes}
+    assert "layout_resource" not in by_id[80]  # inherited from 78
+    assert by_id[79]["layout_resource"] is None  # the ViewStub was not inflated from it
     assert legacy["serial"] == "emulator-5554" and legacy["root_count"] == 1
 
 
@@ -584,3 +586,26 @@ def test_tools_list_stays_within_budget():
     listing = {"tools": [{"name": n, "description": e["description"], "inputSchema": e["schema"]}
                          for n, e in tools.items()]}
     assert size(listing) <= 18500
+
+
+def test_invalid_output_params_become_error_dicts():
+    data = lf.load("launcher", "views")
+    for args in ({"detail": "verbose"}, {"max_depth": "deep"}, {"focus_order": "all"}):
+        tool = "dump_accessibility" if "focus_order" in args else "dump_tree"
+        err = out.slim(tool, lf.load("launcher", "a11y") if tool != "dump_tree" else data, args)
+        assert err["tool"] == tool and "must be" in err["error"]
+    assert out.slim("a11y_lint", lf.load("launcher", "a11y_lint"), {"group_by": "x"})["error"]
+    zero = out.slim("dump_tree", data, {"max_depth": 0})  # below 1 means roots only
+    assert "children" not in zero["roots"][0] and zero["roots"][0]["hidden_descendants"] == 8
+
+
+def test_layout_resource_null_marks_a_view_not_inflated_from_its_parents_layout():
+    data = {"roots": [{"id": 1, "class_name": "FrameLayout", "bounds": {"layout": {}},
+                       "layout_resource": {"type": "layout", "name": "main"},
+                       "children": [{"id": 2, "class_name": "View", "bounds": {"layout": {}}},
+                                    {"id": 3, "class_name": "View", "bounds": {"layout": {}},
+                                     "layout_resource": {"type": "layout", "name": "main"}}]}]}
+    root = out.slim("dump_tree", data, {})["roots"][0]
+    assert root["layout_resource"] == {"type": "layout", "name": "main"}
+    assert root["children"][0]["layout_resource"] is None
+    assert "layout_resource" not in root["children"][1]

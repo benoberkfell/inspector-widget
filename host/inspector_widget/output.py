@@ -408,9 +408,7 @@ def finalize(tool: str, result: Any, *, max_bytes: int | None,
 class _Ctx:
     def __init__(self, args: Mapping[str, Any]) -> None:
         md = args.get("max_depth")
-        self.max_depth = int(md) if md not in (None, "", 0) else None
-        if self.max_depth is not None and self.max_depth < 1:
-            self.max_depth = 1
+        self.max_depth = max(1, int(md)) if md not in (None, "") else None
         self.omitted: Counter = Counter()
 
     def cut(self, depth: int) -> bool:
@@ -457,10 +455,6 @@ def _strip_prefix(spec: str, *prefixes: str) -> str:
         if spec.startswith(p):
             return spec[len(p):]
     return spec
-
-
-def _descendants(node: Mapping) -> int:
-    return _count(node) - 1
 
 
 def _set_children(out: dict, node: Mapping, depth: int, ctx: _Ctx,
@@ -516,13 +510,9 @@ def _brief_view_node(n: Mapping, depth: int, ctx: _Ctx, seen: dict[int, Mapping]
     if isinstance(res, Mapping):
         out["resource"] = {k: v for k, v in res.items() if k != "ref"}
     lres = n.get("layout_resource")
-    layout = None
-    if isinstance(lres, Mapping):
-        layout = {k: v for k, v in lres.items() if k != "ref"}
-        if layout != parent_layout:
-            out["layout_resource"] = layout
-    else:
-        layout = parent_layout
+    layout = {k: v for k, v in lres.items() if k != "ref"} if isinstance(lres, Mapping) else None
+    if layout != parent_layout:  # None here means "not inflated from a layout"
+        out["layout_resource"] = layout
     vin = n.get("view_id_name")
     if vin and not (isinstance(res, Mapping) and res.get("name") == vin):
         out["view_id_name"] = vin
@@ -985,6 +975,24 @@ COMPACT_ONLY_TOOLS = ("list_devices", "list_processes", "attach", "detach", "scr
                       "a11y_overlay", "component_image")
 
 
+def _bad_args(tool: str, args: Mapping[str, Any]) -> dict[str, Any] | None:
+    """An error dict when an output parameter has an invalid value, else None."""
+    for p in OUTPUT_PARAMS.get(tool, []):
+        v = args.get(p.name)
+        if v is None or v == "":
+            continue
+        if p.enum and v not in p.enum:
+            return _error(tool, f"{p.name} must be one of {', '.join(p.enum)}, got {v!r}")
+        if p.type == "integer":
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return _error(tool, f"{p.name} must be an integer, got {v!r}")
+            if p.minimum is not None and iv < p.minimum and p.name != "max_depth":
+                return _error(tool, f"{p.name} must be >= {p.minimum}, got {v!r}")
+    return None
+
+
 def slim(tool: str, result: dict, args: dict) -> dict:
     """Apply the Phase-0 brief rules of ``tool`` to its legacy ``result``.
 
@@ -992,7 +1000,8 @@ def slim(tool: str, result: dict, args: dict) -> dict:
     ``user_code_only``, ``focus_order``, ``group_by``, ``filter``, and ``package``
     as a hint). ``detail="full"`` returns ``result`` itself, unchanged. So do
     error results, the compact-only tools and unknown tools. The input is never
-    mutated. An unknown ``root`` yields ``{"error", "tool", "hint"}``.
+    mutated. An unknown or ambiguous ``root``, or an invalid parameter value,
+    yields ``{"error", "tool", "hint"?, "candidates"?}``.
     """
     args = args or {}
     if (args.get("detail") or "brief") == "full":
@@ -1002,7 +1011,7 @@ def slim(tool: str, result: dict, args: dict) -> dict:
     fn = _SLIMMERS.get(tool)
     if fn is None:
         return result
-    return fn(tool, result, args)
+    return _bad_args(tool, args) or fn(tool, result, args)
 
 
 # --------------------------------------------------------------------------- #
