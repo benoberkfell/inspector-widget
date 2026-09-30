@@ -931,6 +931,14 @@ def _truncated(tool: str, ix: Index, h: str, offset: int, shown: int, total: int
 # --------------------------------------------------------------------------- #
 # outline (spec 5.5, 6.3)
 # --------------------------------------------------------------------------- #
+def _plumbing(n: UNode) -> bool:
+    """Compose interop plumbing with nothing in it: every ComposeView has an
+    AndroidViewsHandler whose AndroidView children the index re-parents, so an
+    empty one is not content. Live on Thunderbird's ComposeView rows it took one
+    outline line per row; it collapses into the parent's +N like a wrapper."""
+    return n.kind == "view" and n.type == "AndroidViewsHandler"
+
+
 def _stub(n: UNode) -> bool:
     """A ViewStub placeholder (hidden like zero-size nodes)."""
     if n.kind != "view":
@@ -1031,7 +1039,7 @@ class _Outline:
                 s = False
             else:
                 s = bool(n.z is not None or n.label or n.rid or n.tag or n.issues
-                         or n.stop is not None or not kids
+                         or n.stop is not None or (not kids and not _plumbing(n))
                          or not ACTIONABLE.isdisjoint(n.flags))
                 if not s:  # a node with 2 or more shown children is shown too
                     s = sum(1 for c in kids if shown[c]) >= 2

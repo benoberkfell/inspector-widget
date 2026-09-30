@@ -264,3 +264,17 @@ def test_bare_widgets_show_only_theme_and_density_values(tmp_path):
             assert set(kept[1]) <= THEME_OR_DP, (cls, sorted(set(kept[1]) - THEME_OR_DP))
         assert {"TextView", "MaterialTextView", "Button", "MaterialButton", "Switch",
                 "ImageView", "AppCompatImageView", "EditText", "CheckBox"} <= classes
+
+
+def test_empty_compose_plumbing_takes_no_outline_line(tmp_path):
+    """Live on Thunderbird's ComposeView rows: each row's empty
+    AndroidViewsHandler took an outline line (6 of 29); it collapses now, and
+    detail="all" still lists it."""
+    with Replay("thunderbird_list_compose", str(tmp_path)) as r:
+        r.capture()
+        out = run(r.ctx, "outline", root="#message_list", depth=4, max_lines=80)
+        assert out["lines"] and not any("AndroidViewsHandler" in ln for ln in out["lines"])
+        assert any("@MessageItem_FavouriteButtonIcon" in ln for ln in out["lines"])
+        full = run(r.ctx, "outline", root="#message_list", depth=4, detail="all",
+                   max_lines=400)
+        assert any("AndroidViewsHandler" in ln for ln in full["lines"])
