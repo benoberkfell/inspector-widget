@@ -16,6 +16,12 @@ Subcommands (``inspector-widget --help`` lists all of them):
 Every subcommand except ``detach`` leaves the agent running when it exits, so
 the next run reconnects warm; ``--force`` stops it and injects a fresh one.
 
+JSON output (``--json -``, and the subcommands that always print JSON) is the
+same document the matching MCP tool returns, byte for byte: compact, brief by
+default (``--detail full`` prints this subcommand's full legacy document), and
+over ``--max-bytes`` a spill envelope pointing at a spill file. ``--json FILE``
+writes the whole document and never spills; ``--pretty`` indents for humans.
+
 Run with: ``python3 host/cli.py <subcommand> ...`` (the script adds its own
 directory to sys.path so ``inspector_widget`` resolves without installation).
 """
@@ -36,7 +42,9 @@ if _HERE not in sys.path:
 import inspector_widget as iw  # noqa: E402
 from inspector_widget import adb  # noqa: E402
 from inspector_widget import inject  # noqa: E402
+from inspector_widget import output  # noqa: E402
 from inspector_widget import png as pngmod  # noqa: E402
+from inspector_widget import results  # noqa: E402
 from inspector_widget.client import AgentTimeoutError  # noqa: E402
 from inspector_widget import strings as stringsmod  # noqa: E402
 
@@ -142,36 +150,41 @@ def cmd_attach(args) -> int:
 
 
 def cmd_dump(args) -> int:
+    rc = 0
     with _session(args) as session:
         want_screenshot = bool(args.screenshot)
+        with_props = args.properties or args.resolution_stack
         resp = session.client.dump_tree(
             root_id=args.root_id,
-            properties=args.properties or args.resolution_stack,
+            properties=with_props,
             resolution_stack=args.resolution_stack,
             screenshot=want_screenshot,
             scale=args.scale,
         )
 
+        shot = None
+        if want_screenshot and resp.HasField("screenshot"):
+            w, h = pngmod.write_png(resp.screenshot, args.screenshot)
+            print(f"wrote screenshot {w}x{h} to {args.screenshot}", file=sys.stderr)
+            shot = {"path": args.screenshot, "width": resp.screenshot.width,
+                    "height": resp.screenshot.height,
+                    "bytes": os.path.getsize(args.screenshot),
+                    "scale": resp.screenshot.scale or 1.0}
+
         if args.json:
             data = stringsmod.dump_tree_to_dict(resp)
-            text = json.dumps(data, indent=2)
-            if args.json == "-":
-                print(text)
-            else:
-                with open(args.json, "w") as f:
-                    f.write(text)
-                print(f"wrote tree JSON to {args.json}", file=sys.stderr)
+            result = results.dump_tree(data, args.serial, args.package,
+                                       include_properties=with_props)
+            if shot is not None:
+                result["screenshot"] = shot
+            rc = _emit_result(args, "dump_tree", data, result, what="tree JSON")
         else:
             resolver = stringsmod.StringResolver(resp.strings)
             if not resp.roots:
                 print("(no root views found)", file=sys.stderr)
             for root in resp.roots:
                 _print_node(root, resolver)
-
-        if want_screenshot and resp.HasField("screenshot"):
-            w, h = pngmod.write_png(resp.screenshot, args.screenshot)
-            print(f"wrote screenshot {w}x{h} to {args.screenshot}", file=sys.stderr)
-    return 0
+    return rc
 
 
 def _compose_text_summary(node, out, depth=0):
@@ -203,14 +216,14 @@ def cmd_compose(args) -> int:
                   + stringsmod.ENABLE_INSPECTION_WARNING % "--enable-inspection", file=sys.stderr)
         roots = [w["root"] for w in data.get("windows", []) if w.get("root")]
 
+        rc = 0
         if args.json:
-            text = json.dumps(data, indent=2)
-            if args.json == "-":
-                print(text)
-            else:
-                with open(args.json, "w") as f:
-                    f.write(text)
-                print(f"wrote compose JSON to {args.json}", file=sys.stderr)
+            result = results.with_target(data, args.serial, args.package)
+            if (not args.no_slot_table and not args.enable_inspection
+                    and not stringsmod.compose_slot_table_populated(data)):
+                result["note"] = results.slot_table_note(
+                    "--enable-inspection", stringsmod.ENABLE_INSPECTION_WARNING)
+            rc = _emit_result(args, "dump_compose", data, result, what="compose JSON")
         else:
             lines = []
             for r in roots:
@@ -230,7 +243,7 @@ def cmd_compose(args) -> int:
                 args.scale)
             print(f"wrote compose overlay -> {args.overlay} "
                   f"({summary['boxes']} boxes, {summary['labels']} labels)", file=sys.stderr)
-    return 0
+    return rc
 
 
 # --------------------------------------------------------------------------- #
@@ -264,14 +277,12 @@ def cmd_a11y(args) -> int:
                               if report is not None else None, serial=args.serial,
                               package=args.package, pid=session.pid)
 
+        rc = 0
         if args.json:
-            text = json.dumps(data, indent=2)
-            if args.json == "-":
-                print(text)
-            else:
-                with open(args.json, "w") as f:
-                    f.write(text)
-                print(f"wrote a11y JSON to {args.json}", file=sys.stderr)
+            result = results.with_target(data, args.serial, args.package)
+            if "lint" in result:  # brief: the lint grouped by rule, as a11y_lint gives it
+                result["lint"] = output.slim("a11y_lint", result["lint"], {})
+            rc = _emit_result(args, "dump_accessibility", data, result, what="a11y JSON")
         else:
             order = data.get("focus_order", [])
             if not order:
@@ -290,7 +301,7 @@ def cmd_a11y(args) -> int:
             print(f"wrote a11y overlay -> {args.overlay} "
                   f"({summary['boxes']} boxes, {summary['flagged']} flagged, "
                   f"{summary['flagged_by_bounds']} by finding bounds)", file=sys.stderr)
-    return 0
+    return rc
 
 
 def cmd_a11y_lint(args) -> int:
@@ -312,14 +323,11 @@ def cmd_a11y_lint(args) -> int:
                               (report.compose_data or {}).get("windows"), serial=args.serial,
                               package=args.package, pid=session.pid)
         out = report.to_dict()
+        rc = 0
         if args.json:
-            text = json.dumps(out, indent=2)
-            if args.json == "-":
-                print(text)
-            else:
-                with open(args.json, "w") as f:
-                    f.write(text)
-                print(f"wrote a11y-lint JSON to {args.json}", file=sys.stderr)
+            rc = _emit_result(args, "a11y_lint", out,
+                              results.a11y_lint(out, args.serial, args.package),
+                              what="a11y-lint JSON")
         else:
             print(lintmod.format_text(report))
         if args.overlay:
@@ -334,7 +342,7 @@ def cmd_a11y_lint(args) -> int:
             print(f"wrote a11y-lint overlay -> {args.overlay} ({ov['boxes']} boxes, "
                   f"{ov['flagged']} flagged; {s['error']} error, {s['warn']} warn, "
                   f"{s['info']} info)", file=sys.stderr)
-    return 0
+    return rc
 
 
 # --------------------------------------------------------------------------- #
@@ -367,15 +375,35 @@ def _node_selector(args):
     return node_key, view_id, semantics_id, bounds
 
 
-def _emit_json(obj, dest):
-    """Write ``obj`` as pretty JSON to ``dest`` ('-' => stdout, path => file)."""
-    text = json.dumps(obj, indent=2, default=str)
-    if dest == "-":
-        print(text)
+def _emit_result(args, tool, legacy, result=None, dest=None, what="JSON"):
+    """Print a subcommand's JSON the way MCP tool ``tool`` returns it; the exit code.
+
+    ``--detail full`` prints ``legacy``, this subcommand's full document; otherwise
+    ``result`` (the MCP tool's result dict; default ``legacy``) goes through the
+    brief rules (``output.slim``) with the subcommand's ``--max-depth``,
+    ``--root``, ... values. ``dest`` (default ``--json``) '-' is stdout, budgeted
+    exactly like the MCP: over ``--max-bytes`` the spill envelope is printed and
+    the whole document goes to a spill file. A file ``dest`` gets the whole
+    document (it never spills). Compact unless ``--pretty``. Returns 1 when the
+    brief rules reject an argument (an unknown ``--root``), else 0.
+    """
+    dest = args.json if dest is None else dest
+    targs = output.tool_args_from_cli(args, tool)
+    targs["package"] = getattr(args, "package", None)
+    if "max_bytes" not in targs and getattr(args, "max_bytes", None) is not None:
+        targs["max_bytes"] = args.max_bytes  # a tool's own budget (tb-walk)
+    if (targs.get("detail") or "brief") == "full":
+        doc = legacy
     else:
-        with open(dest, "w") as f:
-            f.write(text)
-        print(f"wrote JSON to {dest}", file=sys.stderr)
+        doc = output.slim(tool, legacy if result is None else result, targs)
+    pretty = bool(getattr(args, "pretty", False))
+    if dest == "-":
+        print(output.finalize(tool, doc, max_bytes=targs.get("max_bytes"), pretty=pretty))
+    else:
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(output.dumps(doc, pretty=pretty))
+        print(f"wrote {what} to {dest}", file=sys.stderr)
+    return 1 if isinstance(doc, dict) and "error" in doc else 0
 
 
 def cmd_inspect(args) -> int:
@@ -391,11 +419,11 @@ def cmd_inspect(args) -> int:
             print(f"wrote integrated overlay -> {args.overlay} "
                   f"({summary.get('boxes')} boxes)", file=sys.stderr)
         if args.json:
-            _emit_json({"roots": merged.get("roots", []),
-                        "summary": merged.get("summary", {}),
-                        "sources": merged.get("sources", {})}, args.json)
-        else:
-            print(json.dumps(merged.get("summary", {}), indent=2))
+            legacy = {"roots": merged.get("roots", []), "summary": merged.get("summary", {}),
+                      "sources": merged.get("sources", {})}
+            return _emit_result(args, "inspect", legacy,
+                                results.inspect(merged, args.serial, args.package))
+        print(output.dumps(merged.get("summary", {}), pretty=args.pretty))
     return 0
 
 
@@ -416,11 +444,9 @@ def cmd_inspect_node(args) -> int:
         if dossier is None:
             print("error: no matching element found for the given selector", file=sys.stderr)
             return 1
-        if args.json:
-            _emit_json(dossier, args.json)
-        else:
-            print(json.dumps(dossier, indent=2, default=str))
-    return 0
+        return _emit_result(args, "inspect_node", dossier,
+                            results.with_target(dossier, args.serial, args.package),
+                            dest=args.json or "-")
 
 
 def cmd_component_image(args) -> int:
@@ -445,8 +471,7 @@ def cmd_component_image(args) -> int:
         else:
             print(f"error: {img.get('error', 'component image failed')}", file=sys.stderr)
             return 1
-        print(json.dumps(img, indent=2, default=str))
-    return 0
+        return _emit_result(args, "component_image", img, dest="-")
 
 
 def cmd_screenshot(args) -> int:
@@ -465,11 +490,9 @@ def cmd_get_properties(args) -> int:
         resp = session.get_properties(
             args.view_id, include_resolution_stack=args.resolution_stack)
         data = stringsmod.get_properties_to_dict(resp)
-        if args.json:
-            _emit_json(data, args.json)
-        else:
-            print(json.dumps(data, indent=2, default=str))
-    return 0
+        return _emit_result(args, "get_properties", data,
+                            results.get_properties(data, args.serial, args.package),
+                            dest=args.json or "-")
 
 
 def cmd_detach(args) -> int:
@@ -507,7 +530,7 @@ def cmd_talkback(args) -> int:
     from inspector_widget.talkback import device as tbdevice
     out = tbdevice.action(args.serial, args.action, package=args.package,
                           verbose_log=args.verbose_log)
-    print(json.dumps(out, indent=2, default=str))
+    _emit_result(args, "talkback", out, dest="-")
     if args.action == "on" and out.get("changed"):
         print("note: TalkBack stays on (device-wide) until `inspector-widget talkback restore`",
               file=sys.stderr)
@@ -541,14 +564,15 @@ def cmd_tb_walk(args) -> int:
             step_timeout_ms=args.step_timeout_ms, settle_ms=args.settle_ms,
             recapture=args.recapture, utterance=args.utterance, injector=args.injector,
             leave_on=args.leave_on, max_lines=args.max_lines, max_bytes=args.max_bytes)
+    rc = 0
     if args.json:
-        _emit_json(result, args.json)
+        rc = _emit_result(args, "tb_walk", result)
     else:
         _print_tb(result)
     if args.leave_on:
         print("note: TalkBack left on (device-wide); `inspector-widget talkback restore` when done",
               file=sys.stderr)
-    return 0
+    return rc
 
 
 def cmd_tb_scenario(args) -> int:
@@ -560,9 +584,8 @@ def cmd_tb_scenario(args) -> int:
             leave_on=args.leave_on, step_timeout_ms=args.step_timeout_ms,
             settle_ms=args.settle_ms)
     if args.json:
-        _emit_json(result, args.json)
-    else:
-        _print_tb(result)
+        return _emit_result(args, "tb_scenario", result)
+    _print_tb(result)
     return 0
 
 
@@ -651,6 +674,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "dump_tree")
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("compose", help="inject + dump the Compose layer (semantics + slot table)")
@@ -669,6 +693,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-enable-inspection", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "dump_compose")
+    output.add_cli_flags(sp, "compose_overlay")
     sp.set_defaults(func=cmd_compose)
 
     sp = sub.add_parser("a11y", help="dump the unified accessibility tree (Views + Compose) + TalkBack reading order")
@@ -689,6 +715,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip iterating each node's extras bundle (roleDescription, compose testTag/id)")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "dump_accessibility")
+    output.add_cli_flags(sp, "a11y_overlay")
     sp.set_defaults(func=cmd_a11y)
 
     sp = sub.add_parser("a11y-lint",
@@ -709,6 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--overlay", metavar="OUT.png", help="also render a severity-colored overlay")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "a11y_lint")
     sp.set_defaults(func=cmd_a11y_lint)
 
     # ----- integrated inspector subcommands (mirror the MCP tools) ----- #
@@ -724,6 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the merged tree as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "inspect")
     sp.set_defaults(func=cmd_inspect)
 
     sp = sub.add_parser("inspect-node",
@@ -735,6 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the dossier as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "inspect_node")
     sp.set_defaults(func=cmd_inspect_node)
 
     sp = sub.add_parser("component-image",
@@ -746,6 +777,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scale", type=float, default=1.0, help="component image scale")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "component_image")
     sp.set_defaults(func=cmd_component_image)
 
     sp = sub.add_parser("screenshot", help="capture a screenshot PNG of the app's current UI")
@@ -767,6 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the properties as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
+    output.add_cli_flags(sp, "get_properties")
     sp.set_defaults(func=cmd_get_properties)
 
     sp = sub.add_parser("talkback", help="TalkBack status/on/off/restore (DEVICE-WIDE: the "
@@ -777,6 +810,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="on: the app that must stay in the foreground")
     sp.add_argument("--verbose-log", action="store_true",
                     help="on: set TalkBack's log level to VERBOSE first (restore puts it back)")
+    output.add_cli_flags(sp, "talkback")
     sp.set_defaults(func=cmd_talkback)
 
     sp = sub.add_parser("tb-walk", help="drive the real TalkBack (DEVICE-WIDE) through the app and "
@@ -796,6 +830,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-lines", type=int, default=60)
     sp.add_argument("--max-bytes", type=int, default=5000)
     _add_tb_common(sp)
+    output.add_cli_flags(sp, "tb_walk")
     sp.set_defaults(func=cmd_tb_walk)
 
     sp = sub.add_parser("tb-scenario", help="where real TalkBack focus goes after an action, "
@@ -811,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
                                      "broadcast:<args> | probe:<action>")
     sp.add_argument("--wait-ms", type=int, default=2000)
     _add_tb_common(sp)
+    output.add_cli_flags(sp, "tb_scenario")
     sp.set_defaults(func=cmd_tb_scenario)
 
     sp = sub.add_parser("detach", help="stop a running agent for every client (sends SHUTDOWN; "

@@ -83,11 +83,15 @@ def _roundtrip(block_mcp: bool) -> dict:
 
 def _assert_protocol(by_id: dict) -> None:
     assert by_id[1]["result"]["serverInfo"]["name"] == "inspector-widget"
-    names = {t["name"] for t in by_id[2]["result"]["tools"]}
-    assert names == set(mcp_server.TOOLS)
+    tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
+    assert set(tools) == set(mcp_server.TOOLS)
+    # the Phase-0 output parameters are in the schemas the server really lists
+    props = tools["dump_tree"]["inputSchema"]["properties"]
+    assert {"detail", "max_bytes", "max_depth", "root"} <= set(props)
     call = by_id[3]["result"]
     assert call["isError"] is True
-    assert "error" in json.loads(call["content"][0]["text"])
+    text = call["content"][0]["text"]
+    assert "error" in json.loads(text) and "\n" not in text  # compact JSON
 
 
 def test_sdk_transport_roundtrip():

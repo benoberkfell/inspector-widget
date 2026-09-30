@@ -5,8 +5,8 @@ This is the highest-leverage regression guard for the whole bug class that this
 test pass targets: it statically scans ``cli.py`` and ``mcp_server.py`` for every
 ``<module>.<attr>`` access on the inspector_widget submodules they import
 (adb / a11y / a11y_lint / overlay / png / correlate / strings / inject / client /
-results) and asserts the referenced attribute is a real member of the imported
-module.
+output / results) and asserts the referenced attribute is a real member of the
+imported module.
 
 It would have caught, in one shot:
   * ``adb.display_density`` / ``adb.font_scale`` missing from adb.py
@@ -43,7 +43,7 @@ _HOST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # signature scan at the bottom of this file covers the rest of the package.
 _POLICED_SUBMODULES = {
     "adb", "a11y", "a11y_lint", "overlay", "png", "correlate", "strings",
-    "inject", "client", "results",
+    "inject", "client", "output", "results",
 }
 
 _SCRIPTS = ("cli.py", "mcp_server.py")
@@ -157,6 +157,12 @@ def test_scan_actually_finds_contract_symbols() -> None:
         ("a11y_lint", "run_lint"),
         ("overlay", "render_integrated_overlay"),
         ("png", "write_png"),
+        # Phase 0: both surfaces leave through the output layer, with the same results
+        ("output", "slim"),
+        ("output", "finalize"),
+        ("output", "augment_schemas"),
+        ("output", "add_cli_flags"),
+        ("output", "tool_args_from_cli"),
         ("results", "dump_tree"),
         ("results", "a11y_lint"),
     }
@@ -198,6 +204,7 @@ _SIG_SOURCES = (
     "inspector_widget/inject.py",
     "inspector_widget/client.py",
     "inspector_widget/correlate.py",
+    "inspector_widget/output.py",
     "inspector_widget/results.py",
     "inspector_widget/talkback/device.py",
     "inspector_widget/talkback/inject.py",
@@ -608,7 +615,10 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("Session", "dump_a11y"),           # the walk's focus reader
         ("adb", "shell"),                   # talkback/device.py
         ("diff", "analyze"),
-        ("results", "dump_tree"),           # mcp_server -> the shared result shapes
+        ("output", "slim"),                 # mcp_server / cli -> the output layer
+        ("output", "finalize"),
+        ("output", "add_cli_flags"),
+        ("results", "dump_tree"),           # mcp_server / cli -> the shared result shapes
         ("results", "get_properties"),
         ("results", "with_target"),
         ("strings", "dump_tree_to_dict"),   # mcp_server's dump_tree (E3: no second decoder)

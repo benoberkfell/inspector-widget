@@ -807,10 +807,13 @@ def _slim_compose_overlay(tool: str, result: Mapping, args: Mapping) -> dict:
 
 # ---- dump_accessibility ---------------------------------------------------- #
 def _a11y_pred(spec: str) -> Callable[[Mapping], bool]:
+    """A node's ``node_key`` (``view:<id>``, ``compose:<acv>:<sem>``), else
+    ``host:virt`` / ``a11y:host:virt``, else its packed ``id``."""
     target = _strip_prefix(spec, "a11y:")
     if ":" in target:
         host, _, virt = target.partition(":")
-        return lambda n: str(n.get("host_view_id")) == host and str(n.get("virtual_id")) == virt
+        return lambda n: n.get("node_key") == spec or (
+            str(n.get("host_view_id")) == host and str(n.get("virtual_id")) == virt)
     return lambda n: str(n.get("id")) == target
 
 
@@ -859,15 +862,38 @@ def _slim_dump_accessibility(tool: str, result: Mapping, args: Mapping) -> dict:
         elif mode == "none":
             extra["focus_order"] = len(order)
         else:
-            stops = [e for e in order if isinstance(e, Mapping) and e.get("is_focus_stop")]
-            out["focus_order"] = [{"order": e.get("order"), "id": e.get("id"),
-                                   "speakable": e.get("speakable")} for e in stops]
+            stops = [e for e in order if isinstance(e, Mapping) and _is_stop(e)]
+            out["focus_order"] = [_brief_stop(e) for e in stops]
             extra["focus_order_non_stops"] = len(order) - len(stops)
     return _finish(out, ctx, extra)
 
 
+def _is_stop(entry: Mapping) -> bool:
+    """a11y.py lists stops only (``is_focus_stop`` appears only with structural
+    entries); recordings from before it marked every entry."""
+    return bool(entry.get("is_focus_stop", entry.get("order") is not None))
+
+
+def _brief_stop(entry: Mapping) -> dict:
+    """A focus stop as ``{order, key, speak}`` (plus ``unlabeled`` / ``window`` when
+    set); the packed ``id`` only when there is no ``key`` (older recordings, which
+    call ``speak`` ``speakable``)."""
+    out: dict[str, Any] = {"order": entry.get("order")}
+    if entry.get("key") is not None:
+        out["key"] = entry["key"]
+    else:
+        out["id"] = entry.get("id")
+    for k in ("speak", "speakable", "unlabeled", "window", "covered_by"):
+        if k in entry:
+            out[k] = entry[k]
+    return out
+
+
 # ---- a11y_lint --------------------------------------------------------------- #
 def _finding_node_id(f: Mapping) -> Any:
+    """The finding's node_key (what inspect_node takes), else its node id."""
+    if f.get("node_key"):
+        return f["node_key"]
     node = f.get("node")
     if isinstance(node, Mapping):
         return node.get("id")
@@ -875,9 +901,15 @@ def _finding_node_id(f: Mapping) -> Any:
 
 
 def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
+    """Findings grouped by rule (count, message once, 3 node keys); the run's
+    ``stats`` and its info-level diagnostics are left out and counted."""
     if (args.get("group_by") or "rule") == "none":
         return dict(result)
-    out: dict[str, Any] = {k: v for k, v in result.items() if k not in ("findings", "summary")}
+    out: dict[str, Any] = {k: v for k, v in result.items()
+                           if k not in ("findings", "summary", "stats", "diagnostics")}
+    extra: dict[str, int] = {}
+    if isinstance(result.get("stats"), Mapping):
+        extra["stats"] = len(result["stats"])
     summary = result.get("summary")
     if isinstance(summary, Mapping):
         out["summary"] = {k: v for k, v in summary.items() if k != "by_rule"}
@@ -894,7 +926,15 @@ def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
         if r["n"] > len(r["nodes"]):
             r["more"] = r["n"] - len(r["nodes"])
     out["by_rule"] = by_rule
-    return out
+    diags = result.get("diagnostics")
+    if isinstance(diags, list):
+        kept = [d for d in diags if not (isinstance(d, Mapping) and d.get("level") == "info")]
+        extra["info_diagnostics"] = len(diags) - len(kept)
+        if kept:
+            out["diagnostics"] = kept
+    elif diags is not None:
+        out["diagnostics"] = diags
+    return _finish(out, _Ctx({}), extra)
 
 
 # ---- inspect / inspect_node -------------------------------------------------- #

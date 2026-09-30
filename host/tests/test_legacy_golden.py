@@ -1,16 +1,19 @@
-"""The legacy tool outputs, pinned (work package G1).
+"""The legacy tool outputs, pinned (work package G1), and the Phase-0 rollback.
 
 ``tests/golden/legacy/<scene>/<surface>-legacy.json.gz`` holds what every legacy
 MCP tool and CLI subcommand returned before Phase 0, through the real entry
 points over the harness fake adb and agent, on four scenes (``record_goldens.py``).
-Running the same calls must reproduce them, entry by entry, parsed JSON (and the
-text of the human outputs), so any change to a shaper shows up as a readable
-path-level diff. The only exceptions are the entries re-recorded since, each
-with its reason (``LEGACY_DELTAS``).
+Running the same calls with the rollback (``detail="full"`` and ``max_bytes=0``;
+``--detail full --max-bytes 0``) must reproduce them (spec section 2.7), entry by
+entry, parsed JSON (and the text of the human outputs). The only exceptions are
+the entries re-recorded since, each with its reason (``LEGACY_DELTAS``).
+
+``<surface>-brief.json.gz`` pins the Phase-0 defaults (brief, budgeted) the same
+way, so any change to a shaper or to the brief rules shows up as a path-level diff.
 
 Regenerate a golden only for a deliberate change, and say why in the commit:
-``PYTHONPATH=. .venv/bin/python tests/record_goldens.py [--only ENTRY] [SCENE...]``
-(a re-recorded entry needs a ``LEGACY_DELTAS`` reason).
+``PYTHONPATH=. .venv/bin/python tests/record_goldens.py [--mode brief|legacy]
+[--only ENTRY] [SCENE...]`` (a legacy entry needs a ``LEGACY_DELTAS`` reason).
 """
 
 from __future__ import annotations
@@ -40,8 +43,14 @@ def _check(scene: str, surface: str, tmp_path, mode: str) -> None:
 
 @pytest.mark.parametrize("scene", rg.SCENES)
 @pytest.mark.parametrize("surface", ["mcp", "cli"])
-def test_legacy_outputs_match_the_goldens(scene, surface, tmp_path):
+def test_the_rollback_reproduces_the_legacy_outputs(scene, surface, tmp_path):
     _check(scene, surface, tmp_path, "legacy")
+
+
+@pytest.mark.parametrize("scene", rg.SCENES)
+@pytest.mark.parametrize("surface", ["mcp", "cli"])
+def test_brief_outputs_match_the_goldens(scene, surface, tmp_path):
+    _check(scene, surface, tmp_path, "brief")
 
 
 def test_only_the_documented_deltas_were_re_recorded():

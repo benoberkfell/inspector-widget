@@ -115,8 +115,10 @@ def test_wide_scene_shape():
     ("inspect", {"include_properties": True}, 3_850_000),
 ])
 def test_wide_scene_reproduces_the_e6_sizes_through_mcp(mcp, tool, args, e6_bytes):
-    text, is_error = mcp.use(fs.wide_scene()).text(tool, **args)
-    assert not is_error, text[:300]
+    """E6 measured the MCP text before Phase 0: the tool's full result, indent=2."""
+    result = mcp.use(fs.wide_scene()).run(tool, **args)
+    assert "error" not in result, result
+    text = json.dumps(result, indent=2, default=str)
     assert abs(len(text.encode()) - e6_bytes) <= 0.25 * e6_bytes
 
 
@@ -318,5 +320,13 @@ def test_wide_scene_over_the_harness_fake_adb(monkeypatch, tmp_path):
     fakeagent.install(monkeypatch, dev, build_out=str(tmp_path / "build-out"))
     # the replay's Hello names the build install() placed, as an injected agent does
     dev.behaviour = fs.replay_behaviour("wide", build_id=dev.default_build_id)
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(tmp_path / "store"))
+    # Phase 0: the 259-view tree is over the 32,000 B default, so an envelope comes back
     text, is_error = mcp_server._call_tool_text("dump_tree", dict(T))
-    assert not is_error and abs(len(text.encode()) - 149_000) <= 0.25 * 149_000
+    env = json.loads(text)
+    assert not is_error and env["truncated"] and len(text.encode()) <= 3000
+    assert env["summary"]["nodes"] == 259 and env["spill_path"].startswith(str(tmp_path))
+    # the rollback: the whole legacy content, compact (E6's 149 KB was indent=2)
+    text, is_error = mcp_server._call_tool_text("dump_tree", dict(T, detail="full", max_bytes=0))
+    assert not is_error and len(json.loads(text)["roots"]) == 1
+    assert abs(len(text.encode()) - 65_000) <= 0.25 * 65_000

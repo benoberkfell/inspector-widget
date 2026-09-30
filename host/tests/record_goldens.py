@@ -62,13 +62,13 @@ PACKAGE = fakeagent.DEFAULT_PACKAGE
 VIEW_ID = {"default": 1003, "wide": 1001, "launcher": 82, "viewscreen": 13}
 
 #: Golden modes: ``legacy`` is the pre-Phase-0 output, which ``detail="full"``
-#: with ``max_bytes=0`` must reproduce (spec section 2.7) once Phase 0 is in.
-MODES = ("legacy",)
+#: with ``max_bytes=0`` must reproduce (spec section 2.7); ``brief`` is the
+#: Phase-0 default output.
+MODES = ("legacy", "brief")
 
-#: The rollback: MCP arguments and CLI flags that restore the legacy content
-#: (none yet: before Phase 0 the default output is the legacy one).
-ROLLBACK_ARGS: dict[str, Any] = {}
-ROLLBACK_FLAGS: tuple[str, ...] = ()
+#: The rollback: MCP arguments and CLI flags that restore the legacy content.
+ROLLBACK_ARGS = {"detail": "full", "max_bytes": 0}
+ROLLBACK_FLAGS = ("--detail", "full", "--max-bytes", "0")
 
 #: The commit the legacy goldens were recorded from (G1, before Phase 0).
 G1_COMMIT = "f2d308280ee5"
@@ -457,7 +457,7 @@ def _write_entries(scene: str, surface: str, mode: str, entries: Mapping[str, An
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--mode", choices=MODES, default="legacy")
+    p.add_argument("--mode", choices=MODES, default="brief")
     p.add_argument("--surface", choices=("mcp", "cli"), action="append",
                    help="only this surface (repeatable; default both)")
     p.add_argument("--only", action="append", metavar="ENTRY",

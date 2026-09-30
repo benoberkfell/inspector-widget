@@ -672,3 +672,55 @@ def test_layout_resource_null_marks_a_view_not_inflated_from_its_parents_layout(
     assert root["layout_resource"] == {"type": "layout", "name": "main"}
     assert root["children"][0]["layout_resource"] is None
     assert "layout_resource" not in root["children"][1]
+
+
+# --------------------------------------------------------------------------- P0-2 shapes
+def test_a11y_lint_brief_on_the_unified_report_shape():
+    """The unified lint's report: node_keys (what inspect_node takes) instead of
+    packed ids; ``stats`` and info-level diagnostics are left out and counted."""
+    report = {
+        "density": 420, "summary": {"error": 1, "warn": 1, "info": 0, "total": 2},
+        "findings": [
+            {"rule": "a11y.label.missing", "severity": "error", "node_key": "compose:5:6",
+             "node": {"id": 99}, "message": "no name"},
+            {"rule": "a11y.touch_target.small", "severity": "warn", "node_key": "view:7",
+             "node": {"id": 7}, "message": "small"}],
+        "diagnostics": [{"level": "info", "code": "a11y.dump", "message": "roots=1"},
+                        {"level": "warn", "code": "identity.degenerate", "message": "keys"}],
+        "stats": {"nodes": 40, "rules": ["a11y.label.missing"], "elapsed_ms": 3},
+        "generation": "g1", "contrast_sampled": True}
+    brief = out.slim("a11y_lint", report, {})
+    assert brief["by_rule"]["a11y.label.missing"] == {"sev": "error", "n": 1, "msg": "no name",
+                                                      "nodes": ["compose:5:6"]}
+    assert brief["diagnostics"] == [report["diagnostics"][1]]
+    assert brief["omitted"] == {"info_diagnostics": 1, "stats": 3}
+    assert "stats" not in brief and "findings" not in brief
+    assert brief["contrast_sampled"] is True and brief["generation"] == "g1"
+    assert out.slim("a11y_lint", report, {"group_by": "none"}) == report
+
+
+def test_focus_order_brief_on_the_current_a11y_shape():
+    """a11y.py lists stops only, as {order, key, id, speak, unlabeled?, window?}."""
+    order = [{"order": 1, "key": "view:3", "id": 12884901887, "speak": "Title", "window": 0},
+             {"order": 2, "key": "compose:6:2", "id": 25769803778, "speak": "Unlabeled",
+              "unlabeled": True, "window": 1}]
+    data = {"windows": [], "focus_order": order}
+    brief = out.slim("dump_accessibility", data, {})
+    assert brief["focus_order"] == [
+        {"order": 1, "key": "view:3", "speak": "Title", "window": 0},
+        {"order": 2, "key": "compose:6:2", "speak": "Unlabeled", "unlabeled": True, "window": 1}]
+    assert "omitted" not in brief  # every entry is a stop: nothing left out
+
+
+def test_dump_accessibility_root_takes_a_node_key():
+    leaf = {"host_view_id": 6, "virtual_id": 2, "id": 2, "node_key": "compose:6:2"}
+    host = {"host_view_id": 6, "virtual_id": -1, "id": 5, "node_key": "view:6",
+            "children": [leaf]}
+    data = {"windows": [{"root_view_id": 1, "root": {"host_view_id": 1, "virtual_id": -1,
+                                                     "id": 1, "node_key": "view:1",
+                                                     "children": [host]}}]}
+    for spec in ("view:6", "6:-1", "a11y:6:-1"):
+        assert out.slim("dump_accessibility", data, {"root": spec})["windows"][0]["root"][
+            "node_key"] == "view:6", spec
+    assert out.slim("dump_accessibility", data, {"root": "compose:6:2"})["windows"][0][
+        "root"]["node_key"] == "compose:6:2"

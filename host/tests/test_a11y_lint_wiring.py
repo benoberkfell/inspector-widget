@@ -121,7 +121,8 @@ def _fake_device(monkeypatch):
 def test_cli_a11y_lint_runs_device_free(monkeypatch, capsys):
     import json
     _fake_device(monkeypatch)
-    args = cli.build_parser().parse_args(["a11y-lint", "--rule", "R1", "--json", "-"])
+    args = cli.build_parser().parse_args(["a11y-lint", "--rule", "R1", "--json", "-",
+                                          "--detail", "full"])
     assert args.func(args) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["summary"]["total"] == 0 and out["stats"]["rules"] == ["a11y.label.missing"]

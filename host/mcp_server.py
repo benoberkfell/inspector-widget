@@ -21,7 +21,10 @@
 # This module owns only: the 18 tool schemas (15 inspection tools + 3 TalkBack
 # tools), argument validation, per-(serial,package) session caching, and
 # screenshot temp-file materialisation. Protobuf responses are shaped by the
-# package (strings, a11y, correlate, results), the same code the CLI uses.
+# package (strings, a11y, correlate, results); every tool result then leaves
+# through inspector_widget.output: compact JSON, brief by default
+# (detail="full" for the legacy content), and over max_bytes a spill envelope
+# plus a spill file (Phase 0 of docs/design/capture-and-walk.md).
 #
 # See host/README.md for build + run + `claude mcp add` instructions.
 
@@ -1054,7 +1057,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "handler": _h_dump_tree,
         "description": (
             "The View hierarchy (auto-attaches). Nodes carry id (uniqueDrawingId, for "
-            "get_properties), class_name, screen-px bounds, resource, text and flags."
+            "get_properties), class_name, bounds [x,y,w,h] in screen px (render when "
+            "transformed), resource, text and flags. max_depth=1 lists the window roots."
         ),
         "schema": {
             "type": "object",
@@ -1064,7 +1068,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_properties": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Add each view's attributes (large; see get_properties).",
+                    "description": "Add each view's non-default attributes.",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
@@ -1090,8 +1094,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "get_properties": {
         "handler": _h_get_properties,
         "description": (
-            "Every attribute of one view: typed name/type/value, is_layout for layout params, "
-            "gravity/flags as their names, dimensions in px, resource references resolved."
+            "Every attribute of one view as {name: value}: colors #AARRGGBB, dimensions px, "
+            "gravity/flags by name, resources @type/name."
         ),
         "schema": {
             "type": "object",
@@ -1134,7 +1138,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "The Jetpack Compose layer dump_tree stops at: the semantics tree (text, "
             "contentDescription, role, state, bounds of each on-screen element) and, when "
-            "populated, the slot table's composables with file:line. Auto-attaches."
+            "populated, the slot table's app composables with file:line. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1201,9 +1205,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Lint the a11y tree (Views, Compose, RecyclerView cells, AndroidView-in-Compose), "
             "rules R1..R18: labels, touch targets, contrast (per window), roles, state, empty "
-            "stops, headings, grouping, text size, duplicates, forms, links, traversal. A finding "
-            "has rule, severity, node_key (for inspect_node), bounds (px, dp), window, message "
-            "and evidence; plus summary, diagnostics, generation."
+            "stops, headings, grouping, text size, duplicates, forms, links, traversal. by_rule: "
+            "each rule's count, message and first node_keys (for inspect_node); group_by=none "
+            "lists every finding (node_key, bounds px/dp, window, message, evidence)."
         ),
         "schema": {
             "type": "object",
@@ -1405,7 +1409,8 @@ TOOLS.update({
             "The whole screen as one merged tree: Views with every ComposeView's semantics "
             "grafted in (RecyclerView cells, AndroidView nesting) and a11y joined by id. Keys "
             "view:<id>, compose:<acvId>:<semId>, composeview:<acvId>. Nodes carry bounds, view{}, "
-            "compose{}, a11y{} (TalkBack order) and correlation_confidence; summary has counts."
+            "compose{}, a11y{} (TalkBack order) and conf when the join is not exact; summary "
+            "has counts."
         ),
         "schema": {
             "type": "object",
@@ -1641,6 +1646,19 @@ TOOLS.update({
         },
     },
 })
+
+
+# Phase-0 output parameters (detail, max_bytes, max_depth, root, user_code_only,
+# focus_order, group_by, filter), generated from inspector_widget.output's one
+# OUTPUT_PARAMS table; the CLI gets the same flags from it (add_cli_flags).
+# If the host package won't import, the server still starts (compact JSON, no
+# output parameters) and --self-check says why.
+try:
+    from inspector_widget import output
+except Exception:  # pragma: no cover - depends on the host package
+    output = None  # type: ignore[assignment]
+if output is not None:
+    output.augment_schemas(TOOLS)
 
 
 # Tools that manage the session themselves (attach re-attaches once on its own;
@@ -1932,16 +1950,42 @@ def _call_tool_text(name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
     failures identically (``isError: true`` + a JSON ``{"error": ...}`` body).
     ``_run_tool`` converts handler failures into a top-level ``{"error": ...}``
     dict rather than raising, so that key is what marks a failed call.
+
+    Every result leaves through the output layer (Phase 0): the brief rules of
+    ``output.slim`` unless ``detail="full"``, then ``output.finalize``, which
+    encodes compact JSON and, over ``max_bytes``, writes the result to a spill
+    file and returns the spill envelope instead. An unknown or ambiguous
+    ``root`` comes back from ``slim`` as an error.
     """
     try:
-        result = _run_tool(name, {} if arguments is None else arguments)
-        is_error = isinstance(result, dict) and "error" in result
-        return json.dumps(result, indent=2, default=str), is_error
+        args = {} if arguments is None else arguments
+        result = _run_tool(name, args)
+        return _render_result(name, result, args)
     except (ToolError, HostUnavailableError) as exc:
-        return json.dumps({"error": str(exc)}), True
+        return _compact({"error": str(exc)}), True
     except Exception as exc:  # surfaced to the agent, not raised
         log.exception("tool %s failed", name)
-        return json.dumps({"error": f"{type(exc).__name__}: {exc}", "tool": name}), True
+        return _compact({"error": f"{type(exc).__name__}: {exc}", "tool": name}), True
+
+
+def _compact(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _render_result(name: str, result: Any, args: Any) -> Tuple[str, bool]:
+    """``(text, is_error)`` for a tool's result dict and the arguments it was called
+    with: errors as they are (compact), everything else slimmed and budgeted."""
+    failed = isinstance(result, dict) and "error" in result
+    if failed or output is None:
+        return _compact(result), failed
+    entry = TOOLS.get(name)
+    if entry is not None and isinstance(args, dict):
+        args = _normalize_arguments(entry["schema"], args)  # as the tool saw them
+    if not isinstance(args, dict):
+        args = {}
+    brief = output.slim(name, result, args)
+    text = output.finalize(name, brief, max_bytes=args.get("max_bytes"))
+    return text, isinstance(brief, dict) and "error" in brief
 
 
 def _build_mcp_server() -> Any:
