@@ -979,3 +979,36 @@ def test_r2_vertical_list_does_not_clip_width():
     f = of(lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[lazy])))),
            "a11y.touch_target.small")
     assert [(x.severity, "clipped_axes" in x.evidence) for x in f] == [("warn", False)]
+
+
+# --------------------------------------------------------------------------- #
+# Live-verified Compose shapes (emulator, Compose ui 1.7): synthetic role /
+# contentDescription children, state-only toggles, touch bounds vs layout size.
+# Density 390 is the emulator's: 48dp = 117px.
+# --------------------------------------------------------------------------- #
+def test_r4_compose_button_whose_description_repeats_its_text_child():
+    # Button(Modifier.semantics { contentDescription = "Next" }) { Text("Next") }: Compose
+    # serves the description on a synthetic child (id + 2e9) and the role on another
+    # (id + 1e9), so TalkBack reads "Next, Next, button".
+    fake_cd = comp(20, 31 + 2_000_000_000, cd="Next", b=(39, 686, 190, 117))
+    fake_role = comp(20, 31 + 1_000_000_000, "android.widget.Button", b=(39, 686, 190, 117))
+    txt = comp(20, 33, "android.widget.TextView", text="Next", b=(80, 720, 100, 50))
+    btn = comp(20, 31, flags=CLICK + ("screen_reader_focusable",), b=(39, 686, 190, 117),
+               kids=[fake_cd, fake_role, txt])
+    rep = lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[btn]))))
+    f = of(rep, "a11y.label.redundant")
+    assert [(x.node_key, x.evidence["reason"]) for x in f] == [("compose:20:31", "equals_text")]
+    # the synthetic nodes are folded into the button, not reported on their own
+    assert all(":2000000031" not in (x.node_key or "") for x in rep.findings)
+    assert of(rep, "a11y.role.missing_on_clickable") == []
+
+
+def test_r1_bare_switch_that_only_speaks_its_state_is_unlabeled():
+    sw = comp(20, 30, flags=CLICK + ("checkable",), state="On", b=(39, 686, 127, 117))
+    rep = lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[sw]))))
+    f = of(rep, "a11y.label.missing")
+    assert keys(f) == ["compose:20:30"] and "state, not what it is" in f[0].message
+    named = comp(20, 30, flags=CLICK + ("checkable",), state="On", cd="Wi-Fi",
+                 b=(39, 686, 127, 117))
+    rep2 = lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[named]))))
+    assert of(rep2, "a11y.label.missing") == []

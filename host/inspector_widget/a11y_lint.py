@@ -455,8 +455,10 @@ def _compose_index(compose_data: Optional[Dict[str, Any]]
     return index, hosts, unique
 
 
-def _compose_label(attrs: Dict[str, Any]) -> str:
-    for k in ("ContentDescription", "Text", "StateDescription"):
+def _compose_label(attrs: Dict[str, Any], with_state: bool = True) -> str:
+    keys = ("ContentDescription", "Text", "StateDescription") if with_state else (
+        "ContentDescription", "Text")
+    for k in keys:
         v = _clean(attrs.get(k))
         if v:
             return v
@@ -556,6 +558,8 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
             stats["compose_joined"] += 1
         child_hidden = hidden_tree or n.important in _HIDE_TREE
         n.children = [mk(c, n, win, child_hidden) for c in (d.get("children") or [])]
+        if vid != -1 and n.children:
+            _fold_compose_fakes(n)
         return n
 
     for i, w in enumerate(a11y_data.get("windows") or []):
@@ -568,6 +572,28 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         windows.append(win)
         roots.append(rn)
     return roots, windows, stats
+
+
+# Compose (ui 1.7+) serves a merging node's Role and contentDescription on synthetic
+# children, ids semId + 1e9 and semId + 2e9, so TalkBack reads the description before the
+# children. They name/type their parent; they are not elements of their own.
+_FAKE_ROLE_OFFSET = 1_000_000_000
+_FAKE_CD_OFFSET = 2_000_000_000
+
+
+def _fold_compose_fakes(n: _Node) -> None:
+    """Move a Compose node's synthetic role/contentDescription children into the node."""
+    kept = []
+    for c in n.children:
+        if c.host_view_id == n.host_view_id and not c.children:
+            if c.virtual_id == n.virtual_id + _FAKE_CD_OFFSET:
+                n.cd = n.cd or c.cd
+                continue
+            if c.virtual_id == n.virtual_id + _FAKE_ROLE_OFFSET:
+                n.compose_role = n.compose_role or _ROLE_BY_CLASS.get(c.simple_class)
+                continue
+        kept.append(c)
+    n.children = kept
 
 
 def _build_compose(roots_in: List[Dict[str, Any]], ctx: LintContext
@@ -754,7 +780,7 @@ class _Run:
         self.nodes: List[_Node] = []
         self.by_id: Dict[int, _Node] = {}
         self.label_for_targets: Set[int] = set()
-        self._label_memo: Dict[int, Tuple[str, str]] = {}
+        self._label_memo: Dict[Tuple[int, bool], Tuple[str, str]] = {}
         self._stop_memo: Dict[int, bool] = {}
         self._cand_desc: Dict[int, bool] = {}
         self.stats: Dict[str, int] = {}
@@ -843,7 +869,7 @@ class _Run:
         return n.focus_ancestor
 
     def _collect_desc(self, n: _Node, parts: List[str], depth: int = 0,
-                      include_offscreen: bool = False) -> None:
+                      include_offscreen: bool = False, with_state: bool = True) -> None:
         if depth > 64:
             return
         for c in n.children:
@@ -856,43 +882,66 @@ class _Run:
                 continue  # a contentDescription replaces the subtree
             if c.text:
                 parts.append(c.text)
-            if c.state:
+            if c.state and with_state:
                 parts.append(c.state)
-            self._collect_desc(c, parts, depth + 1, include_offscreen)
+            self._collect_desc(c, parts, depth + 1, include_offscreen, with_state)
 
-    def effective_label(self, n: _Node) -> Tuple[str, str]:
-        """(label, source) as TalkBack would compute it for a focused ``n``."""
-        k = id(n)
+    def effective_label(self, n: _Node, with_state: bool = True) -> Tuple[str, str]:
+        """(label, source) as TalkBack would compute it for a focused ``n``.
+
+        ``with_state=False`` gives the accessible *name* only: a stateDescription
+        ("On", "Checked", Compose's computed toggle state) says how a control is, not
+        what it is, so a bare Switch that speaks only "On, switch" has no name (R1).
+        """
+        k = (id(n), with_state)
         if k in self._label_memo:
             return self._label_memo[k]
         res: Tuple[str, str] = ("", "")
-        if n.own_label:
-            res = (n.own_label, "own")
+        own = n.own_label if with_state else (n.cd or n.text)
+        if own:
+            res = (own, "own")
         else:
             parts: List[str] = []
-            self._collect_desc(n, parts)
+            self._collect_desc(n, parts, with_state=with_state)
             if parts:
                 res = (", ".join(parts), "descendants")
             else:
                 for t in n.labeled_by:
                     tgt = self.by_id.get(t)
-                    if tgt is not None and (tgt.own_label or tgt.hint):
-                        res = (tgt.own_label or tgt.hint, "labeled_by")
+                    tgt_label = (tgt.own_label if with_state else (tgt.cd or tgt.text)) if tgt else ""
+                    if tgt is not None and (tgt_label or tgt.hint):
+                        res = (tgt_label or tgt.hint, "labeled_by")
                         break
                 else:
+                    compose_label = n.compose_label if with_state else _compose_label(
+                        (n.compose or {}).get("attrs") or {}, with_state=False)
                     if n.labeled_by:
                         res = ("<labeledBy target not in tree>", "labeled_by_unresolved")
-                    elif n.compose_label:
-                        res = (n.compose_label, "compose_merged")
+                    elif compose_label:
+                        res = (compose_label, "compose_merged")
                     else:
                         # Children scrolled/clipped out of view still name the node
                         # once TalkBack scrolls it in; don't call it unlabelled.
                         off: List[str] = []
-                        self._collect_desc(n, off, include_offscreen=True)
+                        self._collect_desc(n, off, include_offscreen=True, with_state=with_state)
                         if off:
                             res = (", ".join(off), "offscreen_descendants")
         self._label_memo[k] = res
         return res
+
+    def desc_text(self, n: _Node) -> str:
+        """The visible text ``n``'s non-focusable descendants contribute (no descriptions)."""
+        parts: List[str] = []
+        stack = list(reversed(n.children))
+        while stack:
+            c = stack.pop()
+            if c.hidden or "visible_to_user" not in c.flags or _focus_candidate(c):
+                continue
+            if c.text:
+                parts.append(c.text)
+            if not c.cd:
+                stack.extend(reversed(c.children))
+        return " ".join(parts)
 
     def has_candidate_descendant(self, n: _Node) -> bool:
         return self._cand_desc.get(id(n), False)
@@ -974,7 +1023,7 @@ class _Run:
 def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
     if not _visible(n) or not _actionable(n) or _editable(n):
         return []
-    label, _ = run.effective_label(n)
+    label, _ = run.effective_label(n, with_state=False)
     if label:
         return []
     role = run.role(n)
@@ -996,8 +1045,9 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
     return [run.finding(
         "a11y.label.missing", "error", n,
         f"Actionable {what} has no accessible name (no text, contentDescription, "
-        f"stateDescription, labeledBy or labelled non-focusable descendant); TalkBack "
-        f"announces it only as \"{(role or 'unlabelled').lower()}\". Fix: {fix}.",
+        f"labeledBy or labelled non-focusable descendant; a stateDescription such as "
+        f"\"On\" says its state, not what it is); TalkBack announces it only as "
+        f"\"{(role or 'unlabelled').lower()}\". Fix: {fix}.",
         {"role": role, "class_name": n.class_name, "actionable_reason": reason,
          "checked": ["own", "descendants", "labeled_by", "compose_merged"]},
     )]
@@ -1341,7 +1391,11 @@ def rule_redundant_label(n: _Node, run: _Run) -> List[Finding]:
                     f"announces the checked/selected state itself, so the label goes stale "
                     f"or is read twice. Use stateDescription for custom state text.",
                     {"label": n.cd, "role": role, "reason": "state_word", "matched_word": w})]
-    if n.text and not _editable(n) and _norm(n.text) == norm:
+    # The text the node shows: its own, or (a Button whose Text child carries it; Compose
+    # serves the description on a synthetic child, so TalkBack reads both) its
+    # non-focusable descendants'.
+    shown = n.text or (run.desc_text(n) if _focus_candidate(n) else "")
+    if shown and not _editable(n) and _norm(shown) == norm:
         return [run.finding(
             "a11y.label.redundant", "info", n,
             "contentDescription duplicates the visible text; remove it so the visible text is "
