@@ -337,7 +337,7 @@ object AccessibilityInspector {
     private fun connectionOffset(hostNode: AccessibilityNodeInfo, ctx: Ctx): Pair<Int, Int> {
         return try {
             for (i in 0 until hostNode.childCount) {
-                val child = hostNode.getChild(i) ?: continue
+                val child = childOf(hostNode, i) ?: continue
                 val packed = sourceNodeId(child, ctx) ?: continue
                 if (A11yIds.isUndefined(packed) || A11yIds.virtualIdOf(packed) != HOST_VIEW_ID) continue
                 val view = viewFor(A11yIds.accessibilityViewIdOf(packed), ctx) ?: continue
@@ -630,7 +630,7 @@ object AccessibilityInspector {
                             resolveLocal(childIds[i], ctx)
                         } else {
                             try {
-                                node.getChild(i)
+                                childOf(node, i)
                             } catch (t: Throwable) {
                                 // A throwing / transiently-detached child is skipped.
                                 null
@@ -1066,6 +1066,16 @@ object AccessibilityInspector {
         }
 
     // ------------------------------------------------------------ guard helpers
+
+    /**
+     * Child [i] of a connection-backed node, fetched without prefetching on API 33+
+     * (getChild(int, int) with strategy 0). Plain getChild asks the interaction controller
+     * to prefetch up to 50 descendants per call; the in-process connection has no cache to
+     * keep them in and the walk fetches every node itself anyway, so that was main-thread
+     * work thrown away on every node.
+     */
+    private fun childOf(node: AccessibilityNodeInfo, i: Int): AccessibilityNodeInfo? =
+        if (Build.VERSION.SDK_INT >= 33) node.getChild(i, 0) else node.getChild(i)
 
     /**
      * The node's text, masked (Redaction.kt) for a password field: the node says so
