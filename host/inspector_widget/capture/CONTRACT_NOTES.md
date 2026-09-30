@@ -534,3 +534,117 @@ with every consumer.
     an AndroidView holding a TextView and a nested ComposeView; and a dialog.
   - `default_like_scene()`: a port of the harness `default_scene`.
   - `big_scene(n)`: 13 index nodes per cell.
+
+## Refs and carry-over (C5, `capture/refs.py`)
+
+- **`assign(new, prev, *, same_pid, same_generation, alloc) -> (refmap, tomb_updates)`**
+  - `new` is a key-space index (the `build_index` output). `prev` is the lineage's
+    latest published index (ref space) or None. A `prev` whose node ids are not
+    refs raises `ValueError`; two different lineages raise `OpError("bad_args")`.
+  - `alloc(n)` reserves `n` consecutive fresh ref numbers and returns the first
+    one. This is `CaptureStore.next_refs` under `refs_lock`. It is called at most
+    once per capture, and not at all when every node carries over. Fresh refs go
+    out in pre-order (ui tree with windows in z order, then the slot tree), so
+    allocation is deterministic for identical inputs.
+  - `refmap` maps every canonical key of `new` to its ref; hand it to
+    `apply_refs`. `tomb_updates` maps each old ref that found no node to
+    `[type (or kind), label cut to 40 chars with …, sel (or the ref), prev capture id]`.
+  - Side effect: `assign` writes `match`, `since` and `rebound_of` onto `new`'s
+    nodes (`refs.annotate`), so `apply_refs` carries them into the published
+    index. `since` is the capture where the ref was first assigned: the prev
+    node's `since` (or the prev capture id) when carried, else `new.meta.id`
+    (None when that is not a capture id yet).
+  - `plan(...)` is the same without the side effect and returns the whole
+    `Assignment` (`stats` counts per match kind, `rebound`, `ambiguous`).
+- **Helpers for the store and the query layer**: `identity_flags(new.meta,
+  prev.meta) -> (same_pid, same_generation)`; `merge_tomb(tomb, updates)` (cap
+  5,000; dict order is the LRU order, newest last) or `apply_to_lineage(state,
+  updates)`; `touch_tomb(tomb, ref)` on a lookup; `stale_ref_error(ref,
+  capture_id, tomb)` builds `ref_not_in_capture` with the last-seen info and the
+  old `sel` as a candidate. `LineageState` is re-exported from `model`.
+- **Decisions beyond spec 3.9**:
+  - Pass 1 treats `view:`, `sem:` and `a11y:` keys as device identity. Slot keys
+    and `a11y:path:` keys are positional, so pass 1 accepts them only when the
+    type, label and content (first three labels below) also agree.
+  - The collection guard is decided per cell. A cell is a child of a collection:
+    a View whose class is RecyclerView, ListView, GridView (and relatives), a
+    `Lazy*` display type, an `a11y.collection` facet, a Compose `CollectionInfo`
+    attr, or any node whose anchor's last segment has `[i]`. The cell's identity
+    label is its first label that no other cell of that collection has. The cell
+    keeps its refs when that identity is unchanged or absent on both sides, or
+    when it stays at the same position (`adapter_pos`, else the anchor's `[i]`,
+    else the child index) and its data did not move to another cell. Otherwise
+    every node of the cell gets a new ref, and the ones that matched by key get
+    `rebound_of`.
+  - Structure matches a sibling that is unique by `(kind, type, rid, tag,
+    label)` on both sides even when its ordinal changed. Look-alikes are split by
+    content. True twins match by ordinal only when the whole twin group is
+    unchanged; otherwise they are ambiguous, and they and their subtrees stay out
+    of the geometry pass. Collection cells match by content only.
+  - Geometry also needs equal labels (or equal content for label-less nodes),
+    skips nodes inside collection cells, and never breaks an IoU tie.
+  - The a11y uniqueId locator is read from `facets.a11y.unique_id` (or
+    `uniqueId`); C4 should store it under `unique_id`.
+- **Test helpers**: `tests/capture_keyscenes.py` (renamed from `capture_scenes.py`
+  when C4's scene module of that name merged) builds key-space scenes (`V`, `C`,
+  `S`, `A`, `scene()`), re-keys them (`rekey`, `shift_udids`, `key_space`), and
+  `Chain` publishes a sequence the way the store will (plan, annotate, apply,
+  merge tombstones).
+
+## Diff (C8, `capture/diff.py`)
+
+- **`diff(a, b, *, within=None, include=None, min_move_px=4, limit=40,
+  max_bytes=4000, cursor=None, image=False, props_a=None, props_b=None,
+  pixel_diff=None, resolve=None, preview=None) -> dict`**. `a` and `b` are
+  ref-space indexes of one lineage (different lineages raise
+  `OpError("bad_args")`, as do bad argument values). Nodes compare by ref.
+- **What the section 10 signature leaves to the caller** (injected, so diff stays
+  pure):
+  - `props_a` / `props_b`: `node -> {name: value}` (or None) for each capture.
+    Pass them only when both captures have properties; values may be the brief
+    `{value, source?}` form.
+  - `pixel_diff(a, b, refs) -> dict` (C9 through S1, e.g. a lambda around
+    `images.pixel_diff(la, lb, a, b)`). It runs when `image=True` or `include`
+    has `pixels`; its result is returned under `image`.
+  - `resolve(ix, sel) -> UNode` for `within` (C6's `resolve_selector`). Without
+    it, `within` takes refs, keys and aliases. It is looked up in `b`, then `a`.
+  - `preview(ix, root) -> list[str]` for the "new screen" outline (C6's outline
+    lines). The built-in fallback is a depth-2 walk of the ui tree.
+- **`include`**: None means the spec's six defaults, plus `props` when both
+  accessors are given and `params` when both captures have slot nodes. A list
+  or comma string replaces the defaults; `+x` tokens add to them. Asking for
+  something neither capture has adds a note instead of failing.
+- **Result**: `{a: "id @label", b, dt_s, same_pid, within?, summary, notes?,
+  lines, issues?, image?, truncated?, next}`.
+  - `summary` partitions b's nodes in scope: `changed`, `moved`, `unchanged`
+    (shared refs) plus `added` and `rebound` (the latter only when non-zero);
+    `removed` counts a's nodes that are gone.
+  - Lines: `~ <ref Type #rid @tag "label">: <change>` first, then
+    `~ <ref> <change>` for more changes of the same node. The label is left out
+    of the name when the change is the label itself. `> ...: <old parent> -> <new
+    parent>` or `reordered in <parent> (i -> j)` (a longest increasing
+    subsequence keeps the minimum set of siblings in place). `+`/`-` lines are
+    outline lines with `+N` descendants. A rebound pair is `~ <new>: rebound, was
+    <old ref> "<old label>" (+k inside)`. A pure translation is `shifted by
+    dx,dy to [x,y wxh]`; descendants that shift with their parent are counted
+    `(+k inside)`, and three or more siblings shifting together share one line
+    `~ N nodes in <parent> shifted by dx,dy: n1 n2 n3 +k`.
+  - Order: b's pre-order for changed, moved, added and rebound nodes, then the
+    removals in a's pre-order.
+  - `issues`: `{resolved, new}`, each `"<rule> ×N: n1 n2 n3 +k"` (at most 6
+    rules). An issue change alone does not make a node "changed". When only one
+    capture ran `lint=full`, `a11y.contrast*` rules are not compared (noted);
+    when one ran `lint=none`, issues are not compared at all (noted).
+  - Slot nodes are compared only when both captures have a slot table.
+  - Volatile properties (`pressed`, `hovered`) are ignored. At most 6 property or
+    param lines per node, then `props +N more`.
+- **Verdict**: when shared refs are under 40% of the union of ui refs (a rebound
+  pair counts as shared), the result is `{..., verdict: "new screen", shared:
+  "6 of 20 refs (30%)", summary: {added, removed, kept, rebound?}, outline,
+  next: ["outline(capture=...)"]}` with no `lines`.
+- **Budget and cursor**: at most `limit` (1..200) lines and `max_bytes` (0 =
+  unlimited, else 500..32,000, clamped above) bytes of compact JSON. Pages
+  always make progress. The cursor is `<b id>:d:<hash8>:<offset>`; the hash
+  covers a, b, within, the effective include and min_move_px (not limit or
+  max_bytes). A cursor used with other arguments raises `bad_args`. The
+  continuation hint is `diff(a=..., b=..., [within=...,] cursor=...)`.
