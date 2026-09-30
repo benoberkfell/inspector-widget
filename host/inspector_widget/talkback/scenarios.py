@@ -107,7 +107,8 @@ def timeline(drv: Driver, t0: float, wait_s: float, stop_when_quiet: bool,
             break
         time.sleep(SAMPLE_S)
         snap = drv.reader.snapshot()
-    return events, snap
+    # The answer reads the tree as it is now, not as the last event left it.
+    return events, drv.reader.snapshot(fresh=True)
 
 
 def _ensure_proven(drv: Driver, cur: Snapshot) -> Snapshot:
@@ -312,6 +313,15 @@ def _restore(drv: Driver, cur: Snapshot, wait_s: float, legacy: bool) -> Dict[st
     return res
 
 
+def _same_item(before: str, after: str) -> bool:
+    """The same item, maybe updated: equal labels, or one extends the other at a
+    word boundary ("Track 8" -> "Track 8 (played)", not "Message 1" -> "Message 10")."""
+    if before == after:
+        return True
+    short, long_ = sorted((before, after), key=len)
+    return bool(short) and long_.startswith(short) and not long_[len(short)].isalnum()
+
+
 def _survive(drv: Driver, cur: Snapshot, mutate: str, wait_s: float, legacy: bool) -> Dict[str, Any]:
     f0 = cur.focus
     if f0 is None:
@@ -323,7 +333,7 @@ def _survive(drv: Driver, cur: Snapshot, mutate: str, wait_s: float, legacy: boo
     lost_midway = any("focus" in e and e["focus"] is None for e in events[1:])
     first = _first_stop(after, legacy)
     same_ids = f2 is not None and (f2.host, f2.virtual, f2.window) == (f0.host, f0.virtual, f0.window)
-    same_content = f2 is not None and f2.label == f0.label and f2.simple_cls == f0.simple_cls
+    same_content = f2 is not None and _same_item(f0.label, f2.label) and f2.simple_cls == f0.simple_cls
     if f2 is None:
         verdict = "lost"
     elif same_ids and same_content:
