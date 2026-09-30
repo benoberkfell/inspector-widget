@@ -1,0 +1,90 @@
+{
+ "abi": "arm64-v8a",
+ "agent_version": "viewspector-0.1",
+ "api": 37,
+ "compose_generation": 0,
+ "consistency": "settled",
+ "created_at": 1790811296.720543,
+ "device": {
+  "dpi": 480,
+  "font_scale": 1.0,
+  "orientation": "portrait",
+  "screen": [
+   1280,
+   2856
+  ]
+ },
+ "diagnostics": [
+  "the UI changed during capture; settled after 2 attempts"
+ ],
+ "facets": {
+  "a11y": {
+   "bytes": 3272,
+   "ms": 18,
+   "status": "ok"
+  },
+  "compose": {
+   "bytes": 521,
+   "ms": 2,
+   "status": "ok"
+  },
+  "fingerprint": {
+   "bytes": 0,
+   "ms": 7,
+   "status": "ok"
+  },
+  "props": {
+   "bytes": 20644,
+   "ms": 0,
+   "status": "ok"
+  },
+  "shots": {
+   "bytes": 148456,
+   "ms": 5,
+   "status": "ok"
+  },
+  "skp": {
+   "bytes": 0,
+   "ms": 0,
+   "reason": "skp=false",
+   "status": "off"
+  },
+  "slots": {
+   "bytes": 0,
+   "ms": 1,
+   "reason": "not populated (slots=\"enable\" is destructive: resets remember{} state)",
+   "status": "unavailable"
+  },
+  "views": {
+   "bytes": 26521,
+   "ms": 75,
+   "status": "ok"
+  },
+  "windows": {
+   "bytes": 6,
+   "ms": 2,
+   "status": "ok"
+  }
+ },
+ "fingerprint": "2cc83f36a63856ae0af5db48a7901d53",
+ "id": "c3rfy0",
+ "label": "fx_d1",
+ "lineage": {
+  "package": "com.oberkfell.a11yprobe",
+  "serial": "emulator-5558"
+ },
+ "options": {
+  "a11y_rendering": false,
+  "lint": "tree",
+  "props": true,
+  "resolution_stack": false,
+  "screenshot": true,
+  "screenshot_scale": 1.0,
+  "settle_ms": 0,
+  "skp": false,
+  "slots": "if_available"
+ },
+ "pid": 12125,
+ "schema": 1,
+ "took_ms": 514
+}

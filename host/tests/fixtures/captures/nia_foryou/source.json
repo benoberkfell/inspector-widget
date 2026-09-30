@@ -1,0 +1,5 @@
+{
+ "app": "com.google.samples.apps.nowinandroid.demo.debug (nia-demoDebug.apk, Compose 1.10.0-beta02)",
+ "how": "first launch, notification permission denied, Settings dialog opened and closed with OK; capture()",
+ "screen": "For you: topic picker"
+}

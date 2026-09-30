@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "after a11yprobe_s1_a: input swipe 640 2200 640 1100 400; capture(diff_from=\"prev\")",
+ "screen": "InteropActivity S1 after a scroll"
+}

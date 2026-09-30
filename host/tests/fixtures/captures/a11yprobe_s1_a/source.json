@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "am start -S -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S1; capture()",
+ "screen": "InteropActivity S1 (RecyclerView of ComposeView cells)"
+}

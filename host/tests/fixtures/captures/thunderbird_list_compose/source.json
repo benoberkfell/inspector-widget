@@ -1,0 +1,5 @@
+{
+ "app": "net.thunderbird.android.debug (thunderbird-fossDebug.apk, Compose 1.12.1)",
+ "how": "overflow > DEBUG: Feature Flags > use_compose_for_message_list_items on > Apply changes; capture()",
+ "screen": "message list with ComposeView rows"
+}

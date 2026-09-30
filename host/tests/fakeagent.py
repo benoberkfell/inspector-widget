@@ -784,6 +784,14 @@ class FakeAgent:
         self.port = self._srv.getsockname()[1]
         threading.Thread(target=self._accept, name="fakeagent-accept", daemon=True).start()
 
+    @classmethod
+    def from_capture(cls, name: str, **kw: Any) -> "FakeAgent":
+        """An agent serving a recorded capture (tests/fixtures/captures/<name>, or
+        a capture directory): see ``capture_replay.py``."""
+        import capture_replay
+
+        return capture_replay.from_capture(name, **kw)
+
     # ---- connections ------------------------------------------------------- #
     def _accept(self) -> None:
         while True:
