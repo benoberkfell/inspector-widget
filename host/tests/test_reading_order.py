@@ -327,3 +327,16 @@ def test_unresolvable_views_get_no_key_and_no_duplicate_noise():
         (None, "orphan one"), (None, "orphan two")]
     assert d["summary"]["unresolved_nodes"] == 2
     assert "reading_order_diagnostics" not in d
+
+
+def test_compose_order_unknown_is_reported_when_the_agent_could_not_compute_it():
+    from inspector_widget import a11y as A
+    from inspector_widget.proto import view_inspection_pb2 as pb
+    resp = pb.DumpA11yResponse(diagnostics=(
+        "roots=2; api=37; ids=host-key; a11y-services=off; root#2 compose-traversal computed=1,"
+        "unavailable=2; root#2 query-from-app-process; root#9 compose-traversal unavailable=1"))
+    d = A.a11y_to_dict(resp)
+    kinds = {x["kind"]: x for x in d.get("reading_order_diagnostics", [])}
+    assert kinds["compose_order_unknown"]["count"] == 3
+    ok = A.a11y_to_dict(pb.DumpA11yResponse(diagnostics="root#2 compose-traversal computed=12"))
+    assert "reading_order_diagnostics" not in ok

@@ -31,6 +31,7 @@ TalkBack's ``OrderedTraversalController`` does, and TalkBack's focusability rule
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .proto import view_inspection_pb2 as pb
@@ -460,9 +461,25 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
         out["summary"]["unresolved_nodes"] = unresolved  # host_view_id 0: no node_key
     if response.diagnostics:
         out["diagnostics"] = response.diagnostics
-    if ro["diagnostics"]:
-        out["reading_order_diagnostics"] = ro["diagnostics"]
+    ro_diags = list(ro["diagnostics"])
+    unordered = _compose_order_unavailable(response.diagnostics or "")
+    if unordered:
+        ro_diags.append({
+            "kind": "compose_order_unknown", "count": unordered,
+            "message": (f"{unordered} ComposeView(s) served no traversal linkage (no "
+                        "accessibility service ran and the agent could not compute "
+                        "Compose's order), so their content is in composition order; "
+                        "TalkBack may read it differently (e.g. a Scaffold's top bar first)."),
+        })
+    if ro_diags:
+        out["reading_order_diagnostics"] = ro_diags
     return out
+
+
+def _compose_order_unavailable(diagnostics: str) -> int:
+    """ComposeViews whose traversal order the agent could not produce (its
+    ``compose-traversal ... unavailable=N`` tokens, one per window)."""
+    return sum(int(m) for m in re.findall(r"compose-traversal[^;]*?unavailable=(\d+)", diagnostics))
 
 
 # --------------------------------------------------------------------------- #
