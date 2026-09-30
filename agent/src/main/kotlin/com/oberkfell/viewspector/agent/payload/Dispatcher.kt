@@ -189,7 +189,9 @@ class Dispatcher(private val deviceLock: Any = Any()) {
                 // belongs to a node in the response.
                 val views: List<View> = ArrayList(treeBuilder.visited)
                 val firstRoot: View? = selectRootViews(rootId).firstOrNull()
-                DumpTreeWork(roots, views, firstRoot)
+                // What each View showed now, to spot the ones a later property hop finds changed.
+                val stamps = if (includeProperties) IntArray(views.size) { ViewStamp.of(views[it]) } else null
+                DumpTreeWork(roots, views, firstRoot, stamps)
             }
         if (treeBuilder.truncatedNodes > 0) {
             diag.add(
@@ -199,10 +201,11 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         }
 
         // Properties are read in batches, one main-thread hop each (see PROPERTY_BATCH). A
-        // View detached between hops still reads its last state.
+        // View detached between hops still reads its last state; one that changed between the
+        // tree hop and its batch (a rebound list cell) is counted: properties-changed=N.
         val propertyGroups: List<ViewInspection.PropertyGroup> =
             if (properties != null) {
-                readPropertyGroups(properties, assembled.views, includeResolutionStack, diag)
+                readPropertyGroups(properties, assembled.views, assembled.stamps, includeResolutionStack, diag)
             } else {
                 emptyList()
             }
@@ -238,21 +241,29 @@ class Dispatcher(private val deviceLock: Any = Any()) {
      * properties throw is skipped (Properties.forViewOrNull) and counted. If a batch never
      * got the main thread in time, the dump returns the groups read so far and says so; if
      * one started but overran, nothing can be returned (it still writes the shared string
-     * table), so the timeout propagates as an ERROR.
+     * table), so the timeout propagates as an ERROR. A View whose [stamps] entry (ViewStamp,
+     * taken in the tree hop) no longer matches is counted: its properties describe a later
+     * state than its node ("properties-changed=N").
      */
     private fun readPropertyGroups(
         properties: Properties,
         views: List<View>,
+        stamps: IntArray?,
         includeResolutionStack: Boolean,
         diag: MutableList<String>,
     ): List<ViewInspection.PropertyGroup> {
         val out = ArrayList<ViewInspection.PropertyGroup>(views.size)
+        var changed = 0
         var next = 0
         while (next < views.size) {
+            val start = next
             val batch = views.subList(next, minOf(next + PROPERTY_BATCH, views.size))
             val groups =
                 try {
                     MainThread.run {
+                        if (stamps != null) {
+                            for (i in batch.indices) if (ViewStamp.of(batch[i]) != stamps[start + i]) changed++
+                        }
                         batch.mapNotNull { properties.forViewOrNull(it, includeResolutionStack) }
                     }
                 } catch (e: MainThread.MainThreadTimeoutException) {
@@ -262,6 +273,9 @@ class Dispatcher(private val deviceLock: Any = Any()) {
                 }
             out.addAll(groups)
             next += batch.size
+        }
+        if (changed > 0) {
+            diag.add("properties-changed=$changed (views that changed between the tree read and their property read)")
         }
         if (properties.failedViews > 0) diag.add("properties-failed-views=${properties.failedViews}")
         if (properties.failedProperties > 0) diag.add("properties-failed=${properties.failedProperties}")
@@ -446,6 +460,7 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         val roots: List<ViewInspection.ViewNode>,
         val views: List<View>,
         val firstRoot: View?,
+        val stamps: IntArray?,
     )
 
     // ---------------------------------------------------------- GET_PROPERTIES
