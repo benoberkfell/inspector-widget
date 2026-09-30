@@ -905,3 +905,16 @@ def test_r2_only_unclipped_dimensions_decide_severity():
     f = of(lint(screen(decor(1, rv))), "a11y.touch_target.small")
     assert [x.severity for x in f] == ["warn"]
     assert "height is clipped" in f[0].message and "h" in f[0].evidence["clipped_axes"]
+
+
+def test_r12_flat_lazy_items_in_one_visual_row_are_still_duplicates():
+    # A LazyColumn item without its own semantics node: its two buttons are direct
+    # children of the list, but they sit in the same visual row.
+    e1 = comp(20, 11, "android.widget.Button", flags=CLICK, text="Edit", b=(0, 300, 300, 160))
+    e2 = comp(20, 12, "android.widget.Button", flags=CLICK, text="Edit", b=(400, 300, 300, 160))
+    d1 = comp(20, 13, "android.widget.Button", flags=CLICK, text="Open", b=(0, 500, 300, 160))
+    d2 = comp(20, 14, "android.widget.Button", flags=CLICK, text="Open", b=(0, 700, 300, 160))
+    lazy = comp(20, 9, flags=("scrollable",), b=(0, 260, 1080, 1800), kids=[e1, e2, d1, d2],
+                collection_info={"row_count": -1, "column_count": 1})
+    rep = lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[lazy]))))
+    assert sorted(keys(of(rep, "a11y.duplicate.label"))) == ["compose:20:11", "compose:20:12"]

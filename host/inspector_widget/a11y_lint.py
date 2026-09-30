@@ -1745,7 +1745,21 @@ def rule_duplicate_label(run: _Run) -> List[Finding]:
 
     def per_row_ok(a: _Node, b: _Node) -> bool:
         ca, cb = a.collection_ctx, b.collection_ctx
-        return ca is not None and cb is not None and ca[0] is cb[0] and ca[1] is not cb[1]
+        if ca is None or cb is None or ca[0] is not cb[0] or ca[1] is cb[1]:
+            return False
+        # Compose lazy items often have no semantics node of their own, so two
+        # buttons of ONE visual row can surface as sibling "rows" of the list.
+        # For a one-dimensional list, also require different visual slots.
+        info = ca[0].collection_info or {}
+        cols, rows = info.get("column_count"), info.get("row_count")
+        ra, rb = ca[1], cb[1]
+        if cols == 1:     # vertical list: rows must not share a horizontal band
+            overlap = min(ra.y + ra.h, rb.y + rb.h) - max(ra.y, rb.y)
+            return overlap <= 0.5 * min(ra.h, rb.h)
+        if rows == 1:     # horizontal list
+            overlap = min(ra.x + ra.w, rb.x + rb.w) - max(ra.x, rb.x)
+            return overlap <= 0.5 * min(ra.w, rb.w)
+        return True
 
     for norm, members in groups.items():
         if len(members) < 2:
