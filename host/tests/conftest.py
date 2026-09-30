@@ -339,6 +339,8 @@ def tb_env(fake_device, monkeypatch, tmp_path):
     monkeypatch.setattr(tbdevice, "DISMISS_POLL_S", 0.01)
     monkeypatch.setattr(tbdevice, "DISMISS_WINDOW_S", 0.3)
     monkeypatch.setattr(tbdevice, "UI_WAIT_S", 0.0)
+    from inspector_widget.talkback import walk as tbwalk
+    monkeypatch.setattr(tbwalk, "INITIAL_FOCUS_S", 0.05)
     monkeypatch.setattr(tbdevice, "REFRONT_WAIT_S", 0.01)
     monkeypatch.setattr(tbdevice, "RESTORE_WAIT_S", 1.0)
     monkeypatch.setattr(tbdevice, "ENABLE_WAIT_S", 1.0)

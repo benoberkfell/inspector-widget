@@ -80,7 +80,7 @@ def _panes(s: Snapshot) -> List[str]:
 def timeline(drv: Driver, t0: float, wait_s: float, stop_when_quiet: bool,
              legacy: bool) -> Tuple[List[Dict[str, Any]], Snapshot]:
     """Sample focus and windows until ``wait_s`` (or, with ``stop_when_quiet``,
-    until something changed and then stayed put for WINDOW_QUIET_S)."""
+    until something changed and focus then stayed on a node for WINDOW_QUIET_S)."""
     events: List[Dict[str, Any]] = []
     last: Any = None
     changed_at: Optional[float] = None
@@ -100,7 +100,10 @@ def timeline(drv: Driver, t0: float, wait_s: float, stop_when_quiet: bool,
         now = time.monotonic()
         if now - t0 >= wait_s:
             break
-        if stop_when_quiet and changed_at is not None and now - changed_at >= WINDOW_QUIET_S:
+        # Quiet means focus has landed and stayed: no focus at all is the gap
+        # before TalkBack focuses a new window (550ms or more), not an answer.
+        if stop_when_quiet and changed_at is not None and snap.key is not None \
+                and now - changed_at >= WINDOW_QUIET_S:
             break
         time.sleep(SAMPLE_S)
         snap = drv.reader.snapshot()

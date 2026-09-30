@@ -689,8 +689,9 @@ def status(serial: str) -> Dict[str, Any]:
     enabled = talkback_in(settings.get(SERVICES)) and settings.get(A11Y_ENABLED) == "1"
     out: Dict[str, Any] = {
         "serial": serial,
+        # The TalkBack process outlives the service, so "running" needs both.
         "talkback": {"installed": version, "enabled": enabled,
-                     "running": talkback_pid(serial) is not None if version else False},
+                     "running": enabled and version is not None and talkback_pid(serial) is not None},
         "accessibility_enabled": settings.get(A11Y_ENABLED) == "1",
         "touch_exploration": settings.get(TOUCH_EXPLORATION) == "1",
         "services": services_list(settings.get(SERVICES)),

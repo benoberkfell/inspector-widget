@@ -1757,6 +1757,7 @@ class FakeTalkBack:
         self.grant_on_start = grant_on_start
         # The Accessibility Suite asks for POST_NOTIFICATIONS on EVERY service start.
         self.permission_on_start = permission_on_start
+        self.initial_focus: Optional[Target] = None  # where focus goes when the service starts
         self.log_level = "ERROR"      # Developer settings > Log output level
         self.prefs_screen = "dev"     # dev | levels | confirm (TalkBackPreferencesActivity)
         self.focus: Optional[Target] = None
@@ -1791,6 +1792,8 @@ class FakeTalkBack:
                 self.device.activity_stack.append(self.TRAINING)
             if self.permission_on_start:
                 self.device.activity_stack.append(self.PERMISSION)
+            if self.initial_focus is not None:
+                self.set_focus(self.initial_focus)
         elif not self.running and self.was_running:
             self.was_running = False
             s["touch_exploration_enabled"] = "0"

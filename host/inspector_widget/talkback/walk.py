@@ -52,6 +52,7 @@ DEFAULT_MAX_STEPS = 60
 MAX_STEPS_CAP = 300
 STEP_TIMEOUT_MS = 1500
 SETTLE_MS = 120
+INITIAL_FOCUS_S = 2.0   # TalkBack's first focus on a window it just started on
 POLL_MS = 10
 UNTIL = ("wrap", "edge", "loop", "steps")
 DIRECTIONS = ("next", "prev")
@@ -247,10 +248,28 @@ class DumpIndex:
         return None
 
 
+def _descendant_keys(n: Node) -> set:
+    out: set = set()
+    stack = list(n.children)
+    while stack:
+        c = stack.pop()
+        out.add(c.key)
+        stack.extend(c.children)
+    return out
+
+
 def detect_scroll(prev: Optional[DumpIndex], cur: DumpIndex) -> Optional[Node]:
-    """The scrollable container whose content moved between two dumps, if any."""
+    """The scrollable container whose content moved between two dumps, if any:
+    nodes it holds in both moved, or (a lazy list re-creates its items as it
+    scrolls by a page) it now holds mostly different nodes."""
     if prev is None:
         return None
+    focus = cur.focus
+    c = cur.scroll_container(focus) if focus is not None else None
+    if c is not None and c.key in prev.nodes:
+        before, after = _descendant_keys(prev.nodes[c.key]), _descendant_keys(c)
+        if before and after and len(before & after) < 0.5 * min(len(before), len(after)):
+            return c
     votes: Dict[str, int] = {}
     moved = 0
     for k, n in cur.nodes.items():
@@ -294,6 +313,7 @@ class WaitResult:
     settled_ms: Optional[int]
     polls: int
     aborted: bool = False
+    lost: bool = False  # focus was cleared and did not land anywhere before the timeout
 
 
 class FocusReader(Protocol):
@@ -332,9 +352,15 @@ class DumpFocusReader:
 
     def wait_change(self, prev_key: Optional[str], timeout_s: float, quiet_s: float,
                     abort: Optional[Callable[[], bool]] = None) -> WaitResult:
-        """Poll until the focused key differs from ``prev_key`` and then keeps the
-        same key and bounds for ``quiet_s``. ``moved`` False on timeout (or when
-        ``abort`` says the press was an edge)."""
+        """Poll until focus lands on a node other than ``prev_key`` and keeps the
+        same key and bounds for ``quiet_s``.
+
+        No focus at all is not a landing: while TalkBack auto-scrolls, the focused
+        item scrolls off, is disposed, and focus is gone for a few hundred ms
+        before TalkBack puts it on the next item. ``moved`` False on timeout (or
+        when ``abort`` says the press was an edge); ``lost`` when focus was gone
+        at the timeout.
+        """
         t0 = time.monotonic()
         first: Optional[float] = None
         sig: Any = object()
@@ -345,20 +371,23 @@ class DumpFocusReader:
             polls += 1
             now = snap.t
             k = snap.key
-            if first is None and k != prev_key:
-                first = now
-            if first is not None:
+            if k is not None and k != prev_key:
+                if first is None:
+                    first = now
                 f = snap.focus
                 cur_sig = (k, f.bounds if f is not None else None)
                 if cur_sig != sig:
                     sig, stable_since = cur_sig, now
                 elif now - stable_since >= quiet_s:
-                    return WaitResult(snap, k != prev_key, _ms(first - t0), _ms(stable_since - t0), polls)
-            elif abort is not None and abort():
-                return WaitResult(snap, False, None, None, polls, aborted=True)
+                    return WaitResult(snap, True, _ms(first - t0), _ms(stable_since - t0), polls)
+            else:
+                sig = object()  # cleared, or back where it was: not landed
+                if k == prev_key and abort is not None and abort():
+                    return WaitResult(snap, False, None, None, polls, aborted=True)
             if now - t0 >= timeout_s:
-                moved = first is not None and k != prev_key
-                return WaitResult(snap, moved, _ms(first - t0) if first else None, None, polls)
+                moved = k is not None and k != prev_key
+                return WaitResult(snap, moved, _ms(first - t0) if first else None, None, polls,
+                                  lost=k is None and prev_key is not None)
             time.sleep(self.poll_s)
 
 
@@ -371,8 +400,10 @@ def make_reader(session: Any) -> FocusReader:
 # TalkBack's verbose logcat (optional utterance / edge / auto-scroll source)
 # --------------------------------------------------------------------------- #
 _RE_TTS = re.compile(r"TYPE_VIEW_ACCESSIBILITY_FOCUSED:\s+ttsOutput=\s?(.*?)(?:\s{2,}queueMode|$)")
-_RE_EDGE = re.compile(r"Reach edge")
-_RE_SCROLL = re.compile(r"AutoScrollActor|ScrollAction=ACTION_SCROLL|ACTION_SHOW_ON_SCREEN")
+_RE_EDGE = re.compile(r"FocusProcessor-LogicalNav: Reach edge")
+# Only the actor's own lines: node dumps and pipeline lines list SHOW_ON_SCREEN too.
+_RE_SCROLL = re.compile(r"AutoScrollActor: (?:ScrollAction=ACTION_SCROLL|Perform ACTION_SHOW_ON_SCREEN"
+                        r"|Perform scroll action)")
 
 
 class TalkBackLog:
@@ -688,6 +719,16 @@ class Driver:
                 self._lock_cm.__exit__(None, None, None)
                 self._lock_cm = None
 
+    def settle_initial(self, timeout_s: Optional[float] = None) -> Snapshot:
+        """After TalkBack has just started it puts focus on the window (550ms after
+        the window change); wait for that, then for it to stay put, so a walk
+        starts where a user would."""
+        snap = self.reader.snapshot()
+        if not self.turned_on or snap.key is not None:
+            return snap
+        return self.reader.wait_change(None, INITIAL_FOCUS_S if timeout_s is None else timeout_s,
+                                       0.3).snap
+
     def _wait_services_on(self, timeout_s: float = 5.0) -> None:
         """An agent that reports ``a11y-services=`` waits until it says on."""
         deadline = time.monotonic() + timeout_s
@@ -788,9 +829,14 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
     shortcut) or a node key / part of a label (pressed "next" until focus gets
     there). ``until``: ``wrap`` (one full lap: stop when focus comes back to the
     first stop after an edge), ``edge``, ``loop`` (the first repeated move) or
-    ``steps`` (exactly ``max_steps`` presses). A walk also ends on ``stuck`` (two
+    ``steps`` (exactly ``max_steps`` presses). A lap is full once focus, past an
+    edge, lands on a stop the walk has already read (the first one it reads after
+    the wrap may be new: TalkBack's initial focus skips a title that repeats the
+    window title). A walk also ends on ``stuck`` (two
     presses in a row that move nothing), ``loop`` (a move repeats with no edge in
-    between: TalkBack would never reach the end), ``left_app`` and ``timeout``.
+    between: TalkBack would never reach the end), ``left_app``, ``lost`` (no node held
+    focus after a press twice in a row, or again at the same place after
+    starting over) and ``timeout``.
 
     The full record (every step, the predicted order, findings) is saved under
     ``<store>/walks/<walk id>.json``; the returned dict is at most ``max_bytes``
@@ -816,7 +862,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
     edge_info: Optional[Dict[str, Any]] = None
     tts: Dict[int, str] = {}
     with drv:
-        cur = drv.reader.snapshot()
+        cur = drv.settle_initial()
         legacy = bool(cur.index.legacy)
         model.build(cur.resp, legacy)
         if cur.focus is None and not drv.foreground_ok():
@@ -827,8 +873,9 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
         prev_idx = cur.index
         transitions: Dict[Tuple[Optional[str], Optional[str]], int] = {}
         last_edge_at = -1
-        first: Optional[Node] = cur.focus  # the lap is complete when focus is back here
         no_moves = 0
+        lost = 0
+        last_lost_at = -1
         for i in range(max_steps):
             if time.monotonic() >= deadline:
                 ended = "timeout"
@@ -849,20 +896,33 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                         steps.append(Step(len(steps), None, via="left_app", t=pre.t,
                                           extra={"top": device.top_activity(drv.serial)}))
                         break
-                elif cur.key is not None:
-                    steps.append(Step(len(steps), pre.key, via="stolen", node=pre.focus, t=pre.t))
+                else:
+                    # None -> focus: TalkBack's own initial focus; else the app took it.
+                    via = "stolen" if cur.key is not None else "initial"
+                    steps.append(Step(len(steps), pre.key, via=via, node=pre.focus, t=pre.t))
                 cur, prev_idx = pre, pre.index
-                first = first or cur.focus
             t_sent, _send_ms = drv.press(direction)
             w = drv.wait(cur.key, t_sent)
             new = w.snap
             if w.moved and direction == "next":
                 drv.inj.mark_proven()  # type: ignore[union-attr]
             if new.key is None and cur.key is not None:
-                ended = "left_app"
-                steps.append(Step(len(steps), None, via="left_app", t=new.t,
-                                  extra={"top": device.top_activity(drv.serial)}))
-                break
+                top = device.top_activity(drv.serial)
+                if not (top or "").startswith(drv.package + "/"):
+                    ended = "left_app"
+                    steps.append(Step(len(steps), None, via="left_app", t=new.t, extra={"top": top}))
+                    break
+                # Still in the app, but no node holds focus (cleared and not restored):
+                # the next press starts again from the top of the window.
+                steps.append(Step(len(steps), None, via="lost", t=t_sent,
+                                  scrolled=_key_of(detect_scroll(prev_idx, new.index))))
+                lost += 1
+                last_lost_at = len(steps) - 1
+                cur, prev_idx = new, new.index
+                if lost >= 2:
+                    ended = "lost"
+                    break
+                continue
             if not w.moved:
                 no_moves += 1
                 steps.append(Step(len(steps), cur.key, moved=False, edge=True, via="edge",
@@ -881,6 +941,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                     ended = "stuck"
                     break
                 continue
+            lost = 0
             via = "wrap" if no_moves else "next"
             if via == "next" and new.focus is not None and cur.focus is not None \
                     and new.focus.window != cur.focus.window:
@@ -902,14 +963,17 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             seen_at = transitions.get(tr)
             transitions[tr] = len(steps) - 1
             cur, prev_idx = new, new.index
-            first = first or cur.focus
-            if until == "wrap" and last_edge_at >= 0 and first is not None and new.focus is not None \
-                    and same_node(first.key, first.sig, first.bounds,
-                                  new.key, new.focus.sig, new.focus.bounds):
+            if until == "wrap" and last_edge_at >= 0 and new.focus is not None and any(
+                    s.node is not None and same_node(s.key, s.node.sig, s.node.bounds, new.key,
+                                                     new.focus.sig, new.focus.bounds)
+                    for s in steps[:last_edge_at]):
+                # Past the edge and back on a stop this walk already read: a full lap.
                 ended = "wrap"
                 break
             if seen_at is not None and until != "steps":
-                if last_edge_at > seen_at:
+                if last_lost_at > seen_at:
+                    ended = "lost"  # focus is lost at the same place every lap
+                elif last_edge_at > seen_at:
                     ended = "wrap"
                 else:
                     ended = "loop"
@@ -955,6 +1019,10 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
         snap = drv.wait(snap.key, t).snap
         drv.seek_presses += 1
     return snap
+
+
+def _key_of(n: Optional[Node]) -> Optional[str]:
+    return n.key if n is not None else None
 
 
 def _edge_info(idx: DumpIndex, n: Node, direction: str) -> Optional[Dict[str, Any]]:
@@ -1176,6 +1244,9 @@ def _line(r: Dict[str, Any], speak_len: int) -> str:
         return f"{r['i']}. — edge"
     if r.get("via") == "left_app":
         return f"{r['i']}. — left the app (top: {r.get('top') or '?'})"
+    if r.get("via") == "lost":
+        return f"{r['i']}. — focus lost (no node holds it)" + (
+            f" after scrolling {r['scrolled']}" if r.get("scrolled") else "")
     sp = (r.get("speak") or "").replace("\n", " ")
     if len(sp) > speak_len:
         sp = sp[:speak_len - 1] + "…"

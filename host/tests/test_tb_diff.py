@@ -261,3 +261,13 @@ def test_same_node_by_signature_where_boxes_overlap():
     assert not w.same_node("compose:7:141", "View|Row 3", (0, 100, 300, 80),
                            "compose:7:759", "View|Row 3", (0, 400, 300, 80))
     assert not w.same_node("compose:7:1", "View|", (0, 0, 10, 10), "compose:7:2", "View|", (0, 0, 10, 10))
+
+
+def test_role_only_logcat_speech_is_unlabelled():
+    s = step(1, "view:6", (195, 236, 117, 117), "", speak="Button", utt="logcat")
+    assert diff._ghost_reasons(s, 390) == ["unlabelled"]
+    s = step(1, "view:26", (39, 1000, 1998, 117), "", speak="Edit box", utt="logcat")
+    assert diff._ghost_reasons(s, 390) == ["unlabelled"]
+    s = step(1, "view:5", (39, 236, 117, 117), "Like this photo", speak="Like this photo. Button",
+             utt="logcat")
+    assert diff._ghost_reasons(s, 390) == []

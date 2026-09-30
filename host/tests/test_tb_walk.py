@@ -670,3 +670,85 @@ def test_utterance_logcat_turns_verbose_logging_on_and_back_off(probe):
     assert res["utterance"].startswith("logcat ")
     assert probe.talkback.log_level == "ERROR" and probe.uiautomator_while_on == 0
     assert res["lines"][2] == '2. view:1020 Button "Item 0. Button"'
+
+
+def test_walk_starts_at_talkbacks_initial_focus(probe, monkeypatch):
+    monkeypatch.setattr(tbwalk, "INITIAL_FOCUS_S", 1.0)
+    probe.talkback.initial_focus = tb_item(0)  # the title equals the window title: skipped
+    res = walk(probe, until="edge")
+    assert res["lines"][0] == '0. view:1020 Button "Item 0. Button"'
+    assert res["lines"][1] == '1. view:1021 Button "Item 1. Button"'
+
+
+def test_focus_cleared_by_a_scroll_is_waited_out_then_reported_lost(probe):
+    def scroll_away(tb, action):
+        if action == "next" and tb.focus == tb_item(1):
+            tb.set_focus(None)  # the focused item scrolled off and was disposed
+            return True
+        return False
+
+    probe.talkback.on_press = scroll_away
+    res = walk(probe)
+    assert res["ended"] == "lost"  # lost again at the same place after starting over
+    assert "4. — focus lost (no node holds it)" in res["lines"]
+    assert res["lines"][5] == '5. view:1003 TextView "Title"'  # the next press starts over
+    lost = [f for f in res["findings"] if f["code"] == "tb.focus_lost"]
+    assert lost and lost[0]["refs"] == ["view:1021"]
+
+
+def _index(scene, focus):
+    scene.a11y_focus = focus
+    agent = fakeagent.FakeAgent(scene)
+    try:
+        req = fakeagent.pb.Request(id=1)
+        req.dump_a11y.SetInParent()
+        return tbwalk.DumpIndex(agent.dispatch(req).dump_a11y)
+    finally:
+        agent.stop()
+
+
+def test_a_page_scroll_that_recreates_every_item_is_a_scroll():
+    before = _index(fakeagent.talkback_scene(), tb_item(5))
+    after_scene = fakeagent.talkback_scene()
+    column = next(v for r in after_scene.roots for v in r.walk() if v.id == 1011)
+    for v in column.children:
+        v.id += 100  # the lazy list re-created its items (new ids) one page further
+    after = _index(after_scene, (1120, -1))
+    assert tbwalk.detect_scroll(before, after).key == "view:1010"
+    assert tbwalk.detect_scroll(before, before) is None
+
+
+def test_talkback_log_lines_are_parsed_strictly():
+    edge = "V talkback: FocusProcessor-LogicalNav: Reach edge before searchTargetInNextOrPreviousWindow in:"
+    assert tbwalk._RE_EDGE.search(edge)
+    assert tbwalk._RE_SCROLL.search("D talkback: AutoScrollActor: ScrollAction=ACTION_SCROLL_FORWARD")
+    assert tbwalk._RE_SCROLL.search("D talkback: AutoScrollActor: Perform ACTION_SHOW_ON_SCREEN:result=true")
+    # a node dump or pipeline line that merely lists the action is not a scroll
+    assert not tbwalk._RE_SCROLL.search(
+        "V talkback: Pipeline: execute() target= AccessibilityNodeInfoCompat actions=[ACTION_SHOW_ON_SCREEN]")
+    m = tbwalk._RE_TTS.search("I talkback: TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:  "
+                              "ttsOutput= Like this photo. Button    queueMode=0")
+    assert m and m.group(1) == "Like this photo. Button"
+
+
+def test_focus_after_waits_out_the_gap_before_a_new_window_is_focused(probe, monkeypatch):
+    """Like the D2 Compose Dialog live: focus is gone for ~800ms before TalkBack
+    focuses the new window's heading. No focus is not an answer."""
+    import threading
+    monkeypatch.setattr(tbscenarios, "WINDOW_QUIET_S", 0.1)
+
+    def open_dialog(tb, target):
+        scene = tb.device.live_scene(PKG)
+        heading = ViewSpec(2010, "TextView", "android.widget", (40, 200, 280, 48), text="Share item",
+                           a11y={"class_name": "android.widget.TextView", "text": "Share item",
+                                 "heading": True})
+        scene.roots.append(ViewSpec(2001, "DecorView", "com.android.internal.policy",
+                                    (20, 180, 320, 200), a11y={"class_name": "android.widget.FrameLayout"},
+                                    children=[heading]))
+        tb.set_focus(None)
+        threading.Timer(0.4, tb.set_focus, args=[(2010, -1)]).start()
+
+    probe.talkback.on_click = open_dialog
+    res = scenario(probe, "focus_after", target="Item 2", action="activate", wait_ms=2000)
+    assert res["verdict"] == "initial_ok" and res["focus"]["ref"] == "view:2010"
+    assert [e.get("focus") for e in res["timeline"] if "focus" in e][-2:] == [None, "view:2010"]

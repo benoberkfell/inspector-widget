@@ -47,6 +47,9 @@ FIXES = {
     "tb.double_stop": "Make one of the two the stop: merge the child into the container "
                       "(Modifier.toggleable/clickable on the row, child onClick=null) or make the "
                       "container not focusable.",
+    "tb.focus_lost": "Keep the focused item alive while it scrolls (stable keys / "
+                     "LazyListState, no key churn); TalkBack re-focuses only after a scroll "
+                     "event from the container.",
     "tb.escape": "Use a real Dialog / ModalBottomSheet, or hide the content behind the overlay while "
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
@@ -207,7 +210,7 @@ def first_lap(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Moves up to the first edge or wrap (the lap the order checks look at)."""
     out: List[Dict[str, Any]] = []
     for s in steps:
-        if s.get("edge") or s.get("via") in ("wrap", "left_app"):
+        if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost"):
             break
         if s.get("moved") and s.get("key") and (not out or out[-1]["key"] != s["key"]):
             out.append(s)
@@ -309,10 +312,9 @@ def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
     reasons = []
     speak = (s.get("speak") or "").strip()
-    if s.get("utt") == "logcat":
-        if not speak or _UNLABELLED.search(speak):
-            reasons.append("unlabelled")
-    elif not (s.get("label") or "").strip() and speak.lower().split(",")[0].strip() in _ROLE_ONLY:
+    # TalkBack 17 says just the role ("Button") for an unlabelled control, 16.2 "Unlabelled".
+    words_beyond_role = _tokens(speak) - _ROLE_STATE_WORDS
+    if _UNLABELLED.search(speak) or (not (s.get("label") or "").strip() and not words_beyond_role):
         reasons.append("unlabelled")
     r = _rect(s)
     if r is not None:
@@ -449,6 +451,15 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         out.append(_finding("tb.edge_stuck", "error",
                             f"TalkBack stopped at {_name(last)}: two presses in a row moved nothing "
                             f"(no edge wrap)", [last]))
+    for s in steps:
+        if s.get("via") == "lost":
+            prev = next((p for p in reversed(steps[:s["i"]]) if p.get("key")), None)
+            out.append(_finding(
+                "tb.focus_lost", "warn",
+                f"step {s['i']}: after {_name(prev) if prev else 'the start'}, no node held "
+                f"accessibility focus within the step timeout"
+                + (f" ({s['scrolled']} scrolled: the focused item was disposed)" if s.get("scrolled")
+                   else "") + "; the next swipe starts over from the top", [prev] if prev else []))
     edge = walk.get("edge") or {}
     if edge.get("can_scroll") and last is not None:
         out.append(_finding("tb.edge_stuck", "warn",
