@@ -28,7 +28,6 @@ package com.oberkfell.viewspector.agent.payload
 import android.os.Build
 import android.util.Log
 import android.view.View
-import android.view.ViewGroup
 import com.oberkfell.viewspector.proto.ViewInspection
 
 /**
@@ -56,6 +55,11 @@ class Dispatcher(private val deviceLock: Any = Any()) {
 
         // Default screenshot scale when a DumpTreeCommand leaves it unset (0f).
         const val DEFAULT_SCREENSHOT_SCALE = 1.0f
+
+        // DUMP_TREE reads properties this many Views per main-thread hop, so a big tree
+        // never blocks the UI thread for the whole extraction (other messages, input and
+        // frames run between batches).
+        const val PROPERTY_BATCH = 48
     }
 
     /** False for the commands the Server must run without holding [deviceLock]. */
@@ -74,6 +78,7 @@ class Dispatcher(private val deviceLock: Any = Any()) {
      */
     fun handle(req: ViewInspection.Request): ViewInspection.Response {
         val id = req.id
+        MainThread.setCommandTimeout(mainThreadTimeoutMs(req.commandCase))
         return try {
             when (req.commandCase) {
                 ViewInspection.Request.CommandCase.HELLO -> handleHello(id)
@@ -102,6 +107,20 @@ class Dispatcher(private val deviceLock: Any = Any()) {
             error(id, describe(t))
         }
     }
+
+    /**
+     * How long this command's main-thread hops may wait: whole-tree walks get longer than a
+     * lookup, but every budget stays under the host's deadline for that command (client.py
+     * request_timeout: 30 s, 4x for a11y/Compose/properties), so a slow main thread yields an
+     * ERROR reply rather than a host timeout that drops the connection.
+     */
+    private fun mainThreadTimeoutMs(command: ViewInspection.Request.CommandCase): Long =
+        when (command) {
+            ViewInspection.Request.CommandCase.DUMP_TREE -> MainThread.TREE_TIMEOUT_MS
+            ViewInspection.Request.CommandCase.DUMP_A11Y,
+            ViewInspection.Request.CommandCase.DUMP_COMPOSE -> MainThread.HEAVY_TIMEOUT_MS
+            else -> MainThread.DEFAULT_TIMEOUT_MS
+        }
 
     // ------------------------------------------------------------------ HELLO
 
@@ -159,33 +178,27 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         val strings = StringTable()
         val treeBuilder = TreeBuilder(strings)
         val properties = if (includeProperties) Properties(strings) else null
+        val diag = ArrayList<String>()
 
-        // All View-touching work happens in a single main-thread hop so the tree,
-        // its properties, and the chosen screenshot root are mutually consistent
-        // (no addView/removeView can race between them).
+        // The tree and the screenshot root come from one main-thread hop, so they are
+        // consistent (no addView/removeView can race between them).
         val assembled =
             MainThread.run {
                 val roots: List<ViewInspection.ViewNode> = treeBuilder.buildRoots(rootId)
+                // Exactly the Views the tree emitted (in pre-order), so every property group
+                // belongs to a node in the response.
+                val views: List<View> = ArrayList(treeBuilder.visited)
+                val firstRoot: View? = selectRootViews(rootId).firstOrNull()
+                DumpTreeWork(roots, views, firstRoot)
+            }
 
-                // The live root Views matching the request, used for per-view
-                // property extraction and to pick the screenshot source.
-                val rootViews: List<View> = selectRootViews(rootId)
-
-                val propertyGroups: List<ViewInspection.PropertyGroup> =
-                    if (properties != null) {
-                        val visited = ArrayList<View>()
-                        for (root in rootViews) {
-                            collectViews(root, visited)
-                        }
-                        visited.map { view ->
-                            properties.forView(view, includeResolutionStack)
-                        }
-                    } else {
-                        emptyList()
-                    }
-
-                val firstRoot: View? = rootViews.firstOrNull()
-                DumpTreeWork(roots, propertyGroups, firstRoot)
+        // Properties are read in batches, one main-thread hop each (see PROPERTY_BATCH). A
+        // View detached between hops still reads its last state.
+        val propertyGroups: List<ViewInspection.PropertyGroup> =
+            if (properties != null) {
+                readPropertyGroups(properties, assembled.views, includeResolutionStack, diag)
+            } else {
+                emptyList()
             }
 
         // Screenshot capture must NOT run on the main thread; Capture issues its
@@ -206,11 +219,47 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         val dumpTree =
             ViewInspection.DumpTreeResponse.newBuilder()
                 .addAllRoots(assembled.roots)
-                .addAllProperties(assembled.propertyGroups)
+                .addAllProperties(propertyGroups)
                 .setStrings(strings.build())
                 .apply { if (screenshot != null) setScreenshot(screenshot) }
+                .apply { if (diag.isNotEmpty()) setDiagnostics(diag.joinToString("; ")) }
                 .build()
         return ok(id).setDumpTree(dumpTree).build()
+    }
+
+    /**
+     * Property groups for [views], [PROPERTY_BATCH] per main-thread hop. A view whose
+     * properties throw is skipped (Properties.forViewOrNull) and counted. If a batch never
+     * got the main thread in time, the dump returns the groups read so far and says so; if
+     * one started but overran, nothing can be returned (it still writes the shared string
+     * table), so the timeout propagates as an ERROR.
+     */
+    private fun readPropertyGroups(
+        properties: Properties,
+        views: List<View>,
+        includeResolutionStack: Boolean,
+        diag: MutableList<String>,
+    ): List<ViewInspection.PropertyGroup> {
+        val out = ArrayList<ViewInspection.PropertyGroup>(views.size)
+        var next = 0
+        while (next < views.size) {
+            val batch = views.subList(next, minOf(next + PROPERTY_BATCH, views.size))
+            val groups =
+                try {
+                    MainThread.run {
+                        batch.mapNotNull { properties.forViewOrNull(it, includeResolutionStack) }
+                    }
+                } catch (e: MainThread.MainThreadTimeoutException) {
+                    if (e.started) throw e
+                    diag.add("properties-incomplete: the main thread was busy; read $next of ${views.size} views")
+                    break
+                }
+            out.addAll(groups)
+            next += batch.size
+        }
+        if (properties.failedViews > 0) diag.add("properties-failed-views=${properties.failedViews}")
+        if (properties.failedProperties > 0) diag.add("properties-failed=${properties.failedProperties}")
+        return out
     }
 
     private fun handleCaptureSkp(
@@ -389,7 +438,7 @@ class Dispatcher(private val deviceLock: Any = Any()) {
     /** Carries the main-thread results of a DUMP_TREE across the thread hop. */
     private class DumpTreeWork(
         val roots: List<ViewInspection.ViewNode>,
-        val propertyGroups: List<ViewInspection.PropertyGroup>,
+        val views: List<View>,
         val firstRoot: View?,
     )
 
@@ -462,21 +511,6 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         val roots = RootsDetector.rootViews()
         if (rootId == 0L) return roots
         return roots.filter { ViewReflect.uniqueDrawingId(it) == rootId }
-    }
-
-    /**
-     * Depth-first collects [view] and all descendants into [out], in the same
-     * pre-order the tree walk visits them. MUST be called on the main thread.
-     */
-    private fun collectViews(view: View, out: MutableList<View>) {
-        out.add(view)
-        if (view is ViewGroup) {
-            val count = view.childCount
-            for (i in 0 until count) {
-                val child = view.getChildAt(i) ?: continue
-                collectViews(child, out)
-            }
-        }
     }
 
     /** A DumpTree/Screenshot scale of 0 (unset) defaults to 1.0; clamp to <=1.0. */
