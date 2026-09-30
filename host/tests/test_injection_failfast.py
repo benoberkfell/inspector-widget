@@ -131,7 +131,8 @@ def test_shadowed_kotlin_fails_fast_with_the_cause(fake_device):
     assert msg.startswith(f"the agent payload failed to start in '{PKG}' (pid {PID}): "
                           "java.lang.NoSuchMethodError: No static method checkNotNullParameter")
     assert "kotlin.jvm.internal.Intrinsics resolved to the app's own copy (in its base.apk)" in msg
-    assert "R8/ProGuard shrank" in msg and "minified Kotlin classes" in msg
+    assert msg.endswith("which lacks members the payload uses: the app's Kotlin classes were "
+                        "minified by R8/ProGuard, or are an older version.")
     assert "declaration of" not in msg  # restated, not dumped
     assert "isMinifyEnabled = false" in e.hint and "--force" in e.hint
     assert e.log[0].startswith("initialize: error invoking")
@@ -371,7 +372,21 @@ def test_shadowing_without_the_declaring_apk_is_only_probable():
     e = shadow.error
     assert e.kind == "classpath_shadowing"
     assert ("com.google.protobuf.GeneratedMessageLite probably resolved to the app's own copy, "
-            "which R8/ProGuard shrank: the app's minified protobuf classes") in str(e)
+            "which lacks members the payload uses: the app's protobuf classes were minified") \
+        in str(e)
+
+
+def test_a_linkage_error_on_an_app_class_names_the_app_copy():
+    found = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
+                                           "Caused by: java.lang.NoSuchMethodError: No virtual "
+                                           "method getFoo()I in class Landroidx/compose/ui/Bar; "
+                                           "or its super classes (declaration of "
+                                           "'androidx.compose.ui.Bar' appears in /data/app/~~x/"
+                                           "com.example-y/split_compose.apk)"))
+    e = found.error
+    assert e.kind == "classpath_shadowing"
+    assert ("androidx.compose.ui.Bar resolved to the app's own copy (in its split_compose.apk), "
+            "which lacks members the payload uses: the app's classes were minified") in str(e)
 
 
 def test_a_linkage_error_in_an_unrelated_class_is_not_called_shadowing():

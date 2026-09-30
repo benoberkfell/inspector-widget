@@ -661,7 +661,9 @@ def _shadowed(cause: str) -> Optional[Tuple[str, str, Optional[str], Optional[st
     """``(exception, class, library, apk, detail)`` when ``cause`` is a linkage
     error on a class the app itself provides (its APK is where the class was
     declared) or on a library the payload shares with apps (Kotlin, protobuf).
-    ``apk`` is the app APK the class came from, when the error says."""
+    ``apk`` is the app APK the class came from, when the error says. A payload
+    that relocates its own Kotlin/protobuf never links against the app's, so
+    this then only matches classes it takes from the app on purpose."""
     exc, _, detail = cause.partition(": ")
     if exc not in _LINKAGE_ERRORS:
         return None
@@ -696,8 +698,8 @@ def _agent_error(kind: str, record: _LogRecord, serial: str, package: str, pid: 
             return AgentStartupError(
                 f"the agent payload failed to start in {app}: {exc}: {_clip(detail)}. The "
                 f"payload's {cls} {'resolved' if apk else 'probably resolved'} to {own}, which "
-                f"R8/ProGuard shrank: the app's minified {library or 'library'} classes lack "
-                f"members the payload uses.",
+                f"lacks members the payload uses: the app's {library + ' ' if library else ''}"
+                f"classes were minified by R8/ProGuard, or are an older version.",
                 hint=("Inspect a build of the app without code shrinking (isMinifyEnabled = "
                       "false, e.g. its debug variant). " + retry),
                 kind="classpath_shadowing", cause=cause, log=log, cacheable=True)
