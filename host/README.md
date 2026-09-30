@@ -198,18 +198,51 @@ before anything touches the device, the same way on every transport; an
 explicit `null` for an optional argument means its default, and a whole-number
 float (`12.0`) passes for an integer. `scale` is in (0, 1].
 
+### Output: compact, brief by default, budgeted
+
+Every result leaves through `inspector_widget.output` (Phase 0 of
+`docs/design/capture-and-walk.md`), on the MCP and the CLI alike:
+
+- **Compact JSON.** The CLI's `--pretty` indents it for humans.
+- **`detail="brief"`** (default) drops what the agent does not need and counts
+  every omission (`omitted`, `hidden`, `omitted_defaults`, `hidden_descendants`):
+  bounds become `[x,y,w,h]`; properties become `{name: value}` maps (colors
+  `#AARRGGBB`, resources `@type/name`) holding only non-default values when a
+  tree carries them; a11y nodes drop sentinels and boilerplate actions;
+  `focus_order` keeps the stops as `{order, key, speak}`; `a11y_lint` groups its
+  findings by rule (count, message, the first three node keys); Compose slot
+  tables show app code only (`user_code_only=false` for library composables).
+  **`detail="full"`** returns the tool's whole result (the pre-Phase-0 content).
+- **`max_depth`** (1 = the roots: `dump_tree(max_depth=1)` lists the window roots)
+  and **`root`** (a node id or key from the result) on `dump_tree`,
+  `dump_compose`, `dump_accessibility` and `inspect`; `focus_order` (`stops` |
+  `full` | `none`), `group_by` (`rule` | `none`) and `filter` (`all` |
+  `nondefault`) where they apply.
+- **`max_bytes`** (default `$INSPECTOR_WIDGET_MAX_BYTES`, else 32,000; `0` = no
+  cap; 1,000..200,000). A larger result is written to a spill file under
+  `<store>/spill/` (1 h TTL) and the response is a spill envelope of at most
+  3,000 bytes: `{truncated, tool, bytes, max_bytes, summary, preview, spill_path,
+  hint}`. `detail="full"` with `max_bytes=0` is the rollback to the legacy output.
+
+The CLI takes the same parameters as kebab-case flags with the same defaults
+(`--detail`, `--max-bytes`, `--max-depth`, `--root`, `--user-code-only` /
+`--no-user-code-only`, `--focus-order`, `--group-by`, `--filter`), and
+`--json -` prints the bytes the MCP tool returns for the same arguments.
+`--json FILE` writes the whole document and never spills. With
+`--detail full` each subcommand prints its own pre-Phase-0 document.
+
 | Tool | Arguments | Returns |
 |------|-----------|---------|
 | `list_devices` | — | `{devices:[{serial, api, abi, model, state}], count}` |
 | `list_processes` | `serial?` | `{serial, processes:[{package, pid, running}], count}` — debuggable packages only; running apps first |
 | `attach` | `serial?`, `package`, `force=false` | `{attached, pid, warm, reused, api_level, abi, agent_version, build_id, window_count, root_ids, session, note?}` — injects if needed (idempotent); app must be running. `warm`: the agent was already running; `reused`: this server's cached session was reused; `note` when that session runs an older build. `force=true` stops any running agent and injects a fresh one |
-| `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0` | `{roots:[ViewNode…], root_count, properties?, screenshot?}` — auto-attaches |
-| `get_properties` | `serial`, `package`, `view_id`, `include_resolution_stack=false` | `{view_id, group:{view_id, properties:[{name,type,value,is_layout?,source?,resolution_stack?}]}}` |
+| `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0`, `root_id=0` | `{serial, package, roots:[ViewNode…], root_count, properties?, screenshot?}` — auto-attaches; brief: `properties` is `{view_id: {name: value}}` (non-default values) plus `omitted_defaults` |
+| `get_properties` | `serial`, `package`, `view_id`, `include_resolution_stack=false`, `filter=all` | brief: `{serial, package, view_id, properties:{name: value}}`; full: `{…, group:{view_id, properties:[{name,type,is_layout,value,source?,resolution_stack?}]}}` |
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
 | `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
 | `compose_overlay` | `serial`, `package`, `scale=1.0`, `all_boxes=false` | `{path, boxes, …}` — screenshot with every on-screen Compose element boxed (text/role + bounds) + a flat on-screen text list |
 | `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` and a `generation`; nodes TalkBack never sees carry `ignored`, windows under a modal dialog `covered_by` |
-| `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]`, `include_rendering_info=true` | `{summary, findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window, collection, message, evidence}], diagnostics, stats, density, font_scale, generation, …}` — the detect/verify engine (R1..R18) over the unified a11y tree (Views + Compose), judging what TalkBack reads; `rules` takes ids, `R#` aliases or ATF names; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
+| `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]`, `include_rendering_info=true`, `group_by=rule` | brief: `{summary, by_rule:{rule:{sev, n, msg, nodes:[≤3 node keys], more?}}, diagnostics (warn/error), density, font_scale, generation, contrast_sampled, omitted}`; `group_by=none` / full: `{summary, findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window, collection, message, evidence}], diagnostics, stats, …}` — the detect/verify engine (R1..R18) over the unified a11y tree (Views + Compose), judging what TalkBack reads; `rules` takes ids, `R#` aliases or ATF names; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
 | `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — every window composited (a dialog over its activity), every a11y node boxed + what TalkBack says + reading-order number; red error, amber warn, blue info, green clean, dashed = a finding with no a11y node, drawn at its bounds |
 | `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation and `summary.generation`; can render the integrated overlay (all windows; green exact, amber overlap, grey none) |
 | `inspect_node` | `serial`, `package`, one of `node_key` (`view:<id>` \| `compose:<acvId>:<semanticsId>` \| `composeview:<acvId>`) \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, generation, where, context, view?, compose?, a11y?, list_item?, a11y_only?, a11y_parent?, resolved_from?, key_note?, component_image{path}, lint[], lint_summary, lint_diagnostics}` — `compose` carries the semantics attrs (`source` is null: `file:line` needs `dump_compose` with the slot table), `view` typed properties, `lint` exactly the `a11y_lint` findings for the element and the nodes merged into it |
@@ -236,7 +269,8 @@ float (`12.0`) passes for an integer. `scale` is in (0, 1].
   registry lives per app process in `$INSPECTOR_WIDGET_KEY_CACHE` (default
   `<tmp>/inspector-widget-keys`, `0` = memory only), so separate CLI runs share it.
 - `dump_accessibility` gives every node a `node_key` and returns `focus_order` as
-  `[{order, key, id, speak}]`: one entry per TalkBack focus stop with what TalkBack
+  `[{order, key, id, speak}]` (brief: without `id`; `root` also takes a node key):
+  one entry per TalkBack focus stop with what TalkBack
   announces there (`"Delete, button"`, `"Unlabeled, checkbox, not checked"`), built
   from the accessibility child order plus `traversal_before`/`traversal_after` applied
   across the whole tree. It walks the tree TalkBack gets: a View that is not important
@@ -249,35 +283,41 @@ float (`12.0`) passes for an integer. `scale` is in (0, 1].
 
 ### Node shape (`dump_tree`)
 
-Each `ViewNode` JSON object:
+The MCP and the CLI decode the wire with the same `inspector_widget.strings`.
+Each `ViewNode` JSON object (`detail="full"`; brief notes in brackets):
 
 - `id` — `View.getUniqueDrawingId()`, stable per view instance. **Pass this as
   `view_id` to `get_properties`.**
-- `class_name`, `package_name` — simple class name + package.
-- `bounds` — absolute on-screen `{x, y, w, h}` in px; plus `render_quad`
-  (four `[x,y]` corners) when the view is rotated/scaled/skewed.
-- `resource` — the view's own `@id`, as `{type, namespace, name, ref}` where
-  `ref` is e.g. `"@id/my_button"`.
-- `layout_resource` — the layout file that inflated it, if known.
+- `class_name`, `package_name`, `qualified_name` [dropped when it is just
+  package.class].
+- `bounds` — `{layout: {x, y, w, h}, render?}`: absolute on-screen px, plus the
+  `render` quad (`x0..y3`) when the view is rotated/scaled/skewed [brief:
+  `[x, y, w, h]` and `render` when transformed].
+- `resource` — the view's own `@id`, as `{namespace, type, name}`.
+- `layout_resource` — the layout file that inflated it, if known [brief: only
+  where it differs from the parent's].
 - `view_id_name` — the R.id name (e.g. `"my_button"`), if any.
 - `text` — best-effort text for `TextView`s.
 - `flags` — e.g. `["IS_WEBVIEW"]`.
-- `children` — nested nodes.
+- `children` — nested nodes [brief: `hidden_descendants: N` past `max_depth`].
 
 ### Property shape (`get_properties` / `dump_tree include_properties`)
 
-Each property: `{name, type, value, is_layout?, source?, resolution_stack?}`.
-`type` is one of `STRING, BOOLEAN, BYTE, CHAR, DOUBLE, FLOAT, INT16, INT32,
-INT64, OBJECT, COLOR, GRAVITY, INT_ENUM, INT_FLAG, RESOURCE, DRAWABLE, ANIM,
-ANIMATOR, INTERPOLATOR, DIMENSION`. Decoding:
+Each property (`detail="full"`): `{name, type, is_layout, value, source?,
+resolution_stack?}`. `type` is one of `STRING, BOOLEAN, BYTE, CHAR, DOUBLE, FLOAT,
+INT16, INT32, INT64, OBJECT, COLOR, GRAVITY, INT_ENUM, INT_FLAG, RESOURCE,
+DRAWABLE, ANIM, ANIMATOR, INTERPOLATOR, DIMENSION`. Decoding:
 
-- `COLOR` → `#AARRGGBB` string.
-- `RESOURCE` → `{type, namespace, name, ref}`.
-- `BOOLEAN` → JSON bool; numeric types → JSON number; `DIMENSION`/`FLOAT` →
-  float; string-like types → text.
+- `COLOR` → the ARGB int (brief: `#AARRGGBB`).
+- `GRAVITY` / `INT_FLAG` → the `|`-joined flag names the agent sends
+  (`"center_vertical|start"`; `""` for an empty set).
+- `DIMENSION` → px (int); `FLOAT` → float.
+- `RESOURCE` → `{namespace, type, name}` (brief: `@type/name`).
+- `BOOLEAN` → JSON bool; other numeric types → JSON number; string-like types → text.
 - `is_layout: true` marks layout-param attributes (e.g. `layout_width`).
 - With `include_resolution_stack=true`, `source` names the style/layout that set
-  the value and `resolution_stack` lists the ordered chain considered.
+  the value and `resolution_stack` lists the ordered chain considered (brief:
+  `{value, source, stack}`).
 
 ### Typical agent flow
 

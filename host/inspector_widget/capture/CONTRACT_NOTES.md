@@ -300,8 +300,10 @@ with every consumer.
     `group_by` (a11y_lint) and `filter` (get_properties).
 
   The compact-only tools get no extra params, since `tools/list` must stay at or
-  under 18,500 B. It is 18,379 B with main's TOOLS, which leaves about 120 B for
-  P0-2's doc edits.
+  under 18,500 B. With the three TalkBack tools that took trimming (P0-2): shorter
+  tool and parameter descriptions, `package` without one, a shared `scale`, and
+  `a11y_lint.rules` without its 47-id enum (the handler checks the ids first and
+  names the valid ones). It is 18,337 B with all 18 tools.
   - `max_bytes` defaults to the environment value both in the schema and on the
     CLI, so the two stay equal.
   - The CLI adds `--pretty` everywhere. `add_cli_flags` skips flags a subparser
@@ -310,8 +312,9 @@ with every consumer.
   - `CLI_SUBCOMMANDS` maps each MCP tool to its subcommand, and
     `tool_args_from_cli(ns, tool)` turns parsed flags back into MCP args.
 - **Brief property values** (`normalize.prop_value`):
-  - COLOR becomes `#AARRGGBB`, and GRAVITY/INT_FLAG become their label. The legacy
-    MCP shape has lost the label and stays `0`.
+  - COLOR becomes `#AARRGGBB`. GRAVITY/INT_FLAG are the agent's flag string: the
+    value since E3 (`strings.property_to_dict`), the `label` beside a `0` in older
+    recordings. The legacy MCP recordings lost it and stay `0`.
   - Resources become `@ns:type/name`, and drawable, animator and object class
     names become simple names.
   - FLOAT is rounded to 7 significant digits, which is float32-exact.
@@ -349,6 +352,15 @@ with every consumer.
   `host/tests/gen_library_files.py`. A missing source counts as library. The
   origin is `app` when the file is not a library file and the composable name
   starts upper-case. dump_compose always keeps the window root and semantics nodes.
+- **P0-2 changes to the brief rules**, found wiring them to the live shapes:
+  - a11y_lint lists a finding's `node_key` (what inspect_node takes; the packed
+    id only when there is none) and leaves out `stats` and the info-level
+    diagnostics, counted as `omitted.stats` (fields) and `omitted.info_diagnostics`.
+  - focus_order: a11y.py lists stops only (`is_focus_stop` appears only with
+    structural entries), as `{order, key, id, speak, unlabeled?, window?}`; a
+    brief stop is `{order, key, speak}` plus `unlabeled`/`window`/`covered_by`,
+    and `id` only when there is no `key` (the recordings).
+  - dump_accessibility `root` also takes a node's `node_key`.
 - **Measured brief sizes on the checked-in real outputs**, in compact bytes (spec
   2.6 target in parentheses):
   - launcher `dump_compose`: 17,399 (24,000); with `include_slot_table=false`,
@@ -360,6 +372,66 @@ with every consumer.
   - launcher `get_properties`: 2,154 (3,500)
   - View screen `inspect`: 14,477 (18,000)
   - View screen `dump_tree(include_properties)`: 16,584 (20,000)
+
+## Phase-0 wiring (P0-2, `mcp_server.py`, `cli.py`, `results.py`)
+
+- **MCP.** `_call_tool_text` -> `_render_result(name, result, args)`: an error
+  result goes out as it is (compact, `isError`); anything else is
+  `slim(name, result, args)` with the arguments normalized as the tool saw them
+  (a `null` optional dropped, `12.0` an int), then `finalize(name, brief,
+  max_bytes=args.get("max_bytes"))`. A `slim` error (an unknown `root`) is
+  `isError` too. `output.augment_schemas(TOOLS)` runs once, after the TalkBack
+  tools are in. If the host package cannot import, the server still starts and
+  answers compact JSON.
+- **CLI.** `_emit_result(args, tool, legacy, result)`: `--detail full` prints
+  `legacy`, the subcommand's own pre-Phase-0 document; otherwise `slim(tool,
+  result)`, where `result` is the MCP tool's document built by the same
+  `results.*` function. So `--json -` is byte-equal to the MCP text for the same
+  arguments, except the flag a dump_compose note names (`--enable-inspection` on
+  the CLI). `--json -` is budgeted like the MCP (an envelope and a spill file);
+  `--json FILE` gets the whole document and never spills; exit code 1 when `slim`
+  rejects an argument. The subcommands that always print JSON (inspect-node,
+  get-properties and component-image without `--json`, talkback) go through it
+  too. `add_cli_flags` runs for every subcommand that prints JSON, so `--pretty`
+  is on all of them. A brief `a11y --lint` groups its embedded lint by rule.
+- **`results.py`** (new): the documents both surfaces build, with the target
+  (`serial`, `package`) and the fields each tool always reports
+  (`root_count`, `contrast_sampled`, the dump_compose note).
+- **E3.** mcp_server's own proto decoder is gone: `dump_tree` and
+  `get_properties` use `strings.dump_tree_to_dict` / `get_properties_to_dict`,
+  so the full shapes are the CLI's (bounds `{layout, render?}`, resources
+  `{namespace, type, name}`, properties keyed by view id, COLOR as its int).
+  `strings.property_to_dict` now gives GRAVITY/INT_FLAG the agent's flag string as
+  the value (`""` for an empty set), not `0` beside a `label`. Also deleted: the
+  screenshot helpers and the second PNG encoder (`png.write_png` for both
+  surfaces), `_first_attr` and the `_import_proto` fallback names, the dict branch
+  of `_session_get_windows`, the object branches of `_device_to_json` /
+  `_process_to_json`, `_device_density` and `_lint_fn`.
+- **Goldens** (`tests/golden/legacy/`, `test_legacy_golden.py`): the rollback
+  (`detail="full"`, `max_bytes=0`) reproduces the pre-Phase-0 outputs recorded at
+  G1 except the documented deltas (`record_goldens.LEGACY_DELTAS`): the E3 shapes
+  (MCP `dump_tree`, `get_properties`; GRAVITY/INT_FLAG values in both surfaces'
+  property lists) and the MCP screenshot's file size (another PNG encoder, the
+  same pixels).
+- **Measured** through `_call_tool_text` and the CLI's `--json -` over the harness
+  fake adb and agent (compact bytes; "legacy" is the full result with indent=2,
+  as the MCP sent it before Phase 0):
+
+  | Scene | Call | Legacy | MCP = CLI | Target |
+  |---|---|---|---|---|
+  | launcher | `dump_compose()` | 567,142 | 17,399 | 24,000 |
+  | launcher | `dump_compose(include_slot_table=false)` | 23,941 | 4,470 | 6,000 |
+  | launcher | `inspect()` | 115,286 | 12,781 | 13,000 |
+  | launcher | `dump_accessibility()` | 85,974 | 10,250 | 12,500 |
+  | launcher | `a11y_lint()` | 3,624 | 1,053 | 1,200 |
+  | launcher | `dump_tree(include_properties)` | 106,813 | 3,691 | 8,000 |
+  | launcher | `get_properties(82)` | 11,178 | 2,157 | 3,500 |
+  | View screen | `inspect()` | 117,913 | 14,081 | 18,000 |
+  | View screen | `dump_tree(include_properties)` | 644,021 | 16,767 | 20,000 |
+  | 259-view | `dump_tree(max_depth=1)` | 169,658 | 297 | 2,000 |
+  | 259-view | `dump_tree` / `dump_accessibility` / `inspect` / `+props` | 170 KB-3.85 MB | envelopes of 766-866 | 3,000 |
+
+  `tools/list` is 18,337 B compact (18 tools).
 
 ## Query engine and line grammar (C6, `capture/query.py`, `capture/lines.py`)
 

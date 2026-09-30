@@ -9,7 +9,8 @@ accessibility tree, one screenshot per window), keeps it on disk under an id suc
 Spec: "Capture and Walk" (sections 3-7 and the section 10 contracts).
 Implementation decisions beyond the spec, module by module, are in
 [`CONTRACT_NOTES.md`](CONTRACT_NOTES.md). This package is pure library code. It is not
-wired to the CLI or the MCP server yet (P0-2, S1 and S2 do that).
+wired to the CLI or the MCP server yet (S1 and S2 do that); the output layer
+(`output.py`, `normalize*.py`) is, since P0-2.
 
 ## Module map
 
@@ -86,7 +87,8 @@ another process published meanwhile. `tests/test_capture_pipeline_offline.py`
 
 ## How the wiring packages call in
 
-**P0-2 (legacy tools, both surfaces)** needs only the output layer:
+**P0-2 (legacy tools, both surfaces; done)** uses only the output layer, as
+`mcp_server._render_result` and `cli._emit_result` do:
 
 ```python
 brief = output.slim(tool, result, args)                      # detail="full" is identity
