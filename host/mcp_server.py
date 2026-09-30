@@ -1582,47 +1582,88 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Real MCP SDK path.
 # --------------------------------------------------------------------------- #
-def _serve_with_mcp() -> bool:
-    """Try to serve using the real `mcp` SDK. Returns True if it ran."""
+def _call_tool_text(name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
+    """Run a tool and render its MCP text payload. Returns ``(text, is_error)``.
+
+    Shared by the SDK transport and the JSON-RPC fallback so both report
+    failures identically (``isError: true`` + a JSON ``{"error": ...}`` body).
+    ``_run_tool`` converts handler failures into a top-level ``{"error": ...}``
+    dict rather than raising, so that key is what marks a failed call.
+    """
+    try:
+        result = _run_tool(name, arguments or {})
+        is_error = isinstance(result, dict) and "error" in result
+        return json.dumps(result, indent=2, default=str), is_error
+    except (ToolError, HostUnavailableError) as exc:
+        return json.dumps({"error": str(exc)}), True
+    except Exception as exc:  # surfaced to the agent, not raised
+        log.exception("tool %s failed", name)
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}", "tool": name}), True
+
+
+def _build_mcp_server() -> Any:
+    """Construct the `mcp` SDK server, or return None if the SDK is absent.
+
+    Supports both SDK API generations:
+      - mcp 1.x: ``Server(name)`` + ``@server.list_tools()`` / ``@server.call_tool()``
+        decorators.
+      - mcp 2.x: the decorators are gone; handlers are passed to the constructor
+        as ``on_list_tools`` / ``on_call_tool`` and receive ``(ctx, params)``.
+    Raises if the SDK is importable but neither API shape fits, so
+    ``--self-check`` can report it instead of the server dying at startup.
+    """
     try:
         import mcp.types as types
         from mcp.server import Server
-        from mcp.server.stdio import stdio_server
     except Exception as exc:
         log.info("mcp SDK not available (%r); using JSON-RPC fallback.", exc)
-        return False
+        return None
 
-    server = Server("inspector-widget")
-
-    @server.list_tools()
-    async def list_tools() -> List[Any]:  # type: ignore[misc]
+    def tool_list() -> List[Any]:
         return [
-            types.Tool(
-                name=name,
-                description=entry["description"],
-                inputSchema=entry["schema"],
-            )
+            types.Tool(name=name, description=entry["description"], inputSchema=entry["schema"])
             for name, entry in TOOLS.items()
         ]
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: Dict[str, Any]) -> List[Any]:  # type: ignore[misc]
-        try:
-            result = await asyncio.to_thread(_run_tool, name, arguments or {})
-            payload = json.dumps(result, indent=2, default=str)
-            return [types.TextContent(type="text", text=payload)]
-        except (ToolError, HostUnavailableError) as exc:
-            return [types.TextContent(type="text", text=json.dumps({"error": str(exc)}))]
-        except Exception as exc:  # pragma: no cover - surfaced to agent
-            log.exception("tool %s failed", name)
-            return [
-                types.TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {"error": f"{type(exc).__name__}: {exc}", "tool": name}
-                    ),
-                )
-            ]
+    async def run_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Any:
+        text, is_error = await asyncio.to_thread(_call_tool_text, name, arguments or {})
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=text)], isError=is_error
+        )
+
+    if hasattr(Server, "list_tools"):  # mcp 1.x decorator API
+        server = Server("inspector-widget", version=_SERVER_INFO["version"])
+
+        @server.list_tools()
+        async def list_tools() -> List[Any]:  # type: ignore[misc]
+            return tool_list()
+
+        @server.call_tool()
+        async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:  # type: ignore[misc]
+            return await run_tool(name, arguments)
+
+        return server
+
+    async def on_list_tools(ctx: Any, params: Any) -> Any:  # mcp 2.x handler API
+        return types.ListToolsResult(tools=tool_list())
+
+    async def on_call_tool(ctx: Any, params: Any) -> Any:
+        return await run_tool(params.name, params.arguments)
+
+    return Server(
+        "inspector-widget",
+        version=_SERVER_INFO["version"],
+        on_list_tools=on_list_tools,
+        on_call_tool=on_call_tool,
+    )
+
+
+def _serve_with_mcp() -> bool:
+    """Try to serve using the real `mcp` SDK. Returns True if it ran."""
+    server = _build_mcp_server()
+    if server is None:
+        return False
+    from mcp.server.stdio import stdio_server
 
     async def _main() -> None:
         async with stdio_server() as (read_stream, write_stream):
@@ -1693,36 +1734,10 @@ def _fallback_handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        try:
-            result = _run_tool(name, arguments)
-            text = json.dumps(result, indent=2, default=str)
-            return _jsonrpc_result(
-                req_id, {"content": [{"type": "text", "text": text}], "isError": False}
-            )
-        except (ToolError, HostUnavailableError) as exc:
-            return _jsonrpc_result(
-                req_id,
-                {
-                    "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
-                    "isError": True,
-                },
-            )
-        except Exception as exc:
-            log.exception("tool %s failed", name)
-            return _jsonrpc_result(
-                req_id,
-                {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(
-                                {"error": f"{type(exc).__name__}: {exc}", "tool": name}
-                            ),
-                        }
-                    ],
-                    "isError": True,
-                },
-            )
+        text, is_error = _call_tool_text(name, arguments)
+        return _jsonrpc_result(
+            req_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
+        )
 
     if req_id is not None:
         return _jsonrpc_error(req_id, -32601, f"method not found: {method}")
@@ -1760,26 +1775,56 @@ def _serve_fallback() -> None:
 # Entry point
 # --------------------------------------------------------------------------- #
 def _self_check() -> int:
-    """Print tool surface + host/proto import status; for diagnostics."""
+    """Print tool surface + dependency status; for diagnostics.
+
+    Exits non-zero when something the server needs to start is broken (host
+    package, proto gencode, or an installed-but-incompatible mcp SDK). Missing
+    optional deps are reported with the tools they degrade, but don't fail.
+    """
+    failed = False
     print("Inspector Widget MCP server — self check")
-    print(f"  tools: {', '.join(TOOLS)}")
+    print(f"  tools ({len(TOOLS)}): {', '.join(TOOLS)}")
     try:
         HOST.host  # noqa: B018 - trigger import
         print("  inspector_widget: OK")
     except Exception as exc:
+        failed = True
         print(f"  inspector_widget: UNAVAILABLE ({exc})")
     try:
         HOST.proto  # noqa: B018
         print("  view_inspection_pb2: OK")
     except Exception as exc:
+        failed = True
         print(f"  view_inspection_pb2: UNAVAILABLE ({exc})")
     try:
-        import mcp  # noqa: F401
+        server = _build_mcp_server()
+    except Exception as exc:
+        failed = True
+        print(f"  mcp SDK: INCOMPATIBLE ({type(exc).__name__}: {exc})")
+    else:
+        if server is None:
+            print("  mcp SDK: absent (will use JSON-RPC stdio fallback)")
+        else:
+            print(f"  mcp SDK: {_dist_version('mcp')} OK (real MCP transport)")
+    for mod, dist, degraded in (
+        ("PIL", "Pillow", "compose_overlay, a11y_overlay, inspect overlay, component_image crop fallback"),
+        ("grpc", "grpcio", "component_image SKP rendering (falls back to a screenshot crop)"),
+    ):
+        try:
+            __import__(mod)
+            print(f"  {dist}: {_dist_version(dist)} OK")
+        except Exception:
+            print(f"  {dist}: MISSING — degrades: {degraded} (pip install {dist})")
+    return 1 if failed else 0
 
-        print("  mcp SDK: present (will use real MCP transport)")
+
+def _dist_version(dist: str) -> str:
+    try:
+        from importlib.metadata import version
+
+        return version(dist)
     except Exception:
-        print("  mcp SDK: absent (will use JSON-RPC stdio fallback)")
-    return 0
+        return "unknown version"
 
 
 def main(argv: Optional[List[str]] = None) -> int:

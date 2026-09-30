@@ -31,9 +31,9 @@ From the repo root, install the package that lives under `host/`:
 
 | Extra      | Pulls in        | Enables                                                              |
 |------------|-----------------|---------------------------------------------------------------------|
-| `mcp`      | `mcp>=1.0`      | the real MCP stdio transport (otherwise a built-in JSON-RPC fallback) |
+| `mcp`      | `mcp>=1.19,<3`  | the real MCP stdio transport, SDK 1.x or 2.x (otherwise a built-in JSON-RPC fallback) |
 | `images`   | `grpcio>=1.60`  | `inspector_widget.skia_client` → SKP image decoding                  |
-| `overlay`  | `Pillow>=10`    | native PNG encode + a11y overlay rendering (`inspector_widget.overlay`) |
+| `overlay`  | `Pillow>=10`    | every overlay tool (`inspector_widget.overlay`) + the component-image crop fallback |
 | `dev`      | `pytest`, `ruff`| tests + lint                                                        |
 | `all`      | all of the above| convenience                                                         |
 

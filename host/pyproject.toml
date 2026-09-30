@@ -34,8 +34,9 @@ dependencies = [
 [project.optional-dependencies]
 # Model Context Protocol SDK — enables the real MCP stdio transport in
 # host/mcp_server.py. Without it the server falls back to a built-in
-# JSON-RPC-over-stdio implementation, so this is optional.
-mcp = ["mcp>=1.0"]
+# JSON-RPC-over-stdio implementation, so this is optional. 1.19 is the first
+# 1.x whose call_tool accepts a CallToolResult (needed for isError); 2.x works too.
+mcp = ["mcp>=1.19,<3"]
 # gRPC client used by inspector_widget.skia_client to talk to the Skia parser
 # service for SKP image decoding. Optional — only the SKP image path needs it.
 images = ["grpcio>=1.60"]
@@ -47,7 +48,7 @@ overlay = ["Pillow>=10"]
 dev = ["pytest", "ruff"]
 # Everything (convenience): mcp + images + overlay + dev.
 all = [
-    "mcp>=1.0",
+    "mcp>=1.19,<3",
     "grpcio>=1.60",
     "Pillow>=10",
     "pytest",
