@@ -153,6 +153,9 @@ def test_legacy_agent_ids_still_walk(probe):
         current = agent.behaviour
 
         def behaviour(req):
+            if req.WhichOneof("command") in ("a11y_focus", "a11y_act"):
+                # An A1-era agent predates A11yFocus/A11yAct: the field is unknown to it.
+                return 0, fakeagent.error_response(req.id, "No command set in request")
             delay, action = current(req)
             if req.WhichOneof("command") == "dump_a11y" and action is not None \
                     and not isinstance(action, (str, bytes)):
