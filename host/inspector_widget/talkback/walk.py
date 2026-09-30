@@ -6,13 +6,15 @@ uinput keyboard (:mod:`.inject`), and after every press reads which node holds
 accessibility focus. The walk (A, actual) is then compared with the model's
 predicted order (P) and a visual reading order (V) by :mod:`.diff`.
 
-Focus reading: :class:`DumpFocusReader` polls ``Session.dump_a11y`` (the
-agent's in-process query reports ``accessibility_focused`` exactly as TalkBack
-set it; 16-18ms per read on an emulator) every 10ms until the focused node
-changes and then stays put (key and bounds) for a quiet period. The agent's
-long-poll A11yFocus command (design T2) will replace it behind the same
-:class:`FocusReader` interface; :func:`make_reader` picks it when the Session
-has ``a11y_focus``.
+Focus reading (:func:`make_reader`): with an agent that serves A11yFocus,
+:class:`A11yFocusReader` long-polls ``Session.a11y_focus`` for TalkBack's next
+VIEW_ACCESSIBILITY_FOCUSED event (the reply comes 6-13ms after the event) and
+reads the agent's event tap, so a focus the app takes between presses
+(stolen), a focus nobody holds (lost), auto-scroll (VIEW_SCROLLED) and window
+changes are exact; a full ``dump_a11y`` is taken only when the tree changed or
+focus reached a node the last dump lacks. Older agents get
+:class:`DumpFocusReader`, which polls ``dump_a11y`` (10-50ms per read) every
+10ms until the focused node changes and then stays put for a quiet period.
 
 Node identity: bounds are NOT part of it (they change while a list scrolls).
 With the agent's per-View ids the key is the typed node key (``view:<id>``,
@@ -53,6 +55,7 @@ MAX_STEPS_CAP = 300
 STEP_TIMEOUT_MS = 1500
 SETTLE_MS = 120
 INITIAL_FOCUS_S = 2.0   # TalkBack's first focus on a window it just started on
+EDGE_SLICE_S = 0.25     # long-poll slice while TalkBack's log can report an edge
 POLL_MS = 10
 UNTIL = ("wrap", "edge", "loop", "steps")
 DIRECTIONS = ("next", "prev")
@@ -178,6 +181,13 @@ class DumpIndex:
         s = strings.get
         self.diagnostics = resp.diagnostics or ""
         self.windows: List[int] = [w.root_view_id for w in resp.windows if w.HasField("root")]
+        # WindowInfo (agents with A11yFocus): title, frame, obscured system-bar rects.
+        self.window_meta: Dict[int, Dict[str, Any]] = {}
+        for w in resp.windows:
+            if w.HasField("info"):
+                from ..strings import StringResolver, window_info_to_dict
+                self.window_meta[w.root_view_id] = window_info_to_dict(
+                    w.info, StringResolver(resp.strings))
         hosts_per_window: List[set] = []
         compose_hosts: set = set()
         raw: List[Tuple[Any, int, Optional[Any]]] = []
@@ -236,10 +246,18 @@ class DumpIndex:
         return self.focused[0] if self.focused else None
 
     def window_rect(self, window: int) -> Optional[Rect]:
+        frame = (self.window_meta.get(window) or {}).get("frame")
+        if frame:
+            return (frame["x"], frame["y"], frame["w"], frame["h"])
         for n in self.order:
             if n.window == window and n.parent is None:
                 return n.bounds
         return None
+
+    def obscured(self, window: int) -> List[Rect]:
+        """Screen rects the status bar, nav bar and IME cover over this window."""
+        return [(r["x"], r["y"], r["w"], r["h"])
+                for r in (self.window_meta.get(window) or {}).get("obscured") or []]
 
     def scroll_container(self, n: Node) -> Optional[Node]:
         for a in n.ancestors():
@@ -289,19 +307,24 @@ def detect_scroll(prev: Optional[DumpIndex], cur: DumpIndex) -> Optional[Node]:
 # --------------------------------------------------------------------------- #
 # Focus reading
 # --------------------------------------------------------------------------- #
+_FROM_DUMP = object()
 @dataclass
 class Snapshot:
     index: DumpIndex
     t: float  # time.monotonic() when the read returned
     resp: Any = None  # the DumpA11yResponse (for the model)
+    # The reader's own answer (A11yFocus) when it has one; else the dump's flag.
+    focus_node: Any = field(default=_FROM_DUMP)
+    events: List[Dict[str, Any]] = field(default_factory=list)  # event tap, since the last read
+    uptime_ms: Optional[int] = None  # device uptime at the read (A11yFocus)
 
     @property
     def focus(self) -> Optional[Node]:
-        return self.index.focus
+        return self.index.focus if self.focus_node is _FROM_DUMP else self.focus_node
 
     @property
     def key(self) -> Optional[str]:
-        f = self.index.focus
+        f = self.focus
         return f.key if f is not None else None
 
 
@@ -391,8 +414,136 @@ class DumpFocusReader:
             time.sleep(self.poll_s)
 
 
+# Events that do not change the tree: a plain step needs no new dump.
+_FOCUS_EVENTS = frozenset({"VIEW_ACCESSIBILITY_FOCUSED", "VIEW_ACCESSIBILITY_FOCUS_CLEARED",
+                           "VIEW_HOVER_ENTER", "VIEW_HOVER_EXIT", "VIEW_FOCUSED",
+                           "TOUCH_INTERACTION_START", "TOUCH_INTERACTION_END",
+                           "TOUCH_EXPLORATION_GESTURE_START", "TOUCH_EXPLORATION_GESTURE_END",
+                           "ANNOUNCEMENT", "VIEW_SELECTED"})
+
+
+def _node_from_focus(focus: Dict[str, Any], legacy: bool) -> Node:
+    """A detached Node for a focus the last dump does not hold."""
+    raw = focus.get("node") or {}
+    n = Node()
+    n.window = int(focus.get("root_view_id") or 0)
+    n.host = int(focus.get("host_view_id") or 0)
+    n.virtual = int(focus.get("virtual_id", HOST_VIEW_ID))
+    n.cls = raw.get("class_name") or ""
+    n.text = raw.get("text") or ""
+    n.cd = raw.get("content_description") or ""
+    n.pane_title = raw.get("pane_title") or ""
+    n.label = _label(n.text, n.cd, [(c.get("text") or "", c.get("content_description") or "")
+                                    for c in raw.get("children") or []])
+    b = ((focus.get("bounds") or {}).get("layout") or {})
+    n.bounds = (b.get("x", 0), b.get("y", 0), b.get("w", 0), b.get("h", 0))
+    n.flags = set(raw.get("flags") or []) & set(_FLAG_FIELDS)
+    n.actions = {a.get("id") for a in raw.get("actions") or []}
+    n.drawing_order = int(raw.get("drawing_order") or 0)
+    n.key = focus.get("node_key") or node_key(n.window, n.host, n.virtual, n.cls, n.label, legacy)
+    return n
+
+
+class A11yFocusReader:
+    """Long-poll the agent's A11yFocus: exact focus moves from its event tap.
+
+    Every read passes the previous reply's ``seq`` as ``after_seq``, so no focus
+    event between two reads is missed (the pre-press guard sees a stolen focus
+    exactly). A full dump is taken only when the events say the tree changed
+    (anything but focus/hover events) or focus is on a node the last dump lacks.
+    """
+
+    kind = "a11y_focus"
+
+    def __init__(self, session: Any) -> None:
+        self.session = session
+        self.legacy: Optional[bool] = None
+        self.seq = 0
+        self.reads = 0
+        self.dumps = 0
+        self.read_ms: List[float] = []
+        self.uptime_ms: Optional[int] = None  # device uptime at the last read
+        self._index: Optional[DumpIndex] = None
+        self._resp: Any = None
+
+    def _dump(self) -> None:
+        resp = self.session.dump_a11y(include_extras=False)
+        self._index = DumpIndex(resp, self.legacy)
+        if self.legacy is None and self._index.order:
+            self.legacy = self._index.legacy
+        self._resp = resp
+        self.dumps += 1
+
+    def _read(self, wait_ms: int = 0, quiet_ms: int = 0) -> Dict[str, Any]:
+        from .. import a11y
+        t0 = time.monotonic()
+        d = a11y.a11y_focus_to_dict(self.session.a11y_focus(
+            after_seq=self.seq, wait_ms=wait_ms, quiet_ms=quiet_ms, max_events=256))
+        self.reads += 1
+        # The read itself, without the time the long-poll spent waiting for TalkBack.
+        self.read_ms.append((time.monotonic() - t0) * 1000 - (d.get("waited_ms") or 0))
+        return d
+
+    def _snap(self, d: Dict[str, Any]) -> Snapshot:
+        focus = d.get("a11y")
+        key = focus.get("node_key") if focus else None
+        events = d.get("events") or []
+        if self._index is None or any(e.get("type") not in _FOCUS_EVENTS for e in events) \
+                or (key is not None and key not in self._index.nodes):
+            self._dump()
+        assert self._index is not None
+        node = None
+        if focus is not None and not focus.get("stale"):
+            node = self._index.nodes.get(key) if key else None
+            if node is None:
+                node = _node_from_focus(focus, bool(self.legacy))
+        self.seq = int(d.get("seq") or self.seq)
+        self.uptime_ms = d.get("read_uptime_ms") or None
+        return Snapshot(self._index, time.monotonic(), self._resp, focus_node=node,
+                        events=events, uptime_ms=self.uptime_ms)
+
+    def snapshot(self) -> Snapshot:
+        return self._snap(self._read())
+
+    def wait_change(self, prev_key: Optional[str], timeout_s: float, quiet_s: float,
+                    abort: Optional[Callable[[], bool]] = None) -> WaitResult:
+        """One long-poll: returns once TalkBack focused a node (then ``quiet_s``
+        with no events), or at the timeout (an edge when focus stayed put)."""
+        before = self.uptime_ms
+        if abort is None:
+            d = self._read(int(timeout_s * 1000), int(quiet_s * 1000))
+        else:
+            # TalkBack's log says "Reach edge" within a few ms: poll in slices so an
+            # edge does not cost the whole timeout; events are kept across slices.
+            deadline = time.monotonic() + timeout_s
+            events: List[Dict[str, Any]] = []
+            while True:
+                left = max(0.0, deadline - time.monotonic())
+                d = self._read(int(min(left, EDGE_SLICE_S) * 1000), int(quiet_s * 1000))
+                events += d.get("events") or []
+                if d.get("focus_event") or left <= EDGE_SLICE_S or abort():
+                    break
+                self.seq = int(d.get("seq") or self.seq)
+            d["events"] = events
+        snap = self._snap(d)
+        k = snap.key
+        focused = [e for e in snap.events if e.get("type") == "VIEW_ACCESSIBILITY_FOCUSED"]
+        first_ms = None
+        if focused and before is not None:
+            first_ms = max(0, int(focused[0].get("uptime_ms", before)) - int(before))
+        moved = k is not None and k != prev_key
+        return WaitResult(snap, moved, first_ms if moved else None, None, 1,
+                          lost=k is None and prev_key is not None)
+
+
 def make_reader(session: Any) -> FocusReader:
-    """The best focus reader the agent supports (A11yFocus long-poll once T2 lands)."""
+    """A11yFocusReader when the agent serves A11yFocus, else DumpFocusReader."""
+    if callable(getattr(session, "a11y_focus", None)):
+        try:
+            session.a11y_focus()
+            return A11yFocusReader(session)
+        except Exception:  # noqa: BLE001 - an agent from before A11yFocus: poll dumps
+            pass
     return DumpFocusReader(session)
 
 
@@ -548,7 +699,27 @@ def predict(resp: Any, legacy: bool) -> Tuple[List[PStop], str, Dict[str, Any]]:
                                                               b.get("w", 0), b.get("h", 0)),
                            win, cls.rsplit(".", 1)[-1]))
     covered = {w["root_view_id"]: w["covered_by"] for w in windows if w.get("covered_by") is not None}
-    return stops, source, {"covered_windows": covered}
+    return stops, source, {"covered_windows": covered, "dump": d}
+
+
+def predict_initial(resp: Any, window: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Where TalkBack puts focus when ``window`` (root_view_id; default the active
+    window) appears: talkback.order's initial-focus rule, which skips a first stop
+    that reads as the window title (the WindowInfo title, else the window's first
+    text). ``{"key", "how", "title", "title_source", "skipped"}``, or None when the
+    model cannot say."""
+    try:
+        from .. import a11y
+        from .order import Navigator
+        from .tree import build
+        nav = Navigator(build(a11y.a11y_to_dict(resp)))
+        win = None
+        if window is not None:
+            win = next((w for w in nav.windows if w.root_view_id == window), None)
+        init = nav.initial_focus(win)
+    except Exception:  # noqa: BLE001 - the walk reports without it
+        return None
+    return {k: init.get(k) for k in ("key", "how", "title", "title_source", "skipped")}
 
 
 def _iter_dicts(windows: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
@@ -674,6 +845,7 @@ class Driver:
         self.restore_error: Optional[str] = None
         self.notes: List[str] = []
         self.seek_presses = 0
+        self.start_via = "keys"
         self._keymaps_tried: List[str] = []
         self._lock_cm: Any = None
 
@@ -774,6 +946,27 @@ class Driver:
                         hint="Check TalkBack is running (talkback status) and that the app has "
                              "focusable content.")
 
+    def return_to(self, key: Optional[str], snap: Snapshot) -> Snapshot:
+        """Put focus back on ``key`` after the keymap proof moved it. The proof's
+        "next" may have hit an edge and wrapped, so one "prev" is not enough: use
+        A11yAct when the agent has it, else up to two "prev" presses."""
+        if key is None or snap.key == key:
+            return snap
+        if isinstance(self.reader, A11yFocusReader):
+            from .. import a11y
+            d = a11y.a11y_act_to_dict(self.session.a11y_act(node_key=key, action="accessibility_focus"))
+            if d.get("performed"):
+                back = self.reader.wait_change(snap.key, self.timeout_s, self.quiet_s).snap
+                if back.key == key:
+                    return back
+        for _ in range(2):
+            t, _ = self.press("prev")
+            self.seek_presses += 1
+            snap = self.wait(snap.key, t).snap
+            if snap.key == key:
+                break
+        return snap
+
     def try_other_keymap(self) -> bool:
         """Switch an unproven keyboard to the classic (Alt) keymap once."""
         keys = self.inj
@@ -806,6 +999,7 @@ class Step:
     node: Optional[Node] = None
     scrolled: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+    index: Optional[DumpIndex] = None  # the dump the node came from (window meta)
 
 
 def _match(sel: str, n: Optional[Node]) -> bool:
@@ -861,15 +1055,20 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
     cycle: List[str] = []
     edge_info: Optional[Dict[str, Any]] = None
     tts: Dict[int, str] = {}
+    initial: Optional[Dict[str, Any]] = None
     with drv:
         cur = drv.settle_initial()
         legacy = bool(cur.index.legacy)
         model.build(cur.resp, legacy)
+        if drv.turned_on and cur.key is not None:
+            initial = predict_initial(cur.resp)
+            if initial is not None:
+                initial["actual"] = cur.key
         if cur.focus is None and not drv.foreground_ok():
             raise WalkError("app_left_foreground", f"{drv.package} is not in the foreground",
                             hint=f"Open {drv.package} on the device, then retry.")
         cur = _seek_start(drv, cur, start, direction, max_steps)
-        steps.append(Step(0, cur.key, via="start", node=cur.focus, t=cur.t))
+        steps.append(Step(0, cur.key, via="start", node=cur.focus, t=cur.t, index=cur.index))
         prev_idx = cur.index
         transitions: Dict[Tuple[Optional[str], Optional[str]], int] = {}
         last_edge_at = -1
@@ -899,7 +1098,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                 else:
                     # None -> focus: TalkBack's own initial focus; else the app took it.
                     via = "stolen" if cur.key is not None else "initial"
-                    steps.append(Step(len(steps), pre.key, via=via, node=pre.focus, t=pre.t))
+                    steps.append(Step(len(steps), pre.key, via=via, node=pre.focus, t=pre.t,
+                                      index=pre.index))
                 cur, prev_idx = pre, pre.index
             t_sent, _send_ms = drv.press(direction)
             w = drv.wait(cur.key, t_sent)
@@ -926,7 +1126,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             if not w.moved:
                 no_moves += 1
                 steps.append(Step(len(steps), cur.key, moved=False, edge=True, via="edge",
-                                  node=cur.focus, t=t_sent))
+                                  node=cur.focus, t=t_sent, index=cur.index))
                 if no_moves >= 2 and not drv.inj.proven and drv.try_other_keymap():  # type: ignore[union-attr]
                     del steps[-2:]  # those presses were not edges: the keymap was wrong
                     no_moves = 0
@@ -946,15 +1146,13 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             if via == "next" and new.focus is not None and cur.focus is not None \
                     and new.focus.window != cur.focus.window:
                 via = "window"
-            scrolled = detect_scroll(prev_idx, new.index)
-            if scrolled is None and new.focus is not None and drv.log is not None \
-                    and drv.log.since(t_sent, "scroll"):
-                scrolled = new.index.scroll_container(new.focus)
+            scrolled = _scrolled_key(drv, prev_idx, new, t_sent)
             if scrolled is not None and via == "next":
                 via = "autoscroll"
             no_moves = 0
             st = Step(len(steps), new.key, via=via, ms=w.first_ms, node=new.focus, t=t_sent,
-                      scrolled=scrolled.key if scrolled is not None else None)
+                      index=new.index,
+                      scrolled=scrolled, extra={"wall_ms": _ms(time.monotonic() - t_sent)})
             steps.append(st)
             if recapture == "on_unknown" and new.key not in model.keys():
                 model.remodel(new.resp, legacy)
@@ -983,6 +1181,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             time.sleep(0.3)  # the last announcement lands ~100ms after its press
             tts = _attribute_tts(steps, drv.log)
     return _finish(drv, steps, model, ended=ended, cycle=cycle, edge_info=edge_info, start=start,
+                   initial=initial,
                    direction=direction, until=until, expect=expect, tts=tts, t_start=t_start,
                    max_lines=max_lines, max_bytes=max_bytes, save=save)
 
@@ -992,15 +1191,17 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
     proves the keymap with "next" (see :class:`.inject.KeyGuard`)."""
     if start == "current" and direction == "next":
         return cur
+    if start not in ("current", "first"):
+        acted = _act_focus(drv, cur, start)
+        if acted is not None:
+            if direction == "prev":  # prove the keymap, then back onto the target
+                return drv.return_to(acted.key, drv.prove(acted.key).snap)
+            return acted
     before = cur
     w = drv.prove(cur.key)
     snap = w.snap
     if start == "current":
-        if before.key is not None and snap.key != before.key:
-            t, _ = drv.press("prev")  # back to where the user was
-            snap = drv.wait(snap.key, t).snap
-            drv.seek_presses += 1
-        return snap
+        return drv.return_to(before.key, snap)  # back to where the user was
     if start == "first":
         t, _ = drv.press("first")
         w2 = drv.wait(snap.key, t)
@@ -1023,6 +1224,55 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
 
 def _key_of(n: Optional[Node]) -> Optional[str]:
     return n.key if n is not None else None
+
+
+def _scrolled_key(drv: Driver, prev_idx: DumpIndex, new: Snapshot, t_sent: float) -> Optional[str]:
+    """The container that scrolled during a step: a VIEW_SCROLLED event (A11yFocus),
+    else nodes that moved between the dumps, else TalkBack's AutoScrollActor log."""
+    for e in new.events:
+        if e.get("type") == "VIEW_SCROLLED" and e.get("node_key"):
+            return e["node_key"]
+    moved = detect_scroll(prev_idx, new.index)
+    if moved is not None:
+        return moved.key
+    if new.focus is not None and drv.log is not None and drv.log.since(t_sent, "scroll"):
+        return _key_of(new.index.scroll_container(new.focus))
+    return None
+
+
+def _act_focus(drv: Driver, cur: Snapshot, start: str) -> Optional[Snapshot]:
+    """Put TalkBack's focus straight on the node ``start`` names (A11yAct
+    ACTION_ACCESSIBILITY_FOCUS; TalkBack's next press continues from there).
+    None when the agent cannot, so the caller presses "next" instead."""
+    if not isinstance(drv.reader, A11yFocusReader):
+        return None
+    target: Optional[str] = None
+    if ":" in start:
+        from .. import a11y
+        try:
+            a11y.parse_node_key(start)
+            target = start
+        except ValueError:
+            target = None
+    if target is None:
+        # A label: prefer a node the model reads as a stop (not a Text inside a row).
+        stops = {s.key for s in predict(cur.resp, bool(cur.index.legacy))[0]} if cur.resp else set()
+        found = [n for n in cur.index.order if _match(start, n)]
+        found.sort(key=lambda n: (n.key not in stops, not n.actionable()))
+        target = found[0].key if found else None
+    if target is None:
+        return None
+    from .. import a11y
+    d = a11y.a11y_act_to_dict(drv.session.a11y_act(node_key=target, action="accessibility_focus"))
+    if not d.get("performed"):
+        drv.notes.append(f"A11yAct could not focus {target}: {d.get('error')}")
+        return None
+    snap = drv.reader.wait_change(cur.key, drv.timeout_s, drv.quiet_s).snap
+    if snap.key == target or _match(start, snap.focus):
+        drv.start_via = "a11y_act"
+        return snap
+    drv.notes.append(f"A11yAct focused {target} but TalkBack's focus is on {snap.key}")
+    return None
 
 
 def _edge_info(idx: DumpIndex, n: Node, direction: str) -> Optional[Dict[str, Any]]:
@@ -1098,6 +1348,12 @@ def _step_record(s: Step, ref: str, speak: str, utt: str, idx_rect: Optional[Rec
     return rec
 
 
+def _inside(r: Rect, o: Rect) -> bool:
+    x, y, w, h = r
+    ox, oy, ow, oh = o
+    return w > 0 and h > 0 and ox <= x and oy <= y and x + w <= ox + ow and y + h <= oy + oh
+
+
 def _covered_by(n: Node) -> Optional[Dict[str, Any]]:
     """A later-drawn sibling subtree (of the node or an ancestor) that covers the
     node's centre and a large part of the window: a same-window overlay."""
@@ -1129,6 +1385,7 @@ def _covered_by(n: Node) -> Optional[Dict[str, Any]]:
 
 
 def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: List[str],
+            initial: Optional[Dict[str, Any]] = None,
             edge_info: Optional[Dict[str, Any]], start: str, direction: str, until: str,
             expect: Optional[Sequence[str]], tts: Dict[int, str], t_start: float,
             max_lines: int, max_bytes: int, save: bool) -> Dict[str, Any]:
@@ -1156,12 +1413,21 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
         rect = None
         if s.node is not None:
             if s.node.window not in win_rects:
-                root = s.node
-                for a in s.node.ancestors():
-                    root = a
-                win_rects[s.node.window] = root.bounds
+                idx = s.index if s.index is not None else None
+                wr = idx.window_rect(s.node.window) if idx is not None else None
+                if wr is None:
+                    root = s.node
+                    for a in s.node.ancestors():
+                        root = a
+                    wr = root.bounds
+                win_rects[s.node.window] = wr
             rect = win_rects[s.node.window]
         rec = _step_record(s, ref_of(s.key), speak, utt, rect)
+        if s.node is not None and s.index is not None:
+            bar = next((o for o in s.index.obscured(s.node.window)
+                        if _inside(s.node.bounds, o)), None)
+            if bar is not None:
+                rec["under_system_bar"] = list(bar)
         if s.node is not None:
             rec["sig"] = s.node.sig
             known = model.match(s.key, s.node.sig, s.node.bounds)
@@ -1186,17 +1452,25 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
     analysis = diff.analyze(walk, expect=expect)
     walk["findings"] = analysis["findings"]
     walk["vs_model"] = analysis["vs_model"]
+    if initial is not None and initial.get("key"):
+        # TalkBack just started and put focus here itself: the model's initial-focus rule.
+        walk["initial"] = dict(initial, model=initial["key"])
+        walk["vs_model"]["initial"] = ("agree" if initial["key"] == initial["actual"] else
+                                       f"model {ref_of(initial['key'])}, actual {ref_of(initial['actual'])}")
     if analysis.get("expect") is not None:
         walk["expect"] = analysis["expect"]
     moves = [r["ms"] for r in records if r.get("ms") is not None]
     reader = drv.reader
+    walls = [r["wall_ms"] for r in records if r.get("wall_ms") is not None]
     walk["ms"] = {"p50": _pct(moves, 0.5), "p95": _pct(moves, 0.95),
-                  "total": _ms(time.monotonic() - t_start),
-                  "read_p50": _pct([int(x) for x in getattr(reader, "read_ms", [])], 0.5)}
+                  "step_p50": _pct(walls, 0.5), "total": _ms(time.monotonic() - t_start),
+                  "read_p50": _pct([int(x) for x in getattr(reader, "read_ms", [])], 0.5),
+                  "reads": getattr(reader, "reads", None), "dumps": getattr(reader, "dumps", None)}
     keys = drv.inj
     walk["talkback"] = f"{drv.enabled.get('version', '?')} {keys.describe() if keys else '?'}"
     walk["reader"] = getattr(reader, "kind", "?")
     walk["seek_presses"] = drv.seek_presses
+    walk["start_via"] = drv.start_via
     walk["remodels"] = model.remodels
     walk["recapture"] = "model only (no capture store on this branch)" if model.remodels else None
     n_logcat = sum(1 for r in records if r.get("utt") == "logcat")
@@ -1266,8 +1540,9 @@ def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) ->
             tags.setdefault(i, []).append(f["code"].split(".", 1)[-1])
     for r in walk["steps"]:
         r["tags"] = sorted(set(tags.get(r["i"], [])))
-    head = {k: walk.get(k) for k in ("walk", "serial", "package", "talkback", "start", "direction",
-                                      "until", "ended", "ms", "utterance", "vs_model", "restore")}
+    head = {k: walk.get(k) for k in ("walk", "serial", "package", "talkback", "reader", "start",
+                                      "direction", "until", "ended", "ms", "utterance", "vs_model",
+                                      "restore")}
     head["steps"] = sum(1 for r in walk["steps"] if r["i"] > 0)
     if walk.get("expect") is not None:
         head["expect"] = walk["expect"]
