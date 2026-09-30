@@ -782,18 +782,22 @@ private fun Knob(on: Boolean) {
 // value = ...)): the secret is hoisted and handed to the app's own composable
 // as a String, which builds the transformation inside. With the slot table
 // (enable_inspection) the wrapper's parameter must be masked too.
-// BAD shows and speaks the secret; there is no Password semantics to redact by.
+// BAD shows and speaks the secret: a "show password" field (a password
+// keyboard, no visual transformation). Compose gives it no Password semantics,
+// so neither its a11y node nor its events say password; the agent must still
+// mask it everywhere, by its keyboard (ComposeInspector.isPasswordNode).
 // ---------------------------------------------------------------------------
 const val COMPOSE_PASSWORD_SECRET = "hunter2-compose-secret"
 const val COMPOSE_WRAPPED_SECRET = "hunter2-wrapped-secret"
 const val COMPOSE_WRAPPED_VALUE_SECRET = "hunter2-wrapped-value-secret"
+const val COMPOSE_VISIBLE_PASSWORD_SECRET = "hunter2-visible-compose"
 
 @Composable
 fun PasswordFieldScenario() {
     var g by remember { mutableStateOf(COMPOSE_PASSWORD_SECRET) }
     var w by remember { mutableStateOf(COMPOSE_WRAPPED_SECRET) }
     var v by remember { mutableStateOf(COMPOSE_WRAPPED_VALUE_SECRET) }
-    var b by remember { mutableStateOf("shown-on-screen") }
+    var b by remember { mutableStateOf(COMPOSE_VISIBLE_PASSWORD_SECRET) }
     Section(
         "Password field",
         good = {
