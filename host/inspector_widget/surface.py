@@ -782,6 +782,8 @@ def _header(doc: Mapping[str, Any]) -> str:
 
 
 def _render_lines(doc: Mapping[str, Any]) -> list[str]:
+    if not any(k in doc for k in ("lines", "rows", "outline")):
+        return _render_json(doc)  # captures show / export / gc: a document, not lines
     out = [_header(doc)]
     for k in ("summary", "issues", "counts"):
         if isinstance(doc.get(k), dict):

@@ -1163,7 +1163,8 @@ what now holds:
   `ops.run(ctx, tool, args)` maps every exception to the error envelope
   (`error_envelope`): `OpError` as it is; `adb.DeviceError` -> `no_session`;
   `TransportError` (a lost session), `AdbError` and other `OSError` -> `device_lost`;
-  `AgentTimeoutError`, `ClientError` and `InjectionError` -> `agent_error`; anything
+  `InjectionError` saying the app is not running or not debuggable -> `no_session`;
+  `AgentTimeoutError`, `ClientError` and any other `InjectionError` -> `agent_error`; anything
   else is a bug and gets the code `internal` (outside the spec's vocabulary on
   purpose: it is not the agent's fault).
 - **`OpContext(store, sessions, caller)`.** `sessions` is a `SessionProvider`:
@@ -1215,7 +1216,8 @@ what now holds:
   other apps it hides; `show` is the meta (non-default options, facet statuses,
   diagnostics, path); `label` with an empty label removes it; `export` writes
   `out/{nodes.jsonl|nodes.json, views.json, compose.json, slots.json, a11y.json,
-  props.json, issues.jsonl, raw/...}` and returns the path (the `out/` directory
+  props.json, issues.jsonl}`, or for `raw` the stored files as they are
+  (`out/raw/*.pb`, `out/shot/w_<root>.pb`, `out/meta.json`), and returns the path (the `out/` directory
   for several files), rows and bytes, never contents; `gc` summarizes the
   store's gc (`all=true` wipes everything, the ref counter included).
 - **node() trim (C6).** node() leaves out `key` when its `ids` spell it
@@ -1226,17 +1228,18 @@ what now holds:
   - launcher: capture 1,153 (2,500); capture with a diff 1,229; `outline()` 2,012
     (2,500); `outline(root=@launcher_list)` 1,639 (2,000); `outline(view="slots")`
     491 (6,000); `outline(view="reading")` 1,553 (2,000); `find(text="state",
-    flags=click)` 388 (600); `node(@launch_heading)` 1,295 (1,500); `lint()` 453
+    flags=click)` 388 (600); `node(@launch_heading)` 1,276 (1,500); `lint()` 453
     (1,200); `captures()` 259 (400); `image(ref)` 296 (400).
   - View screen: capture 1,482; `outline()` 2,688 (3,000, all 40 Views);
     `node(#badSwitch, props="nondefault")` 1,197 on a recapture (1,200); `lint()`
     1,330 (14 findings).
-  - wide: capture 1,518 (3,000); outline pages <= 5,926 (6,000), exactly the 259
+  - wide: capture 1,517 (3,000); outline pages <= 5,926 (6,000), exactly the 259
     Views; `find(text="Label 4", limit=20)` 1,505 (3,000); `node(#view_47,
-    props="nondefault")` 800 (1,500).
-  - Workflows (tokens, spec section 8): W1 912 (1,100), W2 569 (1,100), W3 1,009
-    (1,200; 1,462 with the stand-in renderer), W4 1,982 (2,800), W6 1,266 (2,400),
-    W7 875 (1,600).
+    props="nondefault")` 782 (1,500).
+  - mixed: capture 1,271; `outline()` 992; `lint()` 500.
+  - Workflows (tokens, spec section 8): W1 907 (1,100), W2 563 (1,100), W3 1,004
+    (1,200; 1,462 with the stand-in renderer), W4 1,976 (2,800), W6 1,261 (2,400),
+    W7 870 (1,600).
 
 ## Surface (S2, `inspector_widget/surface.py`)
 
@@ -1265,8 +1268,9 @@ what now holds:
   18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
   logs a warning and lists the default. Every tool stays callable by name.
   Measured tools/list (compact): default 18,337 B, capture 11,634 (12,000),
-  legacy 13,247, all 30,474 (the capture tools spend each parameter description
-  once; the instructions carry the rest).
+  legacy 13,247, capture,talkback 16,724, all 28,385 (the capture tools spend each
+  parameter description once; the instructions carry the rest). Instructions:
+  764 B (capture), 875 B (capture,talkback), 714 B (the default).
 - **Instructions** (`instructions(listed)`, at most 900 B): the spec 5.13 text when
   `capture` is listed, else a legacy text naming the toolset variable; plus a
   TalkBack sentence when `tb_walk` is listed. Sent in initialize by the SDK 1.x

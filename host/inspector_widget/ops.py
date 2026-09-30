@@ -200,7 +200,8 @@ def error_envelope(exc: BaseException) -> dict[str, Any]:
     elif isinstance(exc, ClientError):
         code = "agent_error"
     elif isinstance(exc, InjectionError):
-        code = "agent_error"
+        # the app is not there to inspect (inject.py's two messages), or the agent failed
+        code = "no_session" if re.search(r"is not (running|debuggable)", msg) else "agent_error"
     elif isinstance(exc, (adb.AdbError, OSError)):
         code = "device_lost"
     else:
@@ -1100,12 +1101,10 @@ def _export(ctx: OpContext, lc: LoadedCapture, what: str, fmt: str) -> dict[str,
             recs = [{"ref": n.id, **i.to_dict()} for n in ix.nodes.values() for i in n.issues]
             body = ("\n".join(dumps(r) for r in recs) + "\n").encode("utf-8") if recs else b""
             put("issues.jsonl", body, len(recs))
-        elif part == "raw":
-            rc = lc.raw_capture()
-            files = rc.files()
-            for rel, data in sorted(files.items()):
-                put(f"raw/{rel}", data, 1)
-            put("raw/meta.json", lc.meta.to_json(), 1)
+        elif part == "raw":  # out/raw/*.pb, out/shot/w_<root>.pb, out/meta.json
+            for rel, data in sorted(lc.raw_capture().files().items()):
+                put(rel, data, 1)
+            put("meta.json", lc.meta.to_json(), 1)
     if not written:
         raise OpError("facet_unavailable", f"capture {lc.id} has no {what} to export",
                       hint=f"captures(action=\"show\",id=\"{lc.id}\") lists its facets")

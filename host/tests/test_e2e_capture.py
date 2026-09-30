@@ -94,7 +94,7 @@ def test_capture_and_walk_through_the_mcp_server_and_the_cli(tmp_path):
             mcp_text("node", ref="#badSwitch", props="nondefault")
         assert cli_json("outline", "--view", "reading") == mcp_text("outline", view="reading")
         assert cli_json("lint", "--group", "node") == mcp_text("lint", group="node")
-        assert cli_json("captures") == mcp_text("captures")
+        assert ch.same_moment(cli_json("captures")) == ch.same_moment(mcp_text("captures"))
         # CLI queries never talk to the agent: no SHUTDOWN, no request at all
         assert dev.commands() == before
 
@@ -188,7 +188,8 @@ def test_every_capture_tool_answers_on_every_scene(tmp_path, scene):
         for tool, args in [("outline", {}), ("find", {"flags": ["click"]}),
                            ("node", {"ref": "n1"}), ("lint", {}), ("image", {"overlay": "marks"}),
                            ("diff", {}), ("captures", {})]:
-            assert cli_json(tool, *_argv(args)) == mcp_text(tool, **args), (scene, tool)
+            assert ch.same_moment(cli_json(tool, *_argv(args))) == \
+                ch.same_moment(mcp_text(tool, **args)), (scene, tool)
 
 
 def _argv(args: dict) -> list[str]:

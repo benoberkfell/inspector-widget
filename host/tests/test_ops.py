@@ -288,7 +288,7 @@ def test_cli_and_mcp_callers_get_identical_envelopes(tmp_path):
         for tool, args in QUERIES:
             a, b = run(cli_ctx, tool, **args), run(mcp_ctx, tool, **args)
             assert not ops.is_error(a), (tool, args, a)
-            assert dumps(a) == dumps(b), (tool, args)
+            assert ch.same_moment(dumps(a)) == ch.same_moment(dumps(b)), (tool, args)
         cli_ctx.sessions.close_all()
 
 
@@ -343,7 +343,9 @@ def test_errors_map_to_codes():
              (SessionLostError("gone"), "device_lost"),
              (AgentTimeoutError("slow"), "agent_error"),
              (ClientError("agent said no"), "agent_error"),
-             (InjectionError("not debuggable", hint="rebuild"), "agent_error"),
+             (InjectionError("could not connect to agent socket 'x'"), "agent_error"),
+             (InjectionError("package 'p' is not running on s.", hint="start it"), "no_session"),
+             (InjectionError("package 'p' is not debuggable, so ..."), "no_session"),
              (KeyError("oops"), ops.INTERNAL)]
     for exc, code in cases:
         env = ops.error_envelope(exc)

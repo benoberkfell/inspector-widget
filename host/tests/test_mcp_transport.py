@@ -170,3 +170,20 @@ def test_self_check_flags_grpcio_that_cannot_load_the_stubs(monkeypatch, capsys)
     out = capsys.readouterr().out
     grpc_line = next(line for line in out.splitlines() if "grpcio" in line)
     assert "UNUSABLE" in grpc_line and "1.81.0" in grpc_line
+
+
+@pytest.mark.parametrize("block_mcp", [False, True], ids=["sdk", "fallback"])
+def test_capture_toolset_over_stdio(monkeypatch, block_mcp):
+    """With INSPECTOR_WIDGET_TOOLSET=capture the real server (SDK or fallback, over
+    stdio) lists the 12 capture-and-walk tools and sends their instructions; a
+    capture tool's error is its envelope, with isError."""
+    if not block_mcp:
+        pytest.importorskip("mcp")
+    from inspector_widget import surface
+
+    monkeypatch.setenv("INSPECTOR_WIDGET_TOOLSET", "capture")
+    by_id = _roundtrip(block_mcp=block_mcp)
+    assert by_id[1]["result"]["instructions"] == surface.INSTRUCTIONS
+    names = [t["name"] for t in by_id[2]["result"]["tools"]]
+    assert set(names) == set(surface.toolset_names("capture")) and len(names) == 12
+    assert by_id[3]["result"]["isError"] is True  # no_such_tool, as ever

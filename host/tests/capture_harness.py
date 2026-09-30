@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Iterator
@@ -94,6 +95,15 @@ def harness(scene: str | fakescenes.SceneData, tmp: str, *, toolset: str | None 
 def ops_context(caller: str = "cli", store: CaptureStore | None = None) -> ops.OpContext:
     """An OpContext over the harness store (``$INSPECTOR_WIDGET_CAPTURE_DIR``)."""
     return ops.OpContext(store or CaptureStore(), ops.AttachProvider(), caller)
+
+
+_AGO = re.compile(r"\b\d+[smhd] ago\b")
+
+
+def same_moment(text: str) -> str:
+    """``text`` with the wall-clock ages (``12s ago``) masked: two calls a second
+    apart describe the same capture with different ages."""
+    return _AGO.sub("<ago>", text)
 
 
 def nbytes(obj: Any) -> int:

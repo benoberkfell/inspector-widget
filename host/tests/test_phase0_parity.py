@@ -125,14 +125,19 @@ CASES = [
 ]
 
 #: What may differ, and only in these ways: the flag a note names on its own surface,
-#: and a spill file's name (each call writes its own; the contents are compared).
+#: a spill file's name (each call writes its own; the contents are compared), and a
+#: wall-clock measurement (the lint's elapsed_ms: 0, 1 or 2 ms from call to call).
 _SPILL = re.compile(r'"spill_path":"[^"]*"')
+_TIMING = re.compile(r'"(%s)":\d+' % "|".join(sorted(rg.VOLATILE_KEYS)))
+
+
+def _masked(text: str) -> str:
+    return _TIMING.sub(r'"\1":"<ms>"', _SPILL.sub('"spill_path":"<spill>"', text))
 
 
 def _same_bytes(mcp_text: str, cli_text: str) -> None:
-    a = _SPILL.sub('"spill_path":"<spill>"', mcp_text)
-    b = _SPILL.sub('"spill_path":"<spill>"', cli_text.replace("--enable-inspection",
-                                                              "enable_inspection=true"))
+    a = _masked(mcp_text)
+    b = _masked(cli_text.replace("--enable-inspection", "enable_inspection=true"))
     assert a == b, rg.diff(json.loads(a), json.loads(b))
 
 
