@@ -1,3 +1,6 @@
+# Portions of this file are derived from google/talkback (https://github.com/google/talkback)
+# at commit 229212f (TalkBack 16.2), licensed under the Apache License, Version 2.0.
+# Reimplemented in Python and modified for Inspector Widget; see NOTICE.
 """Why a node is, or is not, a TalkBack focus stop, and how focus reaches it.
 
 Reason codes (stable strings; a ``:<key>`` suffix names the node responsible):

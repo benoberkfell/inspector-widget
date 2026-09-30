@@ -31,11 +31,31 @@ reverse-engineered from and modeled on the following Android Open Source Project
     JVMTI agent attachment.
     https://android.googlesource.com/platform/frameworks/base/
 
-No source code from these projects is copied into or redistributed by this
+No source code from these AOSP projects is copied into or redistributed by this
 repository; they are credited as the basis for the reverse-engineered design. At
 runtime the inspector reflects against the target application's own bundled
 AndroidX libraries, and it downloads Google's "skiaparser" tool from the public
 Android SDK repository on demand — neither is vendored here.
+
+================================================================================
+Attribution: TalkBack (google/talkback)
+================================================================================
+
+The TalkBack navigation model in host/inspector_widget/talkback/ (tree.py,
+rules.py, order.py, speech.py and explain.py) is a derivative work of TalkBack,
+Google's Android screen reader:
+
+  * google/talkback at commit 229212fdf5842191d0a93fc95d9ca1423b346866
+    (TalkBack 16.2), licensed under the Apache License, Version 2.0.
+    https://github.com/google/talkback
+
+Its focus predicates (AccessibilityNodeInfoUtils, Role), linear-navigation order
+(OrderedTraversalController, WorkingTree, ReorderedChildrenIterator,
+WindowTraversal) and focus-announcement composition (TreeNodesDescription) were
+reimplemented in Python from that source and modified: adapted to Inspector
+Widget's accessibility dump format, and calibrated against the observed
+behaviour of TalkBack 17.0. Docstrings cite the upstream file and line each rule
+derives from. No TalkBack source files are redistributed here.
 
 "Android", "Android Studio", and "Jetpack Compose" are trademarks of Google LLC.
 Inspector Widget is an independent project and is not affiliated with, sponsored
