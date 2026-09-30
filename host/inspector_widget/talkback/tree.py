@@ -18,7 +18,9 @@ request that flag (res/xml-v33/accessibilityservice.xml), so the platform serves
 * Compose marks every AndroidView holder invisible while an accessibility service runs
   (AndroidComposeView.addAndroidView: ``info.isVisibleToUser = false`` when the delegate
   ``isEnabled``). A dump taken with no service on shows the holder visible; the projection
-  applies the correction so the model sees what TalkBack would (``services``).
+  applies the correction so the model sees what TalkBack would (``services``). The spike
+  compared dumps with TalkBack on and off on eight screens: this is the ONLY difference (links,
+  structure, bounds, text and importance are identical), so it is the only correction.
 * A node wholly outside its window's interactive region (the part of the window not covered by
   other windows, e.g. under the status bar of an edge-to-edge window) is served with
   isVisibleToUser=false (AOSP AccessibilityInteractionController.adjustIsVisibleToUserIfNeeded,
@@ -66,6 +68,7 @@ _SYSTEM_LP_TYPES = {2009, 2019, 2024, 2001, 2000, 2040, 2041, 2017, 2020, 2003, 
                     2006, 2038, 2036}
 
 _SERVICES_TOKEN = re.compile(r"a11y-services=(on|off)")
+_COMPOSE_UNAVAILABLE = re.compile(r"compose-traversal[^;]*?unavailable=(\d+)")
 _RESOLVED_IMPORTANCE_TOKEN = re.compile(r"root#-?\d+ window type=")
 
 
@@ -466,6 +469,15 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
             "kind": "duplicate_key", "count": len(dupes), "keys": sorted(set(dupes))[:10],
             "message": (f"{len(dupes)} nodes share a node key with an earlier node; links to "
                         "them resolve to the first one."),
+        })
+    unavailable = sum(int(x) for x in _COMPOSE_UNAVAILABLE.findall(diag))
+    if unavailable:
+        # With "computed=N" (no service) or "service=N" the agent's links equal TalkBack's; with
+        # "unavailable" Compose served none, so its content is in composition order.
+        tree.diagnostics.append({
+            "kind": "compose_order_unknown", "count": unavailable,
+            "message": (f"{unavailable} ComposeView(s) served no traversal links; their order "
+                        "here is composition order and TalkBack's may differ."),
         })
     _apply_interactive_region(tree)
     if tree.services == "off":

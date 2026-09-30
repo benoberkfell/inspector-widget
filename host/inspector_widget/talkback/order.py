@@ -839,13 +839,15 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
     Every stop step is ``{"i", "key", "id", "window", "why", "via", "speak", "parts"}`` plus,
     when they apply, ``"unlabelled"``, ``"autoscroll"`` (the container TalkBack scrolls before
     this move; the content it would scroll in is not modelled) and ``"show_on_screen"`` (the
-    scrollable TalkBack asks to bring this target fully into view). ``version`` picks the
-    wording (:data:`.speech.VERSIONS`). ``via`` is how focus got
+    scrollable TalkBack asks to bring this target fully into view; with ``"speak_conf":
+    "pre_scroll"`` when the target is a clipped sliver, whose full text TalkBack speaks only
+    after the scroll). An edge step with ``"autoscroll"`` is a press TalkBack spends scrolling,
+    not pausing. ``version`` picks the wording (:data:`.speech.VERSIONS`). ``via`` is how focus got
     there: ``tree``, ``bounds_swap``, ``chain``, ``before:<key>``, ``before_of:<key>``,
     ``after:<key>``, ``window:<index>`` or ``wrap``. An edge step is ``{"i", "edge": True,
     "key", "window"}``: the press only sets TalkBack's reachEdge; the next one wraps.
     """
-    from .explain import why_stop
+    from .explain import ghost_reasons, why_stop
     from .speech import SpeechState, announce
 
     tb = _as_tree(tree)
@@ -903,8 +905,14 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
         reach_edge = res["reach_edge"]
         target = res["target"]
         if target is None:
-            steps.append({"i": i, "edge": True, "key": pivot.key, "window": pivot.window.index,
-                          **({"duplicate": True} if res["duplicate"] else {})})
+            edge: Dict[str, Any] = {"i": i, "edge": True, "key": pivot.key,
+                                    "window": pivot.window.index}
+            if res["duplicate"]:
+                edge["duplicate"] = True
+            if res["autoscroll"] is not None:
+                # TalkBack scrolls here instead of pausing; what scrolls in is not in the dump.
+                edge["autoscroll"] = res["autoscroll"].key
+            steps.append(edge)
             nodes.append(None)
             last_edge = i
             idle += 1
@@ -928,6 +936,10 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
             step["autoscroll"] = res["autoscroll"].key
         if res["show_on_screen"] is not None:
             step["show_on_screen"] = res["show_on_screen"].key
+            if any(g.startswith("clipped:") for g in ghost_reasons(nav.rules, target)):
+                # TalkBack scrolls the clipped target into view before speaking it; Compose
+                # composes the rest of it then. The dump only has the clipped part.
+                step["speak_conf"] = "pre_scroll"
         steps.append(step)
         nodes.append(target)
         last_seen[id(target)] = i
