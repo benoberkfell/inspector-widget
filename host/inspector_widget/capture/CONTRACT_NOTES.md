@@ -386,3 +386,151 @@ with every consumer.
     header, deflated.
   - The strings.py tree shape round-trips exactly. The a11y windows round-trip
     exactly; `focus_order` is recomputed by a11y.py, so compare windows only.
+
+## Index (C4, `capture/index.py`, `capture/anchors.py`)
+
+- **API.** `build_index(raw) -> Index` (key space, every `ref` None) and
+  `apply_refs(ix, refmap) -> Index` (`remap_ids`, plus every fallback `sel` equal to
+  the node's key becomes its ref). Extras:
+  - `resolve_key(ix, key) -> id` also takes the agent contract spellings
+    `compose:<acv>:<id>` and `composeview:<acv>`, and legacy `compose:<id>`. It raises
+    `OpError("ambiguous", candidates=[ids])` or `OpError("not_found")`.
+    `legacy_candidates(ix, "compose:<id>")` lists what a legacy key could mean.
+  - `FacetReader(raw)` decodes lazily: `props(udid)` (normalize.props_to_map),
+    `prop_list(udid)` (strings.property_to_dict), `slot_params(ids["slot_path"])`
+    (raw strings, for `params="raw"`), `sem_attrs(acv, id)`. `decoded` counts the
+    property groups decoded. `build_index` never decodes properties; it only peeks
+    `visibility`, `enabled`, `clickable` and `longClickable` by string id.
+  - `anchors.py` (pure): `template()`, `without_ordinals()`, `collection_index()`,
+    `is_collection()`, `assign_ui_anchors()`, `assign_sels()`, and `match_sel(ix, sel)`,
+    a reference evaluator of the spec 6.1 path grammar. C6's resolver must agree
+    with it.
+- **Node ids and placement.**
+  - Window roots come from GetWindows order (`z`); DumpTree roots missing from it
+    follow in DumpTree order.
+  - The synthetic Compose root that reuses the ACV id is folded into the ACV View
+    node. Semantics roots come first among the ACV's ui children, then its View
+    children (e.g. `AndroidViewsHandler`).
+  - The children of `AndroidViewsHandler` (AndroidView holders) move in the ui tree
+    under the smallest semantics node of the same ACV that contains them, with
+    flag `interop` and `conf["ui"] = "inferred"`. The handler stays, emptied. The
+    `views` tree keeps the raw View parents.
+  - a11y-only nodes (`kind=a11y`) hang under the node of their a11y parent (else
+    their host View, else the window root), after its other children.
+  - `Index.nodes` order: ui pre-order (windows by z), then slots pre-order.
+    `Index.reading` stays empty and `stop` None; the analyzers (C7) fill them.
+- **Bounds.** Views: `b` is the exact-joined a11y rect when it lies inside the
+  layout rect (the framework's own clipped rect), else the layout rect clipped by
+  its ancestors. `declared_b` is the layout rect when it differs. Semantics: `b` is
+  the agent's rect (already clipped); `declared_b` is the emitter slot's box when it
+  differs and contains `b`. `visible` = area(b) / area(declared_b), 3 decimals.
+  Slots: `b` is the raw box. Compose bounds that are window-relative (pre-CO4, no
+  `bounds=screen` in the DumpCompose diagnostics) are shifted by the window root's
+  origin for that ACV (semantics and slots). This happens when its first sized root
+  lies outside the ACV and fits once shifted, and it adds a diagnostic.
+- **Accessibility join and the ID1 detector.**
+  - Exact: `(udid, -1)` -> `view:<udid>`, `(acv, id)` -> `sem:<acv>:<id>`. With the
+    ID1 fix the ACV's own node `(acv, -1)` stands for its root semantics node; it
+    joins the ACV View.
+  - Host 0 (the agent could not resolve the View): IoU >= 0.6 within the window,
+    `inferred`.
+  - The detector marks a window when it holds a duplicate `(host, virtual)` pair
+    (host != 0), or a virtual node hosted by a View that has View children and is
+    not an ACV, a WebView or a `provider_class` host (the View-screen shape of ID1).
+    Diagnostics: `index.ID1_DUPLICATES` (the spec's text) or `index.ID1_IMPLAUSIBLE`.
+  - In a marked window every a11y facet, including those of a11y-only nodes, is
+    `inferred`. Matching goes top-down over the a11y tree, one-to-one and greedy
+    per sibling group. Candidates are view and compose nodes in the subtree of the
+    parent's match, with IoU >= 0.6. They are ranked by IoU (0.05 steps), then a
+    compatibility score (host id hint, class vs View class or Role, text, clickable,
+    virtual-vs-View when hosts are trustworthy), then the shallowest. A node left
+    over may take a free node in that subtree whose rect overlaps it by >= 90% of
+    the smaller one with compatibility >= 1 (a row clipped by the list viewport).
+    Pre-ID1 a ComposeView's own a11y node may land on the root semantics node
+    instead of the ACV View.
+  - Keys of a11y-only nodes: `a11y:<host>:<virt>` when that pair is unique and the
+    window is not marked, else `a11y:path:<rootUdid>:<0.i.j>`.
+  - Aliases in `by_key`: `a11y:<host>:<virt>` for exact joins with unique pairs,
+    `a11y:path:…` for every matched node in a marked window, `w:<root>`, and
+    `compose:<id>` only when it names exactly one node (a semantics id in one ACV,
+    or an ACV's udid, which was the old synthetic root key).
+  - Links (`labeled_by`, `label_for`, `traversal_before`, `traversal_after`; the
+    first resolvable `labeled_by_list` entry when `labeled_by` is unset) are mapped
+    from the agent's host-key space `(host << 32) ^ (virt & 0xFFFFFFFF)`, and only
+    in unmarked windows.
+- **The a11y facet** holds `class`, `speakable`, `role` (role_description), `flags` (the
+  raw a11y bool names, minus `enabled`/`visible_to_user`/`is_virtual`, plus
+  `disabled`/`hidden`), `actions` (names without the focus/selection/granularity
+  boilerplate), and when present `state`, `hint`, `error`, `tooltip`, `pane`,
+  `container`, `supplemental`. It may also hold `collection {rows, cols, items?,
+  hierarchical?, selection?}`, `item {row, col, row_span?, col_span?, heading?,
+  selected?}`, `range {type, min, max, cur}`, `live`, `checked: "partial"`,
+  `input_type`, `max_text_length`, `text_size_px` and `res` (the full
+  viewIdResourceName), plus `package` (only when it is not the app's), `provider`,
+  `b` (when it differs from the node's `b`), `extras` (empty SPANS dropped) and the
+  links above.
+- **Slots.**
+  - Slot groups are the COMPOSABLE children of each window's synthetic root,
+    kept as the agent's forest. Subcompositions (lazy items, Scaffold slots) are
+    separate roots and are not re-nested.
+  - Facet: `slot {name, params (normalize.compose_value, modifiers removed), mods
+    (the brief modifier chain), sem: [ids]}`.
+  - `ids`: `slot_path` (`"<acv>/<i.j.k>"` into the synthetic root's children),
+    `slot` (`File.kt:line#k`, k counting groups with that source in the ACV), and
+    `layer` (render_node_id, when set).
+  - `text` is the `text` param. `conf["slot"]` is exact, and `conf["sem"]` is
+    inferred when the slot is linked.
+  - **Window**: the linked semantics node's window, else the ACV's window. This
+    refines the model note, where an unlinked slot had `window` None.
+  - A lazy item's `key` param appears in the anchor (`[heading]`).
+- **Slot links (inferred).**
+  - The *emitter* of a semantics node is the deepest slot whose box contains its
+    `b` and agrees with it once clipped by the parent semantics node (IoU >= 0.9).
+    A slot whose `testTag(tag=…)` modifier names the node's tag is preferred.
+    Nodes are processed deepest first, one-to-one.
+  - Its nearest app-origin ancestor-or-self that also fits is the primary link. It
+    gives the node `src`, `declared_b` and (after any role) its `type`.
+  - App-origin slots nested under a primary slot (the nearest one wins) are linked
+    to the same node.
+  - `compose.slots` = [primary, nested… in slot order]; `slot.sem` = [node].
+    `conf["slot"] = "inferred"` on the semantics node.
+- **Derived fields.**
+  - `type`: Compose `Role` attr / a11y `role_description` (one capitalized word) /
+    `ROLE_BY_A11Y_CLASS[a11y class]`; then the primary app slot name; then the View
+    class; then the a11y class simple name unless it is `View`. `role` holds the
+    first step's value.
+  - `label`: a11y speakable (contentDescription > text > stateDescription; a node
+    that is screen-reader-focusable, clickable or long-clickable and has none
+    speaks its non-focusable descendants, joined by ", "); then Compose
+    ContentDescription > Text > EditableText > StateDescription; then View text.
+    `label`, `text`, `desc`, `state` and `hint` are capped at 1,000 chars.
+  - `flags`: the union of a11y, Compose attr and View property flags, in `FLAGS`
+    order. `focus` is dropped when `click` or `longclick` is set (clickable implies
+    focusable), matching the spec's outline examples.
+- **Anchors** (`anchors.py`).
+  - Views: `Class#rid`, or `Class:k`. Semantics and a11y-only nodes: `@tag`, else
+    `Type"label≤24"`, else `Type:k` / `:k`. A duplicate among siblings gets `:k`.
+  - Slots: `Name@src[key]:k` (always with `k`), continuing from the ACV's anchor.
+  - Children of a collection get `[i]`. A collection is an a11y
+    `collection`, a RecyclerView/ListView/GridView-like class, or a Compose node with
+    `CollectionInfo`/`IndexForKey`/`ScrollToIndex`. `i` is the CollectionItemInfo
+    row (or column) when siblings' values are distinct, else the position.
+  - Labels, tags, rids and classes escape `\ / " [ ] :`; sources escape all of those
+    except `:`.
+- **sel**:
+  - Tried in order: `#rid`, `@tag`, `Type"label"`, `"label"`, then `<parent sel> >
+    Type"label"` and `<parent sel> > Type` (unique among the siblings, parent sel
+    not a fallback, at most 3 atoms and 120 chars), else the id.
+  - Labels are used only when ≤ 40 chars on one line, rids only when they match
+    `[A-Za-z_][A-Za-z0-9_.]*`, tags only when they match `[A-Za-z0-9_.:-]+`, and
+    types only when they match `[A-Z][A-Za-z0-9_]*`.
+  - Uniqueness is over ui nodes (view, compose, a11y). Slot nodes always use their
+    id.
+- **Test scenes** (`tests/capture_scenes.py`):
+  - `raw_from_scene(scene)` fetches a RawCapture from an F1 scene.
+  - `V`/`C`/`S` + `encode()` hand-build protobuf screens in post-ID1 form, or
+    pre-ID1 (`pre_id1=True`) and window-relative (`window_relative=True`).
+  - `mixed_scene()`: three ComposeView cells plus a View cell in a RecyclerView;
+    an AndroidView holding a TextView and a nested ComposeView; and a dialog.
+  - `default_like_scene()`: a port of the harness `default_scene`.
+  - `big_scene(n)`: 13 index nodes per cell.
