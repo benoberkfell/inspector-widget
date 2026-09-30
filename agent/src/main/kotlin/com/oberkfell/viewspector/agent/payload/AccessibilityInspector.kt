@@ -51,6 +51,7 @@
  */
 package com.oberkfell.viewspector.agent.payload
 
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
@@ -195,19 +196,26 @@ object AccessibilityInspector {
         val windows = ArrayList<ViewInspection.DumpA11yResponse.Window>()
 
         // Compose computes traversal_before/after (setTraversalValues) only while an accessibility
-        // service is on (AndroidComposeViewAccessibilityDelegateCompat.isEnabled, ui 1.7 to 1.12), so
-        // without one those fields are empty for Compose nodes. Say so; the host must not read
-        // missing linkage as "no ordering constraints".
+        // service is on (AndroidComposeViewAccessibilityDelegateCompat.isEnabled, ui 1.7 to 1.12:
+        // AccessibilityManager.isEnabled AND a non-empty enabled-service list). isEnabled alone is
+        // not enough: it turns true in-process once query-from-app-process opens a direct
+        // connection, with no service running. Without a service ComposeTraversal.prime computes
+        // the order per window below; the token says which case this is.
         val a11yOn = try {
             rootViews.firstOrNull()?.context
-                ?.getSystemService(AccessibilityManager::class.java)?.isEnabled
+                ?.getSystemService(AccessibilityManager::class.java)
+                ?.let { am ->
+                    am.isEnabled &&
+                        am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+                            .isNotEmpty()
+                }
         } catch (t: Throwable) {
-            Log.w(TAG, "AccessibilityManager.isEnabled failed", t)
+            Log.w(TAG, "AccessibilityManager state unavailable", t)
             null
         }
         when (a11yOn) {
             true -> diag.append("; a11y-services=on")
-            false -> diag.append("; a11y-services=off (Compose omits traversal_before/after)")
+            false -> diag.append("; a11y-services=off")
             null -> {}
         }
 
@@ -224,6 +232,9 @@ object AccessibilityInspector {
             // The host node on which app-process query mode was enabled; reset on it in finally.
             var enabledNode: AccessibilityNodeInfo? = null
             val countBefore = ctx.count
+            // Compose's reading order (traversal_before/after) for this window, service or not.
+            val traversal = ComposeTraversal.prime(root)
+            traversal.token()?.let { diag.append("; root#${idOf(root)} $it") }
             try {
                 var node: ViewInspection.A11yNode? = null
                 if (Build.VERSION.SDK_INT >= 34) {
@@ -261,6 +272,7 @@ object AccessibilityInspector {
                 diag.append("; root#${idOf(root)} error ${t.javaClass.simpleName}")
             } finally {
                 resetQueryMode(enabledNode, root)
+                ComposeTraversal.restore(traversal)
             }
         }
 
