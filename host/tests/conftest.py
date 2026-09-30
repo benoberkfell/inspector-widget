@@ -322,3 +322,24 @@ def mcp(fake_device):
         return mcp_server._run_tool(tool, args)
 
     return _call
+
+
+# --------------------------------------------------------------------------- #
+# TalkBack driving (tests/test_tb_*.py): the fake device's TalkBack, settings,
+# uinput and logcat (fakeagent.FakeTalkBack), a private store directory and
+# no real waiting in the enable/dismiss paths.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def tb_env(fake_device, monkeypatch, tmp_path):
+    from inspector_widget.talkback import device as tbdevice
+
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(tbdevice, "START_SETTLE_S", 0.0)
+    monkeypatch.setattr(tbdevice, "DISMISS_WAIT_S", 0.01)
+    monkeypatch.setattr(tbdevice, "REFRONT_WAIT_S", 0.01)
+    monkeypatch.setattr(tbdevice, "RESTORE_WAIT_S", 1.0)
+    monkeypatch.setattr(tbdevice, "ENABLE_WAIT_S", 1.0)
+    monkeypatch.setattr(tbdevice, "_OWNED", set())
+    monkeypatch.setattr(tbdevice, "INJECTOR_STATUS", {})
+    fake_device.store = tmp_path / "store"
+    return fake_device
