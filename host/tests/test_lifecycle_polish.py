@@ -1,4 +1,5 @@
-"""Lifecycle polish, offline: no retry during exit cleanup or after a detach.
+"""Lifecycle polish, offline: no retry during exit cleanup or after a detach,
+retries only for calls that are safe to repeat.
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
@@ -15,7 +16,8 @@ from fakeagent import DEFAULT_SERIAL as SERIAL
 
 import mcp_server
 from inspector_widget import adb, client as clientmod
-from inspector_widget.client import SessionLostError
+from inspector_widget.client import NotSentError, SessionLostError
+from inspector_widget.proto import view_inspection_pb2 as pb
 
 
 def _wait_until(predicate, timeout=3.0):
@@ -35,6 +37,19 @@ def _in_thread(fn):
 def _hang_on(agent, command):
     agent.behaviour = lambda req: ((0, "hang") if req.WhichOneof("command") == command
                                    else agent.default_behaviour(req))
+
+
+def _drop_first(agent, command):
+    """Close the connection instead of answering the first ``command``."""
+    dropped = {"n": 0}
+
+    def behaviour(req):
+        if req.WhichOneof("command") == command and not dropped["n"]:
+            dropped["n"] += 1
+            return 0, "close"
+        return agent.default_behaviour(req)
+
+    agent.behaviour = behaviour
 
 
 # =========================================================================== #
@@ -167,3 +182,56 @@ def test_detach_waits_for_an_attach_to_the_same_app(mcp, fake_device, monkeypatc
     detaching.join(5)
     assert attached["attached"] and detached["agent_stopped"] is True
     assert mcp_server.SESSIONS.all() == [] and fake_device.agent() is None
+
+
+# =========================================================================== #
+# 2. Only calls that are safe to repeat are retried
+# =========================================================================== #
+def test_a_destructive_dump_compose_is_not_resent(mcp, fake_device, warm_agent):
+    _drop_first(warm_agent, "dump_compose")
+    res = mcp("dump_compose", enable_inspection=True)
+    assert "agent session lost" in res["error"], res
+    assert fake_device.commands().count("dump_compose") == 1  # hot-reloaded once, at most
+
+
+def test_a_read_only_dump_compose_is_retried(mcp, fake_device, warm_agent):
+    _drop_first(warm_agent, "dump_compose")
+    res = mcp("dump_compose")
+    assert "error" not in res, res
+    assert fake_device.commands().count("dump_compose") == 2
+
+
+def test_a_destructive_call_that_was_never_sent_is_retried(mcp, fake_device, warm_agent,
+                                                           monkeypatch):
+    """NotSentError proves the agent never saw the request, so sending it on a
+    fresh connection is its first delivery, not a repeat."""
+    real_write = clientmod.framing.write_message
+    failed = {"n": 0}
+
+    def write_fails_once(sock, payload):
+        command = pb.Request.FromString(payload).WhichOneof("command")
+        if command == "dump_compose" and not failed["n"]:
+            failed["n"] += 1
+            raise BrokenPipeError("broken pipe")
+        return real_write(sock, payload)
+
+    monkeypatch.setattr(clientmod.framing, "write_message", write_fails_once)
+    res = mcp("dump_compose", enable_inspection=True)
+    assert failed["n"] == 1 and "error" not in res, res
+    assert fake_device.commands().count("dump_compose") == 1
+    assert fake_device.commands().count("hello") == 2  # reconnected (warm) for the retry
+
+
+def test_retry_policy_table():
+    call = mcp_server._CallState()
+    lost, not_sent = SessionLostError("lost"), NotSentError("not sent")
+    refusal = mcp_server._retry_refusal
+    assert refusal("dump_tree", {}, lost, call) is None
+    assert refusal("dump_compose", {"enable_inspection": False}, lost, call) is None
+    assert refusal("dump_compose", {"enable_inspection": True}, lost, call) is not None
+    assert refusal("dump_compose", {"enable_inspection": True}, not_sent, call) is None
+    for tool in ("attach", "detach"):
+        assert refusal(tool, {}, not_sent, call) is not None
+    # Every tool is classified: read-only, or one that is not simply repeated.
+    unlisted = set(mcp_server.TOOLS) - mcp_server._READ_ONLY_TOOLS - mcp_server._NO_RETRY
+    assert unlisted == {"dump_compose"}

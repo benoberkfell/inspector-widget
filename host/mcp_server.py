@@ -1883,13 +1883,30 @@ TOOLS.update({
 # detach must never re-attach), so _run_tool never retries them.
 _NO_RETRY = frozenset({"attach", "detach"})
 
+# Tools that only read the app's state, so running one twice is harmless even if
+# the agent acted on the first request before the connection went. dump_compose
+# joins them unless enable_inspection hot-reloads the app (see _read_only).
+_READ_ONLY_TOOLS = frozenset({
+    "list_devices", "list_processes", "dump_tree", "get_properties", "screenshot",
+    "compose_overlay", "dump_accessibility", "a11y_lint", "a11y_overlay", "inspect",
+    "inspect_node", "component_image",
+})
+
+
+def _read_only(name: str, args: Dict[str, Any]) -> bool:
+    if name == "dump_compose":
+        return not args.get("enable_inspection")
+    return name in _READ_ONLY_TOOLS
+
 
 def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
                    call: _CallState) -> Optional[str]:
     """Why a call that lost its session must not be retried, or None to retry.
 
-    Never while the server shuts down, never for attach/detach, and never once
-    a detach stopped the agent the call used (the retry would re-inject it).
+    Never while the server shuts down, never for attach/detach, never once a
+    detach stopped the agent the call used (the retry would re-inject it); and
+    a call that changes the app (dump_compose with enable_inspection) only when
+    the request provably never reached the agent (NotSentError).
     """
     if _closing.is_set():
         return "the server is shutting down"
@@ -1897,7 +1914,9 @@ def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
         return "this tool manages its own session"
     if SESSIONS.stopped_during(call):
         return "the app was detached while this call ran"
-    return None
+    if _read_only(name, args) or isinstance(exc, _not_sent_error()):
+        return None
+    return "the request may have reached the agent, and running it twice is not harmless"
 
 
 def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1910,7 +1929,7 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     Arguments are validated against the tool's inputSchema first, the same way
     for every transport. If the agent drops the session mid-call (idle timeout,
-    app restart), the call is retried once on a fresh attach (see
+    app restart), a read-only call is retried once on a fresh attach (see
     _retry_refusal for when it isn't).
     """
     entry = TOOLS.get(name)
@@ -1989,6 +2008,14 @@ def _session_lost_error() -> type:
     except Exception:  # pragma: no cover - host package missing
         return _NeverRaised
     return SessionLostError
+
+
+def _not_sent_error() -> type:
+    try:
+        from inspector_widget.client import NotSentError
+    except Exception:  # pragma: no cover - host package missing
+        return _NeverRaised
+    return NotSentError
 
 
 def _is_expected_error(exc: BaseException) -> bool:

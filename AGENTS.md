@@ -124,9 +124,10 @@ sends SHUTDOWN, which stops the agent for every client (each one sees EOF at onc
 injects one first; it reports the agent stopped only once nothing listens on its socket (exit 1,
 MCP `agent_stopped: false`, otherwise). `--force` (MCP `attach(force=true)`) stops a running agent
 and injects afresh. The MCP server re-attaches a cached session that died (idle timeout, app
-restart, another client's SHUTDOWN) and retries a call once if the connection drops mid-way; a
-timeout is reported, not retried. Nothing re-attaches once exit cleanup starts, or after a
-`detach` stopped that app's agent.
+restart, another client's SHUTDOWN) and retries a read-only call once if the connection drops
+mid-way; a timeout is reported, not retried, and so is a destructive call (`dump_compose` with
+`enable_inspection=true`) unless its request never left the host. Nothing re-attaches once exit
+cleanup starts, or after a `detach` stopped that app's agent.
 Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`,
 default 30s, 4x for screenshots/Compose/a11y dumps; `0` disables it), so a frozen app returns an
 error, not a hang. An app in the background can be frozen by Android (the cached-apps freezer);
