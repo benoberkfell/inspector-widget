@@ -21,10 +21,19 @@ Keys and joins follow the ID contract shared with the agent and ``a11y.py``:
   restricted to the same window / ComposeView and to a11y nodes that no dumped View or
   Compose node claims, tie-broken by text, class/role and depth.
 
+Compose also serves children it merges into a focusable parent (the Text inside a
+clickable row, the Icon under an IconButton) and its synthetic role / contentDescription
+nodes (semantics id + 1e9 / + 2e9) as a11y nodes the semantics dump does not have. They
+are grafted under the node their a11y parent joined (``a11y_only``, ``a11y_parent``), so
+every node key dump_accessibility / a11y_lint hands out resolves here.
+
 Compose keys are valid only until recomposition re-mints the semantics ids. Every merged
-tree carries a ``generation`` (a fingerprint of the Compose ids), and ``find_node``
+tree carries a ``generation`` (a fingerprint of the Compose ids in the a11y dump, the same
+value dump_accessibility and a11y_lint return for that UI state), and ``find_node``
 re-resolves a stale ``compose:`` key by (ComposeView, test tag, label, list row, bounds)
-from the fingerprints recorded for earlier generations of the same session.
+from the fingerprints recorded for earlier generations of the same session (by inspect,
+inspect_node, dump_accessibility and a11y_lint). The registry of a live Session is also
+kept on disk per (serial, package, pid), so separate CLI invocations share it.
 
 The merge walks the **View tree as the spine** (most stable ids + full nesting), grafts
 each Compose window under its AndroidComposeView, re-parents AndroidView holders under the
@@ -35,13 +44,16 @@ Compose node that hosts them, and attaches a11y facets by key. List containers
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import tempfile
 import weakref
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .a11y import HOST_VIEW_ID as _HOST_VIEW_ID
+from .a11y import generation as _a11y_generation
 from .a11y import parse_node_key
 
 CONF_EXACT = "exact"
@@ -293,7 +305,10 @@ class _Merger:
         self.a11y_virt: Dict[Tuple[int, int], dict] = {}
         self.a11y_window: Dict[int, int] = {}
         self.a11y_depth: Dict[int, int] = {}
+        self.a11y_parent: Dict[int, dict] = {}
         self.a11y_all: List[dict] = []
+        # id(a11y node) -> the IntegratedNode that took it as its a11y facet.
+        self.owner: Dict[int, dict] = {}
         roots = [r for r in (a11y_tree or []) if r]
         for r in roots:
             win = self._align_window(r, view_roots, len(roots))
@@ -309,6 +324,7 @@ class _Merger:
                 else:
                     self.a11y_virt.setdefault((h, v), n)
                 for c in reversed(n.get("children", []) or []):
+                    self.a11y_parent[id(c)] = n
                     stack.append((c, depth + 1))
         self.claimed: set = set()
         # (node, group, depth) awaiting the IoU fallback
@@ -336,6 +352,7 @@ class _Merger:
             node["a11y"] = _a11y_facet(exact)
             node["correlation_confidence"] = CONF_EXACT
             self.claimed.add(id(exact))
+            self.owner.setdefault(id(exact), node)
             return
         node["correlation_confidence"] = CONF_NONE
         if node.get("bounds"):
@@ -396,6 +413,7 @@ class _Merger:
                 node["correlation_confidence"] = CONF_OVERLAP
                 node["a11y_iou"] = round(score, 3)
                 self.claimed.add(id(cands[ci]))
+                self.owner.setdefault(id(cands[ci]), node)
 
     # ---- view spine ----
     def merge_view(self, v: dict, window: int, depth: int = 0,
@@ -480,6 +498,7 @@ class _Merger:
             n = {"node_key": key, "bounds": _rect(a.get("bounds")), "a11y": _a11y_facet(a),
                  "correlation_confidence": CONF_EXACT, "a11y_only": True, "children": []}
             self.claimed.add(id(a))
+            self.owner.setdefault(id(a), n)
             for c in a.get("children", []) or []:
                 if _a11y_host(c) == host_id and _a11y_virtual(c) != _HOST_VIEW_ID:
                     n["children"].append(convert(c))
@@ -532,14 +551,50 @@ class _Merger:
 
         return rec(root, depth, not synthetic)
 
+    def _graft_compose_a11y_only(self) -> None:
+        """Graft the a11y nodes of a ComposeView that no Compose semantics node joined: the
+        children Compose merges into a focusable parent (a clickable row's Text, an
+        IconButton's Icon) and its synthetic role / contentDescription nodes. Each goes
+        under the IntegratedNode its nearest a11y ancestor joined, so its key resolves
+        (a11y facet, bounds, crop) instead of looking stale."""
+        for a in self.a11y_all:  # pre-order: an a11y parent is placed before its children
+            if id(a) in self.claimed:
+                continue
+            h, v = _a11y_host(a), _a11y_virtual(a)
+            if v == _HOST_VIEW_ID or h not in self.compose:
+                continue
+            p = self.a11y_parent.get(id(a))
+            while p is not None and id(p) not in self.owner:
+                p = self.a11y_parent.get(id(p))
+            if p is None:
+                continue
+            host = self.owner[id(p)]
+            n: Dict[str, Any] = {
+                "node_key": a.get("node_key") or compose_key(h, v),
+                "bounds": _rect(a.get("bounds")), "a11y": _a11y_facet(a),
+                "correlation_confidence": CONF_EXACT, "a11y_only": True,
+                "a11y_parent": host.get("node_key"), "children": []}
+            if v >= _FAKE_CD_OFFSET:
+                n["compose_synthetic"] = "content_description"
+            elif v >= _FAKE_ROLE_OFFSET:
+                n["compose_synthetic"] = "role"
+            host.setdefault("children", []).append(n)
+            self.claimed.add(id(a))
+            self.owner[id(a)] = n
+
     def build(self) -> List[dict]:
         roots = [self.merge_view(r, int(r.get("id", 0))) for r in self.view_tree]
         self._fallback()
+        self._graft_compose_a11y_only()
         _link_list_items(roots)
         return roots
 
     def unmatched_a11y(self) -> int:
         return sum(1 for n in self.a11y_all if id(n) not in self.claimed)
+
+
+_FAKE_ROLE_OFFSET = 1_000_000_000
+_FAKE_CD_OFFSET = 2_000_000_000
 
 
 def _link_list_items(roots: List[dict]) -> None:
@@ -587,7 +642,10 @@ def build_integrated_tree(view_tree: List[dict], compose: List[dict], a11y: List
     """
     merger = _Merger(view_tree, compose, a11y, props)
     roots = merger.build()
-    generation = _generation(compose, view_tree)
+    # The a11y dump's Compose ids (a11y.generation): the value dump_accessibility and
+    # a11y_lint report for the same UI state. Without an a11y dump, the Compose dump's.
+    generation = (_a11y_generation([r for r in a11y if r]) if a11y
+                  else _generation(compose, view_tree))
     summary = summarize(roots)
     summary["compose_views"] = len(merger.compose)
     summary["a11y_nodes"] = len(merger.a11y_all)
@@ -636,7 +694,68 @@ def _fingerprint(node: dict, row: Optional[int]) -> Dict[str, Any]:
         "role": attrs.get("Role"),
         "row": row,
         "bounds": node.get("bounds"),
+        "src": "merged",
     }
+
+
+# a11y class name (simple) / roleDescription -> the Compose Role name the merged tree uses.
+_ROLE_OF_CLASS = {v: k for k, v in _ROLE_CLASS.items()}
+_ROLE_OF_DESC = {"tab": "Tab", "switch": "Switch"}
+
+
+def _a11y_label(a: dict) -> str:
+    """contentDescription / text of an a11y node, else its non-focusable descendants' (the
+    way a merged Compose node carries its children's text)."""
+    own = a.get("content_description") or a.get("text")
+    if own:
+        return _norm(own)
+    parts: List[str] = []
+    stack = list(reversed(a.get("children") or []))
+    while stack:
+        c = stack.pop()
+        fl = set(c.get("flags") or [])
+        if {"clickable", "focusable", "screen_reader_focusable"} & fl:
+            continue
+        t = c.get("content_description") or c.get("text")
+        if t:
+            parts.append(str(t))
+            continue
+        stack.extend(reversed(c.get("children") or []))
+    return _norm(", ".join(parts))
+
+
+def a11y_fingerprints(a11y_roots: List[dict],
+                      compose_windows: Optional[List[dict]] = None) -> Dict[str, Dict[str, Any]]:
+    """Fingerprints of the Compose nodes of an a11y dump, keyed by their node_key (see
+    :func:`record_a11y`). ``compose_windows`` adds each node's TestTag and Role."""
+    attrs_of: Dict[Tuple[int, int], dict] = {}
+    for w in compose_windows or []:
+        acv = int(w.get("view_id") or 0)
+        for n in _flat([w.get("root")]):
+            if n and n.get("id") is not None:
+                attrs_of[(acv, int(n["id"]))] = n.get("attrs") or {}
+    out: Dict[str, Dict[str, Any]] = {}
+    stack: List[Tuple[dict, Optional[int]]] = [(r, None) for r in reversed(a11y_roots or []) if r]
+    while stack:
+        a, row = stack.pop()
+        cii = a.get("collection_item_info") or {}
+        if cii.get("row_index") is not None:
+            row = cii.get("row_index")
+        key = a.get("node_key") or ""
+        if key.startswith("compose:"):
+            h, v = _a11y_host(a), _a11y_virtual(a)
+            attrs = attrs_of.get((h, v), {})
+            res = a.get("view_id_resource_name") or ""
+            role = (attrs.get("Role") or _ROLE_OF_DESC.get(str(a.get("role_description") or "").lower())
+                    or _ROLE_OF_CLASS.get(_simple(a.get("class_name"))))
+            out[key] = {
+                "acv": h, "label": _a11y_label(a),
+                "test_tag": attrs.get("TestTag") or (res if res and ":id/" not in res else None),
+                "role": role, "row": row, "bounds": _rect(a.get("bounds")), "src": "a11y",
+            }
+        for c in reversed(a.get("children") or []):
+            stack.append((c, row))
+    return out
 
 
 def _compose_nodes_with_rows(roots: List[dict]) -> Iterable[Tuple[dict, Optional[int]]]:
@@ -654,19 +773,61 @@ def _compose_nodes_with_rows(roots: List[dict]) -> Iterable[Tuple[dict, Optional
 
 
 class KeyRegistry:
-    """Fingerprints of the Compose keys minted by recent dumps of one session."""
+    """Fingerprints of the Compose keys minted by recent dumps of one session.
 
-    def __init__(self) -> None:
+    With a ``path`` the registry is loaded from and saved to that JSON file, so separate
+    processes (CLI invocations) on the same app process share it; ``pid`` guards against
+    reusing the fingerprints of a process that has since died.
+    """
+
+    def __init__(self, path: Optional[str] = None, pid: Optional[int] = None) -> None:
         self.generations: "OrderedDict[str, Dict[str, Dict[str, Any]]]" = OrderedDict()
+        self.path = path
+        self.pid = pid
+        if path:
+            self._load()
 
     def record(self, merged: Dict[str, Any]) -> None:
-        gen = merged.get("generation") or ""
         fps = {n["node_key"]: _fingerprint(n, row)
                for n, row in _compose_nodes_with_rows(merged.get("roots", []))}
-        self.generations.pop(gen, None)
-        self.generations[gen] = fps
+        self.record_fingerprints(merged.get("generation") or "", fps)
+
+    def record_fingerprints(self, gen: str, fps: Dict[str, Dict[str, Any]]) -> None:
+        """Merge ``fps`` into generation ``gen`` (the same ids: an a11y dump and an
+        inspect of one UI state add to each other, keeping the fields each one knows)."""
+        cur = self.generations.pop(gen, {})
+        for k, fp in fps.items():
+            old = cur.get(k) or {}
+            cur[k] = {f: (fp.get(f) if fp.get(f) not in (None, "") else old.get(f))
+                      for f in set(old) | set(fp)}
+        self.generations[gen] = cur
         while len(self.generations) > _MAX_GENERATIONS:
             self.generations.popitem(last=False)
+        self._save()
+
+    def _load(self) -> None:
+        try:
+            with open(self.path) as f:  # type: ignore[arg-type]
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict) or (self.pid is not None and data.get("pid") != self.pid):
+            return
+        for gen, fps in data.get("generations") or []:
+            if isinstance(fps, dict):
+                self.generations[str(gen)] = fps
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"pid": self.pid, "generations": list(self.generations.items())}, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
 
     def lookup(self, key: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """Newest recorded (generation, fingerprint) that knew ``key``."""
@@ -681,12 +842,32 @@ _REGISTRIES: "weakref.WeakKeyDictionary[Any, KeyRegistry]" = weakref.WeakKeyDict
 _REGISTRIES_BY_ID: Dict[int, KeyRegistry] = {}
 
 
-def registry_for(session: Any) -> KeyRegistry:
-    """The key registry of a session (kept outside the Session object)."""
+def _registry_path(serial: Any, package: Any, pid: Any) -> Optional[str]:
+    """Where the key registry of (serial, package) lives on disk, or None when the app
+    process is not known (fakes, raw objects). ``$INSPECTOR_WIDGET_KEY_CACHE`` names the
+    directory; set it to "0" to keep registries in memory only."""
+    if not (isinstance(serial, str) and isinstance(package, str) and isinstance(pid, int)):
+        return None
+    root = os.environ.get("INSPECTOR_WIDGET_KEY_CACHE")
+    if root == "0":
+        return None
+    root = root or os.path.join(tempfile.gettempdir(), "inspector-widget-keys")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{serial}_{package}")
+    return os.path.join(root, safe + ".json")
+
+
+def registry_for(session: Any, serial: Optional[str] = None, package: Optional[str] = None,
+                 pid: Optional[int] = None) -> KeyRegistry:
+    """The key registry of a session (kept outside the Session object). A Session that
+    knows its serial, package and pid (or a raw connection given them) gets one backed by
+    a file, shared by every process that inspects the same app process."""
+    serial = serial if serial is not None else getattr(session, "serial", None)
+    package = package if package is not None else getattr(session, "package", None)
+    pid = pid if pid is not None else getattr(session, "pid", None)
     try:
         reg = _REGISTRIES.get(session)
         if reg is None:
-            reg = KeyRegistry()
+            reg = KeyRegistry(_registry_path(serial, package, pid), pid)
             _REGISTRIES[session] = reg
         return reg
     except TypeError:  # not weak-referenceable
@@ -694,8 +875,25 @@ def registry_for(session: Any) -> KeyRegistry:
         if reg is None:
             if len(_REGISTRIES_BY_ID) > 32:
                 _REGISTRIES_BY_ID.clear()
-            reg = _REGISTRIES_BY_ID[id(session)] = KeyRegistry()
+            reg = _REGISTRIES_BY_ID[id(session)] = KeyRegistry(
+                _registry_path(serial, package, pid), pid)
         return reg
+
+
+def record_a11y(session: Any, a11y_data: Any, compose_windows: Optional[List[dict]] = None,
+                serial: Optional[str] = None, package: Optional[str] = None,
+                pid: Optional[int] = None) -> Optional[str]:
+    """Record the Compose keys of an a11y dump (dump_accessibility / a11y_lint) in the
+    session's registry, so inspect_node can re-resolve them after recomposition and flag
+    a recycled cell. Returns the dump's generation."""
+    roots = _a11y_roots(a11y_data)
+    if not roots:
+        return None
+    gen = (a11y_data.get("generation") if isinstance(a11y_data, dict) else None) \
+        or _a11y_generation(roots)
+    registry_for(session, serial, package, pid).record_fingerprints(
+        gen, a11y_fingerprints(roots, compose_windows))
+    return gen
 
 
 def _score_candidate(fp: Dict[str, Any], node: dict, row: Optional[int]) -> Tuple[int, List[str]]:
@@ -852,8 +1050,9 @@ def find_node(merged: Dict[str, Any], *, node_key: Optional[str] = None,
                 if t[1] in _known_acvs(merged):
                     why = (f"{key} is not in the current dump (generation "
                            f"{merged.get('generation')}{last_seen}): Compose re-mints "
-                           "semantics ids on recomposition. Re-run inspect / dump_compose "
-                           "and use a fresh key")
+                           "semantics ids on recomposition. Re-run inspect, "
+                           "dump_accessibility or a11y_lint and use a fresh key, or pass the "
+                           "node's bounds as well")
                 else:
                     why = (f"{key}: no ComposeView {t[1]} in the current dump (generation "
                            f"{merged.get('generation')}{last_seen}); it was detached, "
@@ -877,7 +1076,9 @@ def find_node(merged: Dict[str, Any], *, node_key: Optional[str] = None,
     stack: List[Tuple[dict, int]] = [(r, 0) for r in merged.get("roots", [])]
     while stack:
         n, depth = stack.pop()
-        if _contains_point(n.get("bounds"), cx, cy):
+        # A child Compose merged into its parent (a11y_parent) is part of that element;
+        # the hit-test names the element, as TalkBack's focus does.
+        if not n.get("a11y_parent") and _contains_point(n.get("bounds"), cx, cy):
             area = _area(n.get("bounds"))
             if best is None or depth > best[1] or (depth == best[1] and area < best[2]):
                 best = (n, depth, area)
@@ -906,7 +1107,8 @@ def _note_key_drift(merged: Dict[str, Any], node: dict, registry: Optional[KeyRe
             row = r
             break
     cur = _fingerprint(node, row)
-    changed = [f for f in ("label", "test_tag", "row")
+    fields = ("label", "test_tag", "row") if old.get("src", "merged") == "merged" else ("test_tag", "row")
+    changed = [f for f in fields
                if old.get(f) is not None and cur.get(f) is not None and old[f] != cur[f]]
     if changed:
         node["key_note"] = (f"{node['node_key']} now names different content than when it "
@@ -1099,15 +1301,18 @@ def _shaped_compose(session: Any) -> List[dict]:
         return []
 
 
-def _shaped_a11y(session: Any) -> List[dict]:
-    """Fetch + shape the a11y tree as a list of window-root dicts. Degrades to [] if absent."""
+def _shaped_a11y_data(session: Any, rendering: bool = False) -> Any:
+    """Fetch + shape the a11y dump (the ``a11y.a11y_to_dict`` dict; lists/dicts a fake
+    returns pass through). ``rendering`` asks for ExtraRenderingInfo (text sizes), which
+    the lint needs. None when the session has no a11y dump."""
     fn = getattr(session, "dump_a11y", None)
     if not callable(fn):
-        return []
+        return None
     try:
-        data = fn()
+        data = (fn(root_id=0, include_extras=True, include_rendering_info=True)
+                if rendering else fn())
     except Exception:
-        return []
+        return None
     # Session.dump_a11y() returns the raw DumpA11yResponse proto; shape it to the
     # resolved dict the correlator expects (lists/dicts pass straight through).
     if not isinstance(data, (list, dict)):
@@ -1115,8 +1320,13 @@ def _shaped_a11y(session: Any) -> List[dict]:
             from inspector_widget import a11y as _a11ymod
             data = _a11ymod.a11y_to_dict(data)
         except Exception:
-            return []
-    return _a11y_roots(data)
+            return None
+    return data
+
+
+def _shaped_a11y(session: Any) -> List[dict]:
+    """Fetch + shape the a11y tree as a list of window-root dicts. Degrades to [] if absent."""
+    return _a11y_roots(_shaped_a11y_data(session))
 
 
 def _a11y_roots(data: Any) -> List[dict]:
@@ -1140,11 +1350,14 @@ def _a11y_roots(data: Any) -> List[dict]:
     return []
 
 
-def _merge_session(session: Any, props: bool) -> Tuple[MergedTree, List[dict], List[dict]]:
-    """Fetch the three trees and merge them; returns (merged, compose windows, a11y roots)."""
+def _merge_session(session: Any, props: bool, rendering: bool = False
+                   ) -> Tuple[MergedTree, List[dict], Any]:
+    """Fetch the three trees and merge them; returns (merged, compose windows, a11y data
+    as ``a11y.a11y_to_dict`` shaped it, or a bare list of roots from a fake)."""
     view_roots, prop_map = _shaped_view_tree(session, props)
     compose_windows = _shaped_compose(session)
-    a11y_roots = _shaped_a11y(session)
+    a11y_data = _shaped_a11y_data(session, rendering)
+    a11y_roots = _a11y_roots(a11y_data)
     merged = build_integrated_tree(view_roots, compose_windows, a11y_roots,
                                    props=prop_map if props else None)
     merged["sources"] = {
@@ -1153,7 +1366,7 @@ def _merge_session(session: Any, props: bool) -> Tuple[MergedTree, List[dict], L
         "a11y": bool(a11y_roots),
     }
     merged.registry = registry_for(session)
-    return merged, compose_windows, a11y_roots
+    return merged, compose_windows, a11y_data
 
 
 def inspect_tree(session: Any, include_properties: bool = False) -> Dict[str, Any]:
@@ -1188,11 +1401,13 @@ def _capture_skp(session: Any) -> Optional[Tuple[bytes, int]]:
     return skp, int(getattr(resp, "version", 0) or 0)
 
 
-def _full_screenshot_png(session: Any, dest: str) -> Optional[Tuple[str, float]]:
-    """Capture a full screenshot, write to ``dest`` PNG. Returns (path, scale) or None."""
+def _full_screenshot_png(session: Any, dest: str, root_id: int = 0
+                         ) -> Optional[Tuple[str, float]]:
+    """Capture window ``root_id`` (0 = the first, bottom window), write to ``dest`` PNG.
+    Returns (path, scale) or None."""
     from . import png as pngmod
     try:
-        resp = session.screenshot(root_id=0, scale=1.0)
+        resp = session.screenshot(root_id=int(root_id or 0), scale=1.0)
     except Exception:
         return None
     if not resp.HasField("screenshot"):
@@ -1202,8 +1417,33 @@ def _full_screenshot_png(session: Any, dest: str) -> Optional[Tuple[str, float]]
     return dest, scale
 
 
-def _crop_png(src_png: str, rect: dict, scale: float, dest: str) -> Optional[str]:
-    """Crop ``rect`` (absolute screen px) from a full-screen PNG, dividing by ``scale``."""
+def node_window(merged: Optional[Dict[str, Any]], node: dict) -> Tuple[int, int, int]:
+    """(root_view_id, origin x, origin y) of the window holding ``node``: the root View of
+    its path in the merged tree. (0, 0, 0) when unknown (the first window)."""
+    path = node_path(merged, node) if merged else []
+    if not path:
+        return 0, 0, 0
+    root = path[0]
+    rid = int((root.get("view") or {}).get("id") or 0)
+    b = root.get("bounds") or {}
+    return rid, int(b.get("x", 0) or 0), int(b.get("y", 0) or 0)
+
+
+def window_origins(merged: Dict[str, Any]) -> List[Tuple[int, int, int]]:
+    """[(root_view_id, screen x, screen y)] of the merged tree's windows, bottom first,
+    for :func:`overlay.write_windows_png` (the integrated overlay shows dialogs too)."""
+    out = []
+    for r in merged.get("roots", []) or []:
+        b = r.get("bounds") or {}
+        out.append((int((r.get("view") or {}).get("id") or 0), int(b.get("x", 0) or 0),
+                    int(b.get("y", 0) or 0)))
+    return out
+
+
+def _crop_png(src_png: str, rect: dict, scale: float, dest: str,
+              origin: Tuple[int, int] = (0, 0)) -> Optional[str]:
+    """Crop ``rect`` (absolute screen px) from a window PNG whose top-left sits at screen
+    ``origin``, dividing by ``scale``."""
     try:
         from PIL import Image  # type: ignore
     except ImportError:
@@ -1213,8 +1453,8 @@ def _crop_png(src_png: str, rect: dict, scale: float, dest: str) -> Optional[str
     except Exception:
         return None
     s = scale or 1.0
-    x = int(rect["x"] * s)
-    y = int(rect["y"] * s)
+    x = int((rect["x"] - origin[0]) * s)
+    y = int((rect["y"] - origin[1]) * s)
     w = max(1, int(rect["w"] * s))
     h = max(1, int(rect["h"] * s))
     x2 = min(img.width, x + w)
@@ -1228,13 +1468,15 @@ def _crop_png(src_png: str, rect: dict, scale: float, dest: str) -> Optional[str
 
 
 def component_image(session: Any, node: dict, out_path: Optional[str] = None,
-                    scale: float = 1.0) -> Dict[str, Any]:
+                    scale: float = 1.0, merged: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Cut a per-component image for one IntegratedNode (integ.md §1.4 / §1.5 / tool #15).
 
     Strategy: if the node has a Compose ``render_node_id`` (graphicsLayer layerId), capture an
     SKP and cut that layer via :mod:`skia_client`. Otherwise (or on any SKP failure) BITMAP-crop
-    the node's bounds from a full screenshot. Returns
-    ``{path, source: "skp"|"bitmap_crop", layer_id?, scale, note?}`` (``path`` None on failure).
+    the node's bounds from a screenshot of the node's OWN window (a dialog or popup node is
+    cut from the dialog, not from the activity behind it; ``merged`` locates the window).
+    Returns ``{path, source: "skp"|"bitmap_crop", layer_id?, scale, window?, note?}``
+    (``path`` None on failure).
     """
     out_path = out_path or _tmp_png("component")
     rect = _rect(node.get("bounds"))
@@ -1273,18 +1515,21 @@ def component_image(session: Any, node: dict, out_path: Optional[str] = None,
         return {"path": None, "source": "bitmap_crop", "scale": scale,
                 "error": "node has no bounds to crop"}
     base = _tmp_png("component_base")
-    shot = _full_screenshot_png(session, base)
+    root_id, ox, oy = node_window(merged, node)
+    shot = _full_screenshot_png(session, base, root_id)
     if shot is None:
         _safe_remove(base)
         return {"path": None, "source": "bitmap_crop", "scale": scale,
                 "error": "screenshot capture failed", "note": note}
     base_path, shot_scale = shot
-    cropped = _crop_png(base_path, rect, shot_scale, out_path)
+    cropped = _crop_png(base_path, rect, shot_scale, out_path, (ox, oy))
     _safe_remove(base_path)
     if cropped is None:
         return {"path": None, "source": "bitmap_crop", "scale": shot_scale,
                 "error": "crop failed (Pillow required for bitmap crop)", "note": note}
     result = {"path": cropped, "source": "bitmap_crop", "scale": shot_scale}
+    if root_id:
+        result["window"] = root_id
     if note:
         result["note"] = note
     return result
@@ -1296,26 +1541,35 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
                  bounds: Optional[dict] = None, include_image: bool = True,
                  image_path: Optional[str] = None,
                  lint_fn: Optional[Callable[[Any, int], List[dict]]] = None,  # (roots, density_dpi) -> List[dict]
-                 density: float = 0.0) -> Optional[Dict[str, Any]]:
+                 density: float = 0.0, lint: bool = False, font_scale: float = 1.0,
+                 include_contrast: bool = True) -> Optional[Dict[str, Any]]:
     """Full dossier for ONE element (integ.md §1.4).
 
     Builds the merged tree (with view properties), resolves the target node by
     key/view_id/semantics_id/bounds (re-resolving a stale Compose key when the session saw
     it before), fully populates its facets (``view.properties`` via ``get_properties`` if
     missing, full a11y, full compose attrs), attributes it to its window / list row /
-    ComposeView (``where`` + ``context``), cuts its component image, and attaches the lint
-    findings that target it by typed key (if ``lint_fn`` provided).
+    ComposeView (``where`` + ``context``), cuts its component image from its own window, and
+    attaches the lint findings that target it by typed key.
 
-    ``lint_fn(roots, density_dpi) -> [finding dicts]`` is first given the unified a11y
-    tree (``{"windows": [{"root_view_id", "root"}]}``, the ``a11y.a11y_to_dict`` shape,
-    so View findings are included); a lint that only understands Compose-semantics
-    roots (it raises on that input) is called again with those.
+    ``lint=True`` runs exactly the a11y_lint report (:func:`a11y_lint.run_lint` on the same
+    a11y dump, with Compose detail, rendering info and, with ``include_contrast``, the
+    contrast sample of the node's window) and keeps the findings on this node and on the
+    a11y nodes merged into it; ``lint_summary`` / ``lint_diagnostics`` say what ran (e.g.
+    "contrast not sampled"). ``density`` is the device DPI.
+
+    ``lint_fn(roots, density_dpi) -> [finding dicts]`` is the older hook (tests, custom
+    lints): it is first given the unified a11y tree (``{"windows": [...]}``), and a lint
+    that only understands Compose-semantics roots (it raises on that input) is called
+    again with those.
 
     Raises :class:`NodeKeyError` for an ambiguous bare ``compose:<id>`` / ``semantics_id``
     or a stale Compose key that cannot be re-resolved.
     """
-    # Build with properties so view.properties is available for the target.
-    merged, compose_windows, a11y_roots = _merge_session(session, props=True)
+    # Build with properties so view.properties is available for the target; the lint
+    # needs rendering info (text sizes) from the same a11y dump the keys come from.
+    merged, compose_windows, a11y_data = _merge_session(session, props=True, rendering=lint)
+    a11y_roots = _a11y_roots(a11y_data)
     registry = merged.registry
     try:
         node = find_node(merged, node_key=node_key, view_id=view_id,
@@ -1341,7 +1595,8 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
         "generation": merged.get("generation"),
     }
     for facet in ("view", "compose", "a11y", "render_quad", "a11y_iou", "list_item",
-                  "interop", "a11y_only", "resolved_from", "key_note"):
+                  "interop", "a11y_only", "a11y_parent", "compose_synthetic",
+                  "resolved_from", "key_note"):
         if node.get(facet) is not None:
             dossier[facet] = node[facet]
     dossier.update(attribution(merged, node))
@@ -1349,17 +1604,44 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
     # Component image.
     if include_image:
         img_dest = image_path or _tmp_png("dossier")
-        dossier["component_image"] = component_image(session, node, out_path=img_dest)
+        dossier["component_image"] = component_image(session, node, out_path=img_dest,
+                                                     merged=merged)
 
     # Focused lint: keep the findings whose TYPED key is one of this node's keys (never
-    # a bare int across id spaces).
-    if lint_fn is not None:
+    # a bare int across id spaces), or one of the a11y nodes Compose merged into it.
+    keys = node_typed_keys(node)
+    for c in _flat(node.get("children") or []):
+        if c.get("a11y_only"):
+            keys |= node_typed_keys(c)
+    if lint and isinstance(a11y_data, dict) and a11y_roots:
+        from . import a11y_lint
+        report = a11y_lint.run_lint(
+            session, density=int(density) if density else None, font_scale=font_scale,
+            include_contrast=include_contrast, a11y_data=a11y_data,
+            compose_data={"windows": compose_windows}, focus_keys=_key_strings(keys))
+        out = report.to_dict()
+        dossier["lint"] = [f for f in out["findings"] if _finding_matches(f, keys)]
+        dossier["lint_summary"] = a11y_lint.summarize_dicts(dossier["lint"])
+        dossier["lint_diagnostics"] = out["diagnostics"]
+    elif lint_fn is not None:
         all_findings = _run_lint_fn(lint_fn, a11y_roots, compose_windows, density)
         tag_compose_findings(all_findings, compose_windows)
-        keys = node_typed_keys(node)
         dossier["lint"] = [f for f in all_findings if _finding_matches(f, keys)]
 
     return dossier
+
+
+def _key_strings(keys: set) -> set:
+    """Typed key tuples -> the node_key strings the lint uses (both compose/virtual)."""
+    out = set()
+    for t in keys:
+        if t[0] == "view":
+            out.add(view_key(t[1]))
+        elif t[0] == "virt":
+            out.update({compose_key(t[1], t[2]), f"virtual:{t[1]}:{t[2]}"})
+        elif t[0] == "composeview":
+            out.add(view_key(t[1]))
+    return out
 
 
 def _run_lint_fn(lint_fn: Callable[[Any, int], List[dict]], a11y_roots: List[dict],

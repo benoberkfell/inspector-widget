@@ -464,10 +464,25 @@ def write_screen_png(conn: Any, a11y_dict: Dict[str, Any], out_png: str,
     ``conn.screenshot(root_id=...)`` captures one window root, so an overlay drawn on the
     first window alone shows an empty area where a dialog or popup is. The windows of
     ``a11y_dict`` (``a11y.a11y_to_dict``; z-ordered, bottom first) are alpha-composited
-    at their on-screen origins (their root bounds), onto a canvas the size of the
-    bottom window. Falls back to ``screenshot(root_id=0)`` when a window cannot be
-    captured or Pillow is missing. The window dim behind a dialog is not reproduced.
-    Raises RuntimeError when not even the first window can be captured.
+    at their on-screen origins (their root bounds); see :func:`write_windows_png`.
+    """
+    wins = []
+    for w in a11y_dict.get("windows") or []:
+        if not w.get("root"):
+            continue
+        b = (w["root"].get("bounds") or {}).get("layout") or {}
+        wins.append((int(w.get("root_view_id") or 0), int(b.get("x", 0) or 0),
+                     int(b.get("y", 0) or 0)))
+    return write_windows_png(conn, wins, out_png, scale)
+
+
+def write_windows_png(conn: Any, windows: List[Tuple[int, int, int]], out_png: str,
+                      scale: float = 1.0) -> float:
+    """Composite the windows ``[(root_view_id, screen x, screen y), ...]`` (z-ordered,
+    bottom first) into ``out_png`` on a canvas the size of the bottom window; return the
+    PNG's scale. Falls back to ``screenshot(root_id=0)`` when there is one window, a
+    window cannot be captured or Pillow is missing. The window dim behind a dialog is not
+    reproduced. Raises RuntimeError when not even the first window can be captured.
     """
     from . import png as pngmod
 
@@ -478,23 +493,20 @@ def write_screen_png(conn: Any, a11y_dict: Dict[str, Any], out_png: str,
         pngmod.write_png(shot.screenshot, out_png)
         return float(shot.screenshot.scale) or scale
 
-    wins = [w for w in (a11y_dict.get("windows") or []) if w.get("root")]
-    if len(wins) < 2 or not _HAVE_PIL:
+    if len(windows) < 2 or not _HAVE_PIL:
         return fallback()
     canvas = None
     base_xy = (0, 0)
     got_scale = scale
-    for w in wins:
+    for rid, x, y in windows:
         try:
-            shot = conn.screenshot(root_id=int(w.get("root_view_id") or 0), scale=scale)
+            shot = conn.screenshot(root_id=int(rid or 0), scale=scale)
             if not shot.HasField("screenshot") or not shot.screenshot.width:
                 return fallback()
             iw, ih, rgba = pngmod._decode_to_rgba(shot.screenshot)
         except Exception:
             return fallback()
         img = Image.frombytes("RGBA", (iw, ih), bytes(rgba))
-        b = (w["root"].get("bounds") or {}).get("layout") or {}
-        x, y = int(b.get("x", 0) or 0), int(b.get("y", 0) or 0)
         if canvas is None:
             canvas, base_xy = img, (x, y)
             got_scale = float(shot.screenshot.scale) or scale

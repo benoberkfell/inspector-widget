@@ -198,6 +198,9 @@ class LintContext:
     wcag_mode: bool = False         # WCAG 44dp target instead of Material 48dp
     # root_view_id -> screenshot of that window (preferred over the legacy image).
     window_images: Dict[int, WindowImage] = field(default_factory=dict)
+    # When set, pixel rules (R3) run only on the nodes with these keys (inspect_node's
+    # dossier lint: the same computation as a11y_lint, for one element).
+    image_keys: Optional[Set[str]] = None
     # Filled by the lint: rule crashes, skipped work, identity problems.
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -2151,7 +2154,9 @@ def _execute(run: _Run) -> List[Finding]:
         for rid, fn in NODE_RULES:
             if not run.on(rid):
                 continue
-            if RULES_BY_ID[rid].needs_image and not ctx.has_image and not ctx.component_image_fn:
+            if RULES_BY_ID[rid].needs_image and (
+                    (not ctx.has_image and not ctx.component_image_fn)
+                    or (ctx.image_keys is not None and n.key not in ctx.image_keys)):
                 continue
             try:
                 out.extend(fn(n, run))
@@ -2229,6 +2234,7 @@ class LintReport:
     font_scale: float = 1.0
     wcag_mode: bool = False
     a11y_data: Optional[Dict[str, Any]] = None
+    compose_data: Optional[Dict[str, Any]] = None
 
     @property
     def summary(self) -> Dict[str, Any]:
@@ -2237,7 +2243,7 @@ class LintReport:
         return s
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "density": self.density,
             "font_scale": self.font_scale,
             "wcag_mode": self.wcag_mode,
@@ -2246,6 +2252,10 @@ class LintReport:
             "diagnostics": self.diagnostics,
             "stats": self.stats,
         }
+        if (self.a11y_data or {}).get("generation"):
+            # The generation of the dump the finding keys belong to (see a11y.generation).
+            out["generation"] = self.a11y_data["generation"]
+        return out
 
 
 def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
@@ -2293,7 +2303,7 @@ def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
                  "Compose text never reports it), so R11/R18 did not run and contrast used the "
                  "normal-text threshold.", level="info")
     return LintReport(findings, ctx.diagnostics, stats, ctx.density, ctx.font_scale,
-                      ctx.wcag_mode, a11y_data)
+                      ctx.wcag_mode, a11y_data, compose_data)
 
 
 # --------------------------------------------------------------------------- #
@@ -2309,16 +2319,29 @@ def _window_has_text(root: Dict[str, Any]) -> bool:
     return False
 
 
+def _window_has_key(root: Dict[str, Any], keys: Set[str]) -> bool:
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.get("node_key") in keys:
+            return True
+        stack.extend(n.get("children") or [])
+    return False
+
+
 def capture_window_images(conn: Any, a11y_data: Dict[str, Any], ctx: LintContext,
-                          scale: float = 1.0) -> List[int]:
+                          scale: float = 1.0, only_keys: Optional[Set[str]] = None) -> List[int]:
     """Screenshot every window that has text (``conn.screenshot(root_id=...)``) into
-    ``ctx.window_images``. Returns the captured root_view_ids."""
+    ``ctx.window_images`` (with ``only_keys``: only the windows holding those nodes).
+    Returns the captured root_view_ids."""
     from . import png as pngmod
     got: List[int] = []
     for i, w in enumerate(a11y_data.get("windows") or []):
         root = w.get("root")
         rvid = w.get("root_view_id")
         if not root or not _window_has_text(root):
+            continue
+        if only_keys is not None and not _window_has_key(root, only_keys):
             continue
         try:
             resp = conn.screenshot(root_id=int(rvid or 0), scale=scale)
@@ -2343,9 +2366,14 @@ def run_lint(conn: Any, *, density: Optional[int], font_scale: float = 1.0,
              include_contrast: bool = True, scale: float = 1.0, wcag_mode: bool = False,
              rules: Optional[Iterable[str]] = None, include_rendering_info: bool = True,
              a11y_data: Optional[Dict[str, Any]] = None,
-             include_compose: bool = True) -> LintReport:
-    """Dump (unless ``a11y_data`` is given), join Compose detail, capture window
-    screenshots for contrast, and lint. ``conn`` is a ``Client`` or ``Session``.
+             include_compose: bool = True,
+             compose_data: Optional[Dict[str, Any]] = None,
+             focus_keys: Optional[Iterable[str]] = None) -> LintReport:
+    """Dump (unless ``a11y_data`` is given), join Compose detail (dumped unless
+    ``compose_data`` is given), capture window screenshots for contrast, and lint.
+    ``conn`` is a ``Client`` or ``Session``. ``focus_keys`` limits the pixel work to the
+    windows and nodes with those keys (inspect_node's dossier); every other rule runs on
+    the whole tree, so the findings on those nodes equal a full run's.
 
     Raises :class:`UnknownRuleError` for bad rule ids before touching the device.
     """
@@ -2363,8 +2391,7 @@ def run_lint(conn: Any, *, density: Optional[int], font_scale: float = 1.0,
             root_id=0, include_extras=True, include_rendering_info=bool(include_rendering_info)))
     if a11y_data.get("diagnostics"):
         ctx.diag("a11y.dump", str(a11y_data["diagnostics"]), level="info")
-    compose_data = None
-    if include_compose:
+    if compose_data is None and include_compose:
         try:
             compose_data = dump_compose_to_dict(conn.dump_compose(
                 include_semantics=True, include_slot_table=False, enable_inspection=False))
@@ -2372,9 +2399,15 @@ def run_lint(conn: Any, *, density: Optional[int], font_scale: float = 1.0,
             ctx.diag("compose.unavailable",
                      f"Compose semantics detail unavailable ({type(e).__name__}: {e}); linted "
                      f"the a11y tree alone.", level="info")
+    only = set(focus_keys) if focus_keys is not None else None
+    if only is not None:
+        ctx.image_keys = only
     want_img = include_contrast and (enabled is None or "a11y.contrast.low" in enabled)
     if want_img:
-        capture_window_images(conn, a11y_data, ctx, scale)
+        capture_window_images(conn, a11y_data, ctx, scale, only_keys=only)
+    elif enabled is None or "a11y.contrast.low" in enabled:
+        ctx.diag("contrast.skipped", "Contrast (R3) was not sampled (include_contrast off).",
+                 level="info")
     return lint_unified(a11y_data, ctx, compose_data=compose_data, enabled=enabled)
 
 

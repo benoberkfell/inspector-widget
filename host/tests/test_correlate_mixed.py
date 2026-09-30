@@ -182,19 +182,38 @@ def _reminted(windows, offset=100):
     return out
 
 
+def _reminted_a11y(offset=100):
+    """The a11y dump after the same re-mint: Compose virtual ids (not the fake-node
+    ones, which follow their node, nor the host's own -1) shift with the semantics ids."""
+    roots = _a11y_roots()
+    for n in correlate._flat(roots):
+        v = n.get("virtual_id", -1)
+        if (n.get("node_key") or "").startswith("compose:") and 0 <= v < 1_000_000_000:
+            n["virtual_id"] = v + offset
+            n["node_key"] = f"compose:{n['host_view_id']}:{v + offset}"
+            n["id"] = a11y.a11y_key(n["host_view_id"], v + offset)
+    return roots
+
+
+def _merged_reminted():
+    return _merged(compose=_reminted(mf.compose_windows()), a11y_roots=_reminted_a11y())
+
+
 def test_generation_changes_when_ids_are_reminted():
     a = _merged()
-    b = _merged(compose=_reminted(mf.compose_windows()))
+    b = _merged_reminted()
     assert a["generation"] == a["summary"]["generation"]
     assert a["generation"] != b["generation"]
     assert _merged()["generation"] == a["generation"]
+    # The generation is the a11y dump's: dump_accessibility / a11y_lint report the same one.
+    assert a["generation"] == a11y.a11y_to_dict(mf.a11y_response())["generation"]
 
 
 def test_stale_key_is_reresolved_from_the_previous_generation():
     reg = correlate.KeyRegistry()
     old = _merged()
     reg.record(old)
-    new = _merged(compose=_reminted(mf.compose_windows()))
+    new = _merged_reminted()
     node = correlate.find_node(new, node_key="compose:32:4", registry=reg)
     assert node["node_key"] == "compose:32:104"
     assert node["resolved_from"]["stale_key"] == "compose:32:4"
@@ -203,14 +222,14 @@ def test_stale_key_is_reresolved_from_the_previous_generation():
 
 
 def test_stale_key_without_history_explains_itself():
-    new = _merged(compose=_reminted(mf.compose_windows()))
+    new = _merged_reminted()
     with pytest.raises(correlate.NodeKeyError) as ei:
         correlate.find_node(new, node_key="compose:32:4", registry=correlate.KeyRegistry())
     assert "re-mints" in str(ei.value)
 
 
 def test_stale_key_falls_back_to_bounds_when_given():
-    new = _merged(compose=_reminted(mf.compose_windows()))
+    new = _merged_reminted()
     node = correlate.find_node(new, node_key="compose:32:4",
                                bounds={"x": 950, "y": 470, "w": 100, "h": 100})
     assert node["node_key"] == "compose:32:104"
@@ -282,7 +301,8 @@ class _FakeSession:
 def fake_session(monkeypatch):
     monkeypatch.setattr(correlate, "_shaped_view_tree", lambda s, props: (mf.view_roots(), {}))
     monkeypatch.setattr(correlate, "_shaped_compose", lambda s: mf.compose_windows())
-    monkeypatch.setattr(correlate, "_shaped_a11y", lambda s: _a11y_roots())
+    monkeypatch.setattr(correlate, "_shaped_a11y_data",
+                        lambda s, rendering=False: a11y.a11y_to_dict(mf.a11y_response()))
     return _FakeSession()
 
 
@@ -315,6 +335,9 @@ def test_inspect_node_reresolves_across_calls(fake_session, monkeypatch):
     correlate.inspect_tree(fake_session)  # the agent saw compose:32:4 here
     monkeypatch.setattr(correlate, "_shaped_compose",
                         lambda s: _reminted(mf.compose_windows()))
+    monkeypatch.setattr(correlate, "_shaped_a11y_data",
+                        lambda s, rendering=False: {"windows": [
+                            {"root_view_id": 2, "root": r} for r in _reminted_a11y()]})
     d = correlate.inspect_node(fake_session, node_key="compose:32:4", include_image=False)
     assert d["node_key"] == "compose:32:104"
     assert d["resolved_from"]["stale_key"] == "compose:32:4"
@@ -358,3 +381,159 @@ def test_inspect_node_falls_back_to_compose_roots_for_a_compose_only_lint(fake_s
     d = correlate.inspect_node(fake_session, node_key="compose:42:3", include_image=False,
                                lint_fn=compose_only_lint)
     assert [f["node"]["node_key"] for f in d["lint"]] == ["compose:42:3"]
+
+
+# --------------------------------------------------------------------------- a11y-only Compose keys
+def test_every_key_dump_accessibility_hands_out_resolves():
+    # Compose serves children it merges into a focusable parent (the row's Text, the
+    # IconButton's Icon) and its synthetic role node as a11y nodes the semantics dump
+    # does not have; their keys must resolve, not read as "stale".
+    data = a11y.a11y_to_dict(mf.a11y_response())
+    merged = _merged(a11y_roots=[w["root"] for w in data["windows"]])
+    keys = [n["node_key"] for n in a11y._iter_nodes([w["root"] for w in data["windows"]])
+            if n.get("node_key")]
+    unresolved = [k for k in keys if correlate.find_node(merged, node_key=k) is None]
+    assert unresolved == []
+    text = correlate.find_node(merged, node_key="compose:22:5")
+    assert text["a11y_only"] is True and text["a11y_parent"] == "compose:22:2"
+    assert text["a11y"]["text"] == "Item 0 (compose)" and text["bounds"]["w"] == 700
+    fake = correlate.find_node(merged, node_key=f"compose:22:{mf.FAKE_ROLE_ID}")
+    assert fake["compose_synthetic"] == "role" and fake["a11y_parent"] == "compose:22:4"
+    assert merged["summary"]["a11y_unmatched"] == 0
+
+
+def test_a_hit_test_names_the_element_not_its_merged_child():
+    node = correlate.find_node(_merged(), bounds={"x": 976, "y": 496, "w": 48, "h": 48})
+    assert node["node_key"] == "compose:32:4"
+
+
+def test_stale_key_error_points_at_the_tools_that_mint_keys():
+    with pytest.raises(correlate.NodeKeyError) as ei:
+        correlate.find_node(_merged_reminted(), node_key="compose:32:4",
+                            registry=correlate.KeyRegistry())
+    msg = str(ei.value)
+    assert "dump_accessibility" in msg and "a11y_lint" in msg and "bounds" in msg
+
+
+# --------------------------------------------------------------------------- keys from a11y dumps
+class _Sess:
+    """Weak-referenceable stand-in for a Session (no serial/pid: in-memory registry)."""
+
+
+def test_a11y_dump_keys_reresolve_after_a_remint():
+    sess = _Sess()
+    data = a11y.a11y_to_dict(mf.a11y_response())
+    gen = correlate.record_a11y(sess, data, mf.compose_windows())
+    assert gen == data["generation"]
+    new = _merged_reminted()
+    node = correlate.find_node(new, node_key="compose:32:4", registry=correlate.registry_for(sess))
+    assert node["node_key"] == "compose:32:104"
+    assert node["resolved_from"]["generation"] == gen
+
+
+def test_a11y_dump_key_of_a_rebound_cell_carries_a_note():
+    sess = _Sess()
+    correlate.record_a11y(sess, a11y.a11y_to_dict(mf.a11y_response()), mf.compose_windows())
+    # ComposeView 32 rebound from row 1 to row 7: same ids, other data.
+    resp = mf.a11y_response()
+    cell = resp.windows[0].root.children[1].children[1]
+    cell.collection_item_info.row_index = 7
+    roots = [w["root"] for w in a11y.a11y_to_dict(resp)["windows"]]
+    node = correlate.find_node(_merged(a11y_roots=roots), node_key="compose:32:4",
+                               registry=correlate.registry_for(sess))
+    assert "row" in node.get("key_note", "")
+
+
+def test_the_registry_of_an_app_process_is_shared_across_processes(tmp_path, monkeypatch):
+    # The CLI runs every subcommand in a new process: a-11y-lint records, inspect-node
+    # (another process, another Session object) re-resolves.
+    monkeypatch.setenv("INSPECTOR_WIDGET_KEY_CACHE", str(tmp_path))
+    first, second, other_pid = _Sess(), _Sess(), _Sess()
+    correlate.record_a11y(first, a11y.a11y_to_dict(mf.a11y_response()), mf.compose_windows(),
+                          serial="emulator-5556", package="com.example", pid=4242)
+    reg = correlate.registry_for(second, "emulator-5556", "com.example", 4242)
+    node = correlate.find_node(_merged_reminted(), node_key="compose:32:4", registry=reg)
+    assert node["node_key"] == "compose:32:104"
+    # A new app process (pid) does not inherit a dead process's keys.
+    assert correlate.registry_for(other_pid, "emulator-5556", "com.example", 999).generations == {}
+
+
+# --------------------------------------------------------------------------- dossier lint == a11y_lint
+def test_inspect_node_lint_is_the_a11y_lint_report_for_that_node(fake_session):
+    from inspector_widget import a11y_lint
+    full = a11y_lint.run_lint(fake_session, density=420, include_contrast=False,
+                              a11y_data=a11y.a11y_to_dict(mf.a11y_response()),
+                              compose_data={"windows": mf.compose_windows()}).to_dict()
+    merged = correlate.inspect_tree(fake_session)
+    for key in ("compose:32:3", "compose:32:4", "compose:22:2", "view:52", "view:50"):
+        node = correlate.find_node(merged, node_key=key)
+        mine = {key} | {c["node_key"] for c in correlate._flat(node.get("children") or [])
+                        if c.get("a11y_only")}
+        want = sorted((f["rule"], f["node_key"]) for f in full["findings"] if f["node_key"] in mine)
+        d = correlate.inspect_node(fake_session, node_key=key, include_image=False, lint=True,
+                                   density=420, include_contrast=False)
+        assert sorted((f["rule"], f["node_key"]) for f in d["lint"]) == want, key
+        assert d["lint_summary"]["total"] == len(want)
+        assert any(x["code"] == "contrast.skipped" for x in d["lint_diagnostics"])
+    assert any(f["node_key"] == "view:52" for f in full["findings"])  # the check has teeth
+
+
+# --------------------------------------------------------------------------- component image window
+def test_component_image_crops_a_dialog_node_from_the_dialog_window(tmp_path):
+    PIL = pytest.importorskip("PIL")
+    from PIL import Image
+    import struct
+    import zlib
+    from inspector_widget.proto import view_inspection_pb2 as pb
+
+    def shot(w, h, rgba):
+        raw = struct.pack("<ii", w, h) + bytes([2]) + bytes(rgba) * (w * h)
+        return pb.ScreenshotResponse(screenshot=pb.Screenshot(
+            width=w, height=h, bitmap_type=2, data=zlib.compress(raw), scale=1.0))
+
+    class Shots:
+        calls = []
+
+        def screenshot(self, root_id=0, scale=1.0):
+            self.calls.append(root_id)
+            return {0: shot(200, 200, (255, 255, 255, 255)), 2: shot(200, 200, (255, 255, 255, 255)),
+                    20: shot(80, 60, (200, 0, 0, 255))}[root_id]
+
+    views = [{"id": 2, "class_name": "DecorView", "bounds": {"layout": {"x": 0, "y": 0, "w": 200, "h": 200}}},
+             {"id": 20, "class_name": "DecorView", "bounds": {"layout": {"x": 100, "y": 120, "w": 80, "h": 60}},
+              "children": [{"id": 21, "class_name": "Button",
+                            "bounds": {"layout": {"x": 110, "y": 130, "w": 40, "h": 20}}}]}]
+    merged = correlate.build_integrated_tree(views, [], [])
+    node = correlate.find_node(merged, node_key="view:21")
+    sess = Shots()
+    out = tmp_path / "c.png"
+    img = correlate.component_image(sess, node, out_path=str(out), merged=merged)
+    assert img["path"] and img["window"] == 20 and sess.calls == [20]
+    got = Image.open(out).convert("RGB")
+    assert got.size == (40, 20) and got.getpixel((20, 10)) == (200, 0, 0)
+
+
+# --------------------------------------------------------------------------- re-resolution safety
+def _fp(**kw):
+    base = {"acv": 32, "label": "", "test_tag": None, "role": None, "row": None,
+            "bounds": {"x": 944, "y": 464, "w": 112, "h": 112}, "src": "merged"}
+    base.update(kw)
+    return base
+
+
+def test_reresolution_never_guesses_from_bounds_and_compose_view_alone():
+    reg = correlate.KeyRegistry()
+    reg.record_fingerprints("gold", {"compose:32:4": _fp()})  # nothing but place + ComposeView
+    with pytest.raises(correlate.NodeKeyError):
+        correlate.find_node(_merged_reminted(), node_key="compose:32:4", registry=reg)
+
+
+def test_reresolution_refuses_a_tie():
+    # Two current nodes match the old fingerprint equally well: raise, never pick one.
+    reg = correlate.KeyRegistry()
+    # test tag + label (strong), but every row's Delete button has both.
+    reg.record_fingerprints("gold", {"compose:22:9": _fp(acv=None, label="delete",
+                                                         test_tag="delete", bounds=None)})
+    with pytest.raises(correlate.NodeKeyError) as ei:
+        correlate.find_node(_merged_reminted(), node_key="compose:22:9", registry=reg)
+    assert len(ei.value.candidates) >= 2
