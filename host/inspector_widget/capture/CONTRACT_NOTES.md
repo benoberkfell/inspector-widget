@@ -75,6 +75,151 @@ with every consumer.
   The builder's `sel` is a stand-in (`@tag` or `#rid` when unique, else the ref).
   The real `sel` is computed in C4.
 
+## Store (C2, `capture/store.py`)
+
+- **Constructor.** `CaptureStore(root=None, persist=None, clock=time.time, *, env,
+  ttl_s, max_captures, max_mb, max_bytes, lineage_cap, max_pinned, mem_indexes,
+  mem_bytes, durable, gc_on_publish, rebuild, new_id)`.
+  - `persist=None` (the section 10 default was `True`) reads
+    `INSPECTOR_WIDGET_CAPTURE_PERSIST`. An explicit `True` or `False` wins.
+  - In memory-only mode `root` is a private temp directory. `close()` removes
+    it, and so does exit. `configured_root` still names the configured one.
+  - The keyword-only arguments override the environment and the spec defaults.
+    Tests use them; production code should not need them.
+  - The TTL is at least 60 s. A bare number in `INSPECTOR_WIDGET_CAPTURE_TTL`
+    means seconds; `s`, `m`, `h` and `d` suffixes also work.
+- **Locking.** `refs_lock()` is `store.lock`: an flock that is re-entrant for
+  the thread holding it. S1 holds it across `next_refs`, `refs.assign` and
+  `publish`. `publish` and `save_lineage_state` take it themselves as well. The
+  GC that a publish requests runs when the outermost `refs_lock` is released. It
+  is best-effort and never fails the publish.
+- **`publish(raw, ix, refmap, *, tomb=None) -> id`.**
+  - It mutates `raw.meta`: `id`, `created_at` (when 0) and `prev` (when None; it
+    becomes the lineage's latest).
+  - It applies `meta.label`, moving it silently from another capture of the
+    lineage. Call `label()` after publishing to learn `moved_from`.
+  - It honours `meta.pinned`: `bad_args` when 20 are pinned already.
+  - It merges `tomb` updates. Refs present in `refmap` leave the tomb, which is
+    capped at 5,000 with the oldest dropped first.
+  - It sets the default session and caches the index in memory.
+  - If the id was taken between staging and rename, it re-ids and rewrites
+    meta.json and the index.
+- **Sources of truth.** Labels live in the lineage file (a capture has at most
+  one) and pins in a `.pinned` marker. `meta.json` is written once. `load()` and
+  `list()` overlay the current `label` and `pinned`. `latest` and `prev` are
+  reserved and can never be labels.
+- **Lineage files** also carry `serial` and `package`, because file names are
+  sanitized. `lineage_state()` remembers its lineage, so
+  `save_lineage_state(st)` needs no arguments. `save_lineage_state(st, serial,
+  package)` also works. Save before `publish`, or re-read after it, because
+  publish rewrites `latest` and `history`.
+- **`resolve(spec, lineage)`.**
+  - `latest`, `prev` and `latest~N` walk the lineage's `history`, then any older
+    captures of the lineage (such as pinned ones past the 50-entry history) by
+    `created_at`. Without a lineage they walk the whole store by `created_at`.
+  - A lineage that has no captures gives `capture_not_found`. There is no
+    store-wide fallback, so another app's capture is never returned.
+  - Labels resolve as in spec 4.2. `ambiguous` candidates read `"<id>
+    <serial>/<package>"`.
+  - An empty or None spec means `latest`.
+- **`load(cid)`** takes ids only (case-insensitive). Anything else is
+  `bad_args`: resolve it first. A load counts as a use and touches `.used` at
+  most once a minute.
+- **`LoadedCapture`** has:
+  - `id`, `path`, `meta`, `exists()`, `stripped`;
+  - `index()`, `raw(name)`, `shot(root)`, `shot_roots()`, `skp(root)`,
+    `skp_roots()`, `refmap()`, `raw_capture()`;
+  - `derived(name)`, `put_derived(name, bytes) -> path`, `derived_path(name)`;
+  - `nbytes()`, `node_count()`, `age_s()`.
+
+  Reads after a deletion raise `capture_not_found`. A facet that was never
+  captured reads as None.
+  - Derived names are `derived/<f>`, `img/<f>` or `out/<f>`. A bare name means
+    `derived/<f>`.
+  - `index()` rebuilds an unreadable or old-schema index through
+    `rebuild(raw, refmap) -> Index`, then saves it. The default rebuild is C4's
+    `apply_refs(build_index(raw), refmap)`. S1 should pass one that also runs
+    the analyzers.
+- **Retention.** Caps count pinned captures but never evict them, and never
+  evict `gc(keep=...)`. The eviction order is unlabeled first, then least
+  recently used. The byte cap strips `img/`, `out/`, `derived/` and
+  `raw/skp_*.bin` in that order before it deletes whole captures, and marks
+  stripped captures `.stripped`.
+  - `gc()` returns `{removed:[{id, why}], stripped, staging_purged,
+    trash_purged, spill_purged, incomplete_purged, captures, bytes}`, where
+    `why` is one of `expired`, `lineage_cap`, `count_cap` or `bytes`.
+  - It returns `{"skipped": ...}` while another gc runs.
+  - `gc(all=True)` returns `{all, removed, note}`.
+- **Known gap.** Refs of a lineage's *latest* capture get no tombstone when that
+  capture is dropped or evicted, because no later capture was matched against
+  it. Refs are still never reused: the counter is global.
+
+## Fetch (C3, `capture/fetch.py`)
+
+- **`fetch(session, opts=None, *, compose_generation=0, clock=time.monotonic,
+  sleep, wall_clock=time.time, device=None, retries=2, retry_delay_s=0.15,
+  skp_max_version=109) -> RawCapture`.** `meta.id` is `""` until the store
+  publishes the capture.
+  - `session` only needs the `CaptureSession` protocol, which is the public
+    Session method surface. `pid`, `api_level`, `abi`, `agent_version`,
+    `build_id` and `capture_skp` are read with getattr, so main's Session and
+    session-lifecycle's Session both work.
+  - fetch never calls adb. S1 passes `device={dpi, font_scale}`; fetch derives
+    `screen` and `orientation` from the window roots when they are missing.
+  - `compose_generation` is the lineage's current generation (0 for a new
+    pid). The meta records it plus one when `enable_inspection` was sent. It
+    also bumps when the enable request itself errors, since the hot reload may
+    have happened anyway.
+- **`meta.facets` keys**: `windows`, `views`, `props`, `shots`, `compose`,
+  `slots`, `a11y`, `skp`, `fingerprint`.
+  - `props` rides on DumpTree.
+  - `fingerprint` times the re-check.
+  - Facets that were not requested are `off` with a reason (`screenshot=false`,
+    `slots=off`, `skp=false`, `props=false`).
+- **Registry.** `FACETS` maps each name to a `Facet(name, request, policy,
+  stored, run, position(opts), required, off_reason)`, and `plan(opts)` gives
+  the request order. `windows` and `views` are the required facets.
+- **Slots.** `enable` sends `DumpCompose(slots only, enable_inspection)` first
+  and stores that reply. Retries read without enabling. `if_available` never
+  enables.
+  - Unpopulated slots: `unavailable` with `SLOTS_NOT_POPULATED`.
+  - No ComposeView: `NO_COMPOSE`.
+  - `SLOTS_ENABLE_WARNING` is for the capture response (S1). fetch does not add
+    it to diagnostics.
+- **Screenshots.** The first root is `DumpTree.roots[0]`, whose screenshot the
+  agent embeds. It is split into `shots[firstRoot]`, and `views.pb` is stored
+  without it. Every other root gets `Screenshot(root_id)`, and the first root
+  does too if the embedded shot is missing. Each `shots[root]` is a serialized
+  `Screenshot` message, still deflated.
+- **a11y.** `a11y_rendering=True` sets `include_rendering_info` on the single
+  DumpA11y. Its reply goes to `raw/a11y.pb`, and `RawCapture.a11y_render` stays
+  None (reserved).
+- **SKP.** An SKP is not stored when `supported=false` or when its version is
+  above `SKP_MAX_VERSION` (109). Either case is `unsupported` with a reason.
+- **Errors.**
+  - `OSError` (transport, deadline) always propagates.
+  - A failing required facet raises `OpError("agent_error")`.
+  - An optional facet records `error` and the capture goes on.
+  - A DumpTree that fails with properties is retried without them, giving
+    `props: error`.
+- **Consistency.**
+  - `fingerprint_of(views, compose)` is a blake2b-128 hex over the tuples of
+    spec 3.2. Strings are resolved per message, so a dump with properties and
+    one without give the same value.
+  - `fingerprint_raw(raw)` computes it for a stored capture, and
+    `fingerprint_now(session)` for the live UI.
+  - `meta.fingerprint` is the fingerprint of the stored data, even when the
+    capture is unsettled.
+  - A retry re-fetches every facet. After 3 attempts the capture is
+    `unsettled`, with a diagnostic.
+- **`settle(session, settle_ms) -> bool`** (section 10 said `None`) polls every
+  100 ms and stops at two equal fingerprints. Its budget is `settle_ms`, capped
+  at 3,000 ms. fetch runs it first and adds a diagnostic when the UI never
+  settled.
+- **`unchanged_since(session, meta)`** implements `if_changed_since`. It returns
+  `{capture, unchanged: true, age_s}` when the lineage, the pid and the
+  fingerprint all match, else None. It writes nothing.
+
 ## Output layer (P0-1, `output.py`, `normalize.py`, `normalize_defaults.py`)
 
 - **Call order at the boundary**: `slim(tool, result, args)` then
