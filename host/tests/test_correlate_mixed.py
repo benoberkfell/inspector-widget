@@ -228,6 +228,15 @@ def test_stale_key_without_history_explains_itself():
     assert "re-mints" in str(ei.value)
 
 
+def test_slot_table_key_is_explained_not_called_stale():
+    with pytest.raises(correlate.NodeKeyError) as ei:
+        correlate.find_node(_merged(), node_key="compose:32:-214689528",
+                            registry=correlate.KeyRegistry())
+    msg = str(ei.value)
+    assert "slot-table composable" in msg and "bounds" in msg
+    assert "re-mints" not in msg
+
+
 def test_stale_key_falls_back_to_bounds_when_given():
     new = _merged_reminted()
     node = correlate.find_node(new, node_key="compose:32:4",

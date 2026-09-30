@@ -593,6 +593,9 @@ class _Merger:
         return sum(1 for n in self.a11y_all if id(n) not in self.claimed)
 
 
+# Slot-table (composable) node ids are <= -2 (CONTRACT §9); -1 is "no id".
+_SLOT_ID_MAX = -2
+
 _FAKE_ROLE_OFFSET = 1_000_000_000
 _FAKE_CD_OFFSET = 2_000_000_000
 
@@ -1047,7 +1050,15 @@ def find_node(merged: Dict[str, Any], *, node_key: Optional[str] = None,
                         return node
                     last_seen = f"; last seen in generation {hit[0]}"
             if bounds is None:
-                if t[1] in _known_acvs(merged):
+                if t[1] in _known_acvs(merged) and t[2] <= _SLOT_ID_MAX:
+                    # The agent gives slot-table composables negative ids (stable across
+                    # dumps); the integrated tree holds semantics nodes only.
+                    why = (f"{key} is a slot-table composable (negative id, from compose / "
+                           "dump_compose with the slot table), and the integrated tree holds "
+                           "only semantics nodes. Pass the node's bounds as well to hit-test "
+                           "the element at that spot, or use a key from inspect, "
+                           "dump_accessibility or a11y_lint")
+                elif t[1] in _known_acvs(merged):
                     why = (f"{key} is not in the current dump (generation "
                            f"{merged.get('generation')}{last_seen}): Compose re-mints "
                            "semantics ids on recomposition. Re-run inspect, "
