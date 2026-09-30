@@ -807,7 +807,7 @@ def _ref_error(ix: Index, ref: str, cid: str, tomb: Mapping[str, Sequence] | Non
     if tomb is not None:
         return OpError("ref_not_in_capture",
                        f"{msg}, and this app's lineage has no record of it",
-                       hint="It is a ref of another app (refs belong to one serial and "
+                       hint="Probably a ref of another app (refs belong to one serial and "
                             "package) or a typo: select by text or sel, e.g. find(text=...).")
     return OpError("ref_not_in_capture", msg,
                    hint='Refs are never reused: capture="latest" if it came from a newer '
