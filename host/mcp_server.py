@@ -878,36 +878,32 @@ _PACKAGE = {
 # --------------------------------------------------------------------------- #
 # Accessibility tools (dump / lint / overlay).
 # --------------------------------------------------------------------------- #
-def _a11y_lint_context(session: Any, serial: str, want_image: bool, scale: float,
-                       wcag_mode: bool):
-    """Build a LintContext: probe device density/font_scale (cached per serial),
-    and decode a screenshot to RGBA when contrast (image) rules are requested."""
-    from inspector_widget import a11y_lint, adb, png as pngmod
-    cache = _a11y_lint_context.__dict__.setdefault("_dens", {})
+def _a11y_device_metrics(serial: str):
+    """(density_dpi, font_scale) for the lint, probed once per serial and cached."""
+    from inspector_widget import adb
+    cache = _a11y_device_metrics.__dict__.setdefault("_cache", {})
     if serial not in cache:
         try:
             density = adb.display_density(serial)
         except Exception:
-            density = 420
+            density = None  # the lint assumes 420dpi and says so in its diagnostics
         try:
             fscale = adb.font_scale(serial)
         except Exception:
             fscale = 1.0
         cache[serial] = (density, fscale)
-    density, fscale = cache[serial]
-    ctx = a11y_lint.LintContext(density=density, font_scale=fscale, wcag_mode=wcag_mode)
-    if want_image:
-        try:
-            shot = session.screenshot(root_id=0, scale=scale)
-            if shot.HasField("screenshot"):
-                w, h, rgba = pngmod._decode_to_rgba(shot.screenshot)
-                ctx.screenshot_rgba = rgba
-                ctx.screenshot_w = w
-                ctx.screenshot_h = h
-                ctx.screenshot_scale = float(shot.screenshot.scale) or scale
-        except Exception:
-            log.debug("a11y_lint screenshot decode failed; running tree-only", exc_info=True)
-    return ctx, density, fscale
+    return cache[serial]
+
+
+def _a11y_lint_rules(rules: Any):
+    """Validate rule ids/aliases up front so a typo is a clear tool error."""
+    from inspector_widget import a11y_lint
+    if rules is not None and not isinstance(rules, (list, tuple, str)):
+        raise ToolError(f"rules must be a list of rule ids, got {type(rules).__name__}")
+    try:
+        return a11y_lint.resolve_rule_ids(rules)
+    except a11y_lint.UnknownRuleError as e:
+        raise ToolError(str(e))
 
 
 def tool_dump_accessibility(
@@ -931,32 +927,26 @@ def tool_a11y_lint(
     serial: str, package: str,
     include_contrast: bool = True, scale: float = 1.0,
     wcag_mode: bool = False, rules: Optional[List[str]] = None,
+    include_rendering_info: bool = True,
 ) -> Dict[str, Any]:
-    """Run the host-side accessibility lint (R1..R12) over the Compose semantics
-    tree. Returns findings (rule, severity, node, bounds, dp, message, evidence)
-    plus a summary. Contrast (the one pixel rule) samples a screenshot."""
+    """Run the host-side accessibility lint (R1..R18) over the unified a11y tree
+    (Views + Compose, joined with Compose semantics detail). Returns findings with
+    typed node keys plus a summary and diagnostics. Contrast samples each window."""
     _require(serial, "serial")
     _require(package, "package")
-    from inspector_widget import strings as st, a11y_lint
+    from inspector_widget import a11y_lint
+    enabled = _a11y_lint_rules(rules)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
-    compose = st.dump_compose_to_dict(
-        session.dump_compose(include_semantics=True, include_slot_table=False))
-    roots = [w["root"] for w in compose.get("windows", []) if w.get("root")]
-    enabled = set(rules) if rules else None
-    ctx, density, fscale = _a11y_lint_context(
-        session, serial, want_image=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode))
-    findings = a11y_lint.lint_tree(roots, ctx, enabled=enabled)
-    findings_json = [f.to_dict() for f in findings]
-    return {
-        "serial": serial, "package": package,
-        "density": density, "font_scale": fscale,
-        "wcag_mode": bool(wcag_mode),
-        "contrast_sampled": ctx.has_image,
-        "summary": a11y_lint.summarize(findings),
-        "findings": findings_json,
-        "diagnostics": compose.get("diagnostics"),
-    }
+    density, fscale = _a11y_device_metrics(serial)
+    report = a11y_lint.run_lint(
+        session, density=density, font_scale=fscale,
+        include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
+        rules=enabled, include_rendering_info=bool(include_rendering_info))
+    out = report.to_dict()
+    out.update({"serial": serial, "package": package,
+                "contrast_sampled": bool(out["stats"].get("contrast_windows"))})
+    return out
 
 
 def tool_a11y_overlay(
@@ -968,18 +958,20 @@ def tool_a11y_overlay(
     annotated PNG path plus the lint summary."""
     _require(serial, "serial")
     _require(package, "package")
-    from inspector_widget import (a11y as a11ymod, strings as st, a11y_lint,
+    from inspector_widget import (a11y as a11ymod, a11y_lint,
                                   overlay as ov, png as pngmod)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
-    # A11y tree (for boxes + reading order) and lint findings (for colors).
-    a11y_data = a11ymod.a11y_to_dict(session.dump_a11y(root_id=0, include_extras=True))
-    compose = st.dump_compose_to_dict(
-        session.dump_compose(include_semantics=True, include_slot_table=False))
-    roots = [w["root"] for w in compose.get("windows", []) if w.get("root")]
-    ctx, density, fscale = _a11y_lint_context(
-        session, serial, want_image=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode))
-    findings = [f.to_dict() for f in a11y_lint.lint_tree(roots, ctx)]
+    # One a11y dump feeds both the boxes/reading order and the lint.
+    a11y_data = a11ymod.a11y_to_dict(session.dump_a11y(
+        root_id=0, include_extras=True, include_rendering_info=True))
+    density, fscale = _a11y_device_metrics(serial)
+    report = a11y_lint.run_lint(
+        session, density=density, font_scale=fscale,
+        include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
+        a11y_data=a11y_data)
+    lint_out = report.to_dict()
+    findings = lint_out["findings"]
     shot = session.screenshot(root_id=0, scale=scale)
     if not shot.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
@@ -999,7 +991,8 @@ def tool_a11y_overlay(
         "boxes": summary["boxes"], "labels": summary["labels"],
         "flagged": summary["flagged"], "size": summary["size"],
         "finding_count": len(findings),
-        "summary": a11y_lint.summarize_dicts(findings) if hasattr(a11y_lint, "summarize_dicts") else None,
+        "summary": lint_out["summary"],
+        "lint_diagnostics": lint_out["diagnostics"],
         "diagnostics": a11y_data.get("diagnostics"),
     }
 
@@ -1019,6 +1012,7 @@ def _h_a11y_lint(args: Dict[str, Any]) -> Dict[str, Any]:
         scale=args.get("scale", 1.0),
         wcag_mode=args.get("wcag_mode", False),
         rules=args.get("rules"),
+        include_rendering_info=args.get("include_rendering_info", True),
     )
 
 
@@ -1029,6 +1023,19 @@ def _h_a11y_overlay(args: Dict[str, Any]) -> Dict[str, Any]:
         include_contrast=args.get("include_contrast", True),
         wcag_mode=args.get("wcag_mode", False),
     )
+
+
+def _load_a11y_rule_choices() -> List[str]:
+    try:
+        from inspector_widget import a11y_lint
+        return list(a11y_lint.RULE_CHOICES)
+    except Exception:  # keep the server importable even if the lint cannot load
+        return []
+
+
+_A11Y_RULE_CHOICES = _load_a11y_rule_choices()
+_A11Y_RULE_ITEMS: Dict[str, Any] = (
+    {"type": "string", "enum": _A11Y_RULE_CHOICES} if _A11Y_RULE_CHOICES else {"type": "string"})
 
 
 TOOLS: Dict[str, Dict[str, Any]] = {
@@ -1253,14 +1260,18 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_lint": {
         "handler": _h_a11y_lint,
         "description": (
-            "Run an accessibility LINT over the app's Compose semantics tree and report violations "
-            "(missing labels on actionable elements, <48dp touch targets using real device density, "
-            "low color contrast sampled from the screenshot, redundant/duplicate labels, clickable "
-            "without a role, missing headings, toggles without state, images without descriptions, "
-            "empty focusable stops, broken traversal order). Each finding has a rule id, severity "
-            "(error/warn/info), the node + bounds (px and dp), a remediation message, and evidence. "
-            "Tree-only rules run even with no screenshot; set include_contrast=false to skip the one "
-            "pixel-sampling rule. Auto-attaches."
+            "Run an accessibility LINT (rules R1..R18) over the app's UNIFIED accessibility tree -- "
+            "classic Views, Compose, RecyclerView cells, AndroidView-in-Compose, all in one pass -- and "
+            "report violations: missing labels, <48dp touch targets (touch bounds, real density), low "
+            "text contrast sampled per window, redundant/duplicate labels (per-row list repeats are "
+            "fine), clickable without a role, images without descriptions, toggles without state, "
+            "empty focus stops, heading/grouping structure, non-scalable or tiny text, duplicate "
+            "clickable bounds, contentDescription on text fields, unlabeled form fields, unclear link "
+            "text and traversal-order cycles. Each finding has rule + alias (R#), severity "
+            "(error/warn/info), node_key (view:<id> or compose:<acvId>:<semId>, usable with "
+            "inspect_node), node, bounds (px and dp), window, collection position, a remediation "
+            "message and evidence. Also returns summary and diagnostics. set include_contrast=false "
+            "to skip the one pixel rule. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1273,8 +1284,13 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "description": "Screenshot scale in (0,1] for the contrast sample."},
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "Use WCAG target sizes (44dp) instead of Material (48dp)."},
-                "rules": {"type": "array", "items": {"type": "string"},
-                    "description": "Optional subset of rule ids to run (e.g. 'a11y.label.missing'). Omit for all."},
+                "rules": {"type": "array", "items": _A11Y_RULE_ITEMS,
+                    "description": "Optional subset of rules to run: canonical ids (e.g. "
+                                   "'a11y.label.missing'), aliases 'R1'..'R18', or ATF names "
+                                   "(e.g. 'TouchTargetSize'). Omit for all."},
+                "include_rendering_info": {"type": "boolean", "default": True,
+                    "description": "Request per-node ExtraRenderingInfo (View text size/unit) for the "
+                                   "text-size rules R11/R18 and text-size-aware contrast."},
             },
             "required": ["serial", "package"],
             "additionalProperties": False,
