@@ -10,6 +10,9 @@
 //   # Classic-View (XML) screen:
 //   adb shell am start -n com.oberkfell.a11yprobe/.ViewScenarioActivity
 //
+//   # Bare widgets, no attributes (the host's property-defaults table):
+//   adb shell am start -n com.oberkfell.a11yprobe/.ViewDefaultsActivity
+//
 //   # Mixed View/Compose screens and dialog windows (ids in InteropFragment.kt):
 //   adb shell am start -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S1
 //     S1 RecyclerView of ComposeView cells     S4 LazyColumn with AndroidView rows
@@ -93,10 +96,12 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_SCENARIO = "scenario"
         const val SCENARIO_ALL = "all"
         const val SCENARIO_VIEW_XML = "view_xml"
+        const val SCENARIO_VIEW_DEFAULTS = "view_defaults"
 
         /** The Activity intent for a non-Compose scenario id, or null if MainActivity shows it. */
         fun forwardIntent(context: Context, id: String?): Intent? = when {
             id == SCENARIO_VIEW_XML -> Intent(context, ViewScenarioActivity::class.java)
+            id == SCENARIO_VIEW_DEFAULTS -> Intent(context, ViewDefaultsActivity::class.java)
             interopScenario(id) != null -> Intent(context, InteropActivity::class.java)
                 .putExtra(InteropActivity.EXTRA_SCENARIO, interopScenario(id)!!.id)
             else -> null

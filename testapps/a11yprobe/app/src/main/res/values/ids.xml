@@ -9,4 +9,6 @@
     <item name="compose_cell" type="id" />
     <!-- View tag key holding a classic notify toggle's on/off state. -->
     <item name="tag_notify_on" type="id" />
+    <!-- ViewDefaultsActivity: the column of widgets constructed in code. -->
+    <item name="defaults_bare" type="id" />
 </resources>

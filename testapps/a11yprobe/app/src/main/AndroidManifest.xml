@@ -37,6 +37,13 @@
             android:label="Interop"
             android:theme="@style/Theme.A11yProbe" />
 
+        <!-- Bare widgets (no attributes): the host's property-defaults table. -->
+        <activity
+            android:name=".ViewDefaultsActivity"
+            android:exported="true"
+            android:label="View defaults"
+            android:theme="@style/Theme.A11yProbe" />
+
     </application>
 
 </manifest>
