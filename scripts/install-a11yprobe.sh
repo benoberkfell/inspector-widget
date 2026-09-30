@@ -8,13 +8,16 @@
 # the same JDK-21 / AGP-8.7.2 / Gradle-8.13 / compileSdk-36 matrix as the host.
 #
 # Pipeline (testapps.md §6):
-#   1. select JDK 21 via /usr/libexec/java_home -v 21  (same as scripts/build.sh)
+#   1. select JDK 21: $JAVA_HOME if it already is 21+, else /usr/libexec/java_home -v 21
 #   2. ensure the Gradle wrapper exists in testapps/a11yprobe (copy from root)
 #   3. ./gradlew -p testapps/a11yprobe :app:installDebug
-#   4. am start the launcher MainActivity
+#   4. am start the launcher MainActivity (or one scenario, with --scenario)
 #
-# Usage: scripts/install-a11yprobe.sh [SERIAL] [--no-launch]
-#   SERIAL defaults to $SERIAL or emulator-5554.
+# Usage: scripts/install-a11yprobe.sh [SERIAL] [--no-launch] [--scenario ID]
+#   SERIAL defaults to $SERIAL, then $ANDROID_SERIAL, then emulator-5554.
+#   --scenario ID launches that scenario directly: a Compose id (icon_button, ...,
+#   or "all"), view_xml, or an interop id S1..S6 / D1 / D2. See the top of
+#   testapps/a11yprobe/app/src/main/kotlin/com/oberkfell/a11yprobe/MainActivity.kt.
 #
 # Fails loudly on any error.
 
@@ -37,19 +40,27 @@ ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ----------------------------------------------------------------- args
-SERIAL="${SERIAL:-emulator-5554}"
-for arg in "$@"; do
-    case "$arg" in
+SERIAL="${SERIAL:-${ANDROID_SERIAL:-emulator-5554}}"
+SCENARIO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --no-launch) LAUNCH=0 ;;
-        -*)          die "Unknown flag: $arg" ;;
-        *)           SERIAL="$arg" ;;
+        --scenario)  [ $# -ge 2 ] || die "--scenario needs an id"; SCENARIO="$2"; shift ;;
+        -*)          die "Unknown flag: $1" ;;
+        *)           SERIAL="$1" ;;
     esac
+    shift
 done
 
-# JDK 21 is required by AGP 8.7.2 / Gradle 8.13 (same as scripts/build.sh:41).
+# The app compiles with jvmToolchain(21) (testapps/a11yprobe/app/build.gradle.kts).
+java_major() {
+    "$1/bin/java" -version 2>&1 | awk -F'"' '/version/ { split($2, v, "."); print (v[1] == "1" ? v[2] : v[1]); exit }'
+}
 log "Selecting JDK 21..."
-if ! JAVA_HOME="$(/usr/libexec/java_home -v 21 2>/dev/null)"; then
-    die "JDK 21 not found via /usr/libexec/java_home -v 21. Install Temurin/Corretto 21."
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ] && [ "$(java_major "$JAVA_HOME")" -ge 21 ] 2>/dev/null; then
+    :
+elif ! JAVA_HOME="$(/usr/libexec/java_home -v 21 2>/dev/null)"; then
+    die "JDK 21 not found (set JAVA_HOME, or install Temurin/Corretto 21 for /usr/libexec/java_home -v 21)."
 fi
 export JAVA_HOME
 export PATH="$JAVA_HOME/bin:$PATH"
@@ -88,9 +99,15 @@ ok "Installed $PACKAGE on $SERIAL."
 
 # --------------------------------------------------------------------- launch
 if [ "$LAUNCH" -eq 1 ]; then
-    log "Launching $PACKAGE/.MainActivity ..."
-    "$ADB" -s "$SERIAL" shell am start -n "$PACKAGE/.MainActivity" \
-        || die "Failed to launch MainActivity."
+    if [ -n "$SCENARIO" ]; then
+        log "Launching scenario $SCENARIO ..."
+        "$ADB" -s "$SERIAL" shell am start -S -W -n "$PACKAGE/.MainActivity" --es scenario "$SCENARIO" \
+            || die "Failed to launch scenario $SCENARIO."
+    else
+        log "Launching $PACKAGE/.MainActivity ..."
+        "$ADB" -s "$SERIAL" shell am start -n "$PACKAGE/.MainActivity" \
+            || die "Failed to launch MainActivity."
+    fi
     ok "Launched. Attach Inspector Widget with: scripts/run.sh $SERIAL $PACKAGE"
 else
     ok "Skipping launch (--no-launch). Attach with: scripts/run.sh $SERIAL $PACKAGE"
