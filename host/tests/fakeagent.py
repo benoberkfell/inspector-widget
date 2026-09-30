@@ -200,8 +200,6 @@ class Scene:
     skp: Optional[bytes] = None  # CaptureSkp payload; None -> "empty SKP"
     # root_view_id -> WindowInfo fields (title, layout_title, window_type, wm_flags)
     windows: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    # (host_view_id, virtual_id) of the node holding accessibility focus (FakeTalkBack).
-    a11y_focus: Optional[Tuple[int, int]] = None
 
     def all_views(self) -> List[ViewSpec]:
         return [v for r in self.roots for v in r.walk()]
@@ -923,7 +921,8 @@ class FakeAgent:
         """Dispatcher.handle(): exactly one Response per request."""
         command = req.WhichOneof("command")
         try:
-            if command is None:
+            if command is None or (self.legacy_a11y_ids and command in ("a11y_focus", "a11y_act")):
+                # An A1-era agent predates A11yFocus/A11yAct: the field is unknown to it.
                 return error_response(req.id, "No command set in request")
             return getattr(self, f"_h_{command}")(req.id, getattr(req, command))
         except Exception as exc:  # handler failure -> ERROR with the request id
@@ -1033,7 +1032,7 @@ class FakeAgent:
             w = resp.dump_a11y.windows.add()
             w.root_view_id = r.id
             encode_a11y_view(st, r, w.root, cmd.include_extras, cmd.include_rendering_info)
-            _mark_a11y_focus(w.root, self.current_a11y_focus)
+            _mark_a11y_focus(w.root, self.a11y_focus)
             encode_window_info(st, self.scene, r, w.info)
             diag.append(f"root#{r.id} query-from-app-process")
         st.fill(resp.dump_a11y.strings)
@@ -1056,14 +1055,8 @@ class FakeAgent:
             stack.extend(n.children)
         return None
 
-    @property
-    def current_a11y_focus(self) -> Optional[Tuple[int, int]]:
-        """The app's one accessibility focus, as every read reports it: this agent's own
-        (a11y_act / set_a11y_focus), else the one FakeTalkBack put on the scene."""
-        return self.a11y_focus if self.a11y_focus is not None else self.scene.a11y_focus
-
     def set_a11y_focus(self, host_view_id: Optional[int], virtual_id: int = -1,
-                       delay: float = 0.0) -> None:
+                       delay: float = 0.0, notify: bool = True) -> None:
         """Move accessibility focus (None clears it) the way TalkBack's action does: a
         FOCUS_CLEARED event for the old node, then VIEW_ACCESSIBILITY_FOCUSED for the new
         one. With ``delay`` it happens on a timer thread (to exercise the long-poll)."""
@@ -1076,6 +1069,9 @@ class FakeAgent:
             self.a11y_tap.record(TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED, root.id if root else 0,
                                  old[0], old[1])
         self.a11y_focus = None if host_view_id is None else (host_view_id, virtual_id)
+        hook = getattr(self, "on_focus_change", None)
+        if notify and hook is not None:
+            hook(self.a11y_focus)
         if host_view_id is not None:
             root = self._root_of(host_view_id)
             host = self.scene.find_view(host_view_id)
@@ -1106,7 +1102,7 @@ class FakeAgent:
                 out.stale = True
                 return
             encode_a11y_virtual(st, host.id, n, out.node, True, False)
-        _mark_a11y_focus(out.node, self.current_a11y_focus)
+        _mark_a11y_focus(out.node, self.a11y_focus)
         _prune(out.node, depth)
         out.bounds.CopyFrom(out.node.bounds)
 
@@ -1132,9 +1128,8 @@ class FakeAgent:
         with self._handle_lock:  # Dispatcher.handleA11yFocus: the read runs under the lock
             seq = tap.seq
             diag = [f"roots={len(self.scene.roots)}"]
-            if self.current_a11y_focus is not None:
-                self._focus_proto(st, out.a11y, *self.current_a11y_focus, cmd.subtree_depth,
-                                  "view-root")
+            if self.a11y_focus is not None:
+                self._focus_proto(st, out.a11y, *self.a11y_focus, cmd.subtree_depth, "view-root")
             else:
                 diag.append("no accessibility focus in the app's windows")
             if cmd.include_input_focus:
@@ -1205,9 +1200,8 @@ class FakeAgent:
                                      scroll_delta_y=120 if action_id == 0x1000 else -120)
         else:
             out.error = error
-        if self.current_a11y_focus is not None:
-            self._focus_proto(st, out.after, *self.current_a11y_focus, cmd.subtree_depth,
-                              "view-root")
+        if self.a11y_focus is not None:
+            self._focus_proto(st, out.after, *self.a11y_focus, cmd.subtree_depth, "view-root")
         out.seq = self.a11y_tap.seq
         out.diagnostics = f"roots={len(self.scene.roots)}; via=query-connection"
         st.fill(out.strings)
@@ -1360,7 +1354,7 @@ class FakeDevice:
                               on_request=self._on_request, on_stop=self._on_stop,
                               build_id=build_id)
             agent.package = package  # type: ignore[attr-defined]
-            agent.scene.a11y_focus = self.talkback.focus if self.talkback else None
+            self._join_talkback(agent)
             self.agents.append(agent)
             self.sockets[name] = agent
         return agent
@@ -1605,9 +1599,35 @@ class FakeDevice:
         if len(self.activity_stack) > 1:
             self.activity_stack.pop()
 
+    def _join_talkback(self, agent: "FakeAgent") -> None:
+        """A new agent sees TalkBack's current focus and service state, and focus it
+        moves itself (A11yAct) becomes TalkBack's focus, as on a device."""
+        tb = self.talkback
+        agent.a11y_focus = tb.focus if tb is not None else None
+        agent.touch_exploration = bool(tb is not None and tb.running)
+        agent.services_enabled = agent.touch_exploration
+        agent.on_focus_change = self._agent_moved_focus  # type: ignore[attr-defined]
+
+    def _agent_moved_focus(self, target: Optional[Tuple[int, int]]) -> None:
+        if self.talkback is not None:
+            self.talkback.focus = target
+            self.talkback.edge = False
+
     def set_a11y_focus(self, target: Optional[Tuple[int, int]]) -> None:
+        """TalkBack moved focus: every live agent sees it (dumps) and records the
+        FOCUS_CLEARED / FOCUSED events its event tap would get."""
         for agent in self.agents:
-            agent.scene.a11y_focus = target
+            if not agent.running:
+                continue
+            if target is None:
+                agent.set_a11y_focus(None, notify=False)
+            else:
+                agent.set_a11y_focus(target[0], target[1], notify=False)
+
+    def set_touch_exploration(self, on: bool) -> None:
+        for agent in self.agents:
+            agent.touch_exploration = on
+            agent.services_enabled = on
 
     def live_scene(self, package: str = DEFAULT_PACKAGE) -> Optional[Scene]:
         agent = self.agent(package)
@@ -1727,7 +1747,7 @@ class FakeDevice:
                               on_request=self._on_request, on_stop=self._on_stop,
                               build_id=build_id)
             agent.package = package  # type: ignore[attr-defined]
-            agent.scene.a11y_focus = self.talkback.focus if self.talkback else None
+            self._join_talkback(agent)
             self.agents.append(agent)
             self.sockets[socket_name] = agent
         call["result"] = f"started generation {agent.generation}"
@@ -2060,6 +2080,7 @@ class FakeTalkBack:
             self.was_running = True
             self.starts += 1
             s["touch_exploration_enabled"] = "1"
+            self.device.set_touch_exploration(True)
             if self.grant_on_start:
                 s["touch_exploration_granted_accessibility_services"] = self.COMPONENT
             # TalkBack reads its log level when it binds.
@@ -2073,6 +2094,7 @@ class FakeTalkBack:
         elif not self.running and self.was_running:
             self.was_running = False
             s["touch_exploration_enabled"] = "0"
+            self.device.set_touch_exploration(False)
             self.verbose_log = False
             self.set_focus(None)
 

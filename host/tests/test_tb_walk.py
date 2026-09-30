@@ -216,10 +216,39 @@ def test_leaving_the_app_ends_the_walk(probe):
     probe.activity_stack.pop()
 
 
-def test_focus_taken_between_presses_is_recorded_as_stolen(probe, monkeypatch):
+def test_focus_taken_between_presses_is_recorded_as_stolen(probe):
+    """A11yFocus: the pre-press read (no wait) right after press 3's long-poll sees the
+    app's focus move as a FOCUSED event newer than the step's seq."""
+    state = {"armed": False}
+
+    def arm(tb, action):
+        if len(tb.presses) == 3:
+            state["armed"] = True
+        return False
+
+    def behaviour(req):
+        agent = probe.agent(PKG)
+        cmd = req.WhichOneof("command")
+        if cmd == "a11y_focus" and state["armed"] and req.a11y_focus.wait_ms == 0:
+            state["armed"] = False
+            probe.talkback.set_focus(tb_item(5))  # the app pulled focus (input focus sync)
+        return 0, agent.dispatch(req)
+
+    probe.behaviour = behaviour
+    probe.talkback.on_press = arm
+    res = walk(probe)
+    rec = saved(res)
+    assert rec["reader"] == "a11y_focus"
+    stolen = [s for s in rec["steps"] if s["via"] == "stolen"]
+    assert stolen and stolen[0]["key"] == "view:1025" and stolen[0]["i"] == 4
+    assert any("via=stolen" in ln for ln in res["lines"])
+
+
+def test_dump_reader_records_stolen_focus_too(probe, monkeypatch):
     # With a 30ms poll and a 20ms settle, a step's wait reads exactly twice after
     # its press, so the third read after press 3 is the next step's pre-check.
     monkeypatch.setattr(tbwalk, "POLL_MS", 30)
+    monkeypatch.setattr(tbwalk, "make_reader", tbwalk.DumpFocusReader)
     state = {"dumps": None}
 
     def arm(tb, action):
@@ -232,7 +261,7 @@ def test_focus_taken_between_presses_is_recorded_as_stolen(probe, monkeypatch):
         if req.WhichOneof("command") == "dump_a11y" and state["dumps"] is not None:
             state["dumps"] += 1
             if state["dumps"] == 3:
-                probe.talkback.set_focus(tb_item(5))  # the app pulled focus (input focus sync)
+                probe.talkback.set_focus(tb_item(5))
                 state["dumps"] = None
         return 0, agent.dispatch(req)
 
@@ -240,9 +269,9 @@ def test_focus_taken_between_presses_is_recorded_as_stolen(probe, monkeypatch):
     probe.talkback.on_press = arm
     res = walk(probe)
     rec = saved(res)
+    assert rec["reader"] == "dump_poll"
     stolen = [s for s in rec["steps"] if s["via"] == "stolen"]
     assert stolen and stolen[0]["key"] == "view:1025" and stolen[0]["i"] == 4
-    assert any("via=stolen" in ln for ln in res["lines"])
 
 
 # --------------------------------------------------------------------------- #
@@ -273,6 +302,9 @@ def test_autoscroll_is_detected_and_new_nodes_are_modelled(tb_env):
                 x, y, w, h = v.bounds
                 v.bounds = (x, y - 240, w, h)
                 v.a11y.pop("visible_to_user", None)
+            tap = tb_env.agent(PKG).a11y_tap  # what the platform sends while it scrolls
+            tap.record(fakeagent.TYPE_VIEW_SCROLLED, 1001, 1010, -1, scroll_delta_y=240)
+            tap.record(fakeagent.TYPE_WINDOW_CONTENT_CHANGED, 1001, 1011, -1)
             t.set_focus(tb_item(4))
             return True
         return False
@@ -540,6 +572,8 @@ def test_survive_detects_a_rebound_row_as_drift(probe, monkeypatch):
     def notify_all(args):
         views = _views(probe.live_scene(PKG))
         views[1022].a11y["text"] = "Item 9"  # the View now shows another item
+        probe.agent(PKG).a11y_tap.record(fakeagent.TYPE_WINDOW_CONTENT_CHANGED, 1001, 1022, -1,
+                                         content_change_types=1)
 
     probe.on_broadcast = notify_all
     res = scenario(probe, "survive", target="Item 2", mutate="probe:notify_all")
@@ -726,8 +760,8 @@ def test_focus_cleared_by_a_scroll_is_waited_out_then_reported_lost(probe):
 
 
 def _index(scene, focus):
-    scene.a11y_focus = focus
     agent = fakeagent.FakeAgent(scene)
+    agent.a11y_focus = focus
     try:
         req = fakeagent.pb.Request(id=1)
         req.dump_a11y.SetInParent()
@@ -781,3 +815,126 @@ def test_focus_after_waits_out_the_gap_before_a_new_window_is_focused(probe, mon
     res = scenario(probe, "focus_after", target="Item 2", action="activate", wait_ms=2000)
     assert res["verdict"] == "initial_ok" and res["focus"]["ref"] == "view:2010"
     assert [e.get("focus") for e in res["timeline"] if "focus" in e][-2:] == [None, "view:2010"]
+
+
+# --------------------------------------------------------------------------- #
+# A11yFocus (T2): the long-poll reader, A11yAct starts, WindowInfo in the model
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("reader", ["a11y_focus", "dump_poll"])
+def test_both_readers_walk_the_same_lap(probe, monkeypatch, reader):
+    if reader == "dump_poll":
+        monkeypatch.setattr(tbwalk, "make_reader", tbwalk.DumpFocusReader)
+    res = walk(probe)
+    rec = saved(res)
+    assert rec["reader"] == reader and res["reader"] == reader
+    assert res["ended"] == "wrap" and res["findings"] == []
+    assert keys(rec) == [None, "view:1003"] + [f"view:{1020 + i}" for i in range(6)] \
+        + ["view:1025", "view:1003"]
+    if reader == "a11y_focus":
+        # a plain lap needs one dump (the start): moves come from the event tap
+        assert res["ms"]["dumps"] == 1 and res["ms"]["reads"] >= 2 * res["steps"]
+
+
+def test_start_by_node_key_uses_a11y_act_without_pressing(probe):
+    res = walk(probe, start="view:1023", until="edge")
+    rec = saved(res)
+    assert rec["start_via"] == "a11y_act" and rec["seek_presses"] == 0
+    assert res["lines"][0] == '0. view:1023 Button "Item 3. Button"'
+    assert res["lines"][1] == '1. view:1024 Button "Item 4. Button"'
+    assert probe.talkback.presses[0] == "next"  # no presses before the walk's own
+    assert not [a for a in probe.talkback.presses if a != "next"]
+
+
+def test_start_by_label_prefers_the_stop_and_walks_backwards(probe):
+    res = walk(probe, start="Item 2", direction="prev", until="edge")
+    rec = saved(res)
+    assert rec["start_via"] == "a11y_act"
+    assert probe.talkback.presses[:2] == ["next", "prev"]  # prove, then back onto the target
+    assert keys(rec)[:3] == ["view:1022", "view:1021", "view:1020"]
+
+
+def test_a11y_act_that_fails_falls_back_to_pressing(probe):
+    with pytest.raises(tbwalk.WalkError) as err:
+        walk(probe, start="view:9999", max_steps=8)
+    assert err.value.code == "start_not_found"
+
+
+def test_initial_focus_is_checked_against_the_models_rule(tb_env, monkeypatch):
+    monkeypatch.setattr(tbwalk, "INITIAL_FOCUS_S", 1.0)
+
+    def scene():
+        s = fakeagent.talkback_scene()
+        s.windows[1001] = {"title": "Title"}  # the title stop repeats the window title
+        return s
+
+    tb_env.scene_factory = scene
+    tb = tb_env.talkback
+    tb.order = list(ORDER)
+    tb.initial_focus = tb_item(0)  # TalkBack skips the title, as the model predicts
+    res = walk(tb_env, until="edge")
+    rec = saved(res)
+    assert rec["initial"]["model"] == "view:1020" and rec["initial"]["skipped"] == ["view:1003"]
+    assert res["vs_model"]["initial"] == "agree"
+    tb.initial_focus = TB_TITLE
+    res = walk(tb_env, until="edge")
+    assert res["vs_model"]["initial"] == "model view:1020, actual view:1003"
+
+
+def test_a_stop_under_the_status_bar_is_a_ghost(tb_env):
+    title = ViewSpec(1003, "TextView", "android.widget", (16, 30, 328, 64), text="Title",
+                     a11y={"class_name": "android.widget.TextView", "text": "Title"})
+    hidden = _button(1045, (16, 2, 100, 20), "Behind the bar")  # the fake status bar is 24px
+    tb_env.scene_factory = lambda: _scene_with(title, hidden)
+    tb_env.talkback.order = [TB_TITLE, (1045, -1)]
+    res = walk(tb_env, until="edge")
+    ghost = [f for f in res["findings"] if f["code"] == "tb.ghost_stop"]
+    assert ghost and ghost[0]["refs"] == ["view:1045"] and "under a system bar" in ghost[0]["msg"]
+    assert saved(res)["steps"][2]["under_system_bar"] == [0, 0, 360, 24]
+
+
+def test_focus_after_reports_the_models_initial_focus(probe, monkeypatch):
+    monkeypatch.setattr(tbscenarios, "WINDOW_QUIET_S", 0.1)
+
+    def open_dialog(tb, target):
+        scene = tb.device.live_scene(PKG)
+        heading = ViewSpec(2010, "TextView", "android.widget", (40, 200, 280, 48), text="Share item",
+                           a11y={"class_name": "android.widget.TextView", "text": "Share item",
+                                 "heading": True})
+        scene.roots.append(ViewSpec(2001, "DecorView", "com.android.internal.policy",
+                                    (20, 180, 320, 200), a11y={"class_name": "android.widget.FrameLayout"},
+                                    children=[heading]))
+        scene.windows[2001] = {"title": "Share", "window_type": 2}
+        tb.set_focus((2010, -1))
+
+    probe.talkback.on_click = open_dialog
+    res = scenario(probe, "focus_after", target="Item 2", action="activate")
+    assert res["verdict"] == "initial_ok"
+    assert res["model"]["initial"] == "view:2010" and res["model"]["title"] == "Share"
+
+
+def test_scenario_target_is_focused_after_talkbacks_own_initial_focus(probe, monkeypatch):
+    """TalkBack's initial focus comes ~550ms after it starts: a target focused
+    before that would be overwritten, so the scenario waits for it first."""
+    import threading
+    monkeypatch.setattr(tbwalk, "INITIAL_FOCUS_S", 1.0)
+    tb = probe.talkback
+    real_sync = tb.sync
+
+    def late_initial_focus():
+        was = tb.was_running
+        real_sync()
+        if tb.running and not was:
+            threading.Timer(0.3, tb.set_focus, args=[TB_TITLE]).start()
+
+    monkeypatch.setattr(tb, "sync", late_initial_focus)
+    res = scenario(probe, "survive", target="Item 3", mutate="broadcast:-a x")
+    assert res["target"]["ref"] == "view:1023" and res["verdict"] == "kept"
+
+
+def test_proving_the_keymap_on_the_last_stop_comes_back_to_it(probe, monkeypatch):
+    """Live D1: the target is the last stop, so the proof's "next" hits the edge and
+    wraps; focus must come back to the target before it is activated."""
+    monkeypatch.setattr(tbscenarios, "WINDOW_QUIET_S", 0.1)
+    res = scenario(probe, "focus_after", target="Item 5", action="activate")
+    assert probe.talkback.clicks == [tb_item(5)]
+    assert res["target"]["ref"] == "view:1025"
