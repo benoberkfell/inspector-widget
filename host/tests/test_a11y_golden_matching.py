@@ -102,7 +102,9 @@ def test_row_expectations_mirror_the_flaw_tables():
 
 
 def test_traversal_check_uses_focus_stops_in_order():
-    order = [{"speakable": s, "is_focus_stop": True} for s in G.TRAVERSAL_ORDER]
+    # The compact focus_order shape a11y.a11y_to_dict emits: stops only, spoken text in "speak".
+    order = [{"order": i + 1, "key": f"compose:7:{i}", "id": i, "speak": s}
+             for i, s in enumerate(G.TRAVERSAL_ORDER)]
     G.check_traversal_order(_capture([], focus_order=order))
     swapped = order[:3] + [order[5], order[4], order[3]] + order[6:]
     with pytest.raises(AssertionError):

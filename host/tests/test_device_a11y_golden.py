@@ -166,10 +166,13 @@ class Capture:
         return out
 
     def focus_entry(self, n: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """The focus_order entry for node ``n`` (same key and same bounds)."""
-        nb = rect(n.get("bounds"))
+        """The focus_order entry for node ``n``, or None when ``n`` is not a focus stop.
+
+        focus_order lists only the stops, compactly: {order, key, id, speak, unlabeled?,
+        window?}; ``id`` is the node's host key, unique per dump (ID contract).
+        """
         for e in self.a11y.get("focus_order") or []:
-            if e.get("id") == n.get("id") and rect(e.get("bounds")) == nb:
+            if e.get("id") == n.get("id"):
                 return e
         return None
 
@@ -425,8 +428,7 @@ def _node(cap: Capture, tag: str) -> Dict[str, Any]:
 
 
 def _is_stop(cap: Capture, n: Dict[str, Any]) -> bool:
-    e = cap.focus_entry(n)
-    return bool(e and e.get("is_focus_stop"))
+    return cap.focus_entry(n) is not None
 
 
 def check_heading(good: str, bad: str) -> Callable[[Capture], None]:
@@ -467,7 +469,7 @@ def check_merged_focus(cap: Capture) -> None:
     row = _node(cap, "good_merged_focus")
     assert _is_stop(cap, row), f"the merged row should be one focus stop: {describe(row)}"
     entry = cap.focus_entry(row) or {}
-    assert "Play episode" in str(entry.get("speakable") or ""), (
+    assert "Play episode" in str(entry.get("speak") or ""), (
         f"the merged row should speak its children: {entry}")
     for n in cap.subtree(row)[1:]:
         assert not _is_stop(cap, n), f"a child of the merged row is its own stop: {describe(n)}"
@@ -484,8 +486,8 @@ TRAVERSAL_ORDER = [
 
 def check_traversal_order(cap: Capture) -> None:
     wanted = set(TRAVERSAL_ORDER)
-    seen = [e.get("speakable") for e in cap.a11y.get("focus_order") or []
-            if e.get("is_focus_stop") and e.get("speakable") in wanted]
+    seen = [e.get("speak") for e in cap.a11y.get("focus_order") or []
+            if e.get("speak") in wanted]
     assert seen == TRAVERSAL_ORDER, (
         "reading order of the traversal scenario is wrong\n"
         f"  expected: {TRAVERSAL_ORDER}\n  actual:   {seen}")
@@ -683,7 +685,11 @@ def device():
     if PACKAGE not in adb.list_debuggable_packages(SERIAL):
         pytest.skip(f"{PACKAGE} is not installed/debuggable on {SERIAL}; "
                     f"run scripts/install-a11yprobe.sh {SERIAL}")
-    if "InteropActivity" not in adb.shell(SERIAL, f"dumpsys package {PACKAGE}"):
+    # InteropActivity has no intent filter, so `dumpsys package` does not list it;
+    # resolving the explicit component does.
+    resolved = adb.shell(SERIAL, f"cmd package resolve-activity --brief -n {PACKAGE}/.InteropActivity",
+                         check=False)
+    if "InteropActivity" not in resolved:
         pytest.skip(f"the A11yProbe build on {SERIAL} predates the interop corpus; "
                     f"reinstall it with scripts/install-a11yprobe.sh {SERIAL}")
     missing = [a for a in (inject.NATIVE_SO_NAME, inject.BOOTSTRAP_DEX_NAME, inject.PAYLOAD_JAR_NAME)
