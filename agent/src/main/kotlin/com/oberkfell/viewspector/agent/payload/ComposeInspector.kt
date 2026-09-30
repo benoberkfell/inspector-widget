@@ -62,6 +62,14 @@
  * node and slot-table group is guarded on its own, so one bad value costs that value, never the
  * ComposeView; the failures are counted in the diagnostics.
  *
+ * PASSWORDS (Redaction.kt): a Password semantics node's EditableText / InputText go out masked.
+ * The slot table is read in two passes per ComposeView: the first collects every password
+ * field's text (a call with a PasswordVisualTransformation or a password keyboard, a
+ * *SecureTextField, a Password semantics node's content, and the secret-named String
+ * parameters of a composable wrapping such a field), the second emits the nodes with every
+ * parameter value and modifier argument masked where it is, or embeds, one of those texts. So
+ * the secret stays masked in the app's own wrappers above the field, not only below it.
+ *
  * DIAGNOSTICS (tokens separated by "; ", stable prefixes for the host to match):
  *   found N AndroidComposeView(s) [(M nested in interop Views)]; bounds=screen
  *   compose_obfuscated: Compose present but classes are renamed (AndroidComposeView is <cls>),
@@ -124,6 +132,16 @@ object ComposeInspector {
         var slotGroupFailures = 0
         var slotTruncated = 0
         val slotIds = SlotIds()
+
+        /**
+         * This ComposeView's password texts: its Password semantics nodes' content and its
+         * slot table's password fields' text parameters, all gathered before any slot-table
+         * value is interned (see [gatherSlotSecrets]).
+         */
+        val secrets = Redaction.Secrets()
+
+        /** Each named slot-table group's parameters, read once by [gatherSlotSecrets]. */
+        val slotParams = java.util.IdentityHashMap<Any, SlotParams?>()
         private val logged = HashSet<String>()
 
         /** Log the first failure of each [kind] (per ComposeView), without a second failure. */
@@ -214,9 +232,18 @@ object ComposeInspector {
                     if (groups.isEmpty()) {
                         slotEmpty.add(acvId)
                     } else {
+                        // Pass 1: every password field's text, before anything is interned
+                        // (a string in the table goes out with the response).
+                        for (g in groups) {
+                            try {
+                                gatherSlotSecrets(g, 0, ctx)
+                            } catch (t: Throwable) {
+                                ctx.log("slot-table secrets", t)
+                            }
+                        }
                         for ((i, g) in groups.withIndex()) {
                             try {
-                                for (n in buildSlotChildren(g, strings, 0, 0, off, 0L, i, emptySet(), ctx)) {
+                                for (n in buildSlotChildren(g, strings, 0, 0, off, 0L, i, ctx)) {
                                     rootNode.addChildren(n); produced = true
                                 }
                             } catch (t: Throwable) {
@@ -597,7 +624,8 @@ object ComposeInspector {
             LinkedHashMap()
         }
         try {
-            Redaction.redactComposeAttrs(attrs) // a Password node's field content (Redaction.kt)
+            // A Password node's field content (Redaction.kt); its plaintext also masks the slot table.
+            Redaction.redactComposeAttrs(attrs, ctx.secrets)
         } catch (t: Throwable) {
             // Never send a Password node's text unredacted: drop the field values instead.
             if (attrs.containsKey("Password")) {
@@ -797,7 +825,8 @@ object ComposeInspector {
      * the named ancestors (the nesting that goes on the wire, capped at [SLOT_MAX_DEPTH]);
      * [rawDepth] the raw groups (capped at [SLOT_RAW_MAX_DEPTH] as a recursion guard). A cut
      * subtree is counted in [ctx] (slot_truncated); a child group that throws is counted
-     * (slot_partial) and its siblings still come through.
+     * (slot_partial) and its siblings still come through. Every parameter value and modifier
+     * argument goes out masked by ctx.secrets ([gatherSlotSecrets] ran first).
      */
     private fun buildSlotChildren(
         group: Any,
@@ -807,7 +836,6 @@ object ComposeInspector {
         off: IntArray,
         parentId: Long,
         siblingIndex: Int,
-        secrets: Set<String>,
         ctx: WalkCtx,
     ): List<ViewInspection.ComposeNode> {
         if (rawDepth > SLOT_RAW_MAX_DEPTH) {
@@ -821,18 +849,14 @@ object ComposeInspector {
         }
         val id = if (name != null) ctx.slotIds.mint(group, name, parentId, siblingIndex) else parentId
         val childNamedDepth = if (name != null) namedDepth + 1 else namedDepth
-        // Parameters are read before the children: a password field's text parameters become
-        // secrets its whole subtree masks (BasicTextField, the decoration box... get the value).
-        val params = if (name == null) null else try {
-            slotParameters(group, name)
-        } catch (t: Throwable) {
-            ctx.log("slot-table parameters", t)
-            null
-        }
-        val childSecrets = if (params != null && params.password) {
-            HashSet(secrets).apply { addAll(params.texts) }
-        } else {
-            secrets
+        // Read by the gathering pass; a group it could not reach is read now, and a password
+        // field's text still becomes a secret before its subtree and its own attrs go out.
+        val params = when {
+            name == null -> null
+            ctx.slotParams.containsKey(group) -> ctx.slotParams[group]
+            else -> readSlotParams(group, name, ctx)?.also {
+                if (it.password) ctx.secrets.addAll(it.texts)
+            }
         }
         val childGroups = (invoke(group, "getChildren") as? Collection<*>) ?: emptyList<Any?>()
         val childNodes = ArrayList<ViewInspection.ComposeNode>()
@@ -842,7 +866,7 @@ object ComposeInspector {
             try {
                 childNodes.addAll(
                     buildSlotChildren(
-                        c, strings, rawDepth + 1, childNamedDepth, off, id, index++, childSecrets, ctx,
+                        c, strings, rawDepth + 1, childNamedDepth, off, id, index++, ctx,
                     ),
                 )
             } catch (t: Throwable) {
@@ -864,7 +888,7 @@ object ComposeInspector {
         // stopping at the next named composable (whose modifiers belong to it).
         val mods = LinkedHashSet<String>()
         try {
-            collectOwnedModifiers(group, mods, 0)
+            collectOwnedModifiers(group, mods, 0, ctx.secrets)
         } catch (t: Throwable) {
             ctx.log("slot-table modifiers", t)
         }
@@ -879,8 +903,9 @@ object ComposeInspector {
         val rnid = try { collectRenderNodeId(group, 0) } catch (t: Throwable) { 0L }
         if (rnid != 0L) b.renderNodeId = rnid
         for ((key, value) in params?.list.orEmpty()) {
-            // A password field's text, wherever it is passed down in its subtree, goes out masked.
-            val shown = if (value in childSecrets) Redaction.mask(value) else value
+            // A password field's text goes out masked wherever it is passed: down into the
+            // field's own subtree, up from a wrapper composable, or embedded in another value.
+            val shown = ctx.secrets.mask(value)
             b.addAttrs(
                 ViewInspection.ComposeNode.Attr.newBuilder()
                     .setKey(strings.intern(key)).setValue(strings.intern(shown)).build()
@@ -897,14 +922,14 @@ object ComposeInspector {
      * Requires isDebugInspectorInfoEnabled (we set it in enableInspection). Returns null if none.
      */
     /** Decoded modifier strings from a single group's getModifierInfo() (empty unless a NodeGroup). */
-    private fun slotModifiersOf(group: Any): List<String> {
+    private fun slotModifiersOf(group: Any, secrets: Redaction.Secrets): List<String> {
         val infos = invoke(group, "getModifierInfo") as? List<*> ?: return emptyList()
         if (infos.isEmpty()) return emptyList()
         val parts = ArrayList<String>()
         for (mi in infos) {
             if (mi == null) continue
             val mod = invoke(mi, "getModifier") ?: continue
-            describeModifierElement(mod)?.let { parts.add(it) }
+            describeModifierElement(mod, secrets)?.let { parts.add(it) }
         }
         return parts
     }
@@ -944,17 +969,24 @@ object ComposeInspector {
     }
 
     /** Collect modifiers from [group] and its UNNAMED descendant chain, stopping at named composables. */
-    private fun collectOwnedModifiers(group: Any, out: MutableSet<String>, depth: Int) {
+    private fun collectOwnedModifiers(
+        group: Any,
+        out: MutableSet<String>,
+        depth: Int,
+        secrets: Redaction.Secrets,
+    ) {
         if (depth > 20) return
-        out.addAll(slotModifiersOf(group))
+        out.addAll(slotModifiersOf(group, secrets))
         val children = invoke(group, "getChildren") as? Collection<*> ?: return
         for (c in children) {
             if (c == null) continue
-            if (meaningfulName(c) == null) collectOwnedModifiers(c, out, depth + 1)
+            if (meaningfulName(c) == null) collectOwnedModifiers(c, out, depth + 1, secrets)
         }
     }
 
-    private fun describeModifierElement(el: Any): String? {
+    /** [el] as "name(arg=value, ...)", each value masked by [secrets] (a text field's semantics
+     *  modifier lists its InputText). */
+    private fun describeModifierElement(el: Any, secrets: Redaction.Secrets): String? {
         // InspectableValue: nameFallback + inspectableElements (Sequence<ValueElement>).
         val name = invoke(el, "getNameFallback") as? String
         val args = ArrayList<String>()
@@ -969,7 +1001,7 @@ object ComposeInspector {
                 val ve = iter.next() ?: continue
                 val vn = invoke(ve, "getName") as? String ?: continue
                 val vv = invoke(ve, "getValue")
-                args.add("$vn=${SafeString.of(vv)}")
+                args.add("$vn=${secrets.mask(SafeString.of(vv))}")
             }
         } catch (_: Throwable) {
             args.add("…")
@@ -979,23 +1011,26 @@ object ComposeInspector {
         return if (args.isEmpty()) base else "$base(${args.joinToString(", ")})"
     }
 
-    /** Read a Group's call parameters (ParameterInformation: name, value) as key/value strings. */
     /**
-     * A named group's call parameters, stringified. [password]: the call is a password field
-     * (a PasswordVisualTransformation or a password keyboard among its parameters, or a
-     * *SecureTextField), whose text parameters ([texts], non-empty CharSequences) are secrets.
+     * A named group's call parameters, stringified (not yet masked). [password]: the call is a
+     * password field (a PasswordVisualTransformation or a password keyboard among its
+     * parameters, or a *SecureTextField), whose text parameters ([texts], non-empty
+     * CharSequences) are secrets. [secretNamed]: the text parameters whose name says secret
+     * (password=, pin=, ...), secrets when the call wraps a password field.
      */
     private class SlotParams(
         val list: List<Pair<String, String>>,
         val password: Boolean,
         val texts: List<String>,
+        val secretNamed: List<String>,
     )
 
     private fun slotParameters(group: Any, name: String): SlotParams {
         val params = invoke(group, "getParameters") as? List<*>
-            ?: return SlotParams(emptyList(), false, emptyList())
+            ?: return SlotParams(emptyList(), false, emptyList(), emptyList())
         val out = ArrayList<Pair<String, String>>()
         val texts = ArrayList<String>()
+        val secretNamed = ArrayList<String>()
         var password = Redaction.isComposeSecureFieldName(name)
         for (p in params) {
             if (p == null) continue
@@ -1003,10 +1038,55 @@ object ComposeInspector {
             val pv = invoke(p, "getValue")
             if (!password && Redaction.isComposePasswordParam(pv)) password = true
             val shown = SafeString.of(pv)
-            if (pv is CharSequence && shown.isNotEmpty()) texts.add(shown)
+            if (pv is CharSequence && shown.isNotEmpty()) {
+                texts.add(shown)
+                if (Redaction.isSecretParamName(pn)) secretNamed.add(shown)
+            }
             out.add(pn to shown)
         }
-        return SlotParams(out, password, if (password) texts else emptyList())
+        return SlotParams(out, password, texts, secretNamed)
+    }
+
+    /** [slotParameters], remembered in [ctx] for the second pass; null when unreadable. */
+    private fun readSlotParams(group: Any, name: String, ctx: WalkCtx): SlotParams? {
+        val params = try {
+            slotParameters(group, name)
+        } catch (t: Throwable) {
+            ctx.log("slot-table parameters", t)
+            null
+        }
+        ctx.slotParams[group] = params
+        return params
+    }
+
+    /**
+     * Pass 1 over a composition's groups: read every named group's parameters (kept for
+     * [buildSlotChildren]) and add every password field's text to ctx.secrets, so the second
+     * pass masks it in EVERY group of the ComposeView, above the field as well as below it: an
+     * app's own wrapper (Thunderbird's TextFieldOutlinedPassword(value=...), PasswordInput(
+     * password=...)) takes the secret as a plain String and builds the transformation inside.
+     * A composable with a password field below it also gives up its text parameters whose
+     * name says secret. Returns whether [group] is or contains a password field. Interns
+     * nothing.
+     */
+    private fun gatherSlotSecrets(group: Any, rawDepth: Int, ctx: WalkCtx): Boolean {
+        if (rawDepth > SLOT_RAW_MAX_DEPTH) return false
+        val name = meaningfulName(group)
+        val params = if (name == null) null else readSlotParams(group, name, ctx)
+        var below = false
+        val children = (invoke(group, "getChildren") as? Collection<*>) ?: emptyList<Any?>()
+        for (c in children) {
+            if (c == null) continue
+            try {
+                if (gatherSlotSecrets(c, rawDepth + 1, ctx)) below = true
+            } catch (t: Throwable) {
+                ctx.log("slot-table secrets", t)
+            }
+        }
+        if (params == null) return below
+        if (params.password) ctx.secrets.addAll(params.texts)
+        if (below) ctx.secrets.addAll(params.secretNamed)
+        return params.password || below
     }
 
     /** Group.box is window px (ui-tooling-data boundsOfLayoutNode uses positionInWindow); shift to screen. */

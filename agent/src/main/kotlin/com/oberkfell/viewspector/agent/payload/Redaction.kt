@@ -6,7 +6,10 @@
  * TransformationMethod), and so would the "text" property and the accessibility text of
  * a visible-password field. Every text path masks such text with one U+2022 per
  * character (the PasswordTransformationMethod dot), so the length (and "has text")
- * survives for linting while the secret does not.
+ * survives for linting while the secret does not: the View tree and properties
+ * (TreeBuilder, Properties), the a11y text (AccessibilityInspector), the recorded
+ * accessibility events (A11yEventTap), and the Compose semantics and slot table
+ * (ComposeInspector, through [Secrets] for the values a password field's text reaches).
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -116,16 +119,90 @@ object Redaction {
     /** SecureTextField / OutlinedSecureTextField / BasicSecureTextField (Compose 1.7+). */
     fun isComposeSecureFieldName(name: String): Boolean = name.endsWith("SecureTextField")
 
+    /** Words of a parameter name that say it holds a secret (see [isSecretParamName]). */
+    private val SECRET_NAME_WORDS = setOf(
+        "password", "passwd", "passcode", "passphrase", "pin", "pincode", "secret", "credential",
+        "credentials",
+    )
+
+    /**
+     * Whether a composable parameter's [name] says it holds a secret: one of its words
+     * (camelCase or snake_case: newPassword, pin_code, userSecret) is password, passcode, pin,
+     * secret... Used only on a composable that wraps a password field, which may take the
+     * secret as a String and build the field's transformation itself (Thunderbird's
+     * PasswordInput(password = ...)).
+     */
+    fun isSecretParamName(name: String): Boolean {
+        val words = ArrayList<String>()
+        val sb = StringBuilder()
+        for (i in name.indices) {
+            val c = name[i]
+            val separator = c == '_' || c == '-'
+            val boundary = separator ||
+                (c.isUpperCase() && i > 0 && (name[i - 1].isLowerCase() || name[i - 1].isDigit()))
+            if (boundary && sb.isNotEmpty()) {
+                words.add(sb.toString().lowercase())
+                sb.setLength(0)
+            }
+            if (!separator) sb.append(c)
+        }
+        if (sb.isNotEmpty()) words.add(sb.toString().lowercase())
+        return words.any { it in SECRET_NAME_WORDS }
+    }
+
+    /**
+     * Secret texts (a password field's content) and the masking of any string that is one or
+     * embeds one. A secret shorter than [MIN_EMBEDDED] chars masks only a string equal to it:
+     * masking every "a" inside every other string would garble the dump, not protect it.
+     */
+    class Secrets {
+        private val texts = HashSet<String>()
+        private var longestFirst: List<String>? = null
+
+        /** Adds [text] unless it is empty or already masked (the dots are no secret). */
+        fun add(text: String) {
+            if (text.isEmpty() || text.all { it == MASK_CHAR }) return
+            if (texts.add(text)) longestFirst = null
+        }
+
+        fun addAll(texts: Iterable<String>) {
+            for (t in texts) add(t)
+        }
+
+        fun isEmpty(): Boolean = texts.isEmpty()
+
+        /** [value] masked when it is a secret; else each secret it embeds masked in place. */
+        fun mask(value: String): String {
+            if (texts.isEmpty() || value.isEmpty()) return value
+            if (value in texts) return Redaction.mask(value)
+            val order = longestFirst
+                ?: texts.filter { it.length >= MIN_EMBEDDED }.sortedByDescending { it.length }
+                    .also { longestFirst = it }
+            var out = value
+            for (s in order) {
+                if (out.contains(s)) out = out.replace(s, Redaction.mask(s))
+            }
+            return out
+        }
+
+        private companion object {
+            const val MIN_EMBEDDED = 3
+        }
+    }
+
     /** Compose semantics keys whose value is the text field's content. */
     private val COMPOSE_SECRET_KEYS = arrayOf("EditableText", "InputText")
 
     /**
      * Mask the field content in a Compose semantics config ([attrs] = name -> stringified
      * value, as ComposeInspector reads it) when the node is a password field (it carries
-     * the Password key). Returns true when something was masked.
+     * the Password key). The plaintext is added to [secrets] first (InputText is the raw
+     * content; EditableText the transformed dots), so the slot table can mask it wherever a
+     * composable takes it as a parameter. Returns true when something was masked.
      */
-    fun redactComposeAttrs(attrs: MutableMap<String, String>): Boolean {
+    fun redactComposeAttrs(attrs: MutableMap<String, String>, secrets: Secrets? = null): Boolean {
         if (!attrs.containsKey("Password")) return false
+        if (secrets != null) for (key in COMPOSE_SECRET_KEYS) attrs[key]?.let { secrets.add(it) }
         var changed = false
         for (key in COMPOSE_SECRET_KEYS) {
             val v = attrs[key] ?: continue
