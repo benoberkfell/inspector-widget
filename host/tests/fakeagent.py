@@ -49,6 +49,12 @@ Properties.kt, Capture.kt, ComposeInspector.kt, AccessibilityInspector.kt):
 * /proc/net/unix lists each bound name as a listening entry (Flags
   00010000) and each open client connection as a connected entry under the
   same name (Flags 0, St 03), as Linux does;
+* a11y nodes carry the ids of the A1-fixed agent (improve/a11y-agent-identity):
+  every node has its own View's ``host_view_id`` and Compose nodes their
+  semantics id as ``virtual_id``. The agent on this branch still reports the
+  root's id for every node and the low 32 bits of the packed child id
+  (ledger A1); ``legacy_a11y_ids = True`` reproduces that, and a strict xfail
+  in test_e2e_fake_agent.py shows what it breaks on the host;
 * Hello reports ``viewspector-0.1+<sha256 of the payload.jar it was loaded
   from>`` (the build handshake). ``build_id=None`` models an agent from before
   the handshake, which reports plain ``viewspector-0.1``.
@@ -533,6 +539,28 @@ def encode_a11y_virtual(st: StringTable, host_id: int, n: ComposeNodeSpec, out: 
                             include_rendering_info)
 
 
+def legacy_a11y_ids(root: "pb.A11yNode") -> None:
+    """Rewrite an encoded a11y tree to the ids the agent on this branch sends
+    (ledger A1, AccessibilityInspector.kt walk()/virtualIdOf()): walk() never
+    updates ``sourceView``, so every node carries the ROOT's host_view_id; a
+    child's virtual_id is the LOW 32 bits of the packed child id, i.e. the
+    accessibility view id of the View behind it (the AndroidComposeView, for a
+    Compose node), so real View children are flagged virtual as well."""
+    root_host = root.host_view_id
+
+    def accessibility_view_id(view_id: int) -> int:
+        return view_id % 100 + 10  # any small per-View int; the framework counts up
+
+    def fix(node: "pb.A11yNode") -> None:
+        for child in node.children:
+            child.virtual_id = accessibility_view_id(child.host_view_id)
+            child.is_virtual = True
+            child.host_view_id = root_host
+            fix(child)
+
+    fix(root)
+
+
 def error_response(req_id: int, message: str) -> "pb.Response":
     return pb.Response(id=req_id, status=pb.Response.ERROR, error=message)
 
@@ -574,6 +602,8 @@ class FakeAgent:
         self.close_clients_on_stop = True
         # True: an agent from before Hello/SHUTDOWN skipped handleLock.
         self.hello_waits_for_other_clients = False
+        # True: the A1 id encoding of the agent on this branch (module docstring).
+        self.legacy_a11y_ids = False
         self._handle_lock = threading.Lock()  # Server.kt handleLock
         # True: an agent from before the accept fix. Server.stop() closed the
         # LocalServerSocket, but the thread blocked in accept() kept the name
@@ -844,6 +874,8 @@ class FakeAgent:
             w = resp.dump_a11y.windows.add()
             w.root_view_id = r.id
             encode_a11y_view(st, r, w.root, cmd.include_extras, cmd.include_rendering_info)
+            if self.legacy_a11y_ids:
+                legacy_a11y_ids(w.root)
             diag.append(f"root#{r.id} query-from-app-process")
         st.fill(resp.dump_a11y.strings)
         resp.dump_a11y.diagnostics = "; ".join(diag)
