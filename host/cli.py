@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 
 # Make `inspector_widget` importable when run as a loose script.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,21 +95,29 @@ def _remove_quietly(path):
         pass
 
 
-def _write_composed_overlay(out_path, write_base, render):
+def _base_png():
+    """A new temp file for an overlay's base screenshot (never a path next to
+    the output, which could be a file of the user's)."""
+    fd, path = tempfile.mkstemp(prefix="inspector-widget-base-", suffix=".png")
+    os.close(fd)
+    return path
+
+
+def _write_composed_overlay(write_base, render):
     """Like :func:`_write_overlay`, for a base the overlay module composes itself:
-    ``write_base(base)`` writes ``OUT.png.base.png`` and returns its scale, then
+    ``write_base(base)`` writes the base PNG and returns its scale, then
     ``render(base, scale)`` runs; the base file is always removed."""
-    base = out_path + ".base.png"
+    base = _base_png()
     try:
         return render(base, write_base(base))
     finally:
         _remove_quietly(base)
 
 
-def _write_overlay(shot, out_path, render, fallback_scale):
-    """Write ``shot`` as ``OUT.png.base.png``, run ``render(base, scale)``, and
-    always remove the base file, even if rendering fails."""
-    base = out_path + ".base.png"
+def _write_overlay(shot, render, fallback_scale):
+    """Write ``shot`` to a temp base PNG, run ``render(base, scale)``, and always
+    remove the base file, even if rendering fails."""
+    base = _base_png()
     try:
         pngmod.write_png(shot.screenshot, base)
         return render(base, float(shot.screenshot.scale) or fallback_scale)
@@ -212,7 +221,7 @@ def cmd_compose(args) -> int:
             sem_roots = [w["root"] for w in sem.get("windows", []) if w.get("root")]
             shot = client.screenshot(root_id=0, scale=args.scale)
             summary = _write_overlay(
-                shot, args.overlay,
+                shot,
                 lambda base, scale: ovmod.render_compose_overlay(
                     base, sem_roots, args.overlay, labeled_only=not args.all_boxes, scale=scale),
                 args.scale)
@@ -272,7 +281,6 @@ def cmd_a11y(args) -> int:
         if args.overlay:
             findings = data["lint"]["findings"] if report is not None else None
             summary = _write_composed_overlay(
-                args.overlay,
                 lambda base: ovmod.write_screen_png(client, data, base, scale=args.scale),
                 lambda base, scale: ovmod.render_a11y_overlay(
                     base, data, args.overlay, findings=findings, scale=scale))
@@ -314,7 +322,6 @@ def cmd_a11y_lint(args) -> int:
         if args.overlay:
             from inspector_widget import overlay as ovmod
             ov = _write_composed_overlay(
-                args.overlay,
                 lambda base: ovmod.write_screen_png(client, report.a11y_data, base,
                                                     scale=args.scale),
                 lambda base, scale: ovmod.render_a11y_overlay(
@@ -374,7 +381,6 @@ def cmd_inspect(args) -> int:
         merged = correlate.inspect_tree(session, include_properties=args.properties)
         if args.overlay:
             summary = _write_composed_overlay(
-                args.overlay,
                 lambda base: ovmod.write_windows_png(
                     session, correlate.window_origins(merged), base, scale=args.scale),
                 lambda base, scale: ovmod.render_integrated_overlay(

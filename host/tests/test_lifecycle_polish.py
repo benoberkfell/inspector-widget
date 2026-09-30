@@ -1,7 +1,7 @@
 """Lifecycle polish, offline: no retry during exit cleanup or after a detach,
 retries only for calls that are safe to repeat, the session note on every
 session tool (CLI parity), argument normalization, JSON-RPC notifications,
-bounded forward removal and CLI exit cleanup.
+bounded forward removal and CLI exit cleanup, overlay temp files.
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
@@ -13,6 +13,7 @@ import json
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -480,3 +481,23 @@ def test_the_cli_removes_its_forwards_when_a_subcommand_fails(run_cli, fake_devi
     with pytest.raises(KeyboardInterrupt):
         run_cli("dump")
     assert removed == [1] and fake_device.forward_names() == []
+
+
+# =========================================================================== #
+# 7. CLI overlays never touch a file next to the output
+# =========================================================================== #
+@needs_pil
+@pytest.mark.parametrize("argv", [
+    ("compose", "--overlay"),
+    ("a11y", "--overlay"),
+    ("a11y-lint", "--no-contrast", "--overlay"),
+    ("inspect", "--overlay"),
+])
+def test_an_overlay_leaves_a_users_base_png_alone(run_cli, fake_device, tmp_path, argv):
+    out = tmp_path / "shot.png"
+    mine = Path(f"{out}.base.png")
+    mine.write_bytes(b"the user's file")
+    res = run_cli(*argv, out)
+    assert res.rc == 0, res
+    assert out.is_file() and mine.read_bytes() == b"the user's file"
+    assert list(fake_device.tmpdir.glob("inspector-widget-base-*")) == []
