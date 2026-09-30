@@ -98,7 +98,8 @@ _A11Y_FLAG = {"click": "clickable", "longclick": "long_clickable", "focus": "foc
 def a11y_pb_from_index(ix: Index) -> pb.DumpA11yResponse:
     """The a11y tree a capture of ``ix`` would carry: every node with an ``a11y``
     facet (or of kind a11y) in ui-tree order, with ``(host, virtual)`` from
-    ``ids.a11y``, visible to the user unless flagged hidden."""
+    ``ids.a11y``, visible to the user unless flagged hidden, and the facet's
+    ``collection``/``item`` as CollectionInfo/CollectionItemInfo."""
     def a11y_dict(n) -> dict[str, Any]:
         fac = n.facets.get("a11y") or {}
         host, virt = (int(x) for x in str(n.ids["a11y"]).split(":"))
@@ -113,6 +114,14 @@ def a11y_pb_from_index(ix: Index) -> pb.DumpA11yResponse:
         label = fac.get("speakable") or n.label
         if label:
             d["text"] = label
+        col = fac.get("collection")
+        if col:
+            d["collection_info"] = {"row_count": int(col.get("rows", 0)),
+                                    "column_count": int(col.get("cols", 0))}
+        item = fac.get("item")
+        if item:
+            d["collection_item_info"] = {"row_index": int(item.get("row", 0)),
+                                         "column_index": int(item.get("col", 0))}
         return d
 
     def build(nid: str) -> list[dict[str, Any]]:

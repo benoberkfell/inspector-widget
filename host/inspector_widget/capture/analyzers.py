@@ -24,18 +24,16 @@ only). It reads only the raw facets:
   Only nodes that carry content (a label, text or an action) or contain such nodes
   are reported, and only the topmost node of a hidden or offscreen subtree.
   Content scrolled entirely out of a scroll container is normal and not reported.
-* **Accessibility lint** (``a11y.*``), through a thin adapter over
-  ``inspector_widget.a11y_lint``. ``_lint_windows`` is the single input choice:
-  today it rebuilds Compose semantics dicts from ``raw/compose_sem.pb`` with
-  ``strings.dump_compose_to_dict``, and each finding maps to a node through
-  ``sem:<acv>:<id>``. Switching to the unified a11y tree (improve/a11y-lint-unified)
-  changes that one function; findings that carry a typed ``node_key`` are already
-  understood by ``_finding_key``. Contrast runs only for ``lint="full"`` or
-  ``lint_view(contrast=True)``, reads each window's own stored screenshot, and is
-  cached in the capture's derived store.
-* **Reading order**: ``a11y.compute_traversal_order`` (or the newer
-  ``a11y.reading_order``) over the stored a11y tree, mapped to node ids; sets
-  ``stop`` and ``Index.reading``.
+* **Accessibility lint** (``a11y.*``): ``a11y_lint.run_lint`` over the stored
+  unified a11y tree (``raw/a11y.pb``, Views and Compose alike) with the Compose
+  semantics (``raw/compose_sem.pb``) joined for detail, exactly as the live
+  ``a11y_lint`` tool runs it. Each finding maps back to its dump node and from
+  there to an index node (``_A11yDump``). Contrast runs only for ``lint="full"``
+  or ``lint_view(contrast=True)``, reads each window's own stored screenshot, and
+  is cached in the capture's derived store.
+* **Reading order**: the calibrated TalkBack model (``talkback.reading_order``)
+  over the same stored a11y tree, mapped to node ids; sets ``stop`` and
+  ``Index.reading``.
 
 ``lint_view(ix, loaded, ...)`` is the ``lint`` tool body: grouped by rule (with
 template collapse of repeated findings in collection cells), by node, or flat,
@@ -49,7 +47,7 @@ import json
 import re
 import statistics
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -85,15 +83,21 @@ FOOTER_RESERVE = 280
 LINT_MAX_BYTES = 4000
 LINT_LIMIT = 30
 PER_RULE = 3
-#: bump when the cached lint shape changes (derived/lint.<hash>.json)
-LINT_CACHE_VERSION = 1
+#: bump when the cached lint shape or its input changes (derived/lint.<hash>.json);
+#: 2: the unified a11y tree replaced Compose semantics as the lint input
+LINT_CACHE_VERSION = 2
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
 _EDGE_SLOP = 1
 _LABEL_CUT = 32
-_EVIDENCE_DROP = frozenset({"label", "announceable_keys", "structural_keys", "fg_lum",
-                            "bg_lum", "px_sampled", "fg_fraction", "sample",
-                            "text_size_class"})
+#: evidence the capture does not keep: what the node itself says (label, class),
+#: how the lint worked it out (sampling, label sources searched, the bounds used,
+#: the standard behind min_dp, clipped axes: render.clipped reports clipping), and
+#: the lint's typed keys of other nodes (``node_ids`` names them as refs instead)
+_EVIDENCE_DROP = frozenset({"label", "class_name", "announceable_keys", "structural_keys",
+                            "fg_lum", "bg_lum", "px_sampled", "fg_fraction", "sample",
+                            "text_size_class", "checked", "bounds_source", "standard",
+                            "floor_dp", "clipped_axes", "duplicates", "duplicate_of"})
 SLIVER_NOTE = "low confidence: only a sliver is visible at the scroll edge"
 
 
@@ -103,12 +107,41 @@ SLIVER_NOTE = "low confidence: only a sliver is visible at the scroll edge"
 class _Src:
     """A LoadedCapture (store), a RawCapture (before publish) or None, behind one
     read-only surface: ``meta``, ``raw(name)``, ``shot(root)``, ``derived(name)``,
-    ``put_derived(name, bytes)``. Missing facets read as None."""
+    ``put_derived(name, bytes)``, plus the decoded ``a11y_dump()`` and
+    ``compose_dict()``. Missing facets read as None."""
 
     def __init__(self, loaded: Any) -> None:
         self.obj = loaded
         self.meta = getattr(loaded, "meta", None)
         self._shots: dict[int, Any] = {}
+        self._a11y: _A11yDump | None = None
+        self._compose: dict[str, Any] | None = None
+        self._decoded: set[str] = set()
+
+    def a11y_dump(self) -> _A11yDump | None:
+        """The stored accessibility tree, decoded once (None without the facet)."""
+        if "a11y" not in self._decoded:
+            self._decoded.add("a11y")
+            data = self.raw("a11y")
+            if data:
+                from ..proto import view_inspection_pb2 as pb
+
+                self._a11y = _A11yDump(pb.DumpA11yResponse.FromString(data))
+        return self._a11y
+
+    def compose_dict(self) -> dict[str, Any] | None:
+        """The stored Compose semantics, shaped by ``strings.dump_compose_to_dict``
+        (the lint joins its detail onto the a11y tree), or None."""
+        if "compose" not in self._decoded:
+            self._decoded.add("compose")
+            data = self.raw("compose_sem")
+            if data:
+                from .. import strings
+                from ..proto import view_inspection_pb2 as pb
+
+                self._compose = strings.dump_compose_to_dict(
+                    pb.DumpComposeResponse.FromString(data))
+        return self._compose
 
     def raw(self, name: str) -> bytes | None:
         o = self.obj
@@ -510,93 +543,111 @@ def _clean(ev: Mapping[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# The stored accessibility tree (the input of the lint and the reading order)
+# --------------------------------------------------------------------------- #
+def _iter_dicts(root: dict[str, Any]) -> Iterable[tuple[dict[str, Any], tuple[int, ...]]]:
+    stack: list[tuple[dict[str, Any], tuple[int, ...]]] = [(root, (0,))]
+    while stack:
+        n, path = stack.pop()
+        yield n, path
+        kids = n.get("children") or []
+        for i in range(len(kids) - 1, -1, -1):
+            stack.append((kids[i], path + (i,)))
+
+
+class _A11yDump:
+    """``raw/a11y.pb`` as ``a11y.a11y_to_dict`` shapes it (typed node keys, window
+    meta, TalkBack exclusions): the one input of both the lint
+    (``a11y_lint.run_lint``) and the reading order (``talkback.reading_order``).
+    Neither modifies it, so one decode serves both.
+
+    ``mapper(ix)`` maps one of its node dicts to an index node through, in order:
+    the ``a11y:path:`` key (the index builder's alias when a11y ids are not
+    unique, ID1), then, only when the ``(host, virtual)`` pair is unique in the
+    dump, the ``a11y:`` key, a node whose ``ids.a11y`` names the pair, and
+    ``view:<host>`` / ``sem:<host>:<id>``. A duplicated pair is never guessed."""
+
+    def __init__(self, resp: Any) -> None:
+        from .. import a11y
+
+        self.data = a11y.a11y_to_dict(resp)
+        self.where: dict[int, tuple[int, tuple[int, ...]]] = {}
+        self.pairs: Counter = Counter()
+        self.by_pair: dict[tuple[Any, Any], list[tuple[int, dict[str, Any]]]] = {}
+        self.by_packed: dict[int, dict[str, Any] | None] = {}
+        self.has_roots = False
+        for wi, w in enumerate(self.data.get("windows") or []):
+            root = w.get("root")
+            if not root:
+                continue
+            self.has_roots = True
+            root_udid = int(w.get("root_view_id") or root.get("host_view_id") or 0)
+            for n, path in _iter_dicts(root):
+                self.where[id(n)] = (root_udid, path)
+                pair = (n.get("host_view_id"), n.get("virtual_id"))
+                self.pairs[pair] += 1
+                self.by_pair.setdefault(pair, []).append((wi, n))
+                if n.get("id") is not None:
+                    packed = int(n["id"])
+                    self.by_packed[packed] = None if packed in self.by_packed else n
+
+    def mapper(self, ix: Index) -> Callable[[dict[str, Any]], str | None]:
+        a11y_ids: dict[str, str | None] = {}
+        for nid, node in ix.nodes.items():
+            aid = node.ids.get("a11y")
+            if aid is not None:
+                a11y_ids[str(aid)] = None if str(aid) in a11y_ids else nid
+
+        def lookup(n: dict[str, Any]) -> str | None:
+            root, path = self.where.get(id(n), (0, ()))
+            if path:
+                nid = ix.resolve_id(a11y_path_key(root, path))
+                if nid is not None:
+                    return nid
+            h, v = n.get("host_view_id"), n.get("virtual_id")
+            if h is None or v is None or self.pairs[(h, v)] > 1:
+                return None
+            nid = ix.resolve_id(a11y_key(h, v)) or a11y_ids.get(f"{h}:{v}")
+            if nid is not None:
+                return nid
+            return ix.resolve_id(view_key(h) if v == -1 else sem_key(h, v))
+
+        return lookup
+
+    def finding_dict(self, f: Any) -> dict[str, Any] | None:
+        """The dump node a lint finding is about. A pair the dump repeats (ID1) is
+        told apart by the finding's window and bounds, or not at all."""
+        node = getattr(f, "node", None) or {}
+        cands = self.by_pair.get((node.get("host_view_id"), node.get("virtual_id"))) or []
+        if len(cands) > 1:
+            win = (getattr(f, "window", None) or {}).get("index")
+            bounds = getattr(f, "bounds", None)
+            cands = [(wi, n) for wi, n in cands
+                     if (win is None or wi == win) and a11y_lint._rect_of(n) == bounds]
+        return cands[0][1] if len(cands) == 1 else None
+
+
+# --------------------------------------------------------------------------- #
 # The lint adapter
 # --------------------------------------------------------------------------- #
-@dataclass
-class _LintWindow:
-    """One Compose window's semantics tree, with surrogate node ids."""
-
-    acv: int
-    root: dict[str, Any]
-    keys: dict[int, str]  # surrogate id -> canonical key
-
-
-def _lint_windows(src: _Src) -> list[_LintWindow]:
-    """THE lint input choice. Today: the stored Compose semantics
-    (``raw/compose_sem.pb`` via ``strings.dump_compose_to_dict``), which is what
-    ``a11y_lint.lint_tree`` consumes. Every node's ``id`` is replaced by a
-    surrogate unique across windows (ComposeViews reuse semantics ids, ID3), and
-    ``keys`` maps each surrogate back to ``sem:<acv>:<id>``; the synthetic window
-    root, which carries the AndroidComposeView's own id, maps to ``view:<acv>``.
-
-    When improve/a11y-lint-unified lands, return the unified a11y tree
-    (``a11y.a11y_to_dict(raw/a11y.pb)``) here instead; ``_finding_key`` already
-    maps its typed ``node_key`` findings."""
-    data = src.raw("compose_sem")
-    if not data:
-        return []
-    from .. import strings
-    from ..proto import view_inspection_pb2 as pb
-
-    decoded = strings.dump_compose_to_dict(pb.DumpComposeResponse.FromString(data))
-    out: list[_LintWindow] = []
-    counter = 0
-    for w in decoded.get("windows") or []:
-        root = w.get("root")
-        if not root:
-            continue
-        acv = int(w.get("view_id") or 0)
-        keys: dict[int, str] = {}
-        stack = [(root, True)]
-        while stack:
-            node, is_root = stack.pop()
-            counter += 1
-            orig = int(node.get("id") or 0)
-            if is_root and node.get("kind") != "SEMANTICS" and orig == acv:
-                keys[counter] = view_key(acv)
-            elif node.get("kind") == "SEMANTICS":
-                keys[counter] = sem_key(acv, orig)
-            node["id"] = counter
-            stack.extend((c, False) for c in reversed(node.get("children") or []))
-        out.append(_LintWindow(acv, root, keys))
-    return out
-
-
-def _finding_key(f: Any, keys: Mapping[int, str]) -> str | None:
-    """Canonical key of a finding's node: the surrogate id assigned by
-    ``_lint_windows`` when the input carried surrogates, else a typed ``node_key``
-    (the unified lint over the a11y tree). The surrogate wins: the unified lint's
-    adapter for Compose-semantics input derives its typed keys from the node ids it
-    was given (``compose:1:<surrogate>``), which name no real node."""
-    node = getattr(f, "node", None) or {}
-    if not isinstance(node, Mapping):
-        return None
-    sid = node.get("id")
-    if isinstance(sid, int) and sid in keys:
-        return keys[sid]
-    typed = node.get("key")
-    if isinstance(typed, str):
-        parts = typed.split(":")
-        try:
-            if parts[0] == "view" and len(parts) == 2:
-                return view_key(int(parts[1]))
-            if parts[0] == "compose" and len(parts) == 3:
-                return sem_key(int(parts[1]), int(parts[2]))
-            if parts[0] == "virtual" and len(parts) == 3:
-                return a11y_key(int(parts[1]), int(parts[2]))
-        except ValueError:
-            return None
-    return None
-
-
-def _evidence(f: Any, keys: Mapping[int, str], ix: Index) -> dict[str, Any]:
+def _evidence(f: Any, nid: str, dump: _A11yDump,
+              lookup: Callable[[dict[str, Any]], str | None]) -> dict[str, Any]:
+    """The finding's evidence as the capture keeps it. ``node_ids`` names the other
+    nodes involved (R12's same-label group, R13's twin), as node ids."""
     ev: dict[str, Any] = {}
     for k, v in (getattr(f, "evidence", None) or {}).items():
         if (k in _EVIDENCE_DROP or k.startswith("has_") or v is None or v is False
                 or v == [] or v == {}):
             continue
+        if k == "duplicate_of_id":  # R13's other node, named like R12's
+            k, v = "node_ids", [v]
         if k in ("children_ids", "node_ids") and isinstance(v, list):
-            v = [ix.resolve_id(keys.get(x, "")) or x for x in v]
+            # packed a11y ids -> node ids (a repeated or unknown id stays as it is)
+            v = [(lookup(d) if (d := dump.by_packed.get(x)) is not None else None) or x
+                 for x in v]
+            v = [x for x in v if x != nid]
+            if not v:
+                continue
         ev[k] = v
     return ev
 
@@ -605,103 +656,88 @@ def _evidence(f: Any, keys: Mapping[int, str], ix: Index) -> dict[str, Any]:
 class _LintResult:
     issues: list[tuple[str, Issue]] = field(default_factory=list)  # (node id, issue)
     unmapped: list[str] = field(default_factory=list)  # "rule key"
+    errors: list[str] = field(default_factory=list)  # rules that raised
     status: str = "ok"
 
 
-def _map_findings(findings: Iterable[Any], keys: Mapping[int, str], ix: Index,
-                  res: _LintResult) -> None:
-    for f in findings:
-        key = _finding_key(f, keys)
-        nid = ix.resolve_id(key) if key else None
-        if nid is None:
-            res.unmapped.append(f"{f.rule} {key or '?'}")
+def _map_findings(report: Any, dump: _A11yDump, ix: Index, res: _LintResult,
+                  keep: Callable[[str], bool]) -> None:
+    lookup = dump.mapper(ix)
+    for f in report.findings:
+        if not keep(f.rule):
             continue
-        ev = _evidence(f, keys, ix)
+        d = dump.finding_dict(f)
+        nid = lookup(d) if d is not None else None
+        if nid is None:
+            res.unmapped.append(f"{f.rule} {f.node_key or '?'}")
+            continue
+        ev = _evidence(f, nid, dump, lookup)
         conf = "inferred" if ev.pop("low_confidence", False) else "exact"
         res.issues.append((nid, Issue(f.rule, f.severity, ev, conf)))
+    res.errors.extend(str(d.get("message")) for d in report.diagnostics
+                      if d.get("code") == "rule.error")
+
+
+def _run_lint(src: _Src, conn: Any = None, **kw: Any) -> Any:
+    """``a11y_lint.run_lint`` over the stored trees: the unified a11y tree (Views and
+    Compose, every window at once, so cross-node rules see the whole screen) with
+    the Compose semantics joined for detail. ``conn`` is only asked for window
+    screenshots."""
+    compose = src.compose_dict()
+    return a11y_lint.run_lint(conn, a11y_data=src.a11y_dump().data, compose_data=compose,
+                              include_compose=compose is not None, **kw)
 
 
 def _run_tree_lint(src: _Src, ix: Index, *, density: int, font_scale: float,
                    wcag: bool = False) -> _LintResult:
-    """Every tree rule (no pixels) over all windows at once, so cross-node rules
-    (duplicate labels, headings) see the whole screen."""
+    """Every tree rule (no pixels)."""
     res = _LintResult()
-    wins = _lint_windows(src)
-    if not wins:
-        res.status = "no compose semantics"
+    dump = src.a11y_dump()
+    if dump is None or not dump.has_roots:
+        res.status = "no accessibility tree"
         return res
-    keys: dict[int, str] = {}
-    for w in wins:
-        keys.update(w.keys)
-    ctx = a11y_lint.LintContext(density=density, font_scale=font_scale, wcag_mode=wcag)
-    findings = a11y_lint.lint_tree([w.root for w in wins], ctx)
-    _map_findings((f for f in findings if f.rule != CONTRAST_RULE), keys, ix, res)
+    report = _run_lint(src, density=density, font_scale=font_scale, wcag_mode=wcag,
+                       include_contrast=False)
+    _map_findings(report, dump, ix, res, lambda rule: rule != CONTRAST_RULE)
     return res
 
 
-def _decode_shot(shot: Any) -> tuple[int, int, bytes] | None:
-    from .. import png
+class _StoredShots:
+    """The ``conn`` that ``a11y_lint.run_lint`` screenshots windows through: it
+    serves each window's own stored screenshot, so contrast samples exactly the
+    pixels of the capture. A screenshot without a scale gets its width over the
+    window's."""
 
-    try:
-        return png._decode_to_rgba(shot)
-    except Exception:  # noqa: BLE001 - an undecodable screenshot skips contrast only
-        return None
+    def __init__(self, src: _Src, dump: _A11yDump) -> None:
+        self.src = src
+        self.width = {int(w.get("root_view_id") or 0): a11y_lint._rect_of(w["root"])["w"]
+                      for w in dump.data.get("windows") or [] if w.get("root")}
 
+    def screenshot(self, root_id: int = 0, scale: float = 1.0) -> Any:
+        from ..proto import view_inspection_pb2 as pb
 
-def _shift(node: dict[str, Any], dx: int, dy: int) -> None:
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        lay = (n.get("bounds") or {}).get("layout")
-        if lay:
-            lay["x"] = lay.get("x", 0) - dx
-            lay["y"] = lay.get("y", 0) - dy
-        stack.extend(n.get("children") or [])
+        resp = pb.ScreenshotResponse()
+        shot = self.src.shot(root_id)
+        if shot is not None:
+            resp.screenshot.CopyFrom(shot)
+            w = self.width.get(int(root_id), 0)
+            if resp.screenshot.scale <= 0.0 and w > 0:
+                resp.screenshot.scale = resp.screenshot.width / w
+        return resp
 
 
 def _run_contrast(src: _Src, ix: Index, *, density: int, font_scale: float,
                   wcag: bool = False) -> _LintResult:
-    """The contrast rule per Compose window, sampling that window's own stored
-    screenshot (window-relative pixels at the capture scale)."""
+    """The contrast rule, sampling each window's own stored screenshot."""
     res = _LintResult()
-    wins = _lint_windows(src)
-    if not wins:
-        res.status = "no compose semantics"
+    dump = src.a11y_dump()
+    if dump is None or not dump.has_roots:
+        res.status = "no accessibility tree"
         return res
-    decoded: dict[int, tuple[int, int, bytes, float] | None] = {}
-    sampled = 0
-    for w in wins:
-        acv_node = ix.get(view_key(w.acv))
-        win = ix.nodes.get(acv_node.window) if acv_node is not None and acv_node.window else None
-        if win is None or "view" not in win.ids:
-            continue
-        root_udid = int(win.ids["view"])
-        if root_udid not in decoded:
-            shot = src.shot(root_udid)
-            px = _decode_shot(shot) if shot is not None else None
-            if px is None:
-                decoded[root_udid] = None
-            else:
-                wr = _rect(win.b)
-                scale = float(shot.scale or 0.0)
-                if scale <= 0.0:
-                    scale = px[0] / wr[2] if wr and wr[2] > 0 else 1.0
-                decoded[root_udid] = (px[0], px[1], px[2], scale)
-        img = decoded[root_udid]
-        if img is None:
-            continue
-        wr = _rect(win.b) or (0, 0, 0, 0)
-        lay = (w.root.get("bounds") or {}).get("layout") or {}
-        # Screen-space semantics sit inside the window; pre-CO4 dialog trees are
-        # already window-relative and must not be shifted twice.
-        if (wr[0] or wr[1]) and lay.get("x", 0) >= wr[0] and lay.get("y", 0) >= wr[1]:
-            _shift(w.root, wr[0], wr[1])
-        ctx = a11y_lint.LintContext(density=density, font_scale=font_scale, wcag_mode=wcag,
-                                    screenshot_rgba=img[2], screenshot_w=img[0],
-                                    screenshot_h=img[1], screenshot_scale=img[3])
-        findings = a11y_lint.lint_tree([w.root], ctx, enabled={CONTRAST_RULE})
-        _map_findings((f for f in findings if f.rule == CONTRAST_RULE), w.keys, ix, res)
-        sampled += 1
+    report = _run_lint(src, _StoredShots(src, dump), density=density, font_scale=font_scale,
+                       wcag_mode=wcag, rules=[CONTRAST_RULE])
+    _map_findings(report, dump, ix, res, lambda rule: rule == CONTRAST_RULE)
+    sampled = len(report.stats.get("contrast_windows") or ())
     res.status = f"sampled {sampled} window{'s' if sampled != 1 else ''}" if sampled \
         else "unavailable: no screenshot"
     return res
@@ -760,129 +796,35 @@ def _annotate_touch_fp(pairs: Iterable[tuple[str, Issue]],
 # --------------------------------------------------------------------------- #
 # Reading order
 # --------------------------------------------------------------------------- #
-def _iter_dicts(root: dict[str, Any]) -> Iterable[tuple[dict[str, Any], tuple[int, ...]]]:
-    stack: list[tuple[dict[str, Any], tuple[int, ...]]] = [(root, (0,))]
-    while stack:
-        n, path = stack.pop()
-        yield n, path
-        kids = n.get("children") or []
-        for i in range(len(kids) - 1, -1, -1):
-            stack.append((kids[i], path + (i,)))
+def _ordered_stops(dump: Any) -> list[tuple[int, dict[str, Any]]]:
+    """``[(order, node dict)]`` for every TalkBack stop, from the calibrated TalkBack
+    model (``talkback.reading_order``) over an ``a11y.a11y_to_dict`` dump (window
+    order, windows a dialog covers) or a list of window roots."""
+    from ..talkback import reading_order as talkback_order
 
-
-def _ordered_stops(roots: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any] | None]]:
-    """``[(order, node dict)]`` for every TalkBack stop, via whichever reading-order
-    API ``inspector_widget.a11y`` has (``reading_order`` returns the node dicts;
-    the older ``compute_traversal_order`` returns entries whose ``bounds`` is the
-    node's own layout dict)."""
-    from .. import a11y
-
-    ro = getattr(a11y, "reading_order", None)
-    if callable(ro):
-        res = ro(roots)
-        return [(e.get("order"), n) for e, n in zip(res.get("focus_order") or [],
-                                                    res.get("_nodes") or [])
-                if e.get("order") is not None]
-    by_layout: dict[int, dict[str, Any]] = {}
-    merged: set[int] = set()
-    for r in roots:
-        _mark_merged(r, False, merged)
-        for n, _ in _iter_dicts(r):
-            lay = (n.get("bounds") or {}).get("layout")
-            if lay is not None:
-                by_layout[id(lay)] = n
-    out = []
-    for e in a11y.compute_traversal_order(roots):
-        if e.get("order") is None:
-            continue
-        n = by_layout.get(id(e.get("bounds")))
-        if n is not None and id(n) in merged:
-            continue
-        out.append((len(out) + 1, n))
-    return out
-
-
-#: Flags that make an a11y node a TalkBack stop of its own (it takes focus).
-_OWN_FOCUS = frozenset({"clickable", "long_clickable", "focusable", "screen_reader_focusable",
-                        "checkable", "editable"})
-#: Flags of a container that speaks its non-focusable descendants as one stop
-#: (a clickable row, or Compose ``mergeDescendants``).
-_MERGING = frozenset({"clickable", "long_clickable", "screen_reader_focusable"})
-
-
-def _mark_merged(n: dict[str, Any], under_merging: bool, out: set[int]) -> None:
-    """Collect (by ``id()``) the content-only nodes that sit under a merging
-    ancestor. TalkBack reads them as part of that ancestor's stop (RO1), but
-    main's ``a11y.compute_traversal_order`` counts each as a stop of its own; the
-    newer ``a11y.reading_order`` applies the rule itself."""
-    stack = [(n, under_merging)]
-    while stack:
-        node, under = stack.pop()
-        flags = set(node.get("flags") or ())
-        if under and not (flags & _OWN_FOCUS):
-            out.add(id(node))
-        merging = under or bool(flags & _MERGING and "visible_to_user" in flags)
-        stack.extend((c, merging) for c in node.get("children") or ())
+    res = talkback_order(dump)
+    return [(e["order"], n) for e, n in zip(res.get("focus_order") or [],
+                                            res.get("_nodes") or [])
+            if e.get("order") is not None]
 
 
 def reading_order(ix: Index, loaded: Any) -> tuple[list[tuple[int, str]], list[str]] | None:
     """``([(stop, node id)], diagnostics)`` from the stored a11y tree, or None when
-    the capture has no a11y facet.
-
-    Each TalkBack stop maps to a node through, in order: the ``a11y:path:`` key
-    (the index builder's fallback when a11y ids are not unique), then, only when
-    the ``(host, virtual)`` pair is unique in the a11y tree, the ``a11y:`` key, a
-    node whose ``ids.a11y`` names the pair, and ``view:<host>`` / ``sem:<host>:<id>``.
-    A duplicated pair is never guessed."""
+    the capture has no a11y facet. Each TalkBack stop maps to a node through
+    ``_A11yDump.mapper``; a duplicated ``(host, virtual)`` pair is never guessed."""
     src = loaded if isinstance(loaded, _Src) else _Src(loaded)
-    data = src.raw("a11y")
-    if not data:
+    dump = src.a11y_dump()
+    if dump is None:
         return None
-    from .. import a11y, strings
-    from ..proto import view_inspection_pb2 as pb
-
-    resp = pb.DumpA11yResponse.FromString(data)
-    resolver = strings.StringResolver(resp.strings)
-    roots: list[dict[str, Any]] = []
-    where: dict[int, tuple[int, tuple[int, ...]]] = {}
-    pairs: Counter = Counter()
-    for w in resp.windows:
-        if not w.HasField("root"):
-            continue
-        d = a11y.a11y_node_to_dict(w.root, resolver)
-        roots.append(d)
-        root_udid = int(w.root_view_id or d.get("host_view_id") or 0)
-        for n, path in _iter_dicts(d):
-            where[id(n)] = (root_udid, path)
-            pairs[(n.get("host_view_id"), n.get("virtual_id"))] += 1
-    if not roots:
+    if not dump.has_roots:
         return [], []
-    a11y_ids: dict[str, str | None] = {}
-    for nid, node in ix.nodes.items():
-        aid = node.ids.get("a11y")
-        if aid is not None:
-            a11y_ids[str(aid)] = None if str(aid) in a11y_ids else nid
-
-    def lookup(n: dict[str, Any]) -> str | None:
-        root, path = where.get(id(n), (0, ()))
-        if path:
-            nid = ix.resolve_id(a11y_path_key(root, path))
-            if nid is not None:
-                return nid
-        h, v = n.get("host_view_id"), n.get("virtual_id")
-        if h is None or v is None or pairs[(h, v)] > 1:
-            return None
-        nid = ix.resolve_id(a11y_key(h, v)) or a11y_ids.get(f"{h}:{v}")
-        if nid is not None:
-            return nid
-        return ix.resolve_id(view_key(h) if v == -1 else sem_key(h, v))
-
+    lookup = dump.mapper(ix)
     out: list[tuple[int, str]] = []
     seen: set[str] = set()
     missing = 0
-    stops = _ordered_stops(roots)
+    stops = _ordered_stops(dump.data)
     for order, n in stops:
-        nid = lookup(n) if n is not None else None
+        nid = lookup(n)
         if nid is None or nid in seen:
             missing += nid is None
             continue
@@ -890,7 +832,7 @@ def reading_order(ix: Index, loaded: Any) -> tuple[list[tuple[int, str]], list[s
         out.append((int(order), nid))
     diags = []
     if missing:
-        dup = sum(1 for c in pairs.values() if c > 1)
+        dup = sum(1 for c in dump.pairs.values() if c > 1)
         why = "; a11y ids not unique (agent ID1)" if dup else ""
         diags.append(f"reading: {missing} of {len(stops)} TalkBack stops not mapped to nodes{why}")
     return out, diags
@@ -942,6 +884,10 @@ def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None =
         res = _run_tree_lint(src, ix, density=density, font_scale=font_scale)
         lint_pairs.extend(res.issues)
         unmapped = list(res.unmapped)
+        if res.status != "ok":
+            diags.append(f"lint: not run: {res.status}")
+        if res.errors:
+            diags.append(f"lint: {len(res.errors)} rule errors: {res.errors[0]}")
         if lint == "full":
             name = _lint_cache_name(kind="contrast", density=density, font_scale=font_scale,
                                     wcag=False)

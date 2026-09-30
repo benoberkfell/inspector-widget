@@ -886,19 +886,28 @@ with every consumer.
     `HorizontalScrollAxisRange` give a scroll container's axis.
   - Children of a collection have `[i]` in their `anchor`. `type` groups
     same-type siblings.
-- **The lint adapter** is `_lint_windows()`. It is the only place that chooses the
-  lint input, and today that input is the Compose semantics from
-  `raw/compose_sem.pb`.
-  - Node ids are replaced by surrogates, so colliding semantics ids across
-    ComposeViews (ID3) stay distinct. Each surrogate maps back to
-    `sem:<acv>:<id>`, and the synthetic window root maps to `view:<acv>`.
-  - When improve/a11y-lint-unified lands, return the unified a11y tree there.
-    Findings that carry a typed `node_key` (`view:`, `compose:<acv>:<id>`,
-    `virtual:`) already map through `_finding_key`.
-  - A surrogate id wins over a typed key. Over Compose input, the unified lint
-    derives its keys from the ids it is given (`compose:1:<surrogate>`), and
-    those keys name no real node. The launcher mapping was checked against that
-    branch's `a11y_lint.py`: every finding maps.
+- **The lint adapter** runs `a11y_lint.run_lint` over the stored trees, exactly as
+  the live `a11y_lint` tool does: the unified a11y tree (`raw/a11y.pb` through
+  `a11y.a11y_to_dict`, Views and Compose in one pass, so View screens are linted
+  too) with the Compose semantics (`raw/compose_sem.pb`) joined for detail.
+  - `_A11yDump` decodes `raw/a11y.pb` once per analysis; the lint and the reading
+    order share it. A finding maps to its dump node by `(host, virtual)`; a pair
+    the dump repeats (ID1) is told apart by the finding's window and bounds, or
+    reported as unmapped. The dump node maps to an index node as a TalkBack stop
+    does (the `a11y:path:` alias first, then a unique pair).
+  - Contrast asks `run_lint` for window screenshots through `_StoredShots`, which
+    serves each window's own stored screenshot (a scale-less one gets its width
+    over the window's).
+  - Evidence keeps what an agent can act on. Dropped: what the node itself says
+    (`label`, `class_name`), how the lint worked (`checked`, `bounds_source`,
+    `standard`, `floor_dp`, `clipped_axes`, sampling), and the lint's typed keys
+    of other nodes (`duplicates`, `duplicate_of`). `node_ids` names the OTHER
+    nodes involved (R12's same-label group, R13's twin, from
+    `duplicate_of_id`), as node ids that `apply_refs` turns into refs.
+  - No a11y facet: no lint, and the diagnostic `lint: not run: no accessibility
+    tree`. A rule that raised is reported as `lint: N rule errors: ...`.
+  - `LINT_CACHE_VERSION` 2: cached lint results from the Compose-semantics input
+    are not served.
   - A finding whose node is not in the index is reported in diagnostics, never
     dropped silently.
 - **Render issue evidence.**
@@ -1032,14 +1041,14 @@ what now holds:
   `a11y_data_sensitive`, `request_initial_focus`); the rest are dropped.
   `facets.a11y.unique_id` carries the a11y uniqueId (C5's locator).
   `facets.a11y.b` is left out once the View's `b` became that same rect.
-- **Reading order on main's a11y.py (C7).** `a11y.compute_traversal_order` counts
-  every text node as a stop, including Text that a clickable Compose row speaks as
-  part of its own stop (RO1). When `a11y.reading_order` is missing, the analyzer
-  drops a stop that has no focus of its own (`clickable`, `long_clickable`,
-  `focusable`, `screen_reader_focusable`, `checkable`, `editable`) and sits under
-  a visible `clickable`/`long_clickable`/`screen_reader_focusable` ancestor, and
-  renumbers. A focusable-only container (a ScrollView) does not merge. On the
-  launcher replay this gives the title plus the 12 rows (13 stops, was 35).
+- **Reading order (C7).** `talkback.reading_order`, the TalkBack 17 model, over the
+  whole `a11y_to_dict` dump (window order, windows under a dialog). It merges a
+  clickable row's Text into the row's stop (RO1). A ScrollView's children are
+  top-level scroll items, each a stop; TalkBack's `isScrollable` reads scroll
+  actions, not the `scrollable` flag, so a focusable container without a scroll
+  action is one stop that speaks its text. The recorded launcher (pre-ID1, no
+  service, so no traversal links: composition order) reads the 12 rows, then the
+  title; a live dump from a current agent starts at the title, as TalkBack does.
 - **Outline (C6).** In `detail="semantic"`, an a11y-only leaf with no rid, tag,
   issue, stop or action of its own, under a clickable/long-clickable parent that
   has a label, collapses (counted in `hidden.collapsed`): it is Text the row
@@ -1058,21 +1067,19 @@ what now holds:
   highlight colours, autofill flags) do not read as customised. Phase-0 callers
   pass no groups and are unchanged.
 - **Measured with the pipeline** (compact bytes; target in parentheses):
-  - launcher: capture stand-in 1,063 (2,500); `outline()` 2,064 (2,500);
-    `outline(root=@launcher_list)` 1,667 (2,000); `outline(view="slots")` 3,979
-    (6,000); `outline(view="reading")` 1,631 (2,000); `find(text="state",
-    flags=click)` 400 (600); `node(@launch_heading)` 1,378 (1,500); `lint()` 1,028
-    (1,200); crop 231 (400); captures list stand-in 166 (400).
-  - View screen: `outline()` 2,540 (3,000; 38 Views on lines, 2 ViewStubs
-    hidden); `node(#badSwitch, props="nondefault")` 1,098 (1,200).
-  - wide: capture stand-in 2,035 (3,000); outline pages <= 5,503 (6,000), 4 pages
-    holding exactly the 259 Views; `find(text="Label 4", limit=20)` 1,327 (3,000);
-    `node(#view_47, props="nondefault")` 592 (1,500); `outline(root, depth=1)` 483.
-- **Known gaps found at integration** (owned elsewhere):
-  - The lint adapter reads Compose semantics only, so the View screen has 0
-    findings until the unified a11y lint (L1) lands.
-  - The recorded View screen reports action `0x01020036` on most Views, which
-    looks like `android.R.id.accessibilityActionShowOnScreen`. main's `a11y.py`
-    table starts `SHOW_ON_SCREEN` at `0x0102003D`, so the action shows as
-    `CUSTOM_0x01020036` (the R.id block there may be offset; worth checking
-    against the SDK by the a11y owners).
+  (re-measured after the unified lint and the TalkBack model landed)
+  - launcher: capture stand-in 1,069 (2,500); `outline()` 2,026 (2,500);
+    `outline(root=@launcher_list)` 1,653 (2,000); `outline(view="reading")` 1,567
+    (2,000); `find(text="state", flags=click)` 388 (600); `node(@launch_heading)`
+    1,382 (1,500); `lint()` 726 (1,200); crop 281 (400); captures list stand-in
+    174 (400).
+  - View screen (now linted: 14 findings): capture stand-in 2,202 (3,000);
+    `outline()` 2,733 (3,000; 38 Views on lines, 2 ViewStubs hidden); `lint()`
+    1,340 (4,000); `node(#badSwitch, props="nondefault")` 1,196 (1,200).
+  - wide: capture stand-in 2,488 (3,000); outline pages <= 5,913 (6,000), 4 pages
+    holding exactly the 259 Views; `find(text="Label 4", limit=20)` 1,547 (3,000);
+    `node(#view_47, props="nondefault")` 786 (1,500); `outline(root, depth=1)` 641.
+- **Gaps found at integration, since closed:** the View screen had no lint
+  findings while the adapter read Compose semantics (the unified lint closed it),
+  and action `0x01020036` showed as `CUSTOM_0x01020036` (action-ids decodes it as
+  `SHOW_ON_SCREEN`).

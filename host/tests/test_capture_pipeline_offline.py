@@ -375,7 +375,11 @@ def test_launcher_walk(world: dict[str, Captured]) -> None:
 
     summary = p.summary(lc)
     assert nbytes(summary) <= 2500
-    assert summary["lint"] == "14 warn: 12 role, 1 state, 1 touch_target (contrast not run)"
+    # The recording's heading row is clipped at the list's edge, and its Text is not
+    # in the (pre-ID1) a11y tree: TalkBack would say "Unlabelled" there (R1), and
+    # its 33dp-tall sliver is a small target (R2, a likely false positive).
+    assert summary["lint"] == ("1 error 1 info: 1 label_missing, 1 touch_target "
+                               "(contrast not run)")
     heading = c.ref("@launch_heading")
     assert summary["issues"] == f"1 clipped: {heading}"
 
@@ -401,7 +405,10 @@ def test_launcher_walk(world: dict[str, Captured]) -> None:
 
     reading = p.outline(lc, view="reading")
     assert nbytes(reading) <= 2000 and reading["total"] == 13  # 13 TalkBack stops
-    assert reading["lines"][0].startswith("1. ") and '"A11yProbe"' in reading["lines"][0]
+    # the recording has no traversal links (composition order): the 12 rows, then the
+    # top bar's title (test_real_launcher_reading_order_has_one_stop_per_row)
+    assert reading["lines"][0].startswith("1. ") and "@launch_all" in reading["lines"][0]
+    assert reading["lines"][12].startswith("13. ") and '"A11yProbe"' in reading["lines"][12]
 
     found = p.find(lc, text="state", flags=["click"])
     assert nbytes(found) <= 600 and found["total"] == 2
@@ -418,7 +425,7 @@ def test_launcher_walk(world: dict[str, Captured]) -> None:
         "MainActivity.kt:150", "MainActivity.kt:151", "MainActivity.kt:152"]
 
     lint = p.lint(lc)
-    assert nbytes(lint) <= 1200 and lint["counts"] == {"error": 0, "warn": 14, "info": 0}
+    assert nbytes(lint) <= 1200 and lint["counts"] == {"error": 1, "warn": 0, "info": 1}
 
     crop = p.image(lc, heading)
     assert nbytes(crop) <= 400 and crop["px"][1] > 0 and os.path.exists(crop["path"])
@@ -459,6 +466,10 @@ def test_viewscreen_walk(world: dict[str, Captured]) -> None:
     reading = p.outline(lc, view="reading")
     assert nbytes(reading) <= 3000
     assert any("#badImageButton" in line for line in reading["lines"])
+
+    # the unified a11y lint covers Views: the View screen's variants are linted
+    lint = p.lint(lc)
+    assert nbytes(lint) <= DEFAULT_BUDGET["lint"] and sum(lint["counts"].values()) == 14
 
 
 # --------------------------------------------------------------------------- #
@@ -790,7 +801,9 @@ def test_workflow_token_totals(pipe: Pipeline) -> None:
     got["W7"] = tokens(pipe.summary(m.loaded), hits, pipe.lint(m.loaded, within="#feed"),
                        pipe.node(m.loaded, third))
 
-    spec = {"W1": 1100, "W2": 1100, "W3": 1200, "W4": 2800, "W6": 2400, "W7": 1600}
+    # W3 was 1,200 while the View screen had no lint; both of its capture summaries
+    # now carry the screen's 14 findings (the lint line and the outline's markers).
+    spec = {"W1": 1100, "W2": 1100, "W3": 1300, "W4": 2800, "W6": 2400, "W7": 1600}
     over = {k: (got[k], spec[k]) for k in spec if got[k] > spec[k] * 1.25}
     assert not over, over
 

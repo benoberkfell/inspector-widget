@@ -3,7 +3,10 @@ mapping and template collapse, reading order, and the lint view.
 
 Everything runs offline on ``capture_builders`` indexes plus raw facets from the
 real launcher recording (``tests/fixtures/live``) or built from the index itself
-(``loaded_fakes``).
+(``loaded_fakes``). The lint adapter tests run the installed ``a11y_lint``; the
+lint_view mechanics (grouping, template collapse, cursors, budgets) run on the
+spec's launcher example with its hand-made findings, so they do not move when
+the lint's rules do.
 """
 
 from __future__ import annotations
@@ -55,6 +58,14 @@ def _launcher_loaded(ix=None, **raw):
             .SerializeToString(), "views": _real_views()}
     base.update(raw)
     return ix, FakeLoaded(ix, raw=base)
+
+
+def _spec_launcher():
+    """The spec's launcher example as ``capture_builders`` writes it, with its
+    hand-made findings (14 warnings: 12 role, 1 state, 1 touch target, plus the
+    clipped row n22): the lint_view mechanics fixture."""
+    ix = cb.launcher_index()
+    return ix, FakeLoaded(ix)
 
 
 def _views_raw(props: dict[int, dict[str, object]]) -> bytes:
@@ -276,25 +287,46 @@ def test_one_issue_per_subtree_on_the_wide_scene():
 # --------------------------------------------------------------------------- #
 # The lint adapter on the real launcher
 # --------------------------------------------------------------------------- #
-def test_launcher_lint_maps_every_finding_to_the_builder_refs():
-    expected = _issues(cb.launcher_index())
+def test_launcher_lint_maps_every_finding_to_its_node():
+    """The capture's lint is ``a11y_lint.run_lint`` over the stored unified a11y tree,
+    so it finds what the live a11y_lint tool finds on the same dump, and every
+    finding lands on its node. The launcher's rows sit in a collection, so the
+    lint no longer asks them for a role (R5); the screen has no heading (R9), and
+    the last row, clipped at the list's edge, is a small touch target."""
+    from inspector_widget import a11y
+
     ix, loaded = _launcher_loaded()
     _clear(ix)
     an.analyze(ix, loaded, lint="tree", density=480, font_scale=1.0)
     assert not any(d.startswith("lint:") for d in ix.diagnostics), ix.diagnostics
-    got = _issues(ix)
-    # the builder's hand-made clipped issue is a warning; at a scroll edge the analyzer
-    # reports it as info
-    expected["n22"] = [(i, "info" if i == "render.clipped" else s) for i, s in expected["n22"]]
-    assert got == expected
-    # the real lint found exactly the 14 findings of the recorded a11y_lint output
-    recorded = lf.load("launcher", "a11y_lint")["findings"]
-    assert sum(len(v) for v in _issues(ix, "a11y.").values()) == len(recorded) == 14
-    by_ref = {n.ref: n for n in ix.nodes.values()}
-    for f in recorded:
-        sem_id = f["node"]["id"]
-        node = ix.get(f"sem:82:{sem_id}")
-        assert node is not None and f["rule"] in [i.id for i in by_ref[node.ref].issues]
+    assert _issues(ix) == {"n1": [("a11y.heading.structure", "info")],
+                           "n22": [(TOUCH, "info"), ("render.clipped", "info")]}
+    live = a11y_lint.run_lint(
+        None, density=480, include_contrast=False,
+        a11y_data=a11y.a11y_to_dict(pb.DumpA11yResponse.FromString(loaded.raw("a11y"))),
+        compose_data=an._Src(loaded).compose_dict())
+    assert sorted((f.rule, f.severity) for f in live.findings) == sorted(
+        (i.id, i.sev) for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y."))
+
+
+def test_view_screens_are_linted_too():
+    """The unified a11y tree covers Views: the recorded View screen (no Compose at
+    all) gets findings, each on a View node."""
+    import capture_scenes as cs
+
+    from inspector_widget.capture import index as cx
+
+    raw = cs.raw_from_scene(fs.replay_scene("viewscreen"))
+    ix = cx.build_index(raw)
+    an.analyze(ix, raw, lint="tree")
+    assert not any(d.startswith("lint:") for d in ix.diagnostics), ix.diagnostics
+    found = [(n, i) for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y.")]
+    assert found and all(n.kind == "view" for n, _ in found)
+    # the same-label group names the other nodes by node id, never by the lint's keys
+    groups = [(n, i) for n, i in found if i.id == "a11y.duplicate.label"]
+    assert groups and all("duplicates" not in i.evidence for _, i in groups)
+    assert all(i.evidence["node_ids"] and n.id not in i.evidence["node_ids"]
+               and all(x in ix.nodes for x in i.evidence["node_ids"]) for n, i in groups)
 
 
 def test_touch_target_on_scroll_clipped_node_is_a_likely_false_positive():
@@ -331,7 +363,15 @@ def test_analyze_accepts_a_raw_capture_before_publish():
     raw = RawCapture(meta=ix.meta, compose_sem=_real_compose(),
                      a11y=a11y_pb_from_index(cb.launcher_index()).SerializeToString())
     an.analyze(ix, raw, lint="tree")
-    assert len(_issues(ix, "a11y.")) == 12
+    assert sorted(_issues(ix, "a11y.")) == ["n1", "n22"]
+
+
+def test_no_a11y_tree_means_no_lint_and_says_so():
+    ix = cb.launcher_index()
+    _clear(ix)
+    an.analyze(ix, FakeLoaded(ix, raw={"compose_sem": _real_compose()}))
+    assert _issues(ix, "a11y.") == {}
+    assert "lint: not run: no accessibility tree" in ix.diagnostics
 
 
 def test_analyze_without_facets_runs_render_signals_only():
@@ -343,35 +383,76 @@ def test_analyze_without_facets_runs_render_signals_only():
     assert ix.reading == reading  # no a11y facet: the reading order is left alone
 
 
+ACV_CLASS = "androidx.compose.ui.platform.AndroidComposeView"
+
+
+def _raw_of(ix) -> dict[str, bytes]:
+    """The a11y and Compose semantics facets a capture of ``ix`` would carry."""
+    return {"a11y": a11y_pb_from_index(ix).SerializeToString(),
+            "compose_sem": compose_pb_from_index(ix).SerializeToString()}
+
+
 def _two_compose_views():
     """Two ComposeViews whose semantics ids collide (ID3): each has a clickable,
     role-less node with semantics id 5."""
     b = cb.IndexBuilder("cid301", screen=(1080, 2000))
     w = b.window("n1", "DecorView", (0, 0, 1080, 2000), udid=1)
+    b.a11y_facet(w, host=1, virt=-1, **{"class": "android.widget.FrameLayout"})
     for i, (acv, y) in enumerate(((82, 0), (182, 1000))):
         host = b.view(w, f"n{2 + i}", "AndroidComposeView", (0, y, 1080, 1000), udid=acv,
                       cls="AndroidComposeView")
+        b.a11y_facet(host, host=acv, virt=-1, **{"class": ACV_CLASS})
         b.compose(host, f"n{10 + i}", sem_id=5, b=(0, y + 100, 1080, 200), acv=acv,
                   label=f"Row {i}", flags=["click"],
                   attrs={"Text": f"Row {i}", "OnClick": "AccessibilityAction"})
+        b.a11y_facet(f"n{10 + i}", host=acv, virt=5, flags=["click", "focus"],
+                     **{"class": "android.view.View"})
     return b.build()
 
 
 def test_composite_keys_keep_colliding_semantics_ids_apart():
     ix = _two_compose_views()
-    loaded = FakeLoaded(ix, raw={"compose_sem": compose_pb_from_index(ix).SerializeToString()})
-    an.analyze(ix, loaded)
-    assert _issues(ix, "a11y.role") == {"n10": [(ROLE, "warn")], "n11": [(ROLE, "warn")]}
+    an.analyze(ix, FakeLoaded(ix, raw=_raw_of(ix)))
+    # a clickable row with visible text and no role: info (R5 warns only without text)
+    assert _issues(ix, "a11y.role") == {"n10": [(ROLE, "info")], "n11": [(ROLE, "info")]}
 
 
 def test_findings_on_nodes_missing_from_the_index_are_reported_not_dropped():
     ix = _two_compose_views()
-    raw = compose_pb_from_index(ix).SerializeToString()
+    raw = _raw_of(ix)
     del ix.nodes["n11"]
     ix.rebuild_by_key()
-    an.analyze(ix, FakeLoaded(ix, raw={"compose_sem": raw}))
+    an.analyze(ix, FakeLoaded(ix, raw=raw))
     (diag,) = [d for d in ix.diagnostics if d.startswith("lint:")]
-    assert diag.startswith("lint: 1 findings not mapped to nodes") and "sem:182:5" in diag
+    assert diag.startswith("lint: 1 findings not mapped to nodes") and "compose:182:5" in diag
+
+
+def test_repeated_a11y_ids_are_told_apart_by_window_and_bounds_or_not_at_all():
+    """A pre-ID1 agent repeats one (host, virtual) pair across a whole window. A
+    finding still lands on its node when its bounds single out one dump node (the
+    index registers that node's path key), and is reported, never guessed,
+    otherwise."""
+    class F:
+        def __init__(self, x, y, window=0):
+            self.node = {"host_view_id": 1, "virtual_id": 11}
+            self.bounds = {"x": x, "y": y, "w": 10, "h": 10}
+            self.window = {"index": window}
+
+    def a11y(y, kids=()):
+        return {"host_view_id": 1, "virtual_id": 11, "bounds": {"layout": {
+            "x": 0, "y": y, "w": 10, "h": 10}}, "children": list(kids)}
+
+    resp = fs.a11y_to_pb({"windows": [{"root_view_id": 1, "root": {
+        "host_view_id": 1, "virtual_id": -1, "bounds": {"layout": {"x": 0, "y": 0, "w": 10,
+                                                                    "h": 100}},
+        "children": [a11y(0), a11y(20), a11y(20)]}}]})
+    dump = an._A11yDump(resp)
+    ix = cb.launcher_index()
+    ix.by_key["a11y:path:1:0.0"] = "n9"
+    lookup = dump.mapper(ix)
+    assert lookup(dump.finding_dict(F(0, 0))) == "n9"
+    assert dump.finding_dict(F(0, 20)) is None  # two nodes with these bounds
+    assert dump.finding_dict(F(0, 0, window=1)) is None  # not in that window
 
 
 # --------------------------------------------------------------------------- #
@@ -388,27 +469,57 @@ def test_reading_order_maps_talkback_stops_to_refs():
     assert [ix.get(r).stop for r in ix.reading] == list(range(1, 14))
 
 
-def test_merged_row_text_is_not_a_stop_of_its_own():
-    """TalkBack reads a clickable row's non-focusable text as part of the row's stop
-    (RO1); a focusable-only container (a ScrollView) does not merge its children."""
-    def a11y(text=None, flags=(), kids=(), y=0):
-        d = {"host_view_id": 1, "virtual_id": -1, "flags": ["visible_to_user", *flags],
-             "bounds": {"layout": {"x": 0, "y": y, "w": 100, "h": 40}},
-             "children": list(kids)}
-        if text:
-            d["text"] = text
-        return d
+def _tb_node(name, cls, text=None, flags=(), kids=(), y=0, actions=()):
+    """A View a11y node named ``<what>_<host view id>``."""
+    d = {"host_view_id": int(name.rsplit("_", 1)[1]), "virtual_id": -1,
+         "class_name": f"android.widget.{cls}",
+         "flags": ["visible_to_user", "enabled", *flags], "name": name,
+         "bounds": {"layout": {"x": 0, "y": y, "w": 100, "h": 40}}, "children": list(kids)}
+    if text:
+        d["text"] = text
+    if actions:
+        d["actions"] = [{"id": a} for a in actions]
+    return d
 
-    row = a11y(flags=("clickable", "focusable"), y=0,
-               kids=[a11y("Title", y=0), a11y("Subtitle", y=20)])
-    scroll = a11y(flags=("focusable", "scrollable"), y=100,
-                  kids=[a11y("One", y=100), a11y("Two", y=140)])
-    stops = an._ordered_stops([a11y(kids=[row, scroll], y=0)])
-    assert [n.get("text") or "row" for _, n in stops] == ["row", "One", "Two"]
+
+def test_merged_row_text_is_not_a_stop_of_its_own():
+    """TalkBack (talkback.reading_order) reads a clickable row's non-focusable text as
+    part of the row's stop (RO1). A ScrollView does not merge its children: they
+    are top-level scroll items, each a stop. TalkBack's isScrollable reads the
+    scroll actions, not the scrollable flag, so the ScrollView here has one."""
+    row = _tb_node("row_2", "LinearLayout", flags=("clickable", "focusable"), y=0,
+                   kids=[_tb_node("t_3", "TextView", "Title", y=0),
+                         _tb_node("t_4", "TextView", "Subtitle", y=20)])
+    scroll = _tb_node("scroll_5", "ScrollView", flags=("focusable", "scrollable"), y=100,
+                      actions=[0x1000],  # ACTION_SCROLL_FORWARD
+                      kids=[_tb_node("t_6", "TextView", "One", y=100),
+                            _tb_node("t_7", "TextView", "Two", y=140)])
+    stops = an._ordered_stops([_tb_node("root_1", "FrameLayout", kids=[row, scroll])])
+    assert [n.get("text") or n["name"] for _, n in stops] == ["row_2", "One", "Two"]
     assert [o for o, _ in stops] == [1, 2, 3]
 
 
+def test_a_focusable_container_that_does_not_scroll_speaks_its_text_as_one_stop():
+    """A focusable layout with plain text children (no scroll action) is one stop
+    that speaks them, as TalkBack's shouldFocusNode decides for any focusable node
+    with non-focusable speaking children."""
+    box = _tb_node("box_2", "LinearLayout", flags=("focusable",), y=100,
+                   kids=[_tb_node("t_3", "TextView", "One", y=100),
+                         _tb_node("t_4", "TextView", "Two", y=140)])
+    stops = an._ordered_stops([_tb_node("root_1", "FrameLayout", kids=[box])])
+    assert [n["name"] for _, n in stops] == ["box_2"]
+
+
 def test_real_launcher_reading_order_has_one_stop_per_row():
+    """The recorded launcher came from a pre-ID1 agent with no accessibility service,
+    so its a11y tree carries no traversal links and is in composition order: the
+    TalkBack model reads the 12 rows (their Text merged), then the top bar's title.
+    A live dump from a current agent carries Compose's links, and there the title
+    comes first, as TalkBack 17 read it (tests/data/tb/tb17_walks.json)."""
+    import gzip
+    import json
+    import os
+
     import capture_scenes as cs
 
     from inspector_widget.capture import index as cx
@@ -417,9 +528,13 @@ def test_real_launcher_reading_order_has_one_stop_per_row():
     ix = cx.build_index(raw)
     an.analyze(ix, raw, lint="none")
     stops = [ix.nodes[r] for r in ix.reading]
-    assert len(stops) == 13  # the title, then the 12 rows (their Text is merged)
-    assert stops[0].label == "A11yProbe"
-    assert all(n.type == "ListItem" and "click" in n.flags for n in stops[1:])
+    assert len(stops) == 13
+    assert all(n.type == "ListItem" and "click" in n.flags for n in stops[:12])
+    assert stops[12].label == "A11yProbe"
+    here = os.path.dirname(__file__)
+    with gzip.open(os.path.join(here, "data", "tb", "tb17_launcher_on.json.gz")) as f:
+        live = json.load(f)
+    assert an._ordered_stops(live)[0][1].get("text") == "A11yProbe"
 
 
 def test_reading_order_never_guesses_duplicate_pre_id1_ids():
@@ -456,7 +571,7 @@ def _analyzed_launcher():
 
 
 def test_launcher_grouped_lint_fits_1200_bytes():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     out = an.lint_view(ix, loaded)
     text = dumps(out)
     assert len(text.encode("utf-8")) <= 1200, len(text.encode("utf-8"))
@@ -476,7 +591,7 @@ def test_launcher_grouped_lint_fits_1200_bytes():
 
 
 def test_lint_view_groups_by_node_and_flat():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     by_node = an.lint_view(ix, loaded, group="node")["lines"]
     assert len(by_node) == 12
     assert by_node[0] == 'n11 "▶ All scenarios (lint everythin…" !role warn; !state warn'
@@ -485,7 +600,7 @@ def test_lint_view_groups_by_node_and_flat():
 
 
 def test_lint_view_filters_by_rule_severity_and_within():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     render = an.lint_view(ix, loaded, rules=["render."])
     assert [r["rule"] for r in render["rules"]] == ["render.clipped"]
     assert render["rules"][0]["nodes"] == ['n22 "Section heading, MissingHeading" 27 of 216px']
@@ -536,13 +651,13 @@ def test_template_collapse_of_collection_cells():
 
 
 def test_distinct_nodes_are_never_collapsed():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     role = an.lint_view(ix, loaded, rules=["R5"], per_rule=20)["rules"][0]
     assert len(role["nodes"]) == 12 and not any(s.startswith("×") for s in role["nodes"])
 
 
 def test_lint_view_budgets_hold_for_random_max_bytes():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     rnd = random.Random(7)
     for _ in range(60):
         mb = rnd.randint(500, 4000)
@@ -552,7 +667,7 @@ def test_lint_view_budgets_hold_for_random_max_bytes():
 
 
 def test_cursors_page_through_every_finding_once():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     seen: list[str] = []
     cursor = None
     for _ in range(20):
@@ -572,8 +687,11 @@ def test_cursors_page_through_every_finding_once():
 def test_lint_summary_for_capture():
     ix, _ = _analyzed_launcher()
     assert an.lint_summary(ix) == {
-        "lint": "14 warn: 12 role, 1 state, 1 touch_target (contrast not run)",
+        "lint": "2 info: 1 heading, 1 touch_target (contrast not run)",
         "issues": "1 clipped: n22"}
+    ix, _ = _spec_launcher()
+    assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state, 1 touch_target "
+                                           "(contrast not run)")
 
 
 # --------------------------------------------------------------------------- #
@@ -588,22 +706,22 @@ def _contrast_scene():
     popup's text is faint grey on white (low contrast); where the popup sits, the
     main window's own screenshot is plain background."""
     b = cb.IndexBuilder("ccon01", screen=(360, 640), dpi=420)
-    main = b.window("n1", "DecorView", (0, 0, 360, 640), udid=1001)
-    acv = b.view(main, "n2", "AndroidComposeView", (0, 0, 360, 640), udid=1006,
-                 cls="AndroidComposeView")
-    b.compose(acv, "n3", sem_id=2, b=(16, 40, 200, 40), label="Title", attrs={"Text": "Title"})
-    pop = b.window("n4", "PopupDecorView", (40, 400, 280, 200), udid=2001)
-    pacv = b.view(pop, "n5", "AndroidComposeView", (40, 400, 280, 200), udid=2006,
-                  cls="AndroidComposeView")
-    b.compose(pacv, "n6", sem_id=2, b=(60, 420, 200, 40), label="Faint",
-              attrs={"Text": "Faint"})
+    for win, acv, text, udid, typ, box, text_box, label in (
+            ("n1", "n2", "n3", 1001, "DecorView", (0, 0, 360, 640), (16, 40, 200, 40), "Title"),
+            ("n4", "n5", "n6", 2001, "PopupDecorView", (40, 400, 280, 200), (60, 420, 200, 40),
+             "Faint")):
+        b.window(win, typ, box, udid=udid)
+        b.a11y_facet(win, host=udid, virt=-1, **{"class": "android.widget.FrameLayout"})
+        b.view(win, acv, "AndroidComposeView", box, udid=udid + 5, cls="AndroidComposeView")
+        b.a11y_facet(acv, host=udid + 5, virt=-1, **{"class": ACV_CLASS})
+        b.compose(acv, text, sem_id=2, b=text_box, label=label, attrs={"Text": label})
+        b.a11y_facet(text, host=udid + 5, virt=2, **{"class": "android.widget.TextView"})
     ix = b.build()
     strokes = [((70 + 12 * k, 428, 5, 24), LOW) for k in range(12)]
     title = [((20 + 12 * k, 48, 5, 24), (0, 0, 0)) for k in range(12)]
     shots = {1001: screen_of((0, 0, 360, 640), BG, title),
              2001: screen_of((40, 400, 280, 200), BG, strokes)}
-    raw = {"compose_sem": compose_pb_from_index(ix).SerializeToString()}
-    return ix, raw, shots
+    return ix, _raw_of(ix), shots
 
 
 def test_contrast_samples_each_windows_own_screenshot_and_is_cached(monkeypatch):
@@ -652,12 +770,16 @@ def test_contrast_without_screenshots_says_so():
 def test_wcag_mode_reruns_the_tree_lint_with_44dp_targets():
     b = cb.IndexBuilder("cwcag1", screen=(1080, 2000), dpi=160)
     w = b.window("n1", "DecorView", (0, 0, 1080, 2000), udid=1)
+    b.a11y_facet(w, host=1, virt=-1, **{"class": "android.widget.FrameLayout"})
     acv = b.view(w, "n2", "AndroidComposeView", (0, 0, 1080, 2000), udid=82,
                  cls="AndroidComposeView")
-    b.compose(acv, "n3", sem_id=4, b=(0, 0, 46, 46), label="Go", flags=["click"],
-              attrs={"Text": "Go", "OnClick": "x", "Role": "Button"})
+    b.a11y_facet(acv, host=82, virt=-1, **{"class": ACV_CLASS})
+    b.compose(acv, "n3", sem_id=4, b=(0, 0, 46, 46), label="Send", flags=["click"],
+              attrs={"Text": "Send", "OnClick": "x", "Role": "Button"})
+    b.a11y_facet("n3", host=82, virt=4, flags=["click", "focus"],
+                 **{"class": "android.widget.Button"})
     ix = b.build()
-    loaded = FakeLoaded(ix, raw={"compose_sem": compose_pb_from_index(ix).SerializeToString()})
+    loaded = FakeLoaded(ix, raw=_raw_of(ix))
     an.analyze(ix, loaded)
     assert [i.id for i in ix.get("n3").issues] == [TOUCH]
     assert an.lint_view(ix, loaded)["counts"]["warn"] == 1
@@ -672,7 +794,7 @@ def test_lint_view_output_is_json_serializable_and_compact():
 
 
 def test_unknown_rule_from_a_newer_lint_is_kept():
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     ix.get("n9").issues.append(Issue("a11y.future.rule", "warn", {"x": 1}))
     out = an.lint_view(ix, loaded, per_rule=1)
     (fut,) = [r for r in out["rules"] if r["rule"] == "a11y.future.rule"]
@@ -712,25 +834,9 @@ def test_contrast_on_a_scroll_clipped_sliver_is_low_confidence():
 
 
 def test_rules_the_installed_lint_cannot_produce_are_flagged(monkeypatch):
-    ix, loaded = _analyzed_launcher()
+    ix, loaded = _spec_launcher()
     monkeypatch.setattr(a11y_lint, "ALL_RULE_IDS",
                         [r for r in a11y_lint.ALL_RULE_IDS if r != "a11y.duplicate.label"])
     out = an.lint_view(ix, loaded, rules=["R12", "R5"])
     assert out["unavailable"] == ["R12"] and [r["rule"] for r in out["rules"]] == [ROLE]
     assert "unavailable" not in an.lint_view(ix, loaded, rules=["render.clipped"])
-
-
-def test_finding_keys_prefer_the_adapters_surrogates_over_typed_keys():
-    """The unified lint (improve/a11y-lint-unified) keeps our surrogate as node.id and
-    derives node.key from it for Compose input; over its own a11y input there is no
-    surrogate and the typed key is the truth."""
-    class F:
-        def __init__(self, node):
-            self.node = node
-
-    keys = {16: "sem:82:448"}
-    assert an._finding_key(F({"id": 16, "key": "compose:1:16"}), keys) == "sem:82:448"
-    assert an._finding_key(F({"id": 1 << 40, "key": "compose:82:448"}), keys) == "sem:82:448"
-    assert an._finding_key(F({"key": "view:1004"}), {}) == "view:1004"
-    assert an._finding_key(F({"key": "virtual:900:3"}), {}) == "a11y:900:3"
-    assert an._finding_key(F({"id": 99}), keys) is None
