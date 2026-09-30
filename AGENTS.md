@@ -38,7 +38,8 @@ host (python) ──adb push/run-as/attach-agent/forward──► libviewspector
                                                              └► DexClassLoader(payload, parent=appCL)
                                                                 └► payload (Kotlin): LocalServerSocket
 host socket client ◄── VWSPCT01-framed protobuf (proto/view_inspection.proto) ──► Dispatcher
-cli.py / mcp_server.py ── drive the host; mcp_server exposes 18 tools to an LLM agent
+cli.py / mcp_server.py ── drive the host; mcp_server lists 18 tools by default (26 with
+                           INSPECTOR_WIDGET_TOOLSET=all: + the 8 capture-and-walk tools)
 ```
 
 - **Wire**: 8-byte magic `VWSPCT01` + 4-byte big-endian length + protobuf. Abstract socket
@@ -66,8 +67,8 @@ host/                         Python host driver + entry points
   inspector_widget/           the package (adb, inject, framing, client, png, strings,
                               a11y, a11y_lint, overlay, correlate, skiaparser, skia_client,
                               proto/, skia_grpc/, _cli.py/_mcp.py console-script wrappers)
-  cli.py                      CLI entry point (16 subcommands)
-  mcp_server.py               MCP server (18 tools) + `--self-check`
+  cli.py                      CLI entry point (24 subcommands)
+  mcp_server.py               MCP server (26 tools, 18 listed by default) + `--self-check`
   tests/                      device-free pytest suite (+ @device smoke and a11y golden tests)
   pyproject.toml              packaging (wheel ships cli.py + mcp_server.py as py-modules)
   README.md  PACKAGING.md     host driver + packaging docs
@@ -142,7 +143,7 @@ listed under the same `@viewspector_<pid>` for as long as it is open (`adb.socke
 # or manually, from the repo root so $PWD expands to your checkout:
 claude mcp add inspector-widget -- \
   env PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
-host/mcp_server.py --self-check                  # prints proto status + the 18 tools
+host/mcp_server.py --self-check                  # prints proto status, the toolset + its tools
 ```
 
 **Test**:
@@ -184,7 +185,7 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 
 ## 5. Capabilities (CLI ↔ MCP parity)
 
-16 CLI subcommands / 18 MCP tools. Keep them at parity (see §6).
+24 CLI subcommands / 26 MCP tools (18 listed by default). Keep them at parity (see §6).
 
 | Group | MCP tools | CLI subcommands |
 |---|---|---|
@@ -194,6 +195,14 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 | Accessibility | `dump_accessibility`, `a11y_lint`, `a11y_overlay` | `a11y` (+`--lint`/`--overlay`), `a11y-lint` |
 | Integrated | `inspect`, `inspect_node`, `component_image` | `inspect`, `inspect-node`, `component-image` |
 | TalkBack (device-wide; needs TalkBack installed) | `talkback`, `tb_walk`, `tb_scenario` | `talkback status\|on\|off\|restore`, `tb-walk`, `tb-scenario` |
+| Capture and walk (MCP: opt-in, `INSPECTOR_WIDGET_TOOLSET=capture` or `all`) | `capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`, `diff` | the same names |
+
+The capture-and-walk tools come from one registry, `inspector_widget/surface.py` (the MCP
+schemas and the CLI flags, same names and defaults), over `inspector_widget/ops.py`: `capture`
+snapshots the app once into the on-disk store both surfaces share; the others query a stored
+capture without device I/O. `INSPECTOR_WIDGET_TOOLSET` (`legacy`, `capture`, `talkback`, `all`,
+or a comma list) picks what the MCP server lists; the default is `legacy,talkback` until the
+deliberate flip (WP S4), and every tool stays callable by name.
 
 Every subcommand routes through `inspector_widget.attach() -> Session` (the same facade the MCP
 uses); the older ones then drive `session.client` directly (works; their bodies are not yet shared

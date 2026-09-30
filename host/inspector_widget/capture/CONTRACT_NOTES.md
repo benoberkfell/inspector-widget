@@ -1155,3 +1155,131 @@ what now holds:
   findings while the adapter read Compose semantics (the unified lint closed it),
   and action `0x01020036` showed as `CUSTOM_0x01020036` (action-ids decodes it as
   `SHOW_ON_SCREEN`).
+
+## Ops (S1, `inspector_widget/ops.py`)
+
+- **Entry points.** One function per tool, `capture`, `captures`, `outline`, `find`,
+  `node`, `image`, `lint`, `diff`, each `fn(ctx, **args) -> dict`, raising `OpError`.
+  `ops.run(ctx, tool, args)` maps every exception to the error envelope
+  (`error_envelope`): `OpError` as it is; `adb.DeviceError` -> `no_session`;
+  `TransportError` (a lost session), `AdbError` and other `OSError` -> `device_lost`;
+  `AgentTimeoutError`, `ClientError` and `InjectionError` -> `agent_error`; anything
+  else is a bug and gets the code `internal` (outside the spec's vocabulary on
+  purpose: it is not the agent's fault).
+- **`OpContext(store, sessions, caller)`.** `sessions` is a `SessionProvider`:
+  `get(serial, package)`, `close_all()`, and optionally `live_pid(serial,
+  package)` (a cached session's pid, no device I/O) and `device(serial)` (`{dpi,
+  font_scale}`; else adb's, cached per context). `ops.AttachProvider` attaches with
+  `inspector_widget.attach` and disconnects at `close_all()` (never SHUTDOWN): the
+  CLI's provider and the tests'. The MCP server's wraps its session cache.
+  `caller` changes nothing in the responses: the CLI and the MCP get the same bytes.
+- **Session defaulting.** `device_lineage` (capture): explicit serial and package;
+  else the lineage of `diff_from`/`if_changed_since` when it names one capture;
+  else the store's default session (a lone serial or package must match it);
+  else `adb.resolve_serial` (honours `$ANDROID_SERIAL`) and the single running
+  debuggable app, `no_session` with candidates otherwise. `query_lineage` (every
+  other tool) stops before adb: explicit, the capture argument's lineage, the
+  default session; a lone serial or package picks the one lineage of the store
+  that matches (`ambiguous`, or `capture_not_found` when none); None resolves
+  across the whole store. `attach` (MCP and CLI) records the default session.
+- **Capture order** as above ("Capture order"), with the generation: the lineage
+  latest's `compose_generation` when the pid is the same, raised by
+  `OpContext.bump_generation` (the MCP's legacy `dump_compose(enable_inspection)`
+  calls it). The CLI cannot see a hot reload made by another process's legacy
+  tool; the carry-over's collection guard and locators are the fallback there.
+- **`diff_from`** is resolved before any device I/O, in terms of the new capture:
+  `prev` is today's `latest`, `latest~N` today's `latest~(N-1)`, `latest` itself is
+  `bad_args`. A diff that fails after the publish is reported inside `diff`
+  (`{a, error}`), never as a failed capture. **`if_changed_since`** that names no
+  capture (the first poll) captures.
+- **The capture summary** (spec 5.3), within `max_bytes` (3,000): `capture`,
+  `label`/`moved_from`, `pinned`, `session`, `pid`, `device`, `took_ms`,
+  `consistency`, `facets` (counts, or the status reason: `off`, `not populated
+  (...)`), `windows`, `lint`, `issues`, `warning` (slots=enable), `diagnostics` (at
+  most 3, 120 chars), `store` (memory-only), `note` (the session's), `diff`
+  (`{a, summary, lines<=10, issues?}`; empty issue deltas left out), then the
+  preview `outline` (depth 2, at most `outline_lines` lines and 800 B, 400 B next to
+  a diff), `on_screen` (the labelled TalkBack stops the preview does not show, in
+  reading order, at most 3), and `next`. Every cut list ends with `…N more: <call>`;
+  a budget below the header's size never drops the header.
+- **Staleness** on every query response, right after `capture` (after `b` in
+  diff): `age_s` over 120 s; `stale: "<latest> is newer (<dt>s)"` where dt is how
+  much later the lineage's latest was taken; `pid_changed: true` when the
+  provider's live pid, else the latest capture's pid, differs.
+- **Resolution details.** A `cursor` names its capture, which wins over the
+  default `capture="latest"`. `diff(a="prev")` is b's predecessor (`meta.prev`),
+  not the lineage's second newest. `node(refs=[x])` with one entry is `node(ref=x)`.
+  `node(image=true)` embeds `{path, px}` of the crop (or `{error}`).
+- **`captures`.** `list` shows the resolved session's lineage (all of the store
+  when none, or with `all=true`), newest first, and says how many captures of
+  other apps it hides; `show` is the meta (non-default options, facet statuses,
+  diagnostics, path); `label` with an empty label removes it; `export` writes
+  `out/{nodes.jsonl|nodes.json, views.json, compose.json, slots.json, a11y.json,
+  props.json, issues.jsonl, raw/...}` and returns the path (the `out/` directory
+  for several files), rows and bytes, never contents; `gc` summarizes the
+  store's gc (`all=true` wipes everything, the ref counter included).
+- **node() trim (C6).** node() leaves out `key` when its `ids` spell it
+  (`view:16` = `ids.view` 16, `sem:82:448` = `ids.sem`, `a11y:34:21` for an a11y-only
+  node); slot and `a11y:path:` keys stay.
+- **Measured** through `ops.run` over the harness fake adb and agent
+  (`tests/test_capture_budgets.py`, compact bytes; target in parentheses):
+  - launcher: capture 1,153 (2,500); capture with a diff 1,229; `outline()` 2,012
+    (2,500); `outline(root=@launcher_list)` 1,639 (2,000); `outline(view="slots")`
+    491 (6,000); `outline(view="reading")` 1,553 (2,000); `find(text="state",
+    flags=click)` 388 (600); `node(@launch_heading)` 1,295 (1,500); `lint()` 453
+    (1,200); `captures()` 259 (400); `image(ref)` 296 (400).
+  - View screen: capture 1,482; `outline()` 2,688 (3,000, all 40 Views);
+    `node(#badSwitch, props="nondefault")` 1,197 on a recapture (1,200); `lint()`
+    1,330 (14 findings).
+  - wide: capture 1,518 (3,000); outline pages <= 5,926 (6,000), exactly the 259
+    Views; `find(text="Label 4", limit=20)` 1,505 (3,000); `node(#view_47,
+    props="nondefault")` 800 (1,500).
+  - Workflows (tokens, spec section 8): W1 912 (1,100), W2 569 (1,100), W3 1,009
+    (1,200; 1,462 with the stand-in renderer), W4 1,982 (2,800), W6 1,266 (2,400),
+    W7 875 (1,600).
+
+## Surface (S2, `inspector_widget/surface.py`)
+
+- **One registry.** `SPECS` holds a `ToolSpec` per tool (`name`, `cli_name`,
+  `summary`, `params`, `fn` = the ops function, `read_only`, `toolsets`,
+  `description`, a human renderer). `json_schema(spec)` gives the MCP
+  inputSchema, `mcp_entries(toolset, context=, passthrough=)` the entries
+  `mcp_server.TOOLS` holds (with `surface` and, added by the server, `on_error`),
+  `add_cli(subparsers, context=)` the subcommands.
+- **Parameters.** A `Param` is on both surfaces unless allow-listed: `image.inline`
+  is MCP-only (the pixels ride as ImageContent), `image.out` and
+  `capture.build_out` are CLI-only. The CLI flag is `--kebab-name` with the MCP
+  default (booleans that default to true get `--x/--no-x`), plus aliases
+  (`-s -p -c`, `--scale`, `--count`, a repeatable `--rule`); `captures`'s action,
+  id and label, `node`'s refs, `image`'s ref and `diff`'s a/b are positionals. A
+  list parameter takes `a,b` on the CLI. `cli_args` passes only values that differ
+  from the default, so `inspector-widget outline` is exactly MCP `outline()`.
+- **Validation** (`validate`, stdlib, one place for every transport): unknown
+  names, types (a whole-number float is an int), enums, ranges and rule ids
+  (`rules.resolve`) raise `bad_args` with a hint describing the parameter; an
+  explicit null means the default; a comma string is accepted for a list. The MCP
+  server skips its own jsonschema check for these tools.
+- **Toolsets.** `INSPECTOR_WIDGET_TOOLSET` is a name or a comma list: `legacy`
+  (the 15), `capture` (the 4 session tools + the 8 = 12), `talkback` (4 + 3),
+  `all` (26). The default is `legacy,talkback`: exactly the 18 tools (and the
+  18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
+  logs a warning and lists the default. Every tool stays callable by name.
+  Measured tools/list (compact): default 18,337 B, capture 11,634 (12,000),
+  legacy 13,247, all 30,474 (the capture tools spend each parameter description
+  once; the instructions carry the rest).
+- **Instructions** (`instructions(listed)`, at most 900 B): the spec 5.13 text when
+  `capture` is listed, else a legacy text naming the toolset variable; plus a
+  TalkBack sentence when `tb_walk` is listed. Sent in initialize by the SDK 1.x
+  and 2.x servers (a Server without the parameter gets none) and the fallback.
+- **Running.** `execute(name, args, ctx, surface=, passthrough=)` returns a
+  `Result` (a dict, plus `images` and `is_error`); `run()` gives `(text, images,
+  is_error)`. `image(inline=true)` adds `inline_tokens` to the text and the PNG
+  (downscaled to `max_side`) as `(mime, base64)`. The MCP server passes
+  `SessionLostError` through so its retry applies: `capture` is repeated once on a
+  fresh attach unless `slots="enable"` (a hot reload is never repeated).
+- **CLI.** `--json` prints the MCP text byte for byte (`--pretty` indents it);
+  without it a human rendering (a header line, then the lines; `capture` prints
+  its id first, `-q` only the id; `image` prints the path). Errors print the same
+  JSON envelope to stderr, exit 1. The generated subcommands never resolve a
+  serial through adb themselves (queries do no device I/O) and close their
+  sessions without SHUTDOWN.
