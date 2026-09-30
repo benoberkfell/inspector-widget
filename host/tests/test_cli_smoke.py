@@ -62,12 +62,33 @@ def test_subcommand_resolves_a_func(argv, handler_name):
     )
 
 
+# The capture-and-walk subcommands, generated from inspector_widget.surface: each
+# resolves to the registry's runner for its tool (ns.surface_tool).
+_GENERATED = [
+    (["capture"], "capture"),
+    (["captures", "ls"], "captures"),
+    (["outline", "--view", "reading"], "outline"),
+    (["find", "--text", "x", "--flags", "click"], "find"),
+    (["node", "n1", "n2"], "node"),
+    (["image", "n1"], "image"),
+    (["lint", "--rule", "R1"], "lint"),
+    (["diff", "before"], "diff"),
+]
+
+
+@pytest.mark.parametrize("argv,tool", _GENERATED)
+def test_generated_subcommand_resolves_its_tool(argv, tool):
+    ns = cli.build_parser().parse_args(argv)
+    assert callable(ns.func) and ns.surface_tool == tool
+
+
 def test_every_registered_subcommand_is_covered():
-    """Every subparser the CLI registers has an entry in _SUBCOMMANDS, so a newly
-    added subcommand can't slip past this smoke test unparsed."""
+    """Every subparser the CLI registers has an entry in _SUBCOMMANDS (or
+    _GENERATED), so a newly added subcommand can't slip past this smoke test
+    unparsed."""
     parser = cli.build_parser()
     registered = _subparser_names(parser)
-    covered = {argv[0] for argv, _ in _SUBCOMMANDS}
+    covered = {argv[0] for argv, _ in _SUBCOMMANDS} | {argv[0] for argv, _ in _GENERATED}
     assert registered, "no subparsers registered on the parser"
     assert registered == covered, (
         f"subcommands not covered by the smoke test: {registered - covered}; "

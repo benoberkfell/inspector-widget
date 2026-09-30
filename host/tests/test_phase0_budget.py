@@ -159,4 +159,6 @@ def test_tools_list_stays_under_18500_bytes():
     tools = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     text = json.dumps(tools["result"], separators=(",", ":"), ensure_ascii=False)
     assert _size(text) <= 18_500, _size(text)
-    assert len(tools["result"]["tools"]) == len(mcp_server.TOOLS) == 18
+    # the default toolset lists the 15 legacy and 3 TalkBack tools; the 8
+    # capture-and-walk tools are registered too (callable by name) but not listed
+    assert len(tools["result"]["tools"]) == 18 and len(mcp_server.TOOLS) == 26

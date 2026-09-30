@@ -44,9 +44,16 @@ def _defaults(sub: argparse.ArgumentParser) -> dict:
 
 # --------------------------------------------------------------------------- params
 def test_every_mcp_tool_maps_to_a_subcommand():
+    """The legacy and TalkBack tools map through output.CLI_SUBCOMMANDS; the
+    capture-and-walk tools come from inspector_widget.surface, whose registry
+    generates both (test_surface.py checks their parameters)."""
+    from inspector_widget import surface
+
     subs = _subparsers()
-    assert set(output.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS)
-    for tool, sub in output.CLI_SUBCOMMANDS.items():
+    generated = {s.name: s.cli_name for s in surface.SPECS}
+    assert set(output.CLI_SUBCOMMANDS) | set(generated) == set(mcp_server.TOOLS)
+    assert not set(output.CLI_SUBCOMMANDS) & set(generated)
+    for tool, sub in {**output.CLI_SUBCOMMANDS, **generated}.items():
         assert sub in subs, (tool, sub)
 
 

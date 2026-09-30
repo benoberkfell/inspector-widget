@@ -18,13 +18,19 @@
 #      `notifications/initialized`) to drive the same tool surface.
 #
 # The host driver is the single source of truth for adb/injection/transport.
-# This module owns only: the 18 tool schemas (15 inspection tools + 3 TalkBack
-# tools), argument validation, per-(serial,package) session caching, and
+# This module owns only: the 18 legacy tool schemas (15 inspection tools + 3
+# TalkBack tools), argument validation, per-(serial,package) session caching, and
 # screenshot temp-file materialisation. Protobuf responses are shaped by the
-# package (strings, a11y, correlate, results); every tool result then leaves
-# through inspector_widget.output: compact JSON, brief by default
+# package (strings, a11y, correlate, results); every legacy tool result then
+# leaves through inspector_widget.output: compact JSON, brief by default
 # (detail="full" for the legacy content), and over max_bytes a spill envelope
 # plus a spill file (Phase 0 of docs/design/capture-and-walk.md).
+#
+# The 8 capture-and-walk tools (capture, captures, outline, find, node, image,
+# lint, diff) come from one registry, inspector_widget.surface, which also
+# generates the CLI subcommands; inspector_widget.ops implements them.
+# INSPECTOR_WIDGET_TOOLSET chooses what tools/list shows (default: the legacy
+# and TalkBack tools); every tool stays callable by name.
 #
 # See host/README.md for build + run + `claude mcp add` instructions.
 
@@ -541,6 +547,9 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
     note = _session_note(session)
     if note:
         result["note"] = note
+    _remember_session(serial, package)
+    if "capture" in _listed_tools():
+        result["next"] = ["capture()"]
     return result
 
 
@@ -699,6 +708,10 @@ def tool_dump_compose(
     serial = _serial(serial)
     from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
+    if enable_inspection:
+        # The hot reload re-mints semantics ids: the next capture must not carry
+        # refs by device id (even if this request fails after reaching the agent).
+        _note_hot_reload(serial, package, getattr(session, "pid", None))
     resp = session.dump_compose(include_semantics=include_semantics,
                                 include_slot_table=include_slot_table,
                                 enable_inspection=enable_inspection)
@@ -1668,17 +1681,22 @@ _NO_RETRY = frozenset({"attach", "detach", "talkback", "tb_walk", "tb_scenario"}
 
 # Tools that only read the app's state, so running one twice is harmless even if
 # the agent acted on the first request before the connection went. dump_compose
-# joins them unless enable_inspection hot-reloads the app (see _read_only).
+# joins them unless enable_inspection hot-reloads the app, and capture unless
+# slots="enable" does (see _read_only). The other capture-and-walk tools read
+# the store only.
 _READ_ONLY_TOOLS = frozenset({
     "list_devices", "list_processes", "dump_tree", "get_properties", "screenshot",
     "compose_overlay", "dump_accessibility", "a11y_lint", "a11y_overlay", "inspect",
     "inspect_node", "component_image",
+    "captures", "outline", "find", "node", "image", "lint", "diff",
 })
 
 
 def _read_only(name: str, args: Dict[str, Any]) -> bool:
     if name == "dump_compose":
         return not args.get("enable_inspection")
+    if name == "capture":
+        return args.get("slots") != "enable"
     return name in _READ_ONLY_TOOLS
 
 
@@ -1735,10 +1753,15 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _run_tool_call(name: str, entry: Dict[str, Any], args: Any,
                    call: _CallState) -> Dict[str, Any]:
-    """_run_tool's body, with ``call`` as this thread's call state."""
+    """_run_tool's body, with ``call`` as this thread's call state.
+
+    A capture-and-walk tool (an entry with ``on_error``) validates its own
+    arguments (bad_args) and reports every failure in its error envelope."""
+    on_error = entry.get("on_error")
     try:
         args = _normalize_arguments(entry["schema"], args)
-        _validate_arguments(name, entry["schema"], args)
+        if on_error is None:
+            _validate_arguments(name, entry["schema"], args)
         try:
             return entry["handler"](args)
         except _session_lost_error() as exc:
@@ -1751,8 +1774,13 @@ def _run_tool_call(name: str, entry: Dict[str, Any], args: Any,
             log.info("tool %s: %s; re-attaching and retrying once", name, exc)
             return entry["handler"](args)
     except ToolError as exc:
+        if on_error is not None:
+            return on_error(_session_lost_error()(str(exc)))  # closing / detached meanwhile
         return {"error": str(exc), "tool": name}
     except Exception as exc:  # never leak a stack trace through the transport
+        if on_error is not None:
+            log.warning("tool %s failed: %s", name, exc)
+            return on_error(exc)
         if _is_expected_error(exc):
             log.warning("tool %s failed: %s", name, exc)
         else:
@@ -1813,6 +1841,100 @@ def _is_expected_error(exc: BaseException) -> bool:
     except Exception:  # pragma: no cover - host package missing
         return False
     return isinstance(exc, (AdbError, DeviceError, ClientError, TransportError, InjectionError))
+
+
+# --------------------------------------------------------------------------- #
+# Capture and walk (inspector_widget.surface / ops): capture once, then query the
+# stored capture. One registry generates these tools and the CLI subcommands.
+# They are always registered (callable by name); INSPECTOR_WIDGET_TOOLSET picks
+# what tools/list shows (_listed_tools).
+# --------------------------------------------------------------------------- #
+try:
+    from inspector_widget import surface
+except Exception:  # pragma: no cover - depends on the host package
+    surface = None  # type: ignore[assignment]
+
+_TOOLSET_ENV = "INSPECTOR_WIDGET_TOOLSET"  # surface.ENV_TOOLSET
+_OPS: Optional[Any] = None
+_OPS_LOCK = threading.Lock()
+
+
+class _McpSessions:
+    """The ops layer's SessionProvider over this server's session cache."""
+
+    def get(self, serial: str, package: str) -> Any:
+        return SESSIONS.get_or_attach(serial, package)
+
+    def live_pid(self, serial: str, package: str) -> Optional[int]:
+        session = SESSIONS.peek(serial, package)
+        return getattr(session, "pid", None) if session is not None else None
+
+    def device(self, serial: str) -> Dict[str, Any]:
+        density, fscale = _a11y_device_metrics(serial)
+        return {"dpi": density, "font_scale": fscale}
+
+    def close_all(self) -> None:  # the server's exit cleanup owns the sessions
+        pass
+
+
+def _ops_context() -> Any:
+    """The capture store and session provider of this server, created on first use
+    (again when $INSPECTOR_WIDGET_CAPTURE_DIR or _PERSIST names another store)."""
+    global _OPS
+    from inspector_widget import ops
+    from inspector_widget.capture.model import default_store_root
+    from inspector_widget.capture.store import CaptureStore, env_persist
+    root, persist = default_store_root(), env_persist()
+    with _OPS_LOCK:
+        if _OPS is None or _OPS.store.configured_root != root or _OPS.store.persist != persist:
+            _OPS = ops.OpContext(CaptureStore(), _McpSessions(), "mcp")
+        return _OPS
+
+
+def _remember_session(serial: str, package: str) -> None:
+    """attach makes (serial, package) the default session of the capture tools."""
+    if surface is None:
+        return
+    try:
+        from inspector_widget import ops
+        ops.remember_session(_ops_context(), serial, package)
+    except Exception:  # noqa: BLE001 - a convenience, never a failure
+        log.debug("could not record the default session", exc_info=True)
+
+
+def _note_hot_reload(serial: str, package: str, pid: Optional[int]) -> None:
+    if surface is None:
+        return
+    with contextlib.suppress(Exception):
+        _ops_context().bump_generation(serial, package, pid)
+
+
+if surface is not None:
+    TOOLS.update({
+        name: dict(entry, on_error=surface.error_result)
+        for name, entry in surface.mcp_entries(
+            "all", context=_ops_context, passthrough=(_session_lost_error(),)).items()
+    })
+
+
+def _listed_tools() -> Dict[str, Dict[str, Any]]:
+    """The TOOLS entries tools/list shows: the INSPECTOR_WIDGET_TOOLSET toolset
+    (default: the 15 legacy tools and the TalkBack tools), in TOOLS order."""
+    if surface is None:
+        return dict(TOOLS)
+    try:
+        names = set(surface.toolset_names())
+    except ValueError as exc:
+        log.warning("%s; listing the default toolset", exc)
+        names = set(surface.toolset_names(surface.DEFAULT_TOOLSET))
+    return {name: entry for name, entry in TOOLS.items() if name in names}
+
+
+def _instructions() -> Optional[str]:
+    """The MCP ``instructions`` for the listed toolset (at most 900 B)."""
+    if surface is None:
+        return None
+    return surface.instructions(_listed_tools())
 
 
 # --------------------------------------------------------------------------- #
@@ -1951,21 +2073,33 @@ def _call_tool_text(name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
     ``_run_tool`` converts handler failures into a top-level ``{"error": ...}``
     dict rather than raising, so that key is what marks a failed call.
 
-    Every result leaves through the output layer (Phase 0): the brief rules of
-    ``output.slim`` unless ``detail="full"``, then ``output.finalize``, which
-    encodes compact JSON and, over ``max_bytes``, writes the result to a spill
-    file and returns the spill envelope instead. An unknown or ambiguous
-    ``root`` comes back from ``slim`` as an error.
+    Every legacy result leaves through the output layer (Phase 0): the brief
+    rules of ``output.slim`` unless ``detail="full"``, then ``output.finalize``,
+    which encodes compact JSON and, over ``max_bytes``, writes the result to a
+    spill file and returns the spill envelope instead. An unknown or ambiguous
+    ``root`` comes back from ``slim`` as an error. The capture-and-walk tools
+    budget their own responses and are only encoded (compact JSON).
     """
+    text, _images, is_error = _call_tool(name, arguments)
+    return text, is_error
+
+
+def _call_tool(name: str, arguments: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]], bool]:
+    """``(text, images, is_error)``: :func:`_call_tool_text` plus the images a
+    capture-and-walk tool returns beside its text (``image(inline=true)``), as
+    ``(mime, base64)`` pairs for MCP ImageContent."""
     try:
         args = {} if arguments is None else arguments
         result = _run_tool(name, args)
-        return _render_result(name, result, args)
+        if surface is not None and isinstance(result, surface.Result):
+            return result.text(), result.images, result.is_error
+        text, is_error = _render_result(name, result, args)
+        return text, [], is_error
     except (ToolError, HostUnavailableError) as exc:
-        return _compact({"error": str(exc)}), True
+        return _compact({"error": str(exc)}), [], True
     except Exception as exc:  # surfaced to the agent, not raised
         log.exception("tool %s failed", name)
-        return _compact({"error": f"{type(exc).__name__}: {exc}", "tool": name}), True
+        return _compact({"error": f"{type(exc).__name__}: {exc}", "tool": name}), [], True
 
 
 def _compact(obj: Any) -> str:
@@ -1975,6 +2109,8 @@ def _compact(obj: Any) -> str:
 def _render_result(name: str, result: Any, args: Any) -> Tuple[str, bool]:
     """``(text, is_error)`` for a tool's result dict and the arguments it was called
     with: errors as they are (compact), everything else slimmed and budgeted."""
+    if surface is not None and isinstance(result, surface.Result):
+        return result.text(), result.is_error
     failed = isinstance(result, dict) and "error" in result
     if failed or output is None:
         return _compact(result), failed
@@ -2016,16 +2152,30 @@ def _build_mcp_server() -> Any:
         return types.Tool(**kw)
 
     def tool_list() -> List[Any]:
-        return [tool(name, entry) for name, entry in TOOLS.items()]
+        return [tool(name, entry) for name, entry in _listed_tools().items()]
 
     async def run_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Any:
-        text, is_error = await asyncio.to_thread(_call_tool_text, name, arguments or {})
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=text)], isError=is_error
-        )
+        text, images, is_error = await asyncio.to_thread(_call_tool, name, arguments or {})
+        content = [types.TextContent(type="text", text=text)]
+        content += [types.ImageContent(type="image", data=data, mimeType=mime)
+                    for mime, data in images]
+        return types.CallToolResult(content=content, isError=is_error)
+
+    instructions = _instructions()
+
+    def new_server(**kw: Any) -> Any:
+        """Server(...) with the instructions, or without them on an SDK that has
+        no such parameter (they are also in each tool's description)."""
+        if instructions:
+            try:
+                return Server("inspector-widget", version=_SERVER_INFO["version"],
+                              instructions=instructions, **kw)
+            except TypeError:
+                pass
+        return Server("inspector-widget", version=_SERVER_INFO["version"], **kw)
 
     if hasattr(Server, "list_tools"):  # mcp 1.x decorator API
-        server = Server("inspector-widget", version=_SERVER_INFO["version"])
+        server = new_server()
 
         @server.list_tools()
         async def list_tools() -> List[Any]:  # type: ignore[misc]
@@ -2050,12 +2200,7 @@ def _build_mcp_server() -> Any:
     async def on_call_tool(ctx: Any, params: Any) -> Any:
         return await run_tool(params.name, params.arguments)
 
-    return Server(
-        "inspector-widget",
-        version=_SERVER_INFO["version"],
-        on_list_tools=on_list_tools,
-        on_call_tool=on_call_tool,
-    )
+    return new_server(on_list_tools=on_list_tools, on_call_tool=on_call_tool)
 
 
 def _serve_with_mcp() -> bool:
@@ -2130,14 +2275,15 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
         return _jsonrpc_result(req_id, {})
 
     if method == "initialize":
-        return _jsonrpc_result(
-            req_id,
-            {
-                "protocolVersion": _PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": _SERVER_INFO,
-            },
-        )
+        result = {
+            "protocolVersion": _PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": _SERVER_INFO,
+        }
+        instructions = _instructions()
+        if instructions:
+            result["instructions"] = instructions
+        return _jsonrpc_result(req_id, result)
 
     if method == "ping":
         return _jsonrpc_result(req_id, {})
@@ -2150,7 +2296,7 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
                 "inputSchema": entry["schema"],
                 **({"annotations": entry["annotations"]} if entry.get("annotations") else {}),
             }
-            for name, entry in TOOLS.items()
+            for name, entry in _listed_tools().items()
         ]
         return _jsonrpc_result(req_id, {"tools": tools})
 
@@ -2159,10 +2305,10 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(name, str):
             return _jsonrpc_error(req_id, -32602, "invalid params: 'name' must be a string")
         arguments = params.get("arguments")
-        text, is_error = _call_tool_text(name, {} if arguments is None else arguments)
-        return _jsonrpc_result(
-            req_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
-        )
+        text, images, is_error = _call_tool(name, {} if arguments is None else arguments)
+        content = [{"type": "text", "text": text}]
+        content += [{"type": "image", "data": data, "mimeType": mime} for mime, data in images]
+        return _jsonrpc_result(req_id, {"content": content, "isError": is_error})
 
     return _jsonrpc_error(req_id, -32601, f"method not found: {method}")
 
@@ -2208,7 +2354,14 @@ def _self_check() -> int:
     """
     failed = False
     print("Inspector Widget MCP server — self check")
-    print(f"  tools ({len(TOOLS)}): {', '.join(TOOLS)}")
+    listed = _listed_tools()
+    toolset = surface.active_toolset() if surface is not None else "all"
+    print(f"  toolset: {toolset} ({len(listed)} listed; set {_TOOLSET_ENV} = legacy, "
+          f"capture, talkback, all or a comma list)")
+    print(f"  tools ({len(listed)}): {', '.join(listed)}")
+    hidden = [name for name in TOOLS if name not in listed]
+    if hidden:
+        print(f"  not listed, callable by name ({len(hidden)}): {', '.join(hidden)}")
     try:
         HOST.host  # noqa: B018 - trigger import
         print("  inspector_widget: OK")
@@ -2378,8 +2531,9 @@ def _log_startup_health() -> None:
     mcp_sdk = _present("mcp")
     transport = "mcp-sdk" if mcp_sdk == "present" else "jsonrpc-fallback"
     log.info(
-        "Inspector Widget MCP starting: %d tools | host=%s proto=%s | "
-        "Pillow(overlays)=%s grpcio(SKP images)=%s mcp-sdk=%s | transport=%s",
+        "Inspector Widget MCP starting: %d tools listed (toolset %s), %d callable | host=%s "
+        "proto=%s | Pillow(overlays)=%s grpcio(SKP images)=%s mcp-sdk=%s | transport=%s",
+        len(_listed_tools()), surface.active_toolset() if surface is not None else "all",
         len(TOOLS), host_status, proto_status, pillow, grpcio, mcp_sdk, transport,
     )
     try:

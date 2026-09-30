@@ -625,7 +625,9 @@ def test_cli_subcommand_map_matches_the_real_cli_and_mcp():
     import cli
     import mcp_server
 
-    assert set(out.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS)
+    from inspector_widget import surface
+
+    assert set(out.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS) - set(surface.CAPTURE_TOOLS)
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     assert set(out.CLI_SUBCOMMANDS.values()) <= set(sub.choices)
@@ -636,18 +638,24 @@ def test_cli_subcommand_map_matches_the_real_cli_and_mcp():
         out.add_cli_flags(sp, tool)
 
 
-def test_tools_list_stays_within_budget():
+@pytest.mark.parametrize("toolset,limit", [
+    (None, 20000),               # the default listing: the legacy and TalkBack tools
+    ("legacy", 20000),
+    ("capture", 12000),          # spec section 7: the capture toolset's tools/list
+    ("capture,talkback", 20000),
+    ("all", 32000),
+])
+def test_tools_list_stays_within_budget(monkeypatch, toolset, limit):
     import mcp_server
 
-    tools = copy.deepcopy(mcp_server.TOOLS)
-    out.augment_schemas(tools)
-    listing = {"tools": [{"name": n, "description": e["description"], "inputSchema": e["schema"]}
+    if toolset is not None:
+        monkeypatch.setenv("INSPECTOR_WIDGET_TOOLSET", toolset)
+    tools = mcp_server._listed_tools()
+    listing = {"tools": [{"name": n, "description": e["description"], "inputSchema": e["schema"],
+                          **({"annotations": e["annotations"]} if e.get("annotations") else {})}
                          for n, e in tools.items()]}
-    # ~22,550 B for 18 tools today. The per-tool average is what keeps new tools honest.
-    # Once INSPECTOR_WIDGET_TOOLSET exists (capture-wiring S2), budget each toolset's listing
-    # separately (the default legacy listing stays <= 20,000 B); the average applies to every
-    # listing.
-    assert size(listing) <= 23000
+    # The per-tool average is what keeps new tools honest.
+    assert size(listing) <= limit, size(listing)
     assert size(listing) / len(listing["tools"]) <= 1300
 
 

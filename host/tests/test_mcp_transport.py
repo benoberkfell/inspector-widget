@@ -83,8 +83,14 @@ def _roundtrip(block_mcp: bool) -> dict:
 
 def _assert_protocol(by_id: dict) -> None:
     assert by_id[1]["result"]["serverInfo"]["name"] == "inspector-widget"
+    # the instructions (spec 5.13) go out in initialize, at most 900 B
+    instructions = by_id[1]["result"].get("instructions")
+    assert instructions == mcp_server._instructions()
+    assert 0 < len(instructions.encode("utf-8")) <= 900
     tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
-    assert set(tools) == set(mcp_server.TOOLS)
+    # the default toolset: every tool but the capture-and-walk ones (opt-in until S4)
+    assert set(tools) == set(mcp_server._listed_tools())
+    assert set(tools) == set(mcp_server.TOOLS) - set(mcp_server.surface.CAPTURE_TOOLS)
     # the Phase-0 output parameters are in the schemas the server really lists
     props = tools["dump_tree"]["inputSchema"]["properties"]
     assert {"detail", "max_bytes", "max_depth", "root"} <= set(props)
@@ -115,8 +121,9 @@ def test_build_server_with_mcp2_handler_api(monkeypatch):
     )
 
     class Server2:  # 2.x: no list_tools/call_tool decorators
-        def __init__(self, name, *, version="", on_list_tools=None, on_call_tool=None):
-            self.name, self.version = name, version
+        def __init__(self, name, *, version="", instructions=None, on_list_tools=None,
+                     on_call_tool=None):
+            self.name, self.version, self.instructions = name, version, instructions
             self.on_list_tools, self.on_call_tool = on_list_tools, on_call_tool
 
     mcp_pkg = types.ModuleType("mcp")
@@ -129,9 +136,10 @@ def test_build_server_with_mcp2_handler_api(monkeypatch):
 
     server = mcp_server._build_mcp_server()
     assert isinstance(server, Server2)
+    assert server.instructions == mcp_server._instructions()
 
     listed = asyncio.run(server.on_list_tools(None, None))
-    assert {t.name for t in listed.tools} == set(mcp_server.TOOLS)
+    assert {t.name for t in listed.tools} == set(mcp_server._listed_tools())
 
     params = types.SimpleNamespace(name="no_such_tool", arguments=None)
     result = asyncio.run(server.on_call_tool(None, params))

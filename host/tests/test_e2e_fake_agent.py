@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 import fakeagent
+import test_e2e_capture as cap_tests  # capture and walk, both surfaces (not re-collected)
 import test_tb_walk as tb_tests  # the TalkBack tools' e2e tests (a module: not re-collected)
 from fakeagent import DEFAULT_PACKAGE as PKG
 from fakeagent import DEFAULT_PID as PID
@@ -685,6 +686,9 @@ CLI_SUBCOMMAND_TESTS = {
     "talkback": tb_tests.test_cli_talkback_round_trip,
     "tb-walk": tb_tests.test_cli_tb_walk_and_scenario,
     "tb-scenario": tb_tests.test_cli_tb_walk_and_scenario,
+    # capture and walk (tests/test_e2e_capture.py runs them with the MCP server)
+    **{name: cap_tests.test_capture_and_walk_through_the_mcp_server_and_the_cli
+       for name in ("capture", "captures", "outline", "find", "node", "image", "lint", "diff")},
 }
 
 
@@ -1001,6 +1005,8 @@ MCP_TOOL_TESTS = {
     "tb_walk": tb_tests.test_mcp_tb_walk_and_scenario,
     "tb_scenario": tb_tests.test_mcp_tb_walk_and_scenario,
     "detach": test_mcp_detach,
+    **{name: cap_tests.test_capture_and_walk_through_the_mcp_server_and_the_cli
+       for name in ("capture", "captures", "outline", "find", "node", "image", "lint", "diff")},
 }
 
 

@@ -12,6 +12,14 @@ Subcommands (``inspector-widget --help`` lists all of them):
   tb-scenario focus-after|restore|survive  where TalkBack focus goes after an action
   detach     --serial --package  stop a running agent (never injects one)
 
+Capture and walk (the same registry as the MCP tools, inspector_widget.surface):
+  capture    snapshot the app once into the capture store (prints its id)
+  captures   list | show | pin | unpin | label | rm | export | gc
+  outline / find / node / image / lint / diff   query a stored capture (no device I/O)
+These take ``-s/--serial`` and ``-p/--package`` optionally (the last session,
+else the only running debuggable app) and ``-c/--capture`` (latest by default);
+``--json`` prints exactly the MCP tool's text.
+
 ``--serial`` defaults to ``$ANDROID_SERIAL``, else the only attached device.
 Every subcommand except ``detach`` leaves the agent running when it exits, so
 the next run reconnects warm; ``--force`` stops it and injects a fresh one.
@@ -42,11 +50,13 @@ if _HERE not in sys.path:
 import inspector_widget as iw  # noqa: E402
 from inspector_widget import adb  # noqa: E402
 from inspector_widget import inject  # noqa: E402
+from inspector_widget import ops  # noqa: E402
 from inspector_widget import output  # noqa: E402
 from inspector_widget import png as pngmod  # noqa: E402
 from inspector_widget import results  # noqa: E402
 from inspector_widget.client import AgentTimeoutError  # noqa: E402
 from inspector_widget import strings as stringsmod  # noqa: E402
+from inspector_widget import surface  # noqa: E402
 
 DEFAULT_PACKAGE = "com.oberkfell.a11yprobe"
 
@@ -136,8 +146,17 @@ def _write_overlay(shot, render, fallback_scale):
         _remove_quietly(base)
 
 
+def _capture_context(args):
+    """The capture store and session provider of one CLI run: attaches with
+    inspector_widget.attach and closes (never SHUTDOWN) when the subcommand ends."""
+    from inspector_widget.capture.store import CaptureStore
+    return ops.OpContext(CaptureStore(), ops.AttachProvider(
+        build_out=getattr(args, "build_out", None)), "cli")
+
+
 def cmd_attach(args) -> int:
     with _session(args) as session:
+        ops.remember_session(_capture_context(args), args.serial, args.package)
         info = session.info()
         warm = " (warm/reused)" if info["warm"] else ""
         build = f" (build {info['build_id'][:12]})" if info.get("build_id") else ""
@@ -858,6 +877,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--build-out", metavar="DIR", default=None, help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_detach)
 
+    # Capture and walk: generated from the same registry as the MCP tools
+    # (inspector_widget.surface), with the same parameter names and defaults.
+    surface.add_cli(sub, context=_capture_context)
+
     return p
 
 
@@ -874,6 +897,8 @@ def main(argv=None) -> int:
 
 def _run(args) -> int:
     try:
+        if getattr(args, "surface_tool", None):
+            return args.func(args)  # resolves its own session (queries never call adb)
         if hasattr(args, "serial"):
             args.serial = adb.resolve_serial(args.serial)
         return args.func(args)

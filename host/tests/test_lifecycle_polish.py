@@ -245,9 +245,13 @@ def test_retry_policy_table():
     assert refusal("dump_compose", {"enable_inspection": True}, not_sent, call) is None
     for tool in ("attach", "detach"):
         assert refusal(tool, {}, not_sent, call) is not None
+    # capture reads the app, unless slots="enable" hot-reloads it first
+    assert refusal("capture", {}, lost, call) is None
+    assert refusal("capture", {"slots": "enable"}, lost, call) is not None
+    assert refusal("capture", {"slots": "enable"}, not_sent, call) is None
     # Every tool is classified: read-only, or one that is not simply repeated.
     unlisted = set(mcp_server.TOOLS) - mcp_server._READ_ONLY_TOOLS - mcp_server._NO_RETRY
-    assert unlisted == {"dump_compose"}
+    assert unlisted == {"dump_compose", "capture"}
 
 
 # =========================================================================== #

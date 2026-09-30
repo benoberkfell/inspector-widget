@@ -187,6 +187,7 @@ _INJECTING = [
     ["get-properties", "--view-id", "5"],
     ["tb-walk"],
     ["tb-scenario", "survive"],
+    ["capture", "--package", "p"],
 ]
 
 
@@ -208,14 +209,17 @@ def test_cli_without_flag_uses_env(monkeypatch, tmp_path, argv):
 
 
 def test_every_injecting_subcommand_is_covered():
-    """devices/packages/detach/talkback never inject; every other subcommand must take --build-out.
+    """devices/packages/detach/talkback and the capture queries never inject; every
+    other subcommand must take --build-out.
 
     detach still accepts --build-out (older scripts pass it), but hides it from
     --help: it would be a no-op.
     """
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
-    never_inject = ("devices", "packages", "detach", "talkback")
+    never_inject = ("devices", "packages", "detach", "talkback",
+                    # the capture-and-walk queries read the store only
+                    "captures", "outline", "find", "node", "image", "lint", "diff")
     injecting = {name for name in sub.choices if name not in never_inject}
     assert injecting == {argv[0] for argv in _INJECTING}
     for name in injecting:
