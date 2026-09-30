@@ -98,9 +98,10 @@ Run two tools:
   `[{order, key, speak}]`, one entry per focus stop with what TalkBack
   announces there, e.g. `"Delete, button"` or `"Unlabeled, checkbox, not
   checked"`), built from the accessibility child order plus
-  `traversalBefore`/`traversalAfter`; `reading_order_diagnostics` reports
-  cycles and dangling targets. Read this to understand what gets announced and
-  in what order. Every node has a `node_key` you can pass to `inspect_node`.
+  `traversalBefore`/`traversalAfter` (`reading_order_diagnostics` reports
+  cycles and dangling targets); every node has a `node_key` you can pass to
+  `inspect_node`. Read this to
+  understand what gets announced and in what order.
 - **`a11y_lint(serial, package)`** — the rule engine. Returns `findings[]`, each
   with a `rule` id, `severity` (`error` | `warn` | `info`), the `node`
   (`{id, name, role, source}`), `bounds` (px) and `bounds_dp` (dp), a
@@ -144,14 +145,9 @@ For each finding you intend to fix, call **`inspect_node`** to get the full
 element dossier. Select the node by whichever id you have from the lint /
 overlay / a11y dump:
 
-- `node_key` — `"view:<uniqueDrawingId>"`, `"compose:<acvId>:<semanticsId>"`
-  (the ComposeView's id + the semantics id; every ComposeView, e.g. each
-  RecyclerView cell, is its own id space) or `"composeview:<acvId>"`. Compose
-  keys change when the UI recomposes; a key from an earlier dump is
-  re-resolved where possible (the dossier then has `resolved_from`).
+- `node_key` — `"view:<uniqueDrawingId>"` or `"compose:<semanticsId>"`
 - `view_id` — a View's `uniqueDrawingId`
-- `semantics_id` — a Compose node's semantics id (only when a single
-  ComposeView uses it; otherwise the error lists the `compose:<acv>:<id>` keys)
+- `semantics_id` — a Compose node's semantics id
 - `bounds` — `{x, y, w, h}` in screen px (resolves to the deepest covering
   element; handy straight from a finding's `bounds`)
 

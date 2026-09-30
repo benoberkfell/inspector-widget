@@ -319,13 +319,11 @@ def cmd_a11y_lint(args) -> int:
             shot2 = client.screenshot(root_id=0, scale=args.scale)
             base = args.overlay + ".base.png"
             pngmod.write_png(shot2.screenshot, base)
-            ov = ovmod.render_a11y_overlay(base, data, args.overlay,
-                                           findings=[f.to_dict() for f in findings],
-                                           scale=(float(shot2.screenshot.scale) or args.scale))
+            ovmod.render_a11y_overlay(base, data, args.overlay,
+                                      findings=[f.to_dict() for f in findings],
+                                      scale=(float(shot2.screenshot.scale) or args.scale))
             os.remove(base)
-            print(f"wrote a11y-lint overlay -> {args.overlay} ({ov['boxes']} boxes, "
-                  f"{ov['flagged']} flagged, {ov['flagged_by_bounds']} by finding bounds)",
-                  file=sys.stderr)
+            print(f"wrote a11y-lint overlay -> {args.overlay}", file=sys.stderr)
     finally:
         inj.close()
     return 0

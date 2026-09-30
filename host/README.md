@@ -188,13 +188,32 @@ files and the **path** is returned (the image is not inlined).
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
 | `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
 | `compose_overlay` | `serial`, `package`, `scale=1.0`, `all_boxes=false` | `{path, boxes, …}` — screenshot with every on-screen Compose element boxed (text/role + bounds) + a flat on-screen text list |
-| `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, a `node_key` per node, plus the host-computed TalkBack `focus_order` (`[{order, key, speak}]`) and `reading_order_diagnostics` |
+| `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` |
 | `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]` | `{summary, findings:[{rule, severity, node, bounds, bounds_dp, message, evidence}], density, font_scale, …}` — the detect/verify engine; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
 | `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — screenshot with every a11y node boxed + speakable label + reading-order number, colored by severity |
 | `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation; can render the integrated overlay |
 | `inspect_node` | `serial`, `package`, one of `node_key` (`view:<id>` \| `compose:<acvId>:<semanticsId>` \| `composeview:<acvId>`) \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, generation, where, context, view?, compose?, a11y?, list_item?, component_image{path}, lint[]}` — `compose` carries source `file:line` + modifiers, `view` typed properties, `lint` the element-focused findings |
 | `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source}` — cropped PNG of one element (`source`: `skp` \| `bitmap_crop`) |
 | `detach` | `serial`, `package` | `{detached}` — shuts down the agent session, drops the cache |
+
+### Node keys and reading order
+
+- Node keys: `view:<uniqueDrawingId>` for Views, `compose:<acvId>:<semanticsId>` for
+  Compose nodes (every AndroidComposeView — each RecyclerView cell, each ComposeView
+  nested in an AndroidView — is its own id space), `composeview:<acvId>` for a Compose
+  window's root, `virtual:<hostId>:<virtualId>` for other providers' virtual nodes.
+  `inspect` / `dump_accessibility` hand them out; `inspect_node` / `component_image`
+  take them. A bare `compose:<semanticsId>` (or `semantics_id`) is accepted only when
+  one ComposeView has that id. Compose re-mints ids on recomposition: `inspect`'s
+  `summary.generation` changes when that happens, and a key from an earlier dump is
+  re-resolved by ComposeView, test tag, label, list row and bounds (the dossier then
+  carries `resolved_from`).
+- `dump_accessibility` gives every node a `node_key` and returns `focus_order` as
+  `[{order, key, id, speak}]`: one entry per TalkBack focus stop with what TalkBack
+  announces there (`"Delete, button"`, `"Unlabeled, checkbox, not checked"`), built
+  from the accessibility child order plus `traversal_before`/`traversal_after` applied
+  across the whole tree. `reading_order_diagnostics` reports constraint cycles, targets
+  missing from the dump, and linkage ids in the wrong key space.
 
 ### Node shape (`dump_tree`)
 
