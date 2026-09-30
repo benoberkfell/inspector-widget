@@ -332,6 +332,8 @@ def a11y_node_to_dict(node: "pb.A11yNode", resolver: StringResolver) -> Dict[str
         # once it knows which hosts are Compose providers.
         "node_key": (_typed_key(node.host_view_id, node.virtual_id, compose=False)
                      if node.host_view_id else None),
+        # A negative size (a node clipped out of its parent, from an agent that
+        # doesn't clamp getBoundsInScreen) arrives as 0 with "clipped": true.
         "bounds": _bounds_to_dict(node.bounds),
     }
 

@@ -253,7 +253,9 @@ Each `ViewNode` JSON object:
   `view_id` to `get_properties`.**
 - `class_name`, `package_name` — simple class name + package.
 - `bounds` — absolute on-screen `{x, y, w, h}` in px; plus `render_quad`
-  (four `[x,y]` corners) when the view is rotated/scaled/skewed.
+  (four `[x,y]` corners) when the view is rotated/scaled/skewed. A negative
+  size from the agent (an accessibility node clipped out of its parent, e.g.
+  an off-screen pager page) is clamped to 0 and marked `clipped: true`.
 - `resource` — the view's own `@id`, as `{type, namespace, name, ref}` where
   `ref` is e.g. `"@id/my_button"`.
 - `layout_resource` — the layout file that inflated it, if known.

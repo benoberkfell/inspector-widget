@@ -69,7 +69,15 @@ def _quad_to_dict(quad: "pb.Quad") -> Dict[str, int]:
 
 
 def _bounds_to_dict(bounds: "pb.Bounds") -> Dict[str, Any]:
-    out: Dict[str, Any] = {"layout": _rect_to_dict(bounds.layout)}
+    layout = _rect_to_dict(bounds.layout)
+    out: Dict[str, Any] = {"layout": layout}
+    if layout["w"] < 0 or layout["h"] < 0:
+        # getBoundsInScreen clips a node that is scrolled or paged out of its
+        # parent with an unchecked intersect, so an agent that reports it as is
+        # sends right < left (w -264 for an off-screen ViewPager2 page, say).
+        # Such a node has no visible area: size 0, and flagged.
+        layout["w"], layout["h"] = max(0, layout["w"]), max(0, layout["h"])
+        out["clipped"] = True
     # render Quad is present only for transformed views.
     if bounds.HasField("render"):
         out["render"] = _quad_to_dict(bounds.render)

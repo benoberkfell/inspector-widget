@@ -175,3 +175,16 @@ def test_a11y_to_dict_resolves_text_ids(strings_builder):
     assert root["speakable"] == "Close"
     assert root["class_name"] == "android.widget.ImageButton"
     assert "clickable" in root["flags"]
+
+
+def test_negative_sizes_are_clamped_and_flagged_for_views_and_compose(strings_builder):
+    sb = strings_builder
+    view = make_view_node(sb, node_id=5, class_name="FrameLayout", bounds=(10, 20, -5, 30))
+    fine = make_view_node(sb, node_id=6, class_name="FrameLayout", bounds=(10, 20, 5, 30))
+    comp = make_compose_node(sb, node_id=7, name="Box", bounds=(0, 0, 50, -1))
+    resolver = st.StringResolver(sb.build())
+    assert st.node_to_dict(view, resolver)["bounds"] == {
+        "layout": {"x": 10, "y": 20, "w": 0, "h": 30}, "clipped": True}
+    assert "clipped" not in st.node_to_dict(fine, resolver)["bounds"]
+    assert st.compose_node_to_dict(comp, resolver)["bounds"] == {
+        "layout": {"x": 0, "y": 0, "w": 50, "h": 0}, "clipped": True}
