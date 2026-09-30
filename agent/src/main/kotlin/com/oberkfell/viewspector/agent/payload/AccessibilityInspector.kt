@@ -71,8 +71,10 @@ object AccessibilityInspector {
 
     private const val TAG = "ViewSpector"
 
-    // Loop / fan-out guards.
-    private const val MAX_DEPTH = 250
+    // Loop / fan-out guards. walk() depth is 0-based, so MAX_DEPTH = cap - 1 sends at most
+    // WireLimits.MAX_TREE_DEPTH levels (deeper, the host can't parse the response at all);
+    // a node at the cap with children is flagged children_truncated.
+    private const val MAX_DEPTH = WireLimits.MAX_TREE_DEPTH - 1
     private const val MAX_NODES = 5000
     private const val VIEW_MAX_DEPTH = 400
 
@@ -183,6 +185,7 @@ object AccessibilityInspector {
         var nullChildren = 0
         var unenumerable = 0
         var reflectFailures = 0
+        var depthTruncated = 0
         val loggedFailures = HashSet<String>()
         val composeIndex = HashMap<View, ComposeInspector.SemanticsIndex?>()
 
@@ -310,6 +313,13 @@ object AccessibilityInspector {
         if (ctx.nullChildren > 0) diag.append("; null-children=${ctx.nullChildren}")
         if (ctx.unenumerable > 0) diag.append("; provider-children-unreachable=${ctx.unenumerable}")
         if (ctx.reflectFailures > 0) diag.append("; reflect-failures=${ctx.reflectFailures}")
+        if (ctx.depthTruncated > 0) {
+            diag.append(
+                "; depth-truncated=${ctx.depthTruncated} (children below " +
+                    "${WireLimits.MAX_TREE_DEPTH} levels not sent)",
+            )
+        }
+        if (ctx.count >= ctx.maxNodes) diag.append("; node-cap=${ctx.maxNodes} reached (later nodes not sent)")
         return windows to diag.toString()
     }
 
@@ -327,7 +337,7 @@ object AccessibilityInspector {
     private fun connectionOffset(hostNode: AccessibilityNodeInfo, ctx: Ctx): Pair<Int, Int> {
         return try {
             for (i in 0 until hostNode.childCount) {
-                val child = hostNode.getChild(i) ?: continue
+                val child = childOf(hostNode, i) ?: continue
                 val packed = sourceNodeId(child, ctx) ?: continue
                 if (A11yIds.isUndefined(packed) || A11yIds.virtualIdOf(packed) != HOST_VIEW_ID) continue
                 val view = viewFor(A11yIds.accessibilityViewIdOf(packed), ctx) ?: continue
@@ -620,7 +630,7 @@ object AccessibilityInspector {
                             resolveLocal(childIds[i], ctx)
                         } else {
                             try {
-                                node.getChild(i)
+                                childOf(node, i)
                             } catch (t: Throwable) {
                                 // A throwing / transiently-detached child is skipped.
                                 null
@@ -634,6 +644,11 @@ object AccessibilityInspector {
                     b.addChildren(walk(child, identify(child, childId, ctx), ctx, depth + 1, local))
                 }
             }
+        }
+        if (depth >= ctx.maxDepth && safeInt { node.childCount } > 0) {
+            // The depth cap (the wire cap for a dump): this node's children were not walked.
+            b.childrenTruncated = true
+            ctx.depthTruncated++
         }
         return b.build()
     }
@@ -703,7 +718,7 @@ object AccessibilityInspector {
         fun s(cs: CharSequence?): Int = strings.intern(cs?.toString())
 
         // --- text & description ------------------------------------------------
-        b.text = s(safe { node.text })
+        b.text = s(safe { a11yText(node) })
         b.contentDescription = s(safe { node.contentDescription })
         b.hintText = s(safe { node.hintText })
         b.stateDescription = s(safe { node.stateDescription })
@@ -728,12 +743,19 @@ object AccessibilityInspector {
             node.getBoundsInScreen(r)
         } catch (_: Throwable) {
         }
+        // A node clipped away by an ancestor (an off-screen pager page, a row scrolled out
+        // of its list) comes back inverted: View.getBoundsOnScreen clamps each edge to every
+        // parent separately, so right < left or bottom < top (seen: h=-2159). Clamp the size
+        // to 0 (a zero-area node) and flag it rather than send a negative extent.
+        val clipped = r.right < r.left || r.bottom < r.top
         b.bounds = ViewInspection.Bounds.newBuilder()
             .setLayout(
                 ViewInspection.Rect.newBuilder()
-                    .setX(r.left).setY(r.top).setW(r.width()).setH(r.height()),
+                    .setX(r.left).setY(r.top)
+                    .setW(maxOf(0, r.width())).setH(maxOf(0, r.height())),
             )
             .build()
+        if (clipped) b.boundsClipped = true
 
         // --- boolean state flags ----------------------------------------------
         b.clickable = bool { node.isClickable }
@@ -1044,6 +1066,30 @@ object AccessibilityInspector {
         }
 
     // ------------------------------------------------------------ guard helpers
+
+    /**
+     * Child [i] of a connection-backed node, fetched without prefetching on API 33+
+     * (getChild(int, int) with strategy 0). Plain getChild asks the interaction controller
+     * to prefetch up to 50 descendants per call; the in-process connection has no cache to
+     * keep them in and the walk fetches every node itself anyway, so that was main-thread
+     * work thrown away on every node.
+     */
+    private fun childOf(node: AccessibilityNodeInfo, i: Int): AccessibilityNodeInfo? =
+        if (Build.VERSION.SDK_INT >= 33) node.getChild(i, 0) else node.getChild(i)
+
+    /**
+     * The node's text, masked (Redaction.kt) for a password field: the node says so
+     * (isPassword) or its input type is a password variation (a visible-password field is
+     * not isPassword, yet its text is the plaintext). A node showing its hint keeps it.
+     */
+    private fun a11yText(node: AccessibilityNodeInfo): CharSequence? {
+        val text = node.text
+        if (text.isNullOrEmpty()) return text
+        val secret = bool { node.isPassword } ||
+            Redaction.isPasswordInputType(safeInt { node.inputType })
+        if (!secret || bool { node.isShowingHintText }) return text
+        return Redaction.mask(text)
+    }
 
     private inline fun <T> safe(block: () -> T): T? = try {
         block()

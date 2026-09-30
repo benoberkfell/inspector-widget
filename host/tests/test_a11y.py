@@ -55,6 +55,20 @@ def test_a11y_node_to_dict_decodes_actions(strings_builder):
     assert out["actions"][2]["label"] == "Archive"
 
 
+def test_a11y_node_to_dict_surfaces_clipped_bounds(strings_builder):
+    # The agent clamps an inverted boundsInScreen (a node clipped away by an ancestor)
+    # to zero size and sets bounds_clipped; the dict keeps the zero size and the flag.
+    sb = strings_builder
+    node = make_a11y_node(
+        sb, host_view_id=1, virtual_id=-1, bounds=(0, 2856, 1080, 0),
+        text="Skip episode", bool_flags=["bounds_clipped", "clickable"],
+    )
+    from inspector_widget import strings as st
+    out = a11y.a11y_node_to_dict(node, st.StringResolver(sb.build()))
+    assert out["bounds"]["layout"]["h"] == 0
+    assert "bounds_clipped" in out["flags"]
+
+
 def test_a11y_node_to_dict_int_enum_decode(strings_builder):
     sb = strings_builder
     node = make_a11y_node(
