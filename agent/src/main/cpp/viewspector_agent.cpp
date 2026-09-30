@@ -137,16 +137,25 @@ jvmtiEnv* CreateJvmtiEnv(JavaVM* vm) {
   return jvmti;
 }
 
+// How bad a JVMTI error is for the install: kFatal ones abort it (logged at
+// E), kRecoverable ones are worked around (logged at W). The host reads the
+// agent's E lines while it waits for the socket and fails the attach on a
+// fatal one, so a recoverable error must never be logged at E.
+enum class JvmtiSeverity { kFatal, kRecoverable };
+
 // Logs and returns true when err is not JVMTI_ERROR_NONE. Mirrors
 // profiler::CheckJvmtiError in jvmti_helper.cc:47.
-bool CheckJvmtiError(jvmtiEnv* jvmti, jvmtiError err, const char* what) {
+bool CheckJvmtiError(jvmtiEnv* jvmti, jvmtiError err, const char* what,
+                     JvmtiSeverity severity) {
   if (err == JVMTI_ERROR_NONE) {
     return false;
   }
   char* name = nullptr;
   jvmti->GetErrorName(err, &name);
-  VS_LOGE("JVMTI error %d(%s) during %s", err,
-          name == nullptr ? "Unknown" : name, what);
+  const int priority = severity == JvmtiSeverity::kFatal ? ANDROID_LOG_ERROR
+                                                          : ANDROID_LOG_WARN;
+  __android_log_print(priority, kLogTag, "JVMTI error %d(%s) during %s", err,
+                      name == nullptr ? "Unknown" : name, what);
   if (name != nullptr) {
     jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
   }
@@ -162,11 +171,11 @@ bool AddPotentialCapabilities(jvmtiEnv* jvmti) {
   jvmtiCapabilities caps;
   std::memset(&caps, 0, sizeof(caps));
   if (CheckJvmtiError(jvmti, jvmti->GetPotentialCapabilities(&caps),
-                      "GetPotentialCapabilities")) {
+                      "GetPotentialCapabilities", JvmtiSeverity::kRecoverable)) {
     return false;
   }
   return !CheckJvmtiError(jvmti, jvmti->AddCapabilities(&caps),
-                          "AddCapabilities");
+                          "AddCapabilities", JvmtiSeverity::kRecoverable);
 }
 
 // ------------------------------------------------ hidden-api enforcement
@@ -183,7 +192,7 @@ HiddenApiResult DisableHiddenApiEnforcement(jvmtiEnv* jvmti) {
   jint count = 0;
   jvmtiExtensionFunctionInfo* extensions = nullptr;
   if (CheckJvmtiError(jvmti, jvmti->GetExtensionFunctions(&count, &extensions),
-                      "GetExtensionFunctions") ||
+                      "GetExtensionFunctions", JvmtiSeverity::kRecoverable) ||
       extensions == nullptr) {
     VS_LOGW("Hidden-API extension functions unavailable; continuing");
     return HiddenApiResult::kUnavailable;
@@ -203,7 +212,8 @@ HiddenApiResult DisableHiddenApiEnforcement(jvmtiEnv* jvmti) {
   HiddenApiResult result = HiddenApiResult::kUnavailable;
   if (disable_fn != nullptr) {
     const jvmtiError err = disable_fn(jvmti);
-    if (!CheckJvmtiError(jvmti, err, "disable_hidden_api_enforcement_policy")) {
+    if (!CheckJvmtiError(jvmti, err, "disable_hidden_api_enforcement_policy",
+                         JvmtiSeverity::kRecoverable)) {
       VS_LOGI("Hidden-API enforcement disabled for this process");
       result = HiddenApiResult::kDisabled;
     } else {
@@ -287,7 +297,8 @@ struct JvmtiEnvDisposer {
   jvmtiEnv* jvmti;
   void Dispose() {
     if (jvmti == nullptr) return;
-    CheckJvmtiError(jvmti, jvmti->DisposeEnvironment(), "DisposeEnvironment");
+    CheckJvmtiError(jvmti, jvmti->DisposeEnvironment(), "DisposeEnvironment",
+                    JvmtiSeverity::kRecoverable);
     jvmti = nullptr;
   }
   ~JvmtiEnvDisposer() { Dispose(); }
@@ -360,7 +371,7 @@ jint InstallAgent(JavaVM* vm, char* options) {
             jvmti,
             jvmti->AddToBootstrapClassLoaderSearch(
                 parsed.bootstrap_dex_path.c_str()),
-            "AddToBootstrapClassLoaderSearch")) {
+            "AddToBootstrapClassLoaderSearch", JvmtiSeverity::kFatal)) {
       return JNI_ERR;
     }
   }
