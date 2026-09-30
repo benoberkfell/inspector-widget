@@ -63,6 +63,20 @@ def test_dump_tree_to_dict_resolves_ids(strings_builder):
     assert c0["class_name"] == "TextView"
 
 
+def test_dump_tree_to_dict_flags_redacted_password_text(strings_builder):
+    # The agent masks a password field's text (one U+2022 per character) and sets
+    # TEXT_REDACTED; the dict keeps the mask and names the flag.
+    sb = strings_builder
+    field = make_view_node(
+        sb, node_id=7, class_name="EditText", package_name="android.widget",
+        text="\u2022" * 7, flags=pb.ViewNode.TEXT_REDACTED,
+    )
+    out = st.dump_tree_to_dict(pb.DumpTreeResponse(roots=[field], strings=sb.build()))
+    r0 = out["roots"][0]
+    assert r0["text"] == "\u2022" * 7
+    assert r0["flags"] == ["TEXT_REDACTED"]
+
+
 def test_dump_tree_to_dict_screenshot_summary(strings_builder):
     sb = strings_builder
     root = make_view_node(sb, node_id=1, class_name="View")
@@ -194,3 +208,16 @@ def test_a11y_to_dict_resolves_text_ids(strings_builder):
     assert root["speakable"] == "Close"
     assert root["class_name"] == "android.widget.ImageButton"
     assert "clickable" in root["flags"]
+
+
+def test_negative_sizes_are_clamped_and_flagged_for_views_and_compose(strings_builder):
+    sb = strings_builder
+    view = make_view_node(sb, node_id=5, class_name="FrameLayout", bounds=(10, 20, -5, 30))
+    fine = make_view_node(sb, node_id=6, class_name="FrameLayout", bounds=(10, 20, 5, 30))
+    comp = make_compose_node(sb, node_id=7, name="Box", bounds=(0, 0, 50, -1))
+    resolver = st.StringResolver(sb.build())
+    assert st.node_to_dict(view, resolver)["bounds"] == {
+        "layout": {"x": 10, "y": 20, "w": 0, "h": 30}, "clipped": True}
+    assert "clipped" not in st.node_to_dict(fine, resolver)["bounds"]
+    assert st.compose_node_to_dict(comp, resolver)["bounds"] == {
+        "layout": {"x": 0, "y": 0, "w": 50, "h": 0}, "clipped": True}

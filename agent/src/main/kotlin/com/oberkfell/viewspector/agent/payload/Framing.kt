@@ -16,8 +16,10 @@
  */
 package com.oberkfell.viewspector.agent.payload
 
+import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -37,6 +39,10 @@ object Framing {
 
     private const val MAGIC_SIZE: Int = 8
 
+    // Payloads up to this size are read into one exact buffer; larger ones grow a
+    // buffer as bytes actually arrive, so a LEN the peer never delivers costs nothing.
+    private const val READ_CHUNK: Int = 64 * 1024
+
     init {
         // Guard the invariant the wire format depends on. If the constant is
         // ever edited to something other than 8 ASCII bytes this fails loudly
@@ -52,11 +58,12 @@ object Framing {
      * Reads 8 magic bytes (validated against [MAGIC_BYTES]), 4 big-endian length
      * bytes, then exactly that many payload bytes (looping until satisfied —
      * [DataInputStream.readFully] does the loop for us). Throws on magic
-     * mismatch, on a negative length, or on EOF mid-frame.
+     * mismatch, on a length over [maxLength] ([FrameTooLargeException], raised
+     * before anything is allocated; CONTRACT.md §4), or on EOF mid-frame.
      *
      * Mirrors FramingProtocol.readMessage (FramingProtocol.kt:48-59).
      */
-    fun readMessage(ins: InputStream): ByteArray {
+    fun readMessage(ins: InputStream, maxLength: Int = WireLimits.MAX_REQUEST_BYTES): ByteArray {
         val data = DataInputStream(ins)
 
         val magic = ByteArray(MAGIC_SIZE)
@@ -66,19 +73,40 @@ object Framing {
                 "Framing magic mismatch: expected \"$MAGIC\", got ${magic.toAsciiDebug()}"
             )
         }
+        return readPayload(data, maxLength)
+    }
 
-        val length = data.readInt() // big-endian, per DataInputStream contract
-        if (length < 0) {
-            // A negative length means a corrupt/oversized frame (>2GiB or a torn
-            // stream). Treat as fatal for this connection.
-            throw IllegalStateException("Framing length is negative: $length")
-        }
+    /**
+     * A frame whose LEN is over the reader's limit. Thrown BEFORE anything is allocated
+     * for the payload: the stream is then out of step, so the connection must be dropped.
+     */
+    class FrameTooLargeException(val length: Long, val limit: Int) :
+        IllegalStateException("Framing length $length exceeds the $limit-byte limit")
 
-        val payload = ByteArray(length)
-        if (length > 0) {
-            data.readFully(payload) // loops until all `length` bytes are read
+    /**
+     * Reads the 4-byte big-endian LEN (as the unsigned 32-bit value the contract defines)
+     * and then exactly LEN payload bytes. Rejects LEN > [maxLength] before allocating;
+     * a LEN above [READ_CHUNK] is read in chunks so memory follows the bytes received.
+     */
+    private fun readPayload(data: DataInputStream, maxLength: Int): ByteArray {
+        val length = data.readInt().toLong() and 0xFFFFFFFFL // BE uint32
+        if (length > maxLength) throw FrameTooLargeException(length, maxLength)
+        val n = length.toInt()
+        if (n <= READ_CHUNK) {
+            val payload = ByteArray(n)
+            if (n > 0) data.readFully(payload) // loops until all `n` bytes are read
+            return payload
         }
-        return payload
+        val out = ByteArrayOutputStream(READ_CHUNK)
+        val buf = ByteArray(READ_CHUNK)
+        var remaining = n
+        while (remaining > 0) {
+            val got = data.read(buf, 0, minOf(remaining, READ_CHUNK))
+            if (got < 0) throw EOFException("EOF after ${n - remaining} of $n payload bytes")
+            out.write(buf, 0, got)
+            remaining -= got
+        }
+        return out.toByteArray()
     }
 
     /**
@@ -110,7 +138,7 @@ object Framing {
      * The [Server] read loop uses this to distinguish "client hung up cleanly"
      * from "framing error".
      */
-    fun readMessageOrNull(ins: InputStream): ByteArray? {
+    fun readMessageOrNull(ins: InputStream, maxLength: Int = WireLimits.MAX_REQUEST_BYTES): ByteArray? {
         val data = DataInputStream(ins)
 
         val magic = ByteArray(MAGIC_SIZE)
@@ -128,16 +156,7 @@ object Framing {
             )
         }
 
-        val length = data.readInt()
-        if (length < 0) {
-            throw IllegalStateException("Framing length is negative: $length")
-        }
-
-        val payload = ByteArray(length)
-        if (length > 0) {
-            data.readFully(payload)
-        }
-        return payload
+        return readPayload(data, maxLength)
     }
 
     /** Human-readable rendering of magic bytes for error messages. */

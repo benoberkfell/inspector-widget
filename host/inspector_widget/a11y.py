@@ -113,6 +113,9 @@ _BOOL_FLAGS = (
     "content_invalid", "showing_hint_text", "text_entry_key", "text_selectable",
     "field_required", "can_open_popup", "a11y_data_sensitive",
     "request_initial_focus", "is_virtual", "is_traversal_group",
+    # Agent-side markers: children cut at the wire depth cap; boundsInScreen came
+    # back inverted (clipped away by an ancestor) and was clamped to zero size.
+    "children_truncated", "bounds_clipped",
 )
 
 # String-table-id text fields -> output key.
@@ -332,6 +335,8 @@ def a11y_node_to_dict(node: "pb.A11yNode", resolver: StringResolver) -> Dict[str
         # once it knows which hosts are Compose providers.
         "node_key": (_typed_key(node.host_view_id, node.virtual_id, compose=False)
                      if node.host_view_id else None),
+        # A negative size (a node clipped out of its parent, from an agent that
+        # doesn't clamp getBoundsInScreen) arrives as 0 with "clipped": true.
         "bounds": _bounds_to_dict(node.bounds),
     }
 

@@ -285,11 +285,13 @@ def _instance_attrs(cls) -> Set[str]:
     if dataclasses.is_dataclass(cls):
         names |= {f.name for f in dataclasses.fields(cls)}
     names |= set(getattr(cls, "__annotations__", {}))
-    # self.<attr> assignments in the class and in the base classes it inherits from
+    # self.<attr> assignments (and annotations) in the class and in the base classes it
+    # inherits from: attributes a base class's methods set on self are the subclass's too.
     for klass in getattr(cls, "__mro__", (cls,)):
         if (getattr(klass, "__module__", "") or "").split(".")[0] != "inspector_widget" \
                 and klass is not cls:
             continue
+        names |= set(vars(klass).get("__annotations__", {}))
         try:
             tree = ast.parse(textwrap.dedent(inspect.getsource(klass)))
         except (OSError, TypeError, SyntaxError):

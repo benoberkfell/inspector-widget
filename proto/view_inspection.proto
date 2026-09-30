@@ -81,7 +81,16 @@ message ViewNode {
   Resource layout_resource = 6; // layout file that inflated it, if known
   int32 view_id_name = 7;   // string-table id, e.g. "my_button" (R.id name)
   int32 text_value = 8;     // string-table id; best-effort text for TextViews
-  enum Flag { NONE = 0; IS_WEBVIEW = 1; }
+  enum Flag {
+    NONE = 0;
+    IS_WEBVIEW = 1;
+    // text_value (and the "text" property) of a password field is masked: one
+    // U+2022 per character, so the length survives but the secret does not.
+    TEXT_REDACTED = 2;
+    // The node sits at the depth cap (80 levels): it has children that were not
+    // sent, because a deeper tree is unparseable by protobuf's ~100-level limit.
+    CHILDREN_TRUNCATED = 4;
+  }
   int32 flags = 9;          // bitmask of Flag
   repeated ViewNode children = 10;
 }
@@ -120,6 +129,9 @@ message DumpTreeResponse {
   Strings strings = 2;
   repeated PropertyGroup properties = 3; // populated iff include_properties
   Screenshot screenshot = 4;             // populated iff include_screenshot
+  // Human note on what was cut or skipped (e.g. "depth-truncated=3 (max 80)",
+  // "properties-failed=2"); empty when the dump is complete.
+  string diagnostics = 5;
 }
 
 message GetPropertiesCommand {
@@ -244,6 +256,13 @@ message A11yNode {
 
   int32 layout_size_w = 68; int32 layout_size_h = 69;
   float text_size_px = 70; int32 text_size_unit = 71;
+
+  // getBoundsInScreen came back inverted (right < left or bottom < top: the node is
+  // clipped away by an ancestor, e.g. an off-screen pager page); w/h are clamped to 0.
+  bool bounds_clipped = 72;
+  // The node has children that were not sent: it sits at the depth cap (80 levels
+  // in a dump; subtree_depth in an A11yFocus read).
+  bool children_truncated = 73;
 
   repeated A11yNode children = 80;
 }

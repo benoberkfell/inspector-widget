@@ -292,7 +292,9 @@ Each `ViewNode` JSON object (`detail="full"`; brief notes in brackets):
   package.class].
 - `bounds` — `{layout: {x, y, w, h}, render?}`: absolute on-screen px, plus the
   `render` quad (`x0..y3`) when the view is rotated/scaled/skewed [brief:
-  `[x, y, w, h]` and `render` when transformed].
+  `[x, y, w, h]` and `render` when transformed]. A negative size from the
+  agent (an accessibility node clipped out of its parent, e.g. an off-screen
+  pager page) is clamped to 0 and marked `clipped: true` (brief keeps it).
 - `resource` — the view's own `@id`, as `{namespace, type, name}`.
 - `layout_resource` — the layout file that inflated it, if known [brief: only
   where it differs from the parent's].
@@ -351,6 +353,59 @@ foreground, raise the timeout, read the agent's logcat). When the server exits,
 including on SIGTERM, it disconnects its sessions, removes every adb forward it
 made and deletes its PNGs, and leaves the agents running, so the next start
 re-attaches warm.
+
+When an injected agent can't start, the app logs why within milliseconds, and
+the host reads that (`adb logcat --pid <pid>`, tags `ViewSpector`,
+`AndroidRuntime`, `ActivityThread`) while it waits for the agent's socket: the
+attach fails at once with the cause (`inject.AgentStartupError`, carrying
+`kind`, `cause` and the log lines) instead of timing out after ~13 s. The
+kinds:
+
+- `stale_agent`: `Payload.start` died with a linkage error (`NoSuchMethodError`
+  and the like) on a Kotlin or protobuf class under its original name. The
+  payload carries its own Kotlin and protobuf relocated under
+  `com.oberkfell.viewspector.shaded` (CONTRACT.md §2), so an app's own copy,
+  R8-shrunk or not, can't stand in for them; only a `payload.jar` built before
+  that relocation links the app's. The fix is `scripts/build.sh` (or pointing
+  `INSPECTOR_WIDGET_ARTIFACTS` / `--build-out` at a current build-out), not a
+  different build of the app.
+- `classpath_shadowing`: the same, on a class the app itself declares (its APK
+  is named): the app's copy lacks members the payload uses, so inspect a build
+  of the app without code shrinking.
+- `payload_start`, `bootstrap`, `native` (the JVMTI agent aborted; it logs at E
+  only what aborts the install, and a JVMTI error it recovers from, such as
+  hidden-API silencing, at W, which the host ignores), `bind` (an earlier
+  agent still holds the socket name), `crash` (the app died) and `unknown` (an
+  agent error line the host doesn't know, with still no socket 1.5 s later).
+- `library_load`: the app could not load `libviewspector.so`. ActivityThread's
+  E line names only the class loader and the agent argument, so the host
+  quotes ART's own reason from the app's W log (`Agent attach failed
+  (result=N) : Unable to dlopen ...`), or says it wasn't logged.
+
+A failure that recurs on every retry into the same process with the same
+artifacts (a linkage error, a library that can't load, a bootstrap that can't
+find its payload; not an out-of-memory or a thread that couldn't start) is
+remembered by a long-lived host (the MCP server, a Python caller) per
+`(serial, package, pid, artifacts)`, where the artifacts are all three files
+(`inject.artifacts_id`, so rebuilding only the native agent or the bootstrap
+counts), and reported again without re-injecting until the app restarts or an
+artifact changes; `force` injects anyway. A socket timeout with no such error
+says what the app did log since the attach, or that the attach never ran (the
+app's main thread runs it). Before pushing anything the host also checks that
+the app is debuggable and that `libviewspector.so` (by its ELF header) matches
+the app process's ABI: `app_process64` or `app_process32` (read from
+`/proc/<pid>/exe`) on the device's primary ABI, since ART loads agents without
+native-bridge translation. The agent is built for arm64-v8a only (`abiFilters`
+in `agent/build.gradle.kts`), so a 32-bit app or an x86_64 emulator is refused
+with one line (use an arm64 device or emulator image) instead of a failed
+attach.
+
+`inspect` (CLI `--json`, MCP `inspect`) reports in `summary.incomplete` the
+agent's diagnostics tokens that say a dump was cut or partly unreadable
+(`depth-truncated=N`, `node-cap=...`, `semantics_truncated: ...`,
+`slot_truncated: ...`, `compose_obfuscated`, `semantics_failed: ...`,
+`properties-changed=N`, ...), keyed by `view` / `compose` / `a11y`; a View
+node's facet carries its `flags` (`CHILDREN_TRUNCATED`, `TEXT_REDACTED`).
 
 ### Session lifecycle (CLI and Python API)
 

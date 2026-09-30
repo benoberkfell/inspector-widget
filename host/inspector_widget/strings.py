@@ -69,7 +69,15 @@ def _quad_to_dict(quad: "pb.Quad") -> Dict[str, int]:
 
 
 def _bounds_to_dict(bounds: "pb.Bounds") -> Dict[str, Any]:
-    out: Dict[str, Any] = {"layout": _rect_to_dict(bounds.layout)}
+    layout = _rect_to_dict(bounds.layout)
+    out: Dict[str, Any] = {"layout": layout}
+    if layout["w"] < 0 or layout["h"] < 0:
+        # getBoundsInScreen clips a node that is scrolled or paged out of its
+        # parent with an unchecked intersect, so an agent that reports it as is
+        # sends right < left (w -264 for an off-screen ViewPager2 page, say).
+        # Such a node has no visible area: size 0, and flagged.
+        layout["w"], layout["h"] = max(0, layout["w"]), max(0, layout["h"])
+        out["clipped"] = True
     # render Quad is present only for transformed views.
     if bounds.HasField("render"):
         out["render"] = _quad_to_dict(bounds.render)
@@ -174,6 +182,12 @@ def node_to_dict(node: "pb.ViewNode", resolver: StringResolver) -> Dict[str, Any
     flags: List[str] = []
     if node.flags & pb.ViewNode.IS_WEBVIEW:
         flags.append("IS_WEBVIEW")
+    if node.flags & pb.ViewNode.TEXT_REDACTED:
+        # A password field: "text" is one U+2022 per character, not the content.
+        flags.append("TEXT_REDACTED")
+    if node.flags & pb.ViewNode.CHILDREN_TRUNCATED:
+        # At the agent's depth cap: this node has children that were not sent.
+        flags.append("CHILDREN_TRUNCATED")
     if flags:
         out["flags"] = flags
 
@@ -208,6 +222,9 @@ def dump_tree_to_dict(response: "pb.DumpTreeResponse") -> Dict[str, Any]:
             "scale": s.scale,
             "compressed_bytes": len(s.data),
         }
+    if response.diagnostics:
+        # What the agent cut or skipped (depth cap, failed properties).
+        out["diagnostics"] = response.diagnostics
     return out
 
 

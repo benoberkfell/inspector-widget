@@ -44,6 +44,12 @@ cli.py / mcp_server.py ── drive the host; mcp_server lists 18 tools by defau
 
 - **Wire**: 8-byte magic `VWSPCT01` + 4-byte big-endian length + protobuf. Abstract socket
   `viewspector_<pid>`, reached via `adb forward`. **Not** gRPC, **not** the transport daemon.
+- **Classloader**: the payload's loader is a child of the app's (parent-first), yet the payload
+  links against none of the app's classes: it carries its own Kotlin stdlib and protobuf-lite,
+  relocated under `com.oberkfell.viewspector.shaded`, and reaches app types (AndroidX,
+  Compose) only by reflection. So an app's R8-shrunk Kotlin can no longer break the attach;
+  a `NoSuchMethodError` on an unrelocated `kotlin.*` class at attach means a stale
+  `payload.jar` (the host reports `stale_agent`: run `scripts/build.sh`). See CONTRACT.md §2.
 - **Accessibility**: in-process `View.setQueryFromAppProcessEnabled` (API 34+) so a single
   recursion covers Views *and* Compose virtual a11y nodes.
 - **Compose**: pure-reflection extractor over the app's own bundled
@@ -72,7 +78,7 @@ host/                         Python host driver + entry points
   tests/                      device-free pytest suite (+ @device smoke and a11y golden tests)
   pyproject.toml              packaging (wheel ships cli.py + mcp_server.py as py-modules)
   README.md  PACKAGING.md     host driver + packaging docs
-scripts/                      build.sh, run.sh, test.sh, install-a11yprobe.sh
+scripts/                      build.sh, run.sh, test.sh, install-a11yprobe.sh, shadow_check.py
 testapps/a11yprobe/           GOOD/BAD a11y corpus: Compose, classic View, mixed View/Compose, dialogs
 skill/inspector-widget-a11y/  the a11y debugging Skill (SKILL.md, tools.md, rules.md)
 build-out/                    generated artifacts (gitignored): libviewspector.so, bootstrap.dex, payload.jar, BUILD_ID
@@ -254,6 +260,14 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
 **Conventions:**
 - `.java` files live under `agent/src/main/java/...`, **not** `src/main/kotlin` — Kotlin
   resolves them but `javac` never compiles them there → `NoClassDefFoundError` at runtime.
+- The payload's Kotlin stdlib and protobuf-lite are relocated under
+  `com.oberkfell.viewspector.shaded` at build time (`agent/build.gradle.kts`), so an app's own
+  copies (R8-shrunk ones especially) can't shadow them through the parent-first app classloader
+  (CONTRACT.md §2). So never hand a Kotlin-typed value (lambda, `Pair`, `Unit`, `Sequence`)
+  to app code, nor cast an app object to one (`as Function0<*>`, `is Pair<*, *>`): the app's
+  `kotlin.*` is not the payload's. Talk to app objects through `java.*` / `android.*` types
+  and reflection. `scripts/shadow_check.py [APK_OR_DIR ...]` checks payload.jar (build.sh runs
+  it); `INSPECTOR_WIDGET_SHADOW_APKS=<dir>` makes `test_payload_isolation.py` check real APKs.
 - a11y model: the reading order and the lint judge the tree TalkBack gets, not the raw dump.
   Views that are not important for accessibility (`important_for_accessibility` AUTO on a real
   View, see CONTRACT.md §9) are skipped with their children hoisted (`ignored`), and windows
