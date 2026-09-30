@@ -304,3 +304,46 @@ def test_a_walk_from_the_middle_to_the_edge_covers_only_that_part():
     res = diff.analyze(record(back, [pstop(*it) for it in items], ended="edge", direction="prev"))
     skipped = next(f for f in res["findings"] if f["code"] == "tb.skipped")
     assert skipped["refs"] == [items[0][0]] and "back to the edge" in skipped["msg"]
+
+
+def test_a_full_screen_scrim_over_a_button_is_not_a_double_stop():
+    button = step(0, "compose:13:50", (100, 1500, 400, 120), "Apply", speak="Apply. Button",
+                  via="start", flags=["clickable"], ancestors=["compose:13:1"])
+    scrim = step(1, "compose:13:32", (0, 0, 1280, 2856), "", speak="Close sheet",
+                 flags=["clickable"], ancestors=["compose:13:1"])
+    assert "tb.double_stop" not in codes(diff.analyze(record([button, scrim], ended="max_steps")))
+    scrim["ancestors"] = []
+    button["ancestors"] = ["compose:13:32"]  # the Apply button inside the clickable scrim
+    assert "tb.double_stop" in codes(diff.analyze(record([button, scrim], ended="max_steps")))
+
+
+def test_a_cut_off_last_row_with_nothing_to_scroll_is_edge_stuck():
+    parent = [0, 200, 1280, 1000]
+    rows = [step(i, f"view:{10 + i}", (0, 200 + i * 180, 1280, 180), f"Log entry {i + 1}",
+                 via="start" if i == 0 else "next", parent_rect=parent) for i in range(5)]
+    rows.append(step(5, "view:15", (0, 1100, 1280, 100), "Log entry 6", parent_rect=parent))
+    res = diff.analyze(record(rows + [edge(6, "view:15")], ended="edge"))
+    f = next(f for f in res["findings"] if f["code"] == "tb.edge_stuck")
+    assert f["refs"] == ["view:15"] and "cut off" in f["msg"]
+    rows[-1]["container"] = "view:2"  # inside a scroller: TalkBack scrolls it, not this check's case
+    assert "tb.edge_stuck" not in codes(diff.analyze(record(rows + [edge(6, "view:15")], ended="edge")))
+
+
+def test_a_merged_row_read_out_of_screen_order_is_a_wrong_announcement():
+    parts = [{"text": "$5", "rect": [1951, 303, 47, 59]}, {"text": "Socks", "rect": [78, 303, 111, 59]}]
+    row = step(1, "compose:7:5", (39, 264, 1998, 137), "$5 | Socks", speak="$5. Socks", utt="logcat",
+               parts=parts)
+    head = step(0, "compose:7:4", (39, 175, 301, 69), "Cart", via="start")
+    f = next(f for f in diff.analyze(record([head, row]))["findings"] if f["code"] == "tb.wrong_announcement")
+    assert f["refs"] == ["compose:7:5"] and "'$5' before 'Socks'" in f["msg"]
+    assert "clearAndSetSemantics" in f["fix"]
+    row["speak"] = "Socks. $5"  # the same row read in screen order
+    assert "tb.wrong_announcement" not in codes(diff.analyze(record([head, row])))
+
+
+def test_a_model_stop_talkback_scrolls_into_view_first_is_not_judged_a_ghost():
+    head = step(0, "compose:11:4", (39, 175, 900, 69), "Products", via="start")
+    clipped = step(1, "compose:11:43", (0, 2066, 2076, 86), "", speak="Unlabelled", flags=["clickable"])
+    assert "tb.ghost_stop" in codes(diff.analyze(record([head, clipped], ended="autoscroll")))
+    clipped["show_on_screen"] = True  # static_walk: TalkBack shows it (and its clipped text) first
+    assert "tb.ghost_stop" not in codes(diff.analyze(record([head, clipped], ended="autoscroll")))

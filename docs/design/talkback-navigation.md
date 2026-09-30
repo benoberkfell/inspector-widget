@@ -149,6 +149,13 @@ H5 fragment_overlay: BAD a Compose "dialog" drawn inside a Fragment's ComposeVie
 H6 nested_scroll: S5 (Compose > AndroidView > RecyclerView); the walk verifies the inner RecyclerView scrolls, then focus leaves correctly. calibration.
 ### Assertions (host/tests/test_device_talkback.py, @device @talkback, opt-in: device-wide)
 The model predicts expected_stops for every GOOD; every BAD raises expected_findings statically (basis model) AND from the walk; GOOD walks end wrap with no findings; model.mismatch empty or equal to the pinned calibration deltas; walk recordings (steps, events, raw pbs) saved under host/tests/data/tb_walks/ so conformance runs device-free.
+### Measured on TalkBack 17.0 / API 36 (emulator-5556; entries with calibration: true)
+Where TalkBack 17 differs from the predictions above (the corpus was changed to match, and the note in tb_corpus_expected.json says how):
+- TalkBack does not follow input focus from an app's requestFocus() (Button or TextField). C12's trap is an app that takes accessibility focus back on a timer, and C14 GOOD restores focus after back itself (ACTION_ACCESSIBILITY_FOCUS). A paneTitle per destination does not restore focus.
+- Compose drops nodes that a clickable scrim or a sheet covers, and nodes outside the view: C4/C5 do not escape (C4 shows the unlabelled scrim as a ghost), C7's offscreen rows are not in the tree, and C16's offscreen WebView page is hidden (V13, ViewPager2, reproduces AntennaPod).
+- H4's overlaid banner is read FIRST, not last (the model agrees). H3's AndroidView TextViews stay reachable. H6 scrolls and leaves correctly.
+- An unchecked Compose Checkbox without stateDescription speaks no state, as 16.2 does (C10). V6 notifyDataSetChanged resets focus to the top instead of drifting. "N of M" is spoken only when rows carry CollectionItemInfo; RecyclerView's own LinearLayoutManager reports row_count -1, so V12's rows report their positions themselves, as Thunderbird's do.
+- Compose sends no content-change event for a rebound keyless lazy row (C6 BAD). RecyclerView reuses Views, and ComposeView cells, for other items, so a node key alone does not identify an item.
 
 ## Part 6: Device spike plan (emulator-5554)
 Driver: SPIKE=scratchpad/talkback-nav/spike/tb_spike.py (`status | on | off | focus | model | press COMBO | walk --steps N | repeat --runs R`, `--via uinput|emu|sendevent`, `--dry-run`; reads focus from DumpA11y accessibility_focused (field 28), so no agent change is needed; walk logic tested against fakes). Run from a checkout with the a11y-core changes: `cd <checkout>; PY="env PYTHONPATH=host <venv python> $SPIKE/tb_spike.py --serial emulator-5554"`.

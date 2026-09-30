@@ -91,5 +91,8 @@ dependencies {
     implementation("androidx.fragment:fragment-ktx:1.8.3")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
 
+    // TalkBack corpus (TbViewActivity V13): a ViewPager2 whose offscreen page is a WebView.
+    implementation("androidx.viewpager2:viewpager2:1.1.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

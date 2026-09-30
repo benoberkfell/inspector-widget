@@ -4,10 +4,16 @@ reading order (V), and classify what a walk can show (design part 2).
 Pure: it works on the walk record :mod:`.walk` saves (steps, predicted stops,
 how the walk ended), so a stored walk can be re-analysed offline.
 
-Codes: ``tb.out_of_order``, ``tb.loop``, ``tb.edge_stuck``, ``tb.skipped``,
-``tb.ghost_stop``, ``tb.double_stop``, ``tb.escape`` (basis ``walk``, or
-``expect`` when the caller gave the order it expects), and ``model.mismatch``
-(where the model disagrees with the walk: calibration data; the walk wins).
+Codes: ``tb.out_of_order``, ``tb.loop``, ``tb.trap`` (the app took focus
+between presses), ``tb.revisit`` (a stop read twice in one lap),
+``tb.edge_stuck``, ``tb.skipped`` (predicted stops never reached, or text on
+screen nobody read), ``tb.ghost_stop``, ``tb.double_stop``, ``tb.escape``,
+``tb.focus_lost``, ``tb.wrong_announcement`` ("N of M" that counts an item
+TalkBack never stops on; a merged row that reads its texts out of screen
+order) (basis ``walk``, ``model`` for :func:`.walk.static_walk`,
+or ``expect`` when the caller gave the order it expects), and
+``model.mismatch`` (where the model disagrees with the walk: calibration data;
+the walk wins).
 """
 
 from __future__ import annotations
@@ -49,10 +55,24 @@ FIXES = {
     "tb.focus_lost": "Keep the focused item alive while it scrolls (stable keys / "
                      "LazyListState, no key churn); TalkBack re-focuses only after a scroll "
                      "event from the container.",
+    "tb.trap": "Request input focus once (LaunchedEffect(Unit) / a one-off requestFocus), not "
+               "on every recomposition or timer tick: each request pulls TalkBack's focus back.",
+    "tb.revisit": "Give lazy items stable keys and one stop each (a traversal group per card); "
+                  "avoid content that re-lays out while TalkBack scrolls it.",
+    "tb.wrong_announcement": "Keep empty header/footer items out of the adapter (or mark them "
+                             "with CollectionItemInfo that TalkBack can skip) so positions and "
+                             "counts match the rows it reads.",
+    "tb.window_order": "Make the popup focusable/modal (PopupWindow(focusable=true), "
+                       "ListPopupWindow.setModal(true)) or show it in the layout flow, so it is read "
+                       "where it appears.",
     "tb.escape": "Use a real Dialog / ModalBottomSheet, or hide the content behind the overlay while "
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
 }
+# tb.wrong_announcement for a merged row read out of order (FIXES has the "N of M" one).
+_FIX_SPEECH_ORDER = ("Compose the texts in reading order (a merged row reads its children in "
+                     "composition order, not placement), or give the row one label in reading "
+                     "order: clearAndSetSemantics { contentDescription = \"Title, $5\" }.")
 
 
 def _finding(code: str, sev: str, msg: str, steps: Sequence[Dict[str, Any]] = (),
@@ -185,6 +205,9 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
     pos: Optional[int] = P.index(_pk(lap[0])) if lap and _pk(lap[0]) in P else None
     for s in lap[1:]:
         k = _pk(s)
+        if s.get("via") == "stolen":  # the app moved focus, not TalkBack: nothing to predict
+            pos = P.index(k) if k in P else None
+            continue
         exp_i = pos + step if pos is not None else None
         expected = P[exp_i] if exp_i is not None and 0 <= exp_i < len(P) else None
         if expected is not None and k == expected:
@@ -265,6 +288,10 @@ def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
+    if s.get("show_on_screen"):
+        # A model stop TalkBack first scrolls fully into view: what it shows and says
+        # (its clipped text) is known only after the scroll.
+        return []
     reasons = []
     speak = (s.get("speak") or "").strip()
     # TalkBack 17 says just the role ("Button") for an unlabelled control, 16.2 "Unlabelled".
@@ -315,6 +342,9 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
             a, b = _rect(prev), _rect(s)
             if a and b and a != b and (_contains(a, b) or _contains(b, a)):
                 outer, inner = (prev, s) if _contains(a, b) else (s, prev)
+                if "ancestors" in inner and outer.get("ref") not in inner["ancestors"]:
+                    prev = s  # only overlapping (a scrim over a sheet): not a container
+                    continue
                 # The inner stop's own words (its label; role and state words aside)
                 # against what the outer stop says (its label joins its children's
                 # texts, which TalkBack does not speak when they are stops of their own).
@@ -366,11 +396,13 @@ def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Out-of-order stops per screen state: the lap is split where the screen
-    changed (auto-scroll, another window, a stolen focus); inside each segment
-    the stops outside the longest run that follows V are out of order."""
+    changed (auto-scroll, another window, a stolen focus) or focus escaped an
+    overlay (tb.escape says that); inside each segment the stops outside the
+    longest run that follows V are out of order."""
     segments: List[List[Dict[str, Any]]] = [[]]
     for s in lap:
-        if s.get("via") in ("autoscroll", "window", "stolen") and segments[-1]:
+        escaped = bool(s.get("_escape")) != bool(segments[-1] and segments[-1][-1].get("_escape"))
+        if (s.get("via") in ("autoscroll", "window", "stolen") or escaped) and segments[-1]:
             segments.append([])
         segments[-1].append(s)
     out = []
@@ -427,6 +459,11 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                 + (f" ({s['scrolled']} scrolled: the focused item was disposed)" if s.get("scrolled")
                    else "") + "; the next swipe starts over from the top", [prev] if prev else []))
     edge = walk.get("edge") or {}
+    if edge.get("hidden_after") and last is not None and not edge.get("can_scroll"):
+        out.append(_finding("tb.edge_stuck", "warn",
+                            f"TalkBack hit the edge at {_name(last)} with {edge['hidden_after']} "
+                            f"hidden item(s) after it ({_q(edge.get('hidden_first'))}…): they are "
+                            f"clipped, and nothing TalkBack can scroll brings them in", [last]))
     if edge.get("can_scroll") and last is not None:
         out.append(_finding("tb.edge_stuck", "warn",
                             f"TalkBack hit the edge at {_name(last)} while its container "
@@ -476,6 +513,171 @@ def _check_expect(lap: List[Dict[str, Any]], expect: Sequence[str]) -> Tuple[Dic
     return res, findings
 
 
+def _check_trap(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    stolen = [s for s in walk["steps"] if s.get("via") == "stolen"]
+    if not stolen:
+        return []
+    firsts = _uniq([s.get("ref") for s in stolen])
+    return [_finding("tb.trap", "warn",
+                     f"the app pulled accessibility focus to {_name(stolen[0])} between presses "
+                     f"{len(stolen)} time(s) (it moves input or accessibility focus on its own)", stolen,
+                     refs=firsts)]
+
+
+def _check_revisit(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: Dict[str, Dict[str, Any]] = {}
+    out = []
+    for s in lap:
+        if s.get("via") == "stolen":
+            seen = {}  # the app sent focus back: what follows is read again because of that (tb.trap)
+        k = _pk(s)
+        if k in seen and seen[k]["i"] != s["i"] - 1:
+            out.append(_finding("tb.revisit", "warn",
+                                f"step {s['i']}: {_name(s)} was already read at step {seen[k]['i']} "
+                                f"in this lap", [seen[k], s]))
+        seen.setdefault(k, s)
+    return out[:3]
+
+
+_FORWARD = {"forward", "down", "right", "page_down", "page_right"}
+_BACKWARD = {"backward", "up", "left", "page_up", "page_left"}
+
+
+def _check_leave_scrollable(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Focus left a scrollable that can still scroll the way the walk goes: TalkBack
+    did not (or could not: a pager) scroll it, so the rest is unreachable by swipe."""
+    want = _FORWARD if walk.get("direction", "next") == "next" else _BACKWARD
+    out = []
+    prev: Optional[Dict[str, Any]] = None
+    for s in walk["steps"]:
+        if not s.get("moved") or not s.get("key") or s.get("edge"):
+            prev = None if s.get("via") == "left_app" else prev
+            continue
+        if prev is not None and s.get("via") in ("next", "autoscroll", "window") and prev.get("container") \
+                and s.get("container") != prev.get("container") \
+                and set(prev.get("container_can") or []) & want:
+            inside = s.get("container_rect") and prev.get("container_rect") and _rect(s) and \
+                _contains(tuple(prev["container_rect"]), _rect(s))  # type: ignore[arg-type]
+            if not inside:
+                out.append(_finding(
+                    "tb.edge_stuck", "warn",
+                    f"steps {prev['i']}-{s['i']}: focus left {prev['container']} "
+                    f"({prev.get('container_cls')}) while it can still scroll "
+                    f"{'/'.join(sorted(set(prev['container_can']) & want))}: TalkBack did not scroll "
+                    f"it, so the rest of it is unreachable by swipe", [prev, s],
+                    refs=[prev["container"]], keys=[prev["container"]]))
+        prev = s
+    return out[:3]
+
+
+_N_OF_M = re.compile(r"\b(\d+) of (\d+)\b")
+
+
+def _check_n_of_m(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """TalkBack's "N of M" (CollectionItemInfo) on the first row of a list says N > 1:
+    the position counts an item it never stops on (an empty header)."""
+    out = []
+    firsts: Dict[str, Dict[str, Any]] = {}
+    for s in _moves(walk["steps"]):
+        m = _N_OF_M.search(s.get("speak") or "") if s.get("utt") == "logcat" else None
+        c = s.get("container")
+        if m is None or not c or c in firsts or s.get("via") == "autoscroll":
+            continue
+        firsts[c] = s
+        r, cr = _rect(s), s.get("container_rect")
+        n, total = int(m.group(1)), int(m.group(2))
+        if n > 1 and r is not None and cr and r[1] - cr[1] < r[3]:
+            out.append(_finding(
+                "tb.wrong_announcement", "warn",
+                f"step {s['i']}: the first row of {c} is announced \"{n} of {total}\": "
+                f"{n - 1} item(s) before it count but TalkBack never stops on them", [s]))
+    return out[:3]
+
+
+def _check_speech_order(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """A stop that joins its children's texts (a merged row) reads them out of
+    their visual order: "$5, Socks" for a row showing "Socks ... $5"."""
+    out = []
+    for s in _moves(walk["steps"]):
+        parts = s.get("parts") or []
+        speak = (s.get("speak") or "").lower()
+        if len(parts) < 2 or not speak:
+            continue
+        at = [speak.find(p["text"].lower()) for p in parts]
+        if min(at) < 0 or len(set(at)) < len(at):
+            continue  # a part TalkBack did not say (or said inside another): no order to compare
+        spoken = [p["text"] for _i, p in sorted(zip(at, parts, strict=True), key=lambda t: t[0])]
+        seen, _src = visual_order([(p["text"], tuple(p["rect"])) for p in parts])  # type: ignore[misc]
+        if spoken != seen:
+            f = _finding("tb.wrong_announcement", "warn",
+                         f"step {s['i']}: {_name(s)} reads {_q(spoken[0])} before {_q(seen[0])}, "
+                         f"though {_q(seen[0])} comes first on screen (the row joins its texts in "
+                         f"child order: {' / '.join(_q(t) for t in spoken[:4])})", [s])
+            f["fix"] = _FIX_SPEECH_ORDER
+            out.append(f)
+    return out[:3]
+
+
+def _check_cut_off_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """At the edge, the last stop is cut off by its parent (shorter than its
+    siblings, flush with the parent's bottom) and nothing around it scrolls: more
+    content continues below that TalkBack cannot reach."""
+    steps = walk["steps"]
+    edge_at = next((i for i, s in enumerate(steps) if s.get("edge")), None)
+    if edge_at is None or walk.get("direction", "next") != "next":
+        return []
+    last = next((s for s in reversed(steps[:edge_at]) if s.get("moved") and s.get("key")), None)
+    if last is None or last.get("container") or not last.get("parent_rect") or not _rect(last):
+        return []
+    x, y, w, h = _rect(last)  # type: ignore[misc]
+    px, py, pw, ph = last["parent_rect"]
+    siblings = sorted(_rect(s)[3] for s in _moves(steps[:edge_at])  # type: ignore[index]
+                      if s.get("parent_rect") == last["parent_rect"] and s is not last and _rect(s))
+    if len(siblings) < 2:
+        return []
+    typical = siblings[len(siblings) // 2]
+    if y + h >= py + ph - 2 and h < 0.9 * typical:
+        return [_finding("tb.edge_stuck", "warn",
+                         f"step {last['i']}: {_name(last)} is cut off at the bottom of its parent "
+                         f"({h}px of a usual {typical}px) and nothing scrolls: the content below it "
+                         f"is unreachable", [last])]
+    return []
+
+
+def _check_window_order(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """A window TalkBack reads after the content it sits over (a non-focusable popup
+    sorted by its top edge): focus reached it only after the stops below its top."""
+    out = []
+    read: List[Dict[str, Any]] = []
+    for s in first_lap(walk["steps"]) + [s for s in walk["steps"] if s.get("via") == "window"]:
+        if s.get("via") == "window" and s.get("window_rect") and read:
+            top = s["window_rect"][1]
+            below = [r for r in read if r.get("window") != s.get("window") and _rect(r)
+                     and _rect(r)[1] >= top]  # type: ignore[index]
+            if below:
+                out.append(_finding(
+                    "tb.window_order", "warn",
+                    f"step {s['i']}: window {s.get('window')} (from y={top}) is read only after "
+                    f"{len(below)} stop(s) of the window under it that sit lower on screen, e.g. "
+                    f"{_name(below[0])}", [below[0], s]))
+                break
+        if s.get("moved") and s.get("key"):
+            read.append(s)
+    return out
+
+
+def _check_orphans(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    orphans = walk.get("orphans") or []
+    if not orphans:
+        return []
+    names = ", ".join(_q(o["text"]) for o in orphans[:3])
+    more = f" (+{len(orphans) - 3} more)" if len(orphans) > 3 else ""
+    return [_finding("tb.skipped", "warn",
+                     f"{len(orphans)} text(s) on screen that no stop of the lap read: {names}{more}",
+                     refs=[o["key"] for o in orphans if o.get("key")],
+                     keys=[o["key"] for o in orphans if o.get("key")])]
+
+
 def analyze(walk: Dict[str, Any], expect: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Findings + the model comparison for one walk record (see :mod:`.walk`)."""
     steps = walk.get("steps") or []
@@ -484,13 +686,23 @@ def analyze(walk: Dict[str, Any], expect: Optional[Sequence[str]] = None) -> Dic
     lap = first_lap(steps)
     findings: List[Dict[str, Any]] = []
     findings += _check_end(walk)
+    findings += _check_trap(walk)
+    findings += _check_revisit(walk, lap)
+    findings += _check_leave_scrollable(walk)
+    findings += _check_n_of_m(walk)
+    findings += _check_speech_order(walk)
+    findings += _check_cut_off_end(walk)
+    findings += _check_window_order(walk)
+    findings += _check_orphans(walk)
     findings += _check_escape(walk)
     findings += _check_skipped(walk)
     findings += _check_ghosts(walk)
     findings += _check_double(walk)
-    order, vmeta = _check_order(walk, lap)
-    findings += order
     exp_res = None
+    vmeta: Dict[str, Any] = {}
+    if not expect:  # an expected order replaces the visual heuristic
+        order, vmeta = _check_order(walk, lap)
+        findings += order
     if expect:
         exp_res, exp_findings = _check_expect(lap, expect)
         findings += exp_findings
