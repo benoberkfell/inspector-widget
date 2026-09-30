@@ -44,6 +44,14 @@
  * are re-minted on recomposition (e.g. the hot reload enable_inspection triggers), so a key is
  * only valid for the dump that produced it.
  *
+ * DETECTION: an AndroidComposeView is recognised by class name, or structurally when R8 renamed
+ * the class: Compose tags every AndroidComposeView with its WrappedComposition under the resource
+ * id wrapped_composition_tag (resource names survive R8), and, when that id cannot be resolved, by
+ * the kept override of the hidden View.findViewByAccessibilityIdTraversal(int) plus an
+ * accessibility delegate. A renamed one gets a Window like any other; its semantics are then
+ * usually unreachable (the SemanticsOwner/SemanticsNode methods are renamed too), which the
+ * diagnostics say instead of reporting "found 0".
+ *
  * VALUES: semantics values, composable parameters and modifier arguments are app objects; they are
  * stringified by [SafeString], which never runs an arbitrary toString(). Every semantics entry,
  * node and slot-table group is guarded on its own, so one bad value costs that value, never the
@@ -51,8 +59,10 @@
  *
  * DIAGNOSTICS (tokens separated by "; ", stable prefixes for the host to match):
  *   found N AndroidComposeView(s) [(M nested in interop Views)]; bounds=screen
- *   semantics_failed: view#<acvId> <reason>   reason = owner_unreachable | root_unreachable |
- *       error=<Throwable>   (no semantics tree for that ComposeView)
+ *   compose_obfuscated: Compose present but classes are renamed (AndroidComposeView is <cls>),
+ *       semantics/slot table unavailable, a11y still works
+ *   semantics_failed: view#<acvId> <reason>   reason = classes_renamed | owner_unreachable |
+ *       root_unreachable | error=<Throwable>   (no semantics tree for that ComposeView)
  *   semantics_partial: view#<acvId> nodes_failed=N values_failed=M   (the tree is there; N nodes
  *       lost a part, M attribute values read "<error:...>")
  *   slot_failed: view#<acvId> error=<Throwable>
@@ -78,6 +88,8 @@ object ComposeInspector {
 
     // Entries read from one SemanticsConfiguration (a real one holds a few dozen).
     private const val MAX_CONFIG_ENTRIES = 256
+
+    private const val CLASSES_RENAMED = "classes_renamed"
 
     /** Per-ComposeView counters and log throttling for one dump. */
     private class WalkCtx {
@@ -121,15 +133,20 @@ object ComposeInspector {
         val tokens = ArrayList<String>()
         val slotEmpty = ArrayList<Long>()
         val noNodes = ArrayList<Long>()
+        val renamedClasses = LinkedHashSet<String>()
+        var renamedEmpty = 0
 
         val windows = ArrayList<ViewInspection.DumpComposeResponse.Window>()
         for (cv in composeViews) {
             val acvId = cv.uniqueDrawingId
+            val renamed = isRenamed(cv)
+            if (renamed) renamedClasses.add(cv.javaClass.name)
             val ctx = WalkCtx()
             // Window px -> screen px shift for everything Compose reports in window coordinates.
             val off = windowOriginOnScreen(cv)
             // Synthetic root: id = the AndroidComposeView's uniqueDrawingId (== Window.view_id).
-            // NOT a semantics id; the host keys it composeview:<acvId> (see the header, IDS).
+            // NOT a semantics id; the host keys it composeview:<acvId> (see the header, IDS). Its
+            // name stays "AndroidComposeView" for a renamed class too: the host matches on it.
             val rootNode = ViewInspection.ComposeNode.newBuilder()
             rootNode.id = acvId
             rootNode.name = strings.intern("AndroidComposeView")
@@ -141,7 +158,7 @@ object ComposeInspector {
                 val reason = try {
                     val (semRoot, missing) = semanticsRoot(cv)
                     if (semRoot == null) {
-                        missing
+                        if (renamed) CLASSES_RENAMED else missing
                     } else {
                         rootNode.addChildren(buildSemanticsNode(semRoot, strings, 0, off, ctx))
                         produced = true
@@ -191,7 +208,17 @@ object ComposeInspector {
                     .setRoot(rootNode.build())
                     .build()
             )
-            if (!produced) noNodes.add(acvId)
+            if (!produced) {
+                noNodes.add(acvId)
+                if (renamed) renamedEmpty++
+            }
+        }
+        if (renamedEmpty > 0) {
+            val names = renamedClasses.joinToString("/")
+            diag.append(
+                "; compose_obfuscated: Compose present but classes are renamed (AndroidComposeView is " +
+                    "$names), semantics/slot table unavailable, a11y still works",
+            )
         }
         for (t in tokens) diag.append("; ").append(t)
         if (slotEmpty.isNotEmpty()) {
@@ -212,10 +239,13 @@ object ComposeInspector {
      * composition (which fills the tables). Replicates ComposeLayoutInspector.enableInspection +
      * addSlotTable (framework/ViewExtensions.kt) + hotReload. MUST run on the main thread.
      * Returns the number of slot tables newly added (0 => nothing to do / already enabled).
+     * AndroidComposeViews whose class R8 renamed are skipped: the flag, HotReloader and the
+     * tooling-data reader are all looked up by name, so nothing would populate their tables.
      */
     fun enableInspection(rootViews: List<View>): Int {
         val composeViews = ArrayList<View>()
         for (root in rootViews) collectComposeViews(root, composeViews, intArrayOf(0), false, 0)
+        composeViews.removeAll { isRenamed(it) }
         if (composeViews.isEmpty()) return 0
         val cl = composeViews.first().javaClass.classLoader ?: return 0
 
@@ -303,15 +333,77 @@ object ComposeInspector {
         }
     }
 
-    private val acvClassCache = HashMap<Class<*>, Boolean>()
+    // Per-class caches (main thread only). byNameCache: a subclass of AndroidComposeView by name.
+    // overrideCache: an app class that declares the hidden findViewByAccessibilityIdTraversal(int),
+    // which AndroidComposeView overrides and R8 keeps (it overrides a framework method, and
+    // Compose's consumer rules keep it); consulted only when the tag id cannot be resolved.
+    private val byNameCache = HashMap<Class<*>, Boolean>()
+    private val overrideCache = HashMap<Class<*>, Boolean>()
 
-    /** True when [view] is (a subclass of) androidx.compose.ui.platform.AndroidComposeView. */
+    // R.id.wrapped_composition_tag: -1 = not looked up yet, 0 = unavailable.
+    private var wrappedTagId = -1
+
+    /**
+     * True when [view] is an AndroidComposeView: by class name, or structurally when R8 renamed
+     * the class (see the header, DETECTION). Main thread.
+     */
     internal fun isAndroidComposeView(view: View): Boolean {
-        val cls = view.javaClass
-        acvClassCache[cls]?.let { return it }
-        val r = try { isAssignableToName(view, ANDROID_COMPOSE_VIEW) } catch (t: Throwable) { false }
-        acvClassCache[cls] = r
-        return r
+        if (isByName(view.javaClass)) return true
+        if (view !is ViewGroup) return false
+        // Wrapper.android.kt doSetContent: owner.view.setTag(R.id.wrapped_composition_tag, ...)
+        // on every AndroidComposeView. A SparseArray lookup; the value is never touched.
+        val tagId = wrappedCompositionTagId(view)
+        if (tagId != 0) {
+            return try { view.getTag(tagId) != null } catch (_: Throwable) { false }
+        }
+        val overrides = overrideCache.getOrPut(view.javaClass) {
+            try { declaresAccessibilityIdTraversal(view.javaClass) } catch (_: Throwable) { false }
+        }
+        return overrides && try { view.accessibilityDelegate != null } catch (_: Throwable) { false }
+    }
+
+    /** True for an AndroidComposeView found structurally, i.e. one whose class R8 renamed. */
+    internal fun isRenamed(view: View): Boolean = !isByName(view.javaClass)
+
+    private fun isByName(cls: Class<*>): Boolean = byNameCache.getOrPut(cls) {
+        try { isAssignableToName(cls, ANDROID_COMPOSE_VIEW) } catch (_: Throwable) { false }
+    }
+
+    /** An app ViewGroup subclass in [cls]'s chain declares findViewByAccessibilityIdTraversal(int). */
+    private fun declaresAccessibilityIdTraversal(cls: Class<*>): Boolean {
+        if (!ViewGroup::class.java.isAssignableFrom(cls)) return false
+        val boot = View::class.java.classLoader
+        var k: Class<*>? = cls
+        while (k != null && k.classLoader !== boot) {
+            try {
+                val m = k.getDeclaredMethod("findViewByAccessibilityIdTraversal", Int::class.javaPrimitiveType)
+                if (View::class.java.isAssignableFrom(m.returnType)) return true
+            } catch (_: Throwable) {
+                // not declared here
+            }
+            k = k.superclass
+        }
+        return false
+    }
+
+    private fun wrappedCompositionTagId(view: View): Int {
+        if (wrappedTagId != -1) return wrappedTagId
+        var id = 0
+        try {
+            id = view.resources.getIdentifier("wrapped_composition_tag", "id", view.context.packageName)
+        } catch (_: Throwable) {
+            // no resources
+        }
+        if (id == 0) {
+            id = try {
+                Class.forName("androidx.compose.ui.R\$id", false, view.javaClass.classLoader)
+                    .getField("wrapped_composition_tag").getInt(null)
+            } catch (_: Throwable) {
+                0
+            }
+        }
+        wrappedTagId = id
+        return id
     }
 
     /**
@@ -873,8 +965,8 @@ object ComposeInspector {
         return found
     }
 
-    private fun isAssignableToName(obj: Any, fqName: String): Boolean {
-        var c: Class<*>? = obj.javaClass
+    private fun isAssignableToName(cls: Class<*>, fqName: String): Boolean {
+        var c: Class<*>? = cls
         while (c != null) {
             if (c.canonicalName == fqName || c.name == fqName) return true
             c = c.superclass
