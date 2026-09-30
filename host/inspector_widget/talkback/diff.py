@@ -134,15 +134,37 @@ def xy_cut(items: List[Tuple[str, Rect]]) -> List[str]:
     return [k for k, _ in sorted(items, key=lambda it: (it[1][0], it[1][1]))]
 
 
+_T1_VISUAL: List[Any] = []
+
+
+def _t1_order_items() -> Optional[Any]:
+    """T1's talkback.visual.order_items, when it reads a grid of touching rows
+    row by row (walk boxes from Views usually touch: row n ends where n+1 starts)."""
+    if not _T1_VISUAL:
+        fn = None
+        try:
+            fn = importlib.import_module("inspector_widget.talkback.visual").order_items
+            grid = [{"key": k, "bounds": b, "window": 0} for k, b in (
+                ("a", (0, 0, 100, 50)), ("b", (150, 0, 100, 50)),
+                ("c", (0, 50, 100, 50)), ("d", (150, 50, 100, 50)))]
+            if fn(grid) != ["a", "b", "c", "d"]:
+                fn = None
+        except Exception:  # noqa: BLE001 - not merged, or broken: use xy_cut
+            fn = None
+        _T1_VISUAL.append(fn)
+    return _T1_VISUAL[0]
+
+
 def visual_order(items: List[Tuple[str, Rect]]) -> Tuple[List[str], str]:
-    """V: T1's talkback.visual when it is there, else :func:`xy_cut`."""
-    try:
-        visual = importlib.import_module("inspector_widget.talkback.visual")  # T1, once merged
-        keys = visual.visual_order([{"key": k, "bounds": r, "window": 0} for k, r in items])
-        if isinstance(keys, list) and set(keys) == {k for k, _ in items}:
-            return keys, "talkback.visual"
-    except Exception:  # noqa: BLE001 - not merged yet, or it could not order these
-        pass
+    """V: T1's talkback.visual XY-cut when it is merged and sound, else :func:`xy_cut`."""
+    fn = _t1_order_items()
+    if fn is not None:
+        try:
+            keys = fn([{"key": k, "bounds": r, "window": 0} for k, r in items])
+            if isinstance(keys, list) and set(keys) == {k for k, _ in items}:
+                return keys, "talkback.visual"
+        except Exception:  # noqa: BLE001
+            pass
     return xy_cut(items), "xy_cut"
 
 

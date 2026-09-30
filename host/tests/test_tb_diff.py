@@ -157,7 +157,7 @@ def test_prev_walk_agrees_with_the_model_in_reverse():
              for j, i in enumerate([3, 2, 1, 0])]
     res = diff.analyze(record(steps, [pstop(*it) for it in items], direction="prev",
                               ended="max_steps"))
-    assert res["vs_model"] == {"agree": 3, "differ": 0, "model": "test", "visual": "xy_cut"}
+    assert res["vs_model"]["agree"] == 3 and res["vs_model"]["differ"] == 0
     assert res["findings"] == []
 
 

@@ -440,7 +440,7 @@ def _ordered_nodes(windows: List[Dict[str, Any]], d: Dict[str, Any]) -> Tuple[Li
     try:
         # T1's literal port of TalkBack's traversal, when it is merged.
         tborder = importlib.import_module("inspector_widget.talkback.order")
-        res = tborder.reading_order(roots)
+        res = tborder.reading_order(d)  # the whole dump: windows, modality, importance
         return list(res["_nodes"]), [e.get("speak") for e in res["focus_order"]], "talkback.order"
     except Exception:  # noqa: BLE001 - not merged yet, or it could not model this dump
         pass
