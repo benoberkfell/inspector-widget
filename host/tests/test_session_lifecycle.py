@@ -100,13 +100,48 @@ def test_a_hung_request_times_out_and_poisons_the_client(agent):
     assert len(agent.requests) == sent
 
 
-def test_a_slow_trickle_still_meets_the_whole_frame_deadline(agent):
+def test_half_a_header_then_nothing_times_out(agent):
     resp = agent.dispatch(_request("hello"))
     frame = fakeagent.frame(resp)
     agent.behaviour = lambda req: (0, frame[:6])  # half a header, then nothing
     client = agent.connect()
     with pytest.raises(AgentTimeoutError):
         client.hello(timeout=0.3)
+
+
+def test_a_slow_trickle_still_meets_the_whole_frame_deadline():
+    """One byte every 0.1s never trips a per-recv 0.3s timeout; only the
+    deadline for the whole frame stops it."""
+    resp = pb.Response(id=1, status=pb.Response.OK)
+    resp.hello.agent_version = "viewspector-0.1+" + "0" * 64
+    frame = fakeagent.frame(resp)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def trickle():
+        conn, _ = srv.accept()
+        with conn:
+            fakeagent.framing.read_message(conn)
+            for byte in frame:
+                try:
+                    conn.sendall(bytes([byte]))
+                except OSError:
+                    return
+                time.sleep(0.1)
+
+    feeder = threading.Thread(target=trickle, daemon=True)
+    feeder.start()
+    client = Client(socket.create_connection(srv.getsockname(), timeout=5))
+    started = time.monotonic()
+    try:
+        with pytest.raises(AgentTimeoutError):
+            client.hello(timeout=0.3)
+        assert time.monotonic() - started < 1.0
+    finally:
+        client.close()
+        srv.close()
+        feeder.join(5)
 
 
 # =========================================================================== #
@@ -935,6 +970,93 @@ def test_an_older_agent_busy_with_another_client_is_not_just_called_frozen(fake_
     finally:
         busy.join(10)
         other.disconnect()
+
+
+# =========================================================================== #
+# Review round: guards that no test pinned down
+# =========================================================================== #
+def test_an_undecodable_reply_poisons_the_client(agent):
+    garbage = fakeagent.framing.MAGIC + b"\x00\x00\x00\x03" + b"\xff\xff\xff"
+    agent.behaviour = lambda req: (0, garbage)
+    client = agent.connect()
+    with pytest.raises(SessionLostError, match="undecodable reply"):
+        client.hello()
+    assert client.broken
+
+
+def test_minimal_validator_checks_numeric_bounds_and_array_items(fake_device, monkeypatch):
+    monkeypatch.setitem(sys.modules, "jsonschema", None)  # the SDK-less fallback's only check
+    res = mcp_server._run_tool("screenshot", {"serial": SERIAL, "package": PKG, "scale": -1})
+    assert res["error"].startswith("invalid argument scale: -1 is less than the minimum")
+    res = mcp_server._run_tool("a11y_lint", {"serial": SERIAL, "package": PKG, "rules": [1]})
+    assert res["error"] == "invalid argument rules: every item must be a string"
+    assert fake_device.adb_log == []
+
+
+def test_list_processes_defaults_to_the_only_device(fake_device, monkeypatch):
+    monkeypatch.delenv(adb.SERIAL_ENV, raising=False)
+    res = mcp_server._run_tool("list_processes", {})
+    assert res["serial"] == SERIAL and res["count"] == 2  # the two debuggable apps
+
+
+def test_a_single_unauthorized_device_gets_advice_without_a_serial(fake_device, monkeypatch):
+    monkeypatch.delenv(adb.SERIAL_ENV, raising=False)
+    fake_device.state = "unauthorized"
+    with pytest.raises(adb.DeviceError, match="Allow USB debugging"):
+        adb.resolve_serial(None)
+
+
+def test_cli_prints_a_traceback_under_the_legacy_log_variable(fake_device, run_cli, monkeypatch):
+    monkeypatch.delenv("INSPECTOR_WIDGET_LOG", raising=False)
+    monkeypatch.setenv("VIEWSPECTOR_LOG", "DEBUG")
+    res = run_cli("dump", "--package", "com.example.idle")
+    assert res.rc == 1 and "Traceback" in res.err
+
+
+def _no_screenshot(agent):
+    agent.behaviour = lambda req: ((0, pb.Response(id=req.id, status=pb.Response.OK))
+                                   if req.WhichOneof("command") == "screenshot"
+                                   else agent.default_behaviour(req))
+
+
+def test_an_image_that_could_not_be_cut_leaves_no_empty_png(mcp, fake_device, warm_agent):
+    _no_screenshot(warm_agent)
+    res = mcp("inspect_node", view_id=1004)
+    assert "error" not in res and not (res.get("component_image") or {}).get("path"), res
+    res = mcp("component_image", view_id=1004)
+    assert not res.get("path"), res
+    assert [p for p in fake_device.tmpdir.rglob("*.png")] == []
+
+
+@pytest.mark.parametrize("tool,args,command", [
+    ("inspect", {}, "dump_compose"),
+    ("inspect", {}, "dump_a11y"),
+    ("inspect_node", {"view_id": 1004, "include_image": False}, "dump_a11y"),
+    ("component_image", {"view_id": 1004}, "screenshot"),
+])
+def test_a_session_lost_mid_tool_is_retried_not_dropped(mcp, fake_device, warm_agent, tool, args,
+                                                        command):
+    """correlate passes a lost session up, so the tool re-attaches and retries
+    instead of returning a tree with the Compose or a11y facet silently missing."""
+    dropped = {"n": 0}
+
+    def drop_first(req):
+        if req.WhichOneof("command") == command and not dropped["n"]:
+            dropped["n"] += 1
+            return 0, "close"
+        return warm_agent.default_behaviour(req)
+
+    warm_agent.behaviour = drop_first
+    res = mcp(tool, **args)
+    assert "error" not in res, res
+    assert fake_device.commands().count(command) == 2
+    assert fake_device.commands().count("hello") == 2  # re-attached (warm)
+    if tool == "inspect":
+        assert res["sources"] == {"view": True, "compose": True, "a11y": True}
+    elif tool == "inspect_node":
+        assert res["a11y"]["text"] == "OK"
+    else:
+        assert Path(res["path"]).is_file()
 
 
 def test_a_timeout_on_a_frozen_app_says_so(mcp, fake_device, run_cli, monkeypatch):
