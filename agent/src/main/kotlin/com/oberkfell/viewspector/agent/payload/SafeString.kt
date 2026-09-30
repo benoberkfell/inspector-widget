@@ -14,8 +14,9 @@
  * values: framework strings and boxed primitives, enums (through name(), which is final), and an
  * allowlist of Kotlin and Compose value types matched by exact class name. It unpacks known
  * carriers through their getters (AnnotatedString.text, AccessibilityAction.label, the counts of
- * CollectionInfo), recurses into collections, maps, arrays and kotlin Pair/Triple with caps, writes
- * functions and lambdas as "<lambda>", and writes anything else as its class's simple name.
+ * CollectionInfo), reads any other CharSequence through length/get, recurses into collections,
+ * maps, arrays and kotlin Pair/Triple with caps, writes functions and lambdas as "<lambda>", and
+ * writes anything else as its class's simple name.
  *
  * Classes are recognised by NAME, never with `is` against a Kotlin or Compose type: the payload may
  * be loaded child-first (its kotlin.* classes are then not the app's), and names keep this file
@@ -38,6 +39,7 @@ internal object SafeString {
 
     private const val MAX_ITEMS = 64
     private const val MAX_NESTING = 4
+    private const val MAX_CHARS = 20_000
 
     /** [v] as a string; never throws (an internal failure yields "<error:ExceptionName>"). */
     fun of(v: Any?): String = try {
@@ -94,6 +96,9 @@ internal object SafeString {
         val name = cls.name
         carrier(name, v, depth)?.let { return it }
         if (name in TO_STRING_SAFE) return v.toString()
+        // Any other CharSequence (an R8-renamed AnnotatedString, an app Spannable): its chars,
+        // read through length/get, never its toString.
+        if (v is CharSequence) return chars(v)
         if (depth < MAX_NESTING) {
             when {
                 v is Collection<*> -> return items(v.iterator(), depth, top = depth == 0)
@@ -103,6 +108,14 @@ internal object SafeString {
         }
         if (isFunction(cls)) return LAMBDA
         return simpleNameOf(cls)
+    }
+
+    private fun chars(cs: CharSequence): String {
+        val n = cs.length
+        val sb = StringBuilder(minOf(n, MAX_CHARS))
+        for (i in 0 until minOf(n, MAX_CHARS)) sb.append(cs[i])
+        if (n > MAX_CHARS) sb.append('…')
+        return sb.toString()
     }
 
     /** Items joined with ", "; bracketed unless [top] (a top-level list keeps the old bare form). */
