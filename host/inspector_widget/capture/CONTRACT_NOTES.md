@@ -182,3 +182,48 @@ with every consumer.
   - launcher `get_properties`: 2,154 (3,500)
   - View screen `inspect`: 14,477 (18,000)
   - View screen `dump_tree(include_properties)`: 16,584 (20,000)
+
+## Offline scenes (F1, `tests/fakescenes.py`)
+
+- **No harness dependency.** improve/offline-e2e-harness (`tests/fakeagent.py`)
+  is not on `main` yet, so the scenes do not import it. A `SceneData` answers
+  `pb.Request` -> `pb.Response`, and exposes it three ways:
+  - `scene.behaviour` is the harness hook `behaviour(req) -> (0.0, response)`.
+    Use `FakeAgent(behaviour=...)` or set `FakeDevice.behaviour`; the skipped
+    test `test_wide_scene_over_the_harness_fake_adb` runs that path once the
+    harness is present.
+  - `scene.session()` returns a `SceneSession`, an in-process `Session` stand-in
+    with the section 10 public surface:
+    - `dump_tree`, `get_windows`, `screenshot`, `dump_compose`, `dump_a11y`,
+      `get_properties`, `hello` and `capture_skp`
+    - `pid`, `serial`, `package`, `api_level`, `abi`, `agent_version` and
+      `build_id`
+    - `close()`
+
+    Requests and responses are round-tripped through protobuf serialization,
+    and an ERROR raises `SceneError`. C3 (fetch) and C4 (index) can test against
+    real data this way, with no sockets.
+  - `fake_attach(scene)` replaces `inspector_widget.attach` for MCP and CLI
+    tests. Also swap in a fresh `mcp_server.SESSIONS`.
+- **Scenes.**
+  - `wide_scene(fan=6)` is the E6 fixture: 259 Views with 60 properties each, a
+    mirrored a11y tree, one "Root" semantics node and an 8x8 screenshot. It
+    reproduces the E6 MCP sizes within 0.3% (149 KB / 1.74 MB / 488 KB /
+    547 KB / 3.85 MB).
+  - `replay_scene("launcher" | "viewscreen", slots_populated=True)` rebuilds
+    responses from `tests/fixtures/live`. The data is **pre-ID1**: every Compose
+    a11y node is `1:11`.
+  - The slot table is served when requested and inspection is on (as recorded,
+    or after `enable_inspection`). Semantics ids are not re-minted.
+  - `include_semantics=False` strips the semantics subtree from the window root.
+    Properties are served without `source`/`resolution_stack` unless those were
+    requested. An unknown view id returns the agent's
+    `No view found with id N`.
+- **Converters.** `views_to_pb`, `compose_to_pb` and `a11y_to_pb` accept the
+  strings.py and a11y.py shapes and the legacy MCP dump_tree shape.
+  - Legacy E3 values are kept as recorded: GRAVITY/INT_FLAG labels are lost, and
+    `#AARRGGBB` colours are re-encoded to int32.
+  - `png_to_screenshot` produces ABGR_8888 (in-memory R,G,B,A) with a 9-byte LE
+    header, deflated.
+  - The strings.py tree shape round-trips exactly. The a11y windows round-trip
+    exactly; `focus_order` is recomputed by a11y.py, so compare windows only.

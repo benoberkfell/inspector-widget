@@ -33,6 +33,11 @@ These are CLI ``--json`` outputs in the strings.py shapes:
 * ``inspect`` is ``inspect --json``.
 * ``get_properties`` is ``get-properties --view-id 13 --json``.
 
+Each screen also has ``screen.png``, a full-resolution 1280x2856 RGBA image.
+The launcher's is the adb ``screencap`` of the same moment (``live/ref_main.png``).
+The View screen's is the agent's own screenshot (``scen_f/shot.png``).
+``fakescenes.replay_scene`` serves them as agent Screenshots.
+
 The original files are ``scratchpad/live/{mcp_phase2_deps,scen_f}/*.json`` and
 ``scratchpad/live/dump0.json``. The only change is compact re-encoding plus gzip.
 """
