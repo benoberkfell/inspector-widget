@@ -68,10 +68,11 @@ class Server(private val socketName: String) {
     private val terminated = CountDownLatch(1)
 
     // Serializes device work so concurrent client connections never interleave
-    // (they queue rather than wedge) — one request is handled at a time.
+    // (they queue rather than wedge) — one request is handled at a time. HELLO
+    // and SHUTDOWN don't take it (see serveConnection).
     private val handleLock = Any()
 
-    // Live client sockets, so stop() can close them to unblock their reads.
+    // Live client sockets, so stop() can shut them down to unblock their reads.
     private val activeClients =
         java.util.Collections.synchronizedSet(java.util.HashSet<LocalSocket>())
 
@@ -141,8 +142,8 @@ class Server(private val socketName: String) {
 
     /**
      * Requests an orderly shutdown: flags stopped, closes the server socket and
-     * wakes the accept loop so it exits and the abstract name is released.
-     * Idempotent.
+     * wakes the accept loop so it exits and the abstract name is released, and
+     * disconnects every client. Idempotent.
      */
     fun stop() {
         if (stopped.compareAndSet(false, true)) {
@@ -153,12 +154,29 @@ class Server(private val socketName: String) {
             // /proc/net/unix) alive, so a new injection could not bind it.
             // Connect once: accept() returns, the loop sees `stopped`, exits.
             wakeAcceptLoop()
-            // Close any live client sockets so their serve-threads unblock and exit.
+            // Disconnect every client. close() alone is not enough, for the same
+            // reason: it doesn't wake a serve thread blocked reading the socket,
+            // so that client would stay connected, never see EOF, and only find
+            // out on its next request. shutdown() wakes the read (the thread
+            // exits) and sends EOF to the client at once.
             synchronized(activeClients) {
-                for (c in ArrayList(activeClients)) closeQuietly(c)
+                for (c in ArrayList(activeClients)) disconnect(c)
                 activeClients.clear()
             }
         }
+    }
+
+    private fun disconnect(client: LocalSocket) {
+        try {
+            client.shutdownInput()
+        } catch (t: Throwable) {
+            // Already closed or never connected: nothing to wake.
+        }
+        try {
+            client.shutdownOutput()
+        } catch (t: Throwable) {
+        }
+        closeQuietly(client)
     }
 
     /**
@@ -242,11 +260,21 @@ class Server(private val socketName: String) {
                     continue
                 }
 
-            // Serialize device work across concurrent connections.
-            val response: ViewInspection.Response =
-                synchronized(handleLock) { dispatcher.handle(request) }
             val isShutdown =
                 request.commandCase == ViewInspection.Request.CommandCase.SHUTDOWN
+            // Serialize device work across concurrent connections. HELLO and
+            // SHUTDOWN touch no UI, so they are answered at once: a client must
+            // not wait behind another client's long request (an SKP capture, a
+            // big a11y dump) and conclude the app is frozen, and SHUTDOWN must
+            // not wait for work it is about to abandon.
+            val response: ViewInspection.Response =
+                if (isShutdown ||
+                    request.commandCase == ViewInspection.Request.CommandCase.HELLO
+                ) {
+                    dispatcher.handle(request)
+                } else {
+                    synchronized(handleLock) { dispatcher.handle(request) }
+                }
 
             try {
                 writeResponse(output, response)
@@ -258,7 +286,7 @@ class Server(private val socketName: String) {
             touchActivity()
 
             // SHUTDOWN: the reply is on its way to the requester; now stop the
-            // server, which closes every client (this one included).
+            // server, which disconnects every client (this one included).
             if (isShutdown) {
                 Log.i(TAG, "SHUTDOWN handled; stopping the server")
                 stop()
