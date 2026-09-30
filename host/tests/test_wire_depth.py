@@ -216,10 +216,9 @@ def test_the_agent_applies_the_cap_to_every_tree():
     # Compose: semantics nodes sit under the synthetic AndroidComposeView root.
     compose = (PAYLOAD_DIR / "ComposeInspector.kt").read_text()
     assert "SEMANTICS_MAX_DEPTH = WireLimits.MAX_TREE_DEPTH - 2" in compose
-    # The slot table has its own, shallower cap (raw groups, under the same root).
-    slot = re.search(r"SLOT_MAX_DEPTH = (\d+)", compose)
-    if slot:
-        assert int(slot.group(1)) + 2 <= cap
+    # The slot table counts the named-composable levels under the same root.
+    assert "SLOT_MAX_DEPTH = WireLimits.MAX_TREE_DEPTH - 1" in compose
+    assert "namedDepth >= SLOT_MAX_DEPTH" in compose
 
 
 # --------------------------------------------------------------------------- #
