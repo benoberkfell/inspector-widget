@@ -144,3 +144,6 @@ the harness fake adb and agent (`tests/capture_harness.py`): `test_ops.py` (the
 pipeline, resolution, staleness, errors), `test_capture_budgets.py` (the real
 renderers' sizes and the workflow totals), `test_surface.py` (parity, validation,
 toolsets, instructions) and `test_e2e_capture.py` (MCP and CLI on one store).
+`test_capture_replay.py` replays real captures recorded live (A11yProbe,
+Thunderbird, Now in Android; `tests/fixtures/captures`, `tests/capture_replay.py`)
+through the same pipeline and budgets.

@@ -268,6 +268,12 @@ with every consumer.
     `a11y:<host>:<virt>`, by shape.
   - `+N` counts the descendants hidden below the preview depth. It is shown on the
     last previewed level only, so root lines have no `+N`.
+  - A single-child chain is one line (`a > b > c`, at most 8 members) and costs
+    one level, and zero-size leaves (ViewStubs) are left out, so the two levels
+    shown are ones that branch (L1: live on S1 the preview stopped at
+    DecorView/LinearLayout). A brief inspect node's `@pkg:id/name` is `#name`.
+  - The hint suggests `detail="brief"` only when the call asked for full
+    (`finalize(..., detail=)`).
 - **Counted omissions**: `omitted` is a dict of counters, with keys
   - `defaults`, `duplicates`, `depth`, `properties_views`, `attr_values`,
     `boilerplate_actions`, `empty_extras`, `focus_order`,
@@ -491,7 +497,9 @@ with every consumer.
   - In semantic detail a node is shown when it is a window, has a
     label/rid/tag, is actionable (click, longclick, edit, checkable, scroll),
     is a stop, has issues, is a leaf, or has 2 or more shown direct children.
-  - Zero-size nodes and ViewStubs are hidden with their subtree.
+  - Zero-size nodes and ViewStubs are hidden with their subtree. An empty
+    `AndroidViewsHandler` (Compose interop plumbing) is not a content leaf: it
+    collapses into its parent's `+N` (L1: one line per Thunderbird ComposeView row).
   - Each tree node is exactly one of: on a line, collapsed (hoisted through),
     hidden, or counted in one line's `+N`. The response's
     `hidden:{zero_size, collapsed, library}` counts the middle two, and a
@@ -857,6 +865,11 @@ with every consumer.
     skips nodes inside collection cells, and never breaks an IoU tie.
   - The a11y uniqueId locator is read from `facets.a11y.unique_id` (or
     `uniqueId`); C4 should store it under `unique_id`.
+- **Views without device identity (L1).** A #rid is unique per screen, not per
+  app: without an identity match, the locator, structure and geometry passes
+  pair a View only with a View of the same class inflated from the same layout
+  (`layout_res`), so another activity's #coordinator_layout never takes the ref
+  (live: Thunderbird's message list and composer).
 - **Test helpers**: `tests/capture_keyscenes.py` (renamed from `capture_scenes.py`
   when C4's scene module of that name merged) builds key-space scenes (`V`, `C`,
   `S`, `A`, `scene()`), re-keys them (`rekey`, `shift_udids`, `key_space`), and
@@ -995,6 +1008,11 @@ with every consumer.
   - Only nodes with content (a label, text or actions), or containers of such
     nodes, are reported, at most one render issue per subtree. Content scrolled
     fully out of a scroll container is not an issue.
+- **Inferred clips compare look-alikes (L1).** `render.clipped` (inferred)
+  measures a node at a scroll edge against the median of siblings of the same
+  type *and* #rid (a row's #star_click_area is not a #divider), and a scroll
+  container whose actions do not name an axis gets it from its CollectionInfo
+  (rows x 1: vertical; 1 x cols: horizontal).
 - **False positives at a scroll edge.** A touch-target finding on a node clipped
   at a scroll edge gets `note: "likely false positive: clipped at scroll edge"`.
   A contrast finding there gets a low-confidence note and conf inferred.
@@ -1211,6 +1229,10 @@ what now holds:
   default `capture="latest"`. `diff(a="prev")` is b's predecessor (`meta.prev`),
   not the lineage's second newest. `node(refs=[x])` with one entry is `node(ref=x)`.
   `node(image=true)` embeds `{path, px}` of the crop (or `{error}`).
+- **`captures export`**: `format="raw"` copies the protobuf replies (the whole
+  capture for what nodes/all/raw, else the facet's pb) and `format="legacy"`
+  regenerates the old dump JSON (views, compose, slots, a11y); a `what` without
+  that form is `bad_args` (L1: both were ignored).
 - **`captures`.** `list` shows the resolved session's lineage (all of the store
   when none, or with `all=true`), newest first, and says how many captures of
   other apps it hides; `show` is the meta (non-default options, facet statuses,
@@ -1287,3 +1309,24 @@ what now holds:
   JSON envelope to stderr, exit 1. The generated subcommands never resolve a
   serial through adb themselves (queries do no device I/O) and close their
   sessions without SHUTDOWN.
+
+## Live verification and real replays (L1)
+
+- **Fixtures.** `tests/fixtures/captures/<name>/`: `meta.json`, `raw/<facet>.pb.gz`,
+  `shot/w_<root>.pb` and `source.json`, recorded on emulator-5558 (API 37,
+  480 dpi) with the post-hardening agent: A11yProbe (launcher, launcher after
+  slots=enable, View screen, all scenarios, D1 dialog, S1 before/after a scroll,
+  the bare-widget defaults screen), Thunderbird's message list with View and
+  with ComposeView rows (demo mailbox), Now in Android's For you and Settings
+  dialog. `tests/capture_replay.py` records them (`record STORE ID NAME`) and
+  serves one as a `fakescenes.SceneData` (`FakeAgent.from_capture(name)`);
+  `replay_device` gives the harness device the recorded package, pid, density
+  and font scale. `tests/test_capture_replay.py` runs every budget, the >= 95%
+  `conf:exact` and no-ID1 checks, per-window crops, the scroll rebinding and the
+  live regressions over them.
+- **Hardened agent values.** SafeString sends an unlabelled AccessibilityAction as
+  `<action>`, a labelled one as its label and a lambda as `<lambda>`;
+  `normalize.is_action_attr(raw, key)` takes the marker and the SemanticsActions
+  keys, so they stay actions, not attr values.
+- **Composited screens** alpha-composite each window over the ones below (a
+  dialog window is transparent outside its card).
