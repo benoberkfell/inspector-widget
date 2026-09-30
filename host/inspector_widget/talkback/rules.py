@@ -1,3 +1,6 @@
+# Portions of this file are derived from google/talkback (https://github.com/google/talkback)
+# at commit 229212f (TalkBack 16.2), licensed under the Apache License, Version 2.0.
+# Reimplemented in Python and modified for Inspector Widget; see NOTICE.
 """TalkBack 16.2's focus predicates, ported from google/talkback @229212f.
 
 Citations are to the TalkBack tree at that commit; ``UT`` =

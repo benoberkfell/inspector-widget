@@ -1,3 +1,6 @@
+# Portions of this file are derived from google/talkback (https://github.com/google/talkback)
+# at commit 229212f (TalkBack 16.2), licensed under the Apache License, Version 2.0.
+# Reimplemented in Python and modified for Inspector Widget; see NOTICE.
 """A static model of TalkBack's navigation over an Inspector Widget accessibility dump.
 
 A port of google/talkback @229212f (16.2, Apache-2.0) run over the unified a11y tree, calibrated

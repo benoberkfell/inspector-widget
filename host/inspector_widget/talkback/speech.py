@@ -1,3 +1,6 @@
+# Portions of this file are derived from google/talkback (https://github.com/google/talkback)
+# at commit 229212f (TalkBack 16.2), licensed under the Apache License, Version 2.0.
+# Reimplemented in Python and modified for Inspector Widget; see NOTICE.
 """What TalkBack 16.2 says when a node takes accessibility focus, with the source of every word.
 
 A port of the focused-event feedback (``TB`` = ``talkback/src/main/java/com/google/android/
