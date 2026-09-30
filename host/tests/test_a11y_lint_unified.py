@@ -968,3 +968,14 @@ def test_end_to_end_from_the_wire():
     assert [(x.node_key, x.evidence["unit"]) for x in f11] == [("view:12", "px")]
     btn = [x for x in of(rep, "a11y.label.missing") if x.node_key == "compose:20:7"][0]
     assert btn.node["id"] == L.a11y_node_id(20, 7)
+
+
+def test_r2_vertical_list_does_not_clip_width():
+    # A 40dp button flush with the left edge of a vertical list: its width is real.
+    btn = comp(20, 11, "android.widget.Button", flags=CLICK, cd="Back", b=(0, 600, 40, 40))
+    lazy = comp(20, 9, flags=("scrollable",), b=(0, 260, 1080, 1800), kids=[btn],
+                actions=["SCROLL_FORWARD", "SCROLL_DOWN"],
+                collection_info={"row_count": -1, "column_count": 1})
+    f = of(lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[lazy])))),
+           "a11y.touch_target.small")
+    assert [(x.severity, "clipped_axes" in x.evidence) for x in f] == [("warn", False)]

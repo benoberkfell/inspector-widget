@@ -1009,15 +1009,39 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
 _EDGE_TOL = 2
 
 
+_VSCROLL_CLASSES = {"ScrollView", "NestedScrollView", "ListView", "ExpandableListView"}
+_HSCROLL_CLASSES = {"HorizontalScrollView"}
+
+
+def _scroll_axes(c: _Node) -> Set[str]:
+    """Dimensions a scroll container can clip: "h" for vertical, "w" for horizontal."""
+    v = bool({"SCROLL_UP", "SCROLL_DOWN"} & c.actions)
+    h = bool({"SCROLL_LEFT", "SCROLL_RIGHT"} & c.actions)
+    if v != h:
+        return {"h"} if v else {"w"}
+    ci = c.collection_info or {}
+    if ci.get("column_count") == 1:
+        return {"h"}
+    if ci.get("row_count") == 1:
+        return {"w"}
+    if c.simple_class in _VSCROLL_CLASSES:
+        return {"h"}
+    if c.simple_class in _HSCROLL_CLASSES:
+        return {"w"}
+    return {"h", "w"}
+
+
 def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
-    """Axes on which ``n`` touches the edge of a scroll container (any edge) or runs
-    into the window's right/bottom edge -- i.e. its bounds are probably clipped."""
+    """Dimensions in which ``n`` touches the edge of a scroll container (along its
+    scroll axis) or runs into the window's right/bottom edge -- i.e. its bounds are
+    probably clipped."""
     axes: Set[str] = set()
     c = n.clip
     while c is not None:
-        if n.y <= c.y + _EDGE_TOL or n.y + n.h >= c.y + c.h - _EDGE_TOL:
+        can = _scroll_axes(c)
+        if "h" in can and (n.y <= c.y + _EDGE_TOL or n.y + n.h >= c.y + c.h - _EDGE_TOL):
             axes.add("h")
-        if n.x <= c.x + _EDGE_TOL or n.x + n.w >= c.x + c.w - _EDGE_TOL:
+        if "w" in can and (n.x <= c.x + _EDGE_TOL or n.x + n.w >= c.x + c.w - _EDGE_TOL):
             axes.add("w")
         c = c.clip
     win = n.win
@@ -1338,6 +1362,7 @@ def _is_row_like(n: _Node) -> bool:
     if row is n:
         return True
     return row.w > 0 and row.h > 0 and n.w * n.h >= 0.8 * row.w * row.h
+
 
 def rule_role_missing(n: _Node, run: _Run) -> List[Finding]:
     if not _visible(n) or ("clickable" not in n.flags and "CLICK" not in n.actions):
