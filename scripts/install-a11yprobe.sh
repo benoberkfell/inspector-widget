@@ -5,10 +5,10 @@
 # A11yProbe is the GOOD/BAD accessibility corpus the Task-B lint rules and the
 # integrated component view validate against (testapps.md). It is a STANDALONE
 # Gradle build under testapps/a11yprobe (not a viewspector subproject), pinned to
-# the same JDK-21 / AGP-8.7.2 / Gradle-8.13 / compileSdk-36 matrix as the host.
+# the same JDK-17..23 / AGP-8.7.2 / Gradle-8.13 / compileSdk-36 matrix as the host.
 #
 # Pipeline (testapps.md §6):
-#   1. select JDK 21 via /usr/libexec/java_home -v 21  (same as scripts/build.sh)
+#   1. select a JDK 17-23 (scripts/lib/select-jdk.sh, same as scripts/build.sh)
 #   2. ensure the Gradle wrapper exists in testapps/a11yprobe (copy from root)
 #   3. ./gradlew -p testapps/a11yprobe :app:installDebug
 #   4. am start the launcher MainActivity
@@ -46,14 +46,12 @@ for arg in "$@"; do
     esac
 done
 
-# JDK 21 is required by AGP 8.7.2 / Gradle 8.13 (same as scripts/build.sh:41).
-log "Selecting JDK 21..."
-if ! JAVA_HOME="$(/usr/libexec/java_home -v 21 2>/dev/null)"; then
-    die "JDK 21 not found via /usr/libexec/java_home -v 21. Install Temurin/Corretto 21."
-fi
-export JAVA_HOME
-export PATH="$JAVA_HOME/bin:$PATH"
-ok "JAVA_HOME=$JAVA_HOME"
+# A JDK 17-23 runs AGP 8.7.2 / Gradle 8.13 (same selection as scripts/build.sh).
+# shellcheck source=lib/select-jdk.sh
+. "$PROJECT_ROOT/scripts/lib/select-jdk.sh"
+log "Selecting a JDK ($JDK_MIN-$JDK_MAX)..."
+select_jdk || exit 1
+ok "JAVA_HOME=$JAVA_HOME (JDK $(jdk_major "$JAVA_HOME"))"
 
 [ -d "$APP_DIR" ] || die "App dir not found: $APP_DIR"
 [ -x "$ADB" ] || die "adb not found at $ADB"

@@ -87,8 +87,9 @@ build-out/                    generated artifacts (gitignored): libviewspector.s
 ```
 Pinned for reproducibility (in `settings.gradle.kts` / `agent/build.gradle.kts`): AGP 8.7.2,
 Kotlin 2.0.21, protobuf-plugin 0.9.4, NDK `27.1.12297006`, build-tools `36.1.0`, compileSdk/targetSdk 36.
-The real requirements are looser: **JDK 17+** to run Gradle (`build.sh` selects one; code compiles to
-Java 17/11 via toolchains), the wrapper auto-fetches **Gradle 8.13**, and the only hard runtime floor is
+The real requirements are looser: **any JDK 17–23** to run Gradle (`build.sh` honours an in-range
+`JAVA_HOME`, else finds one; the code targets Java 17/11 bytecode, with no exact-JDK toolchain; Gradle
+8.13 can't run on JDK 24+), the wrapper auto-fetches **Gradle 8.13**, and the only hard runtime floor is
 **`minSdk 29`**. Relax the SDK/NDK pins to whatever you have installed. The Gradle wrapper jar is tracked
 so the build runs without a preinstalled `gradle`; **`local.properties` is not tracked** — point Gradle at
 your SDK via `local.properties` (`sdk.dir=...`) or the `ANDROID_HOME` env var.
