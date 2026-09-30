@@ -1242,11 +1242,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "dump_compose), text/contentDescription/stateDescription/role, all a11y state flags, "
             "on-screen bounds, decoded actions (CLICK/SCROLL_FORWARD/SET_PROGRESS/...), collection/"
             "range info and extras. Every node has a typed node_key (view:<id> | "
-            "compose:<acvId>:<semanticsId>) usable with inspect_node. Also returns the "
-            "host-computed TalkBack reading order (focus_order: [{order, key, speak}] — what "
-            "TalkBack announces at each stop, e.g. 'Delete, button'), built from the ANI child "
-            "order + traversal_before/after, with reading_order_diagnostics for cycles and "
-            "dangling targets. Auto-attaches."
+            "compose:<acvId>:<semanticsId>) usable with inspect_node, valid for this dump's "
+            "generation (it changes when Compose re-mints ids; inspect_node re-resolves older "
+            "keys). Also returns the host-computed TalkBack reading order (focus_order: "
+            "[{order, key, speak}] — what TalkBack announces at each stop, e.g. 'Delete, "
+            "button'), built from the ANI child order + traversal_before/after over the tree "
+            "TalkBack sees: Views not important for accessibility are skipped (marked ignored; "
+            "their children read in their place) and windows under an open modal dialog are "
+            "unreachable (covered_by). reading_order_diagnostics reports cycles, dangling targets "
+            "and covered windows. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1275,7 +1279,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "text and traversal-order cycles. Each finding has rule + alias (R#), severity "
             "(error/warn/info), node_key (view:<id> or compose:<acvId>:<semId>, usable with "
             "inspect_node), node, bounds (px and dp), window, collection position, a remediation "
-            "message and evidence. Also returns summary and diagnostics. set include_contrast=false "
+            "message and evidence (window.covered_by marks a window under an open dialog). Also "
+            "returns summary, diagnostics and the dump's generation. set include_contrast=false "
             "to skip the one pixel rule. Auto-attaches."
         ),
         "schema": {
@@ -1548,11 +1553,16 @@ TOOLS.update({
             "Full dossier for ONE element, selected by node_key ('view:<id>' | "
             "'compose:<acvId>:<semanticsId>' | 'composeview:<acvId>'), view_id (uniqueDrawingId), "
             "semantics_id (only when a single ComposeView has it), or bounds {x,y,w,h} (deepest "
-            "covering element). A Compose key from an earlier dump is re-resolved after "
-            "recomposition (resolved_from). Returns all facets fully populated (view "
-            "attributes+properties, full a11y, compose attrs/source), where/context (window > "
-            "list row > ComposeView > node), its component image (SKP cut by graphicsLayer "
-            "layerId, else BITMAP crop) saved to a PNG path, and the lint findings for this node."
+            "covering element). Every key dump_accessibility / a11y_lint / inspect hand out "
+            "resolves (children Compose merged into a focusable parent are a11y_only, with "
+            "a11y_parent); a Compose key from an earlier dump is re-resolved after "
+            "recomposition (resolved_from) and a rebound RecyclerView cell gets a key_note. "
+            "Returns all facets (view attributes+properties, full a11y, compose semantics attrs; "
+            "compose.source file:line only when the slot table is populated), where/context "
+            "(window > list row > ComposeView > node), its component image cut from its own "
+            "window (SKP by graphicsLayer layerId, else BITMAP crop) saved to a PNG path, and "
+            "lint: exactly the a11y_lint findings for this node (and the nodes merged into it), "
+            "with lint_summary and lint_diagnostics."
         ),
         "schema": {
             "type": "object",
@@ -1582,8 +1592,9 @@ TOOLS.update({
         "description": (
             "Cut a per-component image for one element and save it as a PNG. Uses the SKP path "
             "(skiaparser GetViewTree by the Compose graphicsLayer render-node id) when available, "
-            "else a BITMAP crop of the element's bounds from a full screenshot. Returns the PNG "
-            "path and which path produced it (source: 'skp' | 'bitmap_crop')."
+            "else a BITMAP crop of the element's bounds from a screenshot of the element's own "
+            "window (a dialog node is cut from the dialog). Returns the PNG path and which path "
+            "produced it (source: 'skp' | 'bitmap_crop', window: the root view id cropped)."
         ),
         "schema": {
             "type": "object",
