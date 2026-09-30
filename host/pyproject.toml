@@ -40,9 +40,10 @@ mcp = ["mcp>=1.19,<3"]
 # gRPC client used by inspector_widget.skia_client to talk to the Skia parser
 # service for SKP image decoding. Optional — only the SKP image path needs it.
 images = ["grpcio>=1.60"]
-# Pillow gives a faster/native PNG encoder in inspector_widget.png; the module
-# falls back to a pure-stdlib (zlib+struct) encoder when it is absent. Also used
-# by inspector_widget.overlay for a11y overlay rendering.
+# Pillow is required by every overlay tool (inspector_widget.overlay:
+# compose_overlay, a11y_overlay, inspect --overlay) and by the component_image
+# screenshot-crop fallback. inspector_widget.png alone falls back to a stdlib
+# (zlib+struct) encoder without it.
 overlay = ["Pillow>=10"]
 # Developer tooling.
 dev = ["pytest", "ruff"]

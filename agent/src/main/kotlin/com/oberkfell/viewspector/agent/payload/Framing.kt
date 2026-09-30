@@ -24,7 +24,7 @@ import java.io.OutputStream
 /**
  * Reads and writes length-prefixed, magic-tagged messages.
  *
- * Symmetric with the Python host's framing in `viewspector_host`. Both sides
+ * Symmetric with the Python host's framing in `inspector_widget.framing`. Both sides
  * agree on [MAGIC] and a 4-byte big-endian length.
  */
 object Framing {
