@@ -247,8 +247,10 @@ def fake_device(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "SESSIONS", cache)
     # Forwards this process "made" (adb.remove_own_forwards cleans them up at
     # exit) belong to this test's fake device only.
-    from inspector_widget import adb
+    from inspector_widget import adb, inject
     monkeypatch.setattr(adb, "_OWN_FORWARDS", {})
+    # Start-up failures remembered by an earlier test's attach.
+    monkeypatch.setattr(inject, "_FAILED", {})
     monkeypatch.setattr(mcp_server._a11y_device_metrics, "_cache", {}, raising=False)
     try:
         yield dev

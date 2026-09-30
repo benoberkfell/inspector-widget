@@ -194,3 +194,38 @@ def test_structural_node_not_counted_as_stop():
     assert by_id[100]["order"] is None
     assert by_id[1]["is_focus_stop"] is True
     assert by_id[1]["order"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Bounds clipped out of the parent (real-app run B11)
+# --------------------------------------------------------------------------- #
+def test_a11y_negative_sizes_are_clamped_and_flagged(strings_builder):
+    """getBoundsInScreen's unchecked intersect gives right < left for a node
+    scrolled or paged out of its parent (AntennaPod: a ViewPager2 page w=-264,
+    "Skip episode" h=-2159); older agents send that as is."""
+    from inspector_widget import strings as st
+    sb = strings_builder
+    page = make_a11y_node(sb, host_view_id=7, virtual_id=-1, bounds=(1344, 200, -264, 900))
+    skip = make_a11y_node(sb, host_view_id=8, virtual_id=-1, bounds=(40, 2856, 120, -2159))
+    shown = make_a11y_node(sb, host_view_id=9, virtual_id=-1, bounds=(0, 0, 0, 48))
+    resolver = st.StringResolver(sb.build())
+    out = [a11y.a11y_node_to_dict(n, resolver)["bounds"] for n in (page, skip, shown)]
+    assert out[0] == {"layout": {"x": 1344, "y": 200, "w": 0, "h": 900}, "clipped": True}
+    assert out[1] == {"layout": {"x": 40, "y": 2856, "w": 120, "h": 0}, "clipped": True}
+    assert out[2] == {"layout": {"x": 0, "y": 0, "w": 0, "h": 48}}  # zero is not clipped
+
+
+def test_a11y_to_dict_carries_the_clamp_through_the_whole_dump(strings_builder):
+    sb = strings_builder
+    gone = make_a11y_node(sb, host_view_id=3, virtual_id=-1, bounds=(0, 3000, 200, -2159),
+                          text="Skip episode", class_name="android.widget.Button",
+                          bool_flags=["clickable", "focusable"])
+    root = make_a11y_node(sb, host_view_id=1, virtual_id=-1, bounds=(0, 0, 1080, 2400),
+                          class_name="android.widget.FrameLayout",
+                          bool_flags=["visible_to_user"], children=[gone])
+    resp = pb.DumpA11yResponse(strings=sb.build())
+    resp.windows.add(root_view_id=1, root=root)
+    out = a11y.a11y_to_dict(resp)
+    [kid] = out["windows"][0]["root"]["children"]
+    assert kid["bounds"] == {"layout": {"x": 0, "y": 3000, "w": 200, "h": 0}, "clipped": True}
+    assert "clipped" not in out["windows"][0]["root"]["bounds"]
