@@ -41,7 +41,9 @@ Matching runs these passes, each over the nodes the earlier ones left unmatched:
    when its cell is already matched to the cell of the other node (a lone section
    header or pager page is unique on both sides and still a different item). A
    cell root carries only when both collections are matched and show two or more
-   cells, so the locator tells cells apart (a per-item testTag).
+   cells, so the locator tells cells apart (a per-item testTag). Without device
+   identity a View carries only to a View of the same class inflated from the
+   same layout, in every pass (a #rid is unique per screen, not per app).
 3. **Structure**: the parent is matched, and the kind, type, rid, tag and label
    are equal. A node that is the only such sibling on both sides matches even if
    its ordinal changed (so an insertion above keeps the refs below it). Look-alike
@@ -116,6 +118,28 @@ _CONTENT_LABELS = 3
 _GRID = 64
 _ITEM_INDEX_RE = re.compile(r"\[(\d+)\]")
 _ROOT = ""  # the virtual parent of every root
+
+
+def _layout_of(n: UNode) -> str | None:
+    """The layout a View was inflated from (None for other kinds or unknown)."""
+    if n.kind != "view":
+        return None
+    return (n.facets.get("view") or {}).get("layout_res") or None
+
+
+def _same_view_class(a: UNode, b: UNode) -> bool:
+    """Two View nodes carry-over may pair without device identity: the same class
+    and the same inflating layout, when both sides know them. A #rid is only
+    unique per screen: another activity or fragment reuses it for another View
+    (seen live: Thunderbird's #coordinator_layout is a RelativeLayout in
+    layout/message_list and a CoordinatorLayout in layout/message_compose), and a
+    View from another layout file is never the same node."""
+    if a.kind != "view":
+        return True
+    if a.type and b.type and a.type != b.type:
+        return False
+    la, lb = _layout_of(a), _layout_of(b)
+    return not (la and lb and la != lb)
 
 Alloc = Callable[[int], int]
 
@@ -423,7 +447,7 @@ class _Side:
 
     def group_key(self, nid: str) -> tuple:
         n = self.nodes[nid]
-        return n.kind, n.type, n.rid, n.tag, n.label
+        return n.kind, n.type, n.rid, n.tag, n.label, _layout_of(n)
 
 
 # --------------------------------------------------------------------------- #
@@ -590,6 +614,7 @@ class _Matcher:
                     continue
                 pid = by_prev[loc]
                 if (self._free_prev(pid) and prev.nodes[pid].kind == new.nodes[nid].kind
+                        and _same_view_class(new.nodes[nid], prev.nodes[pid])
                         and self._same_cell(nid, pid)):
                     self._pair(nid, pid, "locator")
                     break
@@ -726,7 +751,8 @@ class _Matcher:
                 cands = self._window_candidates(node, grids, prev_windows_by_z)
             for p in cands:
                 pnode = prev.nodes[p]
-                if pnode.kind != node.kind or pnode.type != node.type:
+                if (pnode.kind != node.kind or pnode.type != node.type
+                        or not _same_view_class(node, pnode)):
                     continue
                 v = iou(node.b, pnode.b)
                 if v >= GEOMETRY_MIN_IOU and self._compatible(n, p):
