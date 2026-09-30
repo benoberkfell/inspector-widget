@@ -84,6 +84,9 @@ object AccessibilityInspector {
 
     private const val HOST_VIEW_ID = A11yIds.HOST_VIEW_ID
 
+    // Single-node Compose password lookups a lite snapshot makes before it indexes the tree.
+    private const val LITE_COMPOSE_LOOKUPS = 8
+
     // Cap on emitted extras per node, and skip very large stringified values (Parcelables).
     private const val MAX_EXTRAS = 64
     private const val MAX_EXTRA_VALUE_LEN = 512
@@ -188,6 +191,9 @@ object AccessibilityInspector {
         var depthTruncated = 0
         val loggedFailures = HashSet<String>()
         val composeIndex = HashMap<View, ComposeInspector.SemanticsIndex?>()
+
+        /** Single-node Compose password lookups made in lite mode (see [composePassword]). */
+        var composeLookups = 0
 
         /** Count a failed reflective call; log the first failure of each [kind] per dump. */
         fun fail(kind: String, t: Throwable) {
@@ -727,7 +733,7 @@ object AccessibilityInspector {
         fun s(cs: CharSequence?): Int = strings.intern(cs?.toString())
 
         // --- text & description ------------------------------------------------
-        b.text = s(safe { a11yText(node) })
+        b.text = s(safe { a11yText(node, ident, ctx) })
         b.contentDescription = s(safe { node.contentDescription })
         b.hintText = s(safe { node.hintText })
         b.stateDescription = s(safe { node.stateDescription })
@@ -1088,16 +1094,35 @@ object AccessibilityInspector {
 
     /**
      * The node's text, masked (Redaction.kt) for a password field: the node says so
-     * (isPassword) or its input type is a password variation (a visible-password field is
-     * not isPassword, yet its text is the plaintext). A node showing its hint keeps it.
+     * (isPassword), its input type is a password variation (a visible-password field is
+     * not isPassword, yet its text is the plaintext), or it is a Compose password field
+     * ([composePassword]). A node showing its hint keeps it.
      */
-    private fun a11yText(node: AccessibilityNodeInfo): CharSequence? {
+    private fun a11yText(node: AccessibilityNodeInfo, ident: Ident, ctx: Ctx): CharSequence? {
         val text = node.text
         if (text.isNullOrEmpty()) return text
         val secret = bool { node.isPassword } ||
-            Redaction.isPasswordInputType(safeInt { node.inputType })
+            Redaction.isPasswordInputType(safeInt { node.inputType }) ||
+            composePassword(ident, ctx)
         if (!secret || bool { node.isShowingHintText }) return text
         return Redaction.mask(text)
+    }
+
+    /**
+     * A Compose virtual node whose SemanticsNode is a password field
+     * (ComposeInspector.isPasswordNode). Compose sets no input type, so a visible-password
+     * field's node is neither isPassword nor a password input type. From the dump's semantics
+     * index; the lite snapshot (a node or two) looks up its one node instead, and builds the
+     * index after [LITE_COMPOSE_LOOKUPS] lookups (a deep subtree would walk the tree per node).
+     */
+    private fun composePassword(ident: Ident, ctx: Ctx): Boolean {
+        if (ident.virtualId == HOST_VIEW_ID) return false
+        val view = ident.view ?: return false
+        if (!ComposeInspector.isAndroidComposeView(view)) return false
+        if (ctx.lite && ctx.composeLookups++ < LITE_COMPOSE_LOOKUPS) {
+            return ComposeInspector.isPasswordNode(view, ident.virtualId)
+        }
+        return composeIndexOf(ident, ctx)?.passwords?.contains(ident.virtualId) == true
     }
 
     private inline fun <T> safe(block: () -> T): T? = try {
