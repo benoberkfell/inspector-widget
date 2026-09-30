@@ -695,7 +695,7 @@ def tool_detach(serial: str, package: str) -> Dict[str, Any]:
 def tool_dump_compose(
     serial: str, package: str,
     include_semantics: bool = True, include_slot_table: bool = True,
-    enable_inspection: bool = True,
+    enable_inspection: bool = False,
 ) -> Dict[str, Any]:
     """Dump the Compose layer (semantics tree + slot table) of the app's UI."""
     _require(serial, "serial")
@@ -707,6 +707,10 @@ def tool_dump_compose(
                                 enable_inspection=enable_inspection)
     data = st.dump_compose_to_dict(resp)
     data.update({"serial": serial, "package": package})
+    if include_slot_table and not enable_inspection and not st.compose_slot_table_populated(data):
+        data["note"] = ("slot table not populated (semantics only). Pass enable_inspection=true for "
+                        "composable names/params/file:line. WARNING: "
+                        + st.ENABLE_INSPECTION_WARNING % "enable_inspection=true")
     return data
 
 
@@ -761,7 +765,7 @@ def _h_dump_compose(args: Dict[str, Any]) -> Dict[str, Any]:
         args.get("serial"), args.get("package"),
         include_semantics=args.get("include_semantics", True),
         include_slot_table=args.get("include_slot_table", True),
-        enable_inspection=args.get("enable_inspection", True),
+        enable_inspection=args.get("enable_inspection", False),
     )
 
 
@@ -1189,9 +1193,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "description": "Include the semantics tree (on-screen text/role/bounds)."},
                 "include_slot_table": {"type": "boolean", "default": True,
                     "description": "Also include the slot table (composable hierarchy, parameters, file:line)."},
-                "enable_inspection": {"type": "boolean", "default": True,
-                    "description": "Enable Compose inspection (hot-reload) so the slot table populates. "
-                                   "Triggers one recomposition; state is preserved. Set false to avoid it."},
+                "enable_inspection": {"type": "boolean", "default": False,
+                    "description": "Populate the slot table (composable names, parameters, file:line) by "
+                                   "hot-reloading. DESTRUCTIVE: resets remember{} state in every composition "
+                                   "(open dialogs, text input, scroll, toggles). Off by default; the semantics "
+                                   "tree needs no hot-reload. Also re-mints Compose node ids once."},
             },
             "required": ["serial", "package"],
             "additionalProperties": False,

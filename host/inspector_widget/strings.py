@@ -237,6 +237,24 @@ def compose_node_to_dict(node: "pb.ComposeNode", resolver: StringResolver) -> Di
     return out
 
 
+#: Why ``enable_inspection`` is opt-in. Shared by the CLI and MCP so both warn identically.
+ENABLE_INSPECTION_WARNING = (
+    "enable_inspection hot-reloads every composition in the app process, which resets plain remember{} state (open dialogs, text input, scroll position, toggles). Only use it when you need slot-table detail "
+    "(composable names, parameters, file:line), and capture any state you care about first."
+)
+
+
+def compose_slot_table_populated(data: Dict[str, Any]) -> bool:
+    """True if any window in a ``dump_compose_to_dict`` result carries slot-table
+    (COMPOSABLE) nodes below its synthetic window root."""
+    def walk(node: Dict[str, Any]) -> bool:
+        for child in node.get("children") or []:
+            if child.get("kind") == "COMPOSABLE" or walk(child):
+                return True
+        return False
+    return any(walk(w["root"]) for w in data.get("windows", []) if w.get("root"))
+
+
 def dump_compose_to_dict(response: "pb.DumpComposeResponse") -> Dict[str, Any]:
     resolver = StringResolver(response.strings)
     out: Dict[str, Any] = {
