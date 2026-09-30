@@ -296,7 +296,8 @@ open and the app still has the same pid); a dead one (the agent idled out, the
 app restarted, another client sent SHUTDOWN) is dropped and re-attached, and a
 read-only call whose connection drops mid-way is retried once on a fresh attach.
 Not retried: a timeout (it would only wait again), `attach`/`detach` (they
-manage the session themselves), `dump_compose` with `enable_inspection=true`
+manage the session themselves), the TalkBack tools (a retry would repeat
+device-wide key presses), `dump_compose` with `enable_inspection=true`
 unless the request provably never left the host (the hot reload must not run
 twice), a call whose app a concurrent `detach` stopped (the retry would inject
 the agent again), and anything once the server is exiting. Every tool that
