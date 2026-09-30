@@ -868,21 +868,11 @@ def test_mcp_inspect(mcp, fake_device):
     res = mcp("inspect")
     assert fake_device.commands()[1:] == ["dump_tree", "dump_compose", "dump_a11y"]
     assert res["summary"]["nodes"] == 15 and res["sources"]["a11y"] is True
-    host = find(res["roots"], node_key="view:1006")
-    assert find(host["children"], node_key="compose:1006:6")["a11y"]["virtual_id"] == 6
-
-
-@pytest.mark.xfail(strict=True, reason="A1: the agent on this branch gives every a11y node the "
-                   "root View's host_view_id and the low 32 bits of the packed child id as its "
-                   "virtual_id, so the host's a11y joins only work with the ids of the A1-fixed "
-                   "agent (improve/a11y-agent-identity), which is what the fake sends by default. "
-                   "When that agent lands, delete FakeAgent.legacy_a11y_ids and this test.")
-def test_mcp_inspect_with_the_a11y_ids_this_branchs_agent_sends(mcp, fake_device):
-    fake_device.start_agent(PKG).legacy_a11y_ids = True
-    res = mcp("inspect")
+    # The agent's a11y ids: each node carries its own View's host_view_id, and a
+    # Compose node its semantics id as virtual_id (ledger A1, fixed on device).
     assert find(res["roots"], node_key="view:1004")["a11y"]["host_view_id"] == 1004
     host = find(res["roots"], node_key="view:1006")
-    assert find(host["children"], node_key="compose:6")["a11y"]["virtual_id"] == 6
+    assert find(host["children"], node_key="compose:1006:6")["a11y"]["virtual_id"] == 6
 
 
 @needs_pil
