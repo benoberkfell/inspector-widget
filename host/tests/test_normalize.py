@@ -402,3 +402,31 @@ def test_import_is_cheap_and_protobuf_free():
                        text=True, env=dict(os.environ, PYTHONPATH=HOST_DIR), check=False)
     assert r.returncode == 0, r.stdout + r.stderr
     assert float(r.stdout.split()[0]) < 0.05, r.stdout
+
+
+def test_action_attrs_from_the_hardened_agent():
+    """SafeString (agent-hardening) sends an unlabelled AccessibilityAction as
+    "<action>", a labelled one as its label and a lambda as "<lambda>": all three
+    are actions or lambdas, never attr values (seen live on Thunderbird)."""
+    assert nz.is_action_attr("<action>")
+    assert nz.is_action_attr(" <action> ", "Whatever")
+    assert nz.is_action_attr("Open message", "OnClick")  # labelled: by key
+    assert not nz.is_action_attr("Open message", "ContentDescription")
+    assert not nz.is_action_attr("Archive, Delete", "CustomActions")  # labels TalkBack offers
+    attrs = {
+        "OnClick": "<action>", "OnLongClick": "Select message",
+        "SetTextSubstitution": "<action>", "ShowTextSubstitution": "<action>",
+        "ClearTextSubstitution": "<action>", "GetTextLayoutResult": "<action>",
+        "RequestFocus": "<action>", "TestTag": "onboarding_welcome_start_button",
+        "Text": "Get started", "Role": "Button", "CustomActions": "Archive, Delete",
+    }
+    counts: dict = {}
+    values, actions = nz.compose_attrs_brief(attrs, counts)
+    assert values == {"TestTag": "onboarding_welcome_start_button", "Text": "Get started",
+                      "Role": "Button", "CustomActions": "Archive, Delete"}
+    assert actions == ["OnClick", "OnLongClick", "GetTextLayoutResult", "RequestFocus"]
+    assert counts == {"actions": 3}
+    # a slot parameter holding a lambda: kept as the λ marker for on*/content, else dropped
+    assert nz.compose_value("onClick", "<lambda>") == nz.LAMBDA
+    assert nz.compose_value("content", "<lambda>") == nz.LAMBDA
+    assert nz.compose_value("transform", "<lambda>") is None

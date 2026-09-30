@@ -137,13 +137,29 @@ _DROP_VALUES = frozenset({
 })
 _TMP_RCVR = re.compile(r"^tmp\d+_rcvr$")
 _LAMBDA_VALUE = re.compile(
-    r"^(?:(?:[\w$]+\.)*ComposableLambda(?:Impl|NImpl)?@[0-9a-fA-F]+"
+    r"^(?:<lambda>"  # the hardened agent's marker (SafeString.LAMBDA)
+    r"|(?:[\w$]+\.)*ComposableLambda(?:Impl|NImpl)?@[0-9a-fA-F]+"
     r"|(?:kotlin\.jvm\.functions\.)?Function\d*<.*>"
     r"|(?:[\w$]+\.)+[\w$]*\$\$ExternalSyntheticLambda\d+@[0-9a-fA-F]+"
     r"|(?:[\w$]+\.)+[\w$]*Kt\$[\w$]*@[0-9a-fA-F]+)$", re.DOTALL)
 _ACTION_ATTR = re.compile(
     r"^(?:AccessibilityAction\(|CustomAccessibilityAction\(|(?:kotlin\.jvm\.functions\.)?"
     r"Function\d*<)")
+#: What the hardened agent (SafeString.ACTION) sends for an AccessibilityAction
+#: without a label; a labelled one arrives as its label.
+ACTION_MARKER = "<action>"
+#: The androidx.compose.ui.semantics.SemanticsActions keys. Their values are
+#: actions whatever the agent prints for them (an old agent's toString, the
+#: <action> marker, or the action's label). CustomActions is left out: its value
+#: lists the labels TalkBack offers, which is worth showing.
+SEMANTICS_ACTION_KEYS = frozenset({
+    "GetTextLayoutResult", "OnClick", "OnLongClick", "ScrollBy", "ScrollByOffset",
+    "ScrollToIndex", "OnAutofillText", "SetProgress", "SetSelection", "SetText",
+    "SetTextSubstitution", "ShowTextSubstitution", "ClearTextSubstitution",
+    "InsertTextAtCursor", "OnImeAction", "PerformImeAction", "CopyText", "CutText",
+    "PasteText", "Expand", "Collapse", "Dismiss", "RequestFocus", "PageUp", "PageDown",
+    "PageLeft", "PageRight", "GetScrollViewportLength", "OnFillData",
+})
 _CLASS_HASH = re.compile(r"\b(?:[a-z_][\w]*\.)+(?:[\w$]+\$)?([A-Z][\w]*)(?:\$[\w$]*)?@[0-9a-fA-F]+")
 _VIEW_TOSTRING = re.compile(r"\b(?:[a-z_][\w]*\.)+([A-Z][\w$]*)\{[^}]*\}")
 _BARE_HASH = re.compile(r"\b([A-Z][\w]*)@[0-9a-fA-F]{5,}\b")
@@ -333,10 +349,18 @@ def modifier_brief(raw: str) -> str:
     return ",".join(_mod_element(el) for el in _split_top(v, " → "))
 
 
-def is_action_attr(raw: Any) -> bool:
-    """A semantics attr whose value is a lambda (AccessibilityAction(... Function...)
-    or a bare Function<>): it becomes an ``actions`` entry instead of a value."""
-    return isinstance(raw, str) and _ACTION_ATTR.match(raw.strip()) is not None
+def is_action_attr(raw: Any, key: str | None = None) -> bool:
+    """A semantics attr that is an action: it becomes an ``actions`` entry instead
+    of a value. By value: an AccessibilityAction(... Function...) or bare
+    Function<> toString (agents before the hardening), or the ``<action>`` marker
+    (SafeString); by ``key``: a SemanticsActions key, whose value a hardened agent
+    may send as the action's label."""
+    if not isinstance(raw, str):
+        return False
+    v = raw.strip()
+    if v == ACTION_MARKER or _ACTION_ATTR.match(v) is not None:
+        return True
+    return key in SEMANTICS_ACTION_KEYS
 
 
 def compose_value(key: str, raw: Any) -> str | None:
@@ -398,7 +422,7 @@ def compose_attrs_brief(attrs: Mapping[str, Any] | None,
     values: dict[str, str] = {}
     actions: list[str] = []
     for k, raw in (attrs or {}).items():
-        if is_action_attr(raw):
+        if is_action_attr(raw, k):
             if k in BOILERPLATE_COMPOSE_ACTIONS:
                 _bump(counts, "actions")
             else:
@@ -765,10 +789,12 @@ def nondefault_props(props: Mapping[int, Mapping[str, Any]], classes: Mapping[in
 
 
 __all__ = [
+    "ACTION_MARKER",
     "BOILERPLATE_ACTIONS",
     "BOILERPLATE_COMPOSE_ACTIONS",
     "KEY_PROPS",
     "LAMBDA",
+    "SEMANTICS_ACTION_KEYS",
     "VALUE_CAP",
     "a11y_node_brief",
     "cap",
