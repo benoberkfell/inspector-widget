@@ -178,6 +178,45 @@ def test_no_inferred_clip_without_enough_same_type_siblings():
     assert _render(ix) == {}  # one same-type sibling is not a baseline
 
 
+def _message_rows(collection=None):
+    """Thunderbird's message list (live, emulator-5558): each row is a
+    ConstraintLayout of parts, three of them plain Views (#divider,
+    #star_click_area, #contact_picture_click_area). A RecyclerView says only
+    SCROLL_FORWARD, so without its CollectionInfo nothing names the scroll axis."""
+    b = cb.IndexBuilder("ctbrow", package="net.thunderbird.android.debug", screen=(1280, 2856))
+    w = b.window("n1", "DecorView", (0, 0, 1280, 2856), udid=1)
+    a11y = {"actions": ["SCROLL_FORWARD"]}
+    if collection:
+        a11y["collection"] = collection
+    rv = b.view(w, "n2", "RecyclerView", (0, 348, 1280, 2436), udid=2, rid="message_list",
+                flags=["scroll"], facets={"view": {"class": "RecyclerView"}, "a11y": a11y})
+    for i, y in enumerate((348, 613)):
+        row = b.view(rv, f"n{10 + 10 * i}", "ConstraintLayout", (0, y, 1280, 265),
+                     udid=10 + 10 * i, label=f"Message {i}", flags=["click"])
+        b.view(row, None, "View", (216, y + 262, 1064, 3), udid=11 + 10 * i, rid="divider")
+        b.view(row, None, "View", (1136, y, 144, 265), udid=12 + 10 * i,
+               rid="star_click_area", label="Add star", flags=["click"])
+        b.view(row, None, "View", (0, y, 216, 265), udid=13 + 10 * i,
+               rid="contact_picture_click_area", label="Select", flags=["click"])
+    return b.build()
+
+
+@pytest.mark.parametrize("collection", [None, {"rows": 50, "cols": 1}])
+def test_a_rows_parts_are_not_clipped_by_the_median_of_other_parts(collection):
+    """The star area touches the list's right edge and is far narrower than the
+    row's other plain Views; they are other parts (another #rid), not look-alike
+    siblings, so nothing is clipped (it was, 10 times, on the live screen)."""
+    assert _render(_message_rows(collection)) == {}
+
+
+def test_a_collections_orientation_names_its_scroll_axis():
+    ix = _message_rows({"rows": 50, "cols": 1})
+    assert an._scroll_axes(ix.get("n2")) == {"v"}
+    ix = _message_rows({"rows": 1, "cols": 9})
+    assert an._scroll_axes(ix.get("n2")) == {"h"}
+    assert an._scroll_axes(_message_rows().get("n2")) == {"v", "h"}
+
+
 def _scroll_screen():
     b = cb.IndexBuilder("cscr01", package="com.example", screen=(1080, 2000))
     w = b.window("n1", "DecorView", (0, 0, 1080, 2000), udid=1)

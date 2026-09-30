@@ -284,12 +284,21 @@ def _scroll_axes(n: UNode) -> set[str]:
         axes.add("h")
     elif cls.endswith("ScrollView") or cls in ("ListView", "GridView", "ExpandableListView"):
         axes.add("v")
-    for a in (n.facets.get("a11y") or {}).get("actions") or ():
+    af = n.facets.get("a11y") or {}
+    for a in af.get("actions") or ():
         name = str(a.get("name") if isinstance(a, Mapping) else a)
         if name in ("SCROLL_UP", "SCROLL_DOWN"):
             axes.add("v")
         elif name in ("SCROLL_LEFT", "SCROLL_RIGHT"):
             axes.add("h")
+    if not axes:  # a RecyclerView says only SCROLL_FORWARD; its CollectionInfo tells
+        coll = af.get("collection") if isinstance(af.get("collection"), Mapping) else {}
+        rows, cols = coll.get("rows"), coll.get("cols")
+        if isinstance(rows, int) and isinstance(cols, int):
+            if cols == 1 and rows != 1:
+                axes.add("v")
+            elif rows == 1 and cols != 1:
+                axes.add("h")
     return axes or {"v", "h"}
 
 
@@ -431,7 +440,8 @@ def _clipped_exact(g: _Geo, n: UNode) -> Issue | None:
 
 
 def _clipped_inferred(g: _Geo, n: UNode) -> Issue | None:
-    """Touches a scroll viewport edge and is far smaller than its same-type siblings."""
+    """Touches a scroll viewport edge and is far smaller than its look-alike
+    siblings (the same type and #rid)."""
     ix = g.ix
     s = g.scroll_anc.get(n.id)
     r = _rect(n.b)
@@ -450,7 +460,9 @@ def _clipped_inferred(g: _Geo, n: UNode) -> Issue | None:
         return None
     sizes = []
     for c in ix.children_of(parent.id):
-        if c.id == n.id or c.type != n.type:
+        # look-alikes only: a #rid names a part, so a row's #star_click_area is not
+        # compared with its #divider (seen live on Thunderbird's message rows)
+        if c.id == n.id or c.type != n.type or c.rid != n.rid:
             continue
         cr = _rect(c.b)
         if cr is None or _area(cr) == 0:
