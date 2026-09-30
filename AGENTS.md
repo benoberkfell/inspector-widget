@@ -43,6 +43,12 @@ cli.py / mcp_server.py ── drive the host; mcp_server exposes 15 tools to an 
 
 - **Wire**: 8-byte magic `VWSPCT01` + 4-byte big-endian length + protobuf. Abstract socket
   `viewspector_<pid>`, reached via `adb forward`. **Not** gRPC, **not** the transport daemon.
+- **Classloader**: the payload's loader is a child of the app's (parent-first), yet the payload
+  links against none of the app's classes: it carries its own Kotlin stdlib and protobuf-lite,
+  relocated under `com.oberkfell.viewspector.shaded`, and reaches app types (AndroidX,
+  Compose) only by reflection. So an app's R8-shrunk Kotlin can no longer break the attach;
+  a `NoSuchMethodError` on an unrelocated `kotlin.*` class at attach means a stale
+  `payload.jar` (the host reports `stale_agent`: run `scripts/build.sh`). See CONTRACT.md §2.
 - **Accessibility**: in-process `View.setQueryFromAppProcessEnabled` (API 34+) so a single
   recursion covers Views *and* Compose virtual a11y nodes.
 - **Compose**: pure-reflection extractor over the app's own bundled
