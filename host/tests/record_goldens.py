@@ -61,9 +61,29 @@ PACKAGE = fakeagent.DEFAULT_PACKAGE
 #: A View each scene has (get_properties, inspect_node, component_image).
 VIEW_ID = {"default": 1003, "wide": 1001, "launcher": 82, "viewscreen": 13}
 
-#: Golden modes: ``legacy`` is today's output (and what ``detail="full"`` with
-#: ``max_bytes=0`` must reproduce); ``brief`` is the Phase-0 default output.
-MODES = ("legacy", "brief")
+#: Golden modes: ``legacy`` is the pre-Phase-0 output, which ``detail="full"``
+#: with ``max_bytes=0`` must reproduce (spec section 2.7) once Phase 0 is in.
+MODES = ("legacy",)
+
+#: The rollback: MCP arguments and CLI flags that restore the legacy content
+#: (none yet: before Phase 0 the default output is the legacy one).
+ROLLBACK_ARGS: dict[str, Any] = {}
+ROLLBACK_FLAGS: tuple[str, ...] = ()
+
+#: The commit the legacy goldens were recorded from (G1, before Phase 0).
+G1_COMMIT = "f2d308280ee5"
+
+_E3_FLAGS = ("E3: GRAVITY/INT_FLAG properties carry the agent's flag string as their value "
+             "(it was 0 beside a label, or 0 alone in the MCP)")
+
+#: Legacy entries re-recorded after G1, and why: the only allowed deltas. Each
+#: carries its reason in the golden entry (``delta``).
+LEGACY_DELTAS: dict[tuple[str, str], str] = {
+    ("mcp", "inspect_node"): _E3_FLAGS,
+    ("cli", "dump_props"): _E3_FLAGS,
+    ("cli", "get_properties"): _E3_FLAGS,
+    ("cli", "inspect_node"): _E3_FLAGS,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +147,28 @@ def cli_calls(scene: str, out_dir: str) -> list[tuple[str, list[str]]]:
 
 def is_json_argv(argv: list[str]) -> bool:
     return "--json" in argv
+
+
+def cli_flags(subcommand: str) -> set[str]:
+    """The option strings ``subcommand`` accepts."""
+    import argparse
+
+    import cli
+
+    for action in cli.build_parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices[subcommand]._option_string_actions)
+    return set()
+
+
+def with_flags(argv: list[str], flags: tuple[str, ...]) -> list[str]:
+    """``argv`` plus those ``--flag value`` pairs of ``flags`` the subcommand takes."""
+    known = cli_flags(argv[0])
+    out = list(argv)
+    for flag, value in zip(flags[::2], flags[1::2]):
+        if flag in known:
+            out += [flag, value]
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -233,10 +275,11 @@ def run_mcp(scene: str, tmp: str, extra: Mapping[str, Any] | None = None,
     return out
 
 
-def run_cli(scene: str, tmp: str, extra: list[str] | None = None,
+def run_cli(scene: str, tmp: str, extra: tuple[str, ...] = (),
             names: set[str] | None = None) -> dict[str, dict[str, Any]]:
     """Run the CLI calls of ``scene``; ``{entry: {"argv", "rc", "json"|"stdout",
-    "stderr"}}``. ``extra`` flags are added to every ``--json`` call."""
+    "stderr"}}``. ``extra`` (``--flag value`` pairs) is added to every call whose
+    subcommand takes the flag."""
     import cli
 
     out: dict[str, dict[str, Any]] = {}
@@ -246,7 +289,7 @@ def run_cli(scene: str, tmp: str, extra: list[str] | None = None,
         for name, argv in cli_calls(scene, files):
             if names is not None and name not in names and name != "detach":
                 continue
-            run_argv = list(argv) + (list(extra or []) if is_json_argv(argv) else [])
+            run_argv = with_flags(argv, extra)
             stdout, stderr = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 rc = cli.main(run_argv)
@@ -337,34 +380,88 @@ def diff(golden: Any, actual: Any, path: str = "$", limit: int = 12) -> list[str
 
 def comparable(entry: Mapping[str, Any]) -> dict[str, Any]:
     """What a golden entry pins: the output (JSON or text), the exit code and the
-    error flag; not how it was recorded."""
-    return {k: v for k, v in entry.items() if k in ("json", "stdout", "stderr", "rc", "is_error")}
+    error flag; not how it was recorded. A human output that is one JSON document
+    (``inspect`` prints its summary) is compared parsed, so indentation is free."""
+    out = {k: v for k, v in entry.items() if k in ("json", "stdout", "stderr", "rc", "is_error")}
+    text = out.get("stdout")
+    if isinstance(text, str) and text.lstrip().startswith("{"):
+        try:
+            out["stdout"] = json.loads(text)
+        except ValueError:
+            pass
+    return out
 
 
 # --------------------------------------------------------------------------- #
 # Script
 # --------------------------------------------------------------------------- #
-def record(scenes: list[str], mode: str) -> list[str]:
+def run(scene: str, surface: str, mode: str, tmp: str,
+        names: set[str] | None = None) -> dict[str, dict[str, Any]]:
+    """The entries of one golden file, run now: ``legacy`` passes the rollback
+    arguments (``detail="full"``, ``max_bytes=0``), ``brief`` the defaults."""
+    if surface == "mcp":
+        return run_mcp(scene, tmp, ROLLBACK_ARGS if mode == "legacy" else None, names)
+    return run_cli(scene, tmp, ROLLBACK_FLAGS if mode == "legacy" else (), names)
+
+
+def record(scenes: list[str], mode: str, surfaces: tuple[str, ...] = ("mcp", "cli"),
+           names: set[str] | None = None) -> list[str]:
+    """Run and write the goldens of ``scenes``; with ``names``, only those entries are
+    re-recorded and the rest of each file is kept as it was."""
     commit = source_commit()
     written = []
     for scene in scenes:
-        with tempfile.TemporaryDirectory(prefix="iw-golden-") as tmp:
-            written.append(write_golden(scene, "mcp", mode,
-                                        run_mcp(scene, os.path.join(tmp, "mcp")), commit))
-            written.append(write_golden(scene, "cli", mode,
-                                        run_cli(scene, os.path.join(tmp, "cli")), commit))
+        for surface in surfaces:
+            with tempfile.TemporaryDirectory(prefix="iw-golden-") as tmp:
+                # the whole sequence always runs: an entry may depend on what ran before
+                entries = run(scene, surface, mode, os.path.join(tmp, surface))
+            if names is not None:
+                old = load_golden(scene, surface, mode)["entries"]
+                keep = {k: v for k, v in old.items() if k not in names}
+                entries = {k: v for k, v in entries.items() if k in names}
+                entries = {k: entries.get(k, keep.get(k)) for k in [*old, *entries]
+                           if k in entries or k in keep}
+                written.append(_write_entries(scene, surface, mode, entries, commit, keep))
+            else:
+                written.append(write_golden(scene, surface, mode, entries, commit))
     return written
+
+
+def _write_entries(scene: str, surface: str, mode: str, entries: Mapping[str, Any],
+                   commit: str, keep: Mapping[str, Any]) -> str:
+    """Write ``entries``; those in ``keep`` keep their own ``source_commit``. A
+    re-recorded legacy entry carries its ``LEGACY_DELTAS`` reason as ``delta``."""
+    path = golden_path(scene, surface, mode)
+
+    def fresh(name: str, v: Mapping[str, Any]) -> dict:
+        out = dict(v, source_commit=commit)
+        if mode == "legacy":
+            out["delta"] = LEGACY_DELTAS[(surface, name)]
+        return out
+
+    doc = {"scene": scene, "surface": surface, "mode": mode,
+           "entries": {k: (dict(v) if k in keep else fresh(k, v)) for k, v in entries.items()}}
+    text = json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    with open(path, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as f:
+        f.write(text.encode("utf-8"))
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--mode", choices=MODES, default="legacy")
+    p.add_argument("--surface", choices=("mcp", "cli"), action="append",
+                   help="only this surface (repeatable; default both)")
+    p.add_argument("--only", action="append", metavar="ENTRY",
+                   help="re-record only this entry (repeatable), keeping the others")
     p.add_argument("scenes", nargs="*", metavar="SCENE", help=f"any of {', '.join(SCENES)}")
     args = p.parse_args(argv)
     unknown = sorted(set(args.scenes) - set(SCENES))
     if unknown:
         p.error(f"unknown scene(s): {', '.join(unknown)}")
-    for path in record(args.scenes or list(SCENES), args.mode):
+    surfaces = tuple(args.surface or ("mcp", "cli"))
+    names = set(args.only) if args.only else None
+    for path in record(args.scenes or list(SCENES), args.mode, surfaces, names):
         print(os.path.relpath(path, _HOST_DIR))
     return 0
 

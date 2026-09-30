@@ -145,8 +145,11 @@ def encode_property(st: Strings, p: Mapping[str, Any], out: pb.Property) -> None
     elif t == P.COLOR:
         out.int32_value = _signed32(int(v[1:], 16)) if isinstance(v, str) else int(v or 0)
     elif t in (P.GRAVITY, P.INT_FLAG):
-        out.int32_value = int(v or 0)
-        out.str_value = st.id(p.get("label"))
+        if isinstance(v, str):  # strings.py: the flag string is the value
+            out.str_value = st.id(v)
+        else:  # older shapes: an int (0 as legacy MCP recorded it) plus a label
+            out.int32_value = int(v or 0)
+            out.str_value = st.id(p.get("label"))
     elif t in (P.BYTE, P.CHAR, P.INT16, P.INT32, P.DIMENSION):
         out.int32_value = round(v) if isinstance(v, float) else int(v or 0)
         if p.get("label") is not None:

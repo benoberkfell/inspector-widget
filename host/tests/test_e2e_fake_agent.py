@@ -618,8 +618,9 @@ def test_cli_get_properties(fake_device, run_cli):
 def test_cli_get_properties_decodes_gravity_flags_and_dimensions(fake_device, run_cli):
     props = props_by_name(run_cli("get-properties", "--view-id", "1003", "--json", "-")
                           .json()["properties"])
-    assert props["gravity"]["label"] == "center_vertical|start"
-    assert props["inputType"]["label"] == "text|textCapSentences"
+    assert props["gravity"]["value"] == "center_vertical|start" and "label" not in props["gravity"]
+    assert props["inputType"]["value"] == "text|textCapSentences"
+    assert props["scrollIndicators"]["value"] == ""  # the empty flag set
     assert props["paddingStart"]["value"] == 42
     assert props["layout_marginTop"]["value"] == 16
 

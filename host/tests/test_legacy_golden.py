@@ -1,14 +1,16 @@
 """The legacy tool outputs, pinned (work package G1).
 
 ``tests/golden/legacy/<scene>/<surface>-legacy.json.gz`` holds what every legacy
-MCP tool and CLI subcommand returned, through the real entry points over the
-harness fake adb and agent, on four scenes (see ``record_goldens.py``). These
-tests run the same calls again and compare the parsed JSON (and the text of the
-human outputs) entry by entry, so any change to a shaper shows up as a readable
-path-level diff.
+MCP tool and CLI subcommand returned before Phase 0, through the real entry
+points over the harness fake adb and agent, on four scenes (``record_goldens.py``).
+Running the same calls must reproduce them, entry by entry, parsed JSON (and the
+text of the human outputs), so any change to a shaper shows up as a readable
+path-level diff. The only exceptions are the entries re-recorded since, each
+with its reason (``LEGACY_DELTAS``).
 
 Regenerate a golden only for a deliberate change, and say why in the commit:
-``PYTHONPATH=. .venv/bin/python tests/record_goldens.py [SCENE...]``.
+``PYTHONPATH=. .venv/bin/python tests/record_goldens.py [--only ENTRY] [SCENE...]``
+(a re-recorded entry needs a ``LEGACY_DELTAS`` reason).
 """
 
 from __future__ import annotations
@@ -17,10 +19,9 @@ import pytest
 import record_goldens as rg
 
 
-def _check(scene: str, surface: str, tmp_path, mode: str = "legacy") -> None:
+def _check(scene: str, surface: str, tmp_path, mode: str) -> None:
     golden = rg.load_golden(scene, surface, mode)["entries"]
-    run = rg.run_mcp if surface == "mcp" else rg.run_cli
-    actual = run(scene, str(tmp_path))
+    actual = rg.run(scene, surface, mode, str(tmp_path))
     problems = []
     for name in sorted(set(golden) | set(actual)):
         if name not in actual:
@@ -34,13 +35,25 @@ def _check(scene: str, surface: str, tmp_path, mode: str = "legacy") -> None:
             problems.append(f"{surface} {name} [{scene}] "
                             f"(golden from {golden[name]['source_commit']}):\n    "
                             + "\n    ".join(lines))
-    assert not problems, "legacy outputs changed:\n" + "\n".join(problems)
+    assert not problems, f"{mode} outputs changed:\n" + "\n".join(problems)
 
 
 @pytest.mark.parametrize("scene", rg.SCENES)
 @pytest.mark.parametrize("surface", ["mcp", "cli"])
 def test_legacy_outputs_match_the_goldens(scene, surface, tmp_path):
-    _check(scene, surface, tmp_path)
+    _check(scene, surface, tmp_path, "legacy")
+
+
+def test_only_the_documented_deltas_were_re_recorded():
+    for scene in rg.SCENES:
+        for surface in ("mcp", "cli"):
+            for name, entry in rg.load_golden(scene, surface, "legacy")["entries"].items():
+                if entry["source_commit"] == rg.G1_COMMIT:
+                    assert "delta" not in entry, (scene, surface, name)
+                else:
+                    assert entry.get("delta") == rg.LEGACY_DELTAS[(surface, name)], (
+                        f"{surface} {name} [{scene}] was re-recorded without a documented "
+                        f"reason")
 
 
 def test_goldens_cover_every_legacy_tool_and_subcommand():
@@ -52,13 +65,14 @@ def test_goldens_cover_every_legacy_tool_and_subcommand():
                    "inspect", "inspect-node", "component-image", "screenshot",
                    "get-properties", "detach"}
     for scene in rg.SCENES:
-        mcp = rg.load_golden(scene, "mcp", "legacy")["entries"]
-        assert {e["tool"] for e in mcp.values()} == tools, scene
-        cli = rg.load_golden(scene, "cli", "legacy")["entries"]
-        assert {e["argv"][0] for e in cli.values()} == subcommands, scene
-        for name in ("dump_text", "compose_text", "a11y_text", "inspect_text"):
-            assert "stdout" in cli[name], (scene, name)
-        assert all(e["source_commit"] for e in [*mcp.values(), *cli.values()])
+        for mode in rg.MODES:
+            mcp = rg.load_golden(scene, "mcp", mode)["entries"]
+            assert {e["tool"] for e in mcp.values()} == tools, (scene, mode)
+            cli = rg.load_golden(scene, "cli", mode)["entries"]
+            assert {e["argv"][0] for e in cli.values()} == subcommands, (scene, mode)
+            for name in ("dump_text", "compose_text", "a11y_text", "inspect_text"):
+                assert "stdout" in cli[name], (scene, mode, name)
+            assert all(e["source_commit"] for e in [*mcp.values(), *cli.values()])
 
 
 def test_a_renamed_key_fails_with_a_readable_diff(monkeypatch, tmp_path):
@@ -75,7 +89,7 @@ def test_a_renamed_key_fails_with_a_readable_diff(monkeypatch, tmp_path):
 
     monkeypatch.setattr(strings, "node_to_dict", renamed)
     with pytest.raises(AssertionError) as exc:
-        _check("default", "cli", tmp_path)
+        _check("default", "cli", tmp_path, "legacy")
     msg = str(exc.value)
     assert "cli dump [default]" in msg
     assert "$.json.roots[0].class_name: missing" in msg

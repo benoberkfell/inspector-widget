@@ -29,6 +29,21 @@ def walk(n):
         yield from walk(c)
 
 
+def e3_flags(data):
+    """``data`` (a strings.py tree or property group) as strings.py decodes it since
+    E3: GRAVITY/INT_FLAG carry the agent's flag string as their value. The
+    recordings predate that and hold ``value: 0`` plus a ``label`` (none for an
+    empty flag set)."""
+    out = json.loads(json.dumps(data))
+    groups = out["properties"].values() if isinstance(out.get("properties"), dict) \
+        else [out.get("properties") or []]
+    for plist in groups:
+        for p in plist:
+            if p.get("type") in ("GRAVITY", "INT_FLAG") and p.get("value") in (0, None):
+                p["value"] = p.pop("label", "")
+    return out
+
+
 def wire_fields(windows):
     """a11y windows without what ``a11y_to_dict`` derives on the host rather than
     reads off the wire: node keys and stop orders (a11y-core), and action names
@@ -80,8 +95,8 @@ def test_wide_scene_shape():
     assert len(tree["properties"]) == 259
     assert all(len(p) == 60 for p in tree["properties"].values())
     gravity = next(p for p in tree["properties"][1001] if p["name"] == "gravity")
-    assert gravity == {"name": "gravity", "type": "GRAVITY", "is_layout": False, "value": 0,
-                       "label": "center_vertical|start"}
+    assert gravity == {"name": "gravity", "type": "GRAVITY", "is_layout": False,
+                       "value": "center_vertical|start"}
     a = a11ymod.a11y_to_dict(s.dump_a11y())
     anodes = list(walk(a["windows"][0]["root"]))
     assert len(anodes) == 259 and anodes[0]["flags"][:2] == ["clickable", "focusable"]
@@ -130,7 +145,10 @@ def test_cli_shape_tree_round_trips():
     for screen, name in (("launcher", "views_cli"), ("viewscreen", "views_props")):
         data = lf.load(screen, name)
         back = json.loads(json.dumps(st.dump_tree_to_dict(fs.views_to_pb(data))))
-        assert back == data, f"{screen}/{name}"
+        assert back == e3_flags(data), f"{screen}/{name}"
+        # and the E3 shape itself round-trips as it is
+        again = json.loads(json.dumps(st.dump_tree_to_dict(fs.views_to_pb(back))))
+        assert again == back, f"{screen}/{name}"
 
 
 def test_legacy_mcp_tree_converts_with_e3_values_as_recorded():
@@ -144,7 +162,8 @@ def test_legacy_mcp_tree_converts_with_e3_values_as_recorded():
         assert a["class_name"] == b["class_name"] and a.get("text") == b.get("text")
         assert [a["bounds"][k] for k in "xywh"] == [b["bounds"]["layout"][k] for k in "xywh"]
     props = {p["name"]: p for p in back["properties"][82]}
-    assert props["foregroundGravity"]["value"] == 0 and "label" not in props["foregroundGravity"]
+    # the legacy MCP decoder had already lost the flag string: it reads as the empty set
+    assert props["foregroundGravity"]["value"] == "" and "label" not in props["foregroundGravity"]
     assert props["outlineAmbientShadowColor"]["value"] == -16777216  # "#FF000000" re-encoded
     legacy_82 = next(g for g in data["properties"] if g["view_id"] == 82)
     assert len(back["properties"][82]) == len(legacy_82["properties"])
@@ -223,7 +242,7 @@ def test_replayed_screenshot_decodes_to_the_recorded_pixels():
 def test_viewscreen_replay_and_errors():
     s = fs.replay_scene("viewscreen").session()
     tree = st.dump_tree_to_dict(s.dump_tree(include_properties=True))
-    assert json.loads(json.dumps(tree)) == lf.load("viewscreen", "views_props")
+    assert json.loads(json.dumps(tree)) == e3_flags(lf.load("viewscreen", "views_props"))
     props = st.get_properties_to_dict(s.get_properties(13))
     assert props["view_id"] == 13 and len(props["properties"]) > 100
     with pytest.raises(fs.SceneError, match="No view found with id 999999"):
