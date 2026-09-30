@@ -1,0 +1,1432 @@
+{
+ "source": "TalkBack 17.0.0, emulator-5554 (API 37, 1280x2856): the spike's pass-2 walks (scratchpad/tb-spike/p6/walk_*.json, repeat_traversal.json; focus from the a11y-core agent) with each press's ttsOutput from the verbose log (p6/logcat_*.txt). The first entry is where focus was before the first press; {edge: true} is a press that did not move focus.",
+ "walks": {
+  "traversal": [
+   {
+    "key": "compose:7:9",
+    "label": null,
+    "bounds": [
+     12,
+     180,
+     144,
+     144
+    ],
+    "start": true
+   },
+   {
+    "key": "compose:7:12",
+    "label": "Traversal order",
+    "bounds": [
+     168,
+     210,
+     437,
+     84
+    ],
+    "said": "Traversal order"
+   },
+   {
+    "key": "compose:7:21",
+    "label": "Traversal order",
+    "bounds": [
+     48,
+     396,
+     334,
+     72
+    ],
+    "said": "Traversal order. Heading"
+   },
+   {
+    "key": "compose:7:23",
+    "label": "GOOD",
+    "bounds": [
+     48,
+     504,
+     116,
+     60
+    ],
+    "said": "GOOD"
+   },
+   {
+    "key": "compose:7:26",
+    "label": "1. First",
+    "bounds": [
+     48,
+     588,
+     160,
+     72
+    ],
+    "said": "1. First"
+   },
+   {
+    "key": "compose:7:27",
+    "label": "2. Second",
+    "bounds": [
+     48,
+     660,
+     225,
+     72
+    ],
+    "said": "2. Second"
+   },
+   {
+    "key": "compose:7:28",
+    "label": "3. Third",
+    "bounds": [
+     48,
+     732,
+     174,
+     72
+    ],
+    "said": "3. Third"
+   },
+   {
+    "key": "compose:7:30",
+    "label": "GOOD (reversed layout, reordered by traversalIndex)",
+    "bounds": [
+     48,
+     840,
+     998,
+     60
+    ],
+    "said": "GOOD (reversed layout, reordered by traversalIndex)"
+   },
+   {
+    "key": "compose:7:35",
+    "label": "1. First (reordered)",
+    "bounds": [
+     48,
+     1068,
+     426,
+     72
+    ],
+    "said": "1. First (reordered)"
+   },
+   {
+    "key": "compose:7:34",
+    "label": "2. Second (reordered)",
+    "bounds": [
+     48,
+     996,
+     491,
+     72
+    ],
+    "said": "2. Second (reordered)"
+   },
+   {
+    "key": "compose:7:33",
+    "label": "3. Third (reordered)",
+    "bounds": [
+     48,
+     924,
+     439,
+     72
+    ],
+    "said": "3. Third (reordered)"
+   },
+   {
+    "key": "compose:7:37",
+    "label": "BAD",
+    "bounds": [
+     48,
+     1212,
+     84,
+     60
+    ],
+    "said": "BAD"
+   },
+   {
+    "key": "compose:7:40",
+    "label": "3. Third (bad)",
+    "bounds": [
+     48,
+     1296,
+     308,
+     72
+    ],
+    "said": "3. Third (bad)"
+   },
+   {
+    "key": "compose:7:41",
+    "label": "2. Second (bad)",
+    "bounds": [
+     48,
+     1368,
+     359,
+     72
+    ],
+    "said": "2. Second (bad)"
+   },
+   {
+    "key": "compose:7:42",
+    "label": "1. First (bad)",
+    "bounds": [
+     48,
+     1440,
+     294,
+     72
+    ],
+    "said": "1. First (bad)"
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "compose:7:9",
+    "label": null,
+    "bounds": [
+     12,
+     180,
+     144,
+     144
+    ],
+    "said": "Back to scenario list. Button"
+   },
+   {
+    "key": "compose:7:12",
+    "label": "Traversal order",
+    "bounds": [
+     168,
+     210,
+     437,
+     84
+    ],
+    "said": "Traversal order"
+   }
+  ],
+  "S1": [
+   {
+    "key": "view:10",
+    "label": "S1: RecyclerView of ComposeView cells",
+    "bounds": [
+     0,
+     156,
+     1280,
+     153
+    ],
+    "start": true
+   },
+   {
+    "key": "compose:14:3",
+    "label": null,
+    "bounds": [
+     0,
+     309,
+     1280,
+     192
+    ],
+    "said": "Item 0 (compose). In list"
+   },
+   {
+    "key": "compose:14:5",
+    "label": "Done",
+    "bounds": [
+     680,
+     333,
+     144,
+     144
+    ],
+    "said": "checked. Done. Check box"
+   },
+   {
+    "key": "compose:14:6",
+    "label": null,
+    "bounds": [
+     824,
+     333,
+     144,
+     144
+    ],
+    "said": "On. Notify. Switch"
+   },
+   {
+    "key": "compose:14:8",
+    "label": null,
+    "bounds": [
+     968,
+     333,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:14:10",
+    "label": null,
+    "bounds": [
+     1112,
+     333,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "compose:19:14",
+    "label": null,
+    "bounds": [
+     0,
+     501,
+     1280,
+     192
+    ],
+    "said": "Item 1 (compose)"
+   },
+   {
+    "key": "compose:19:16",
+    "label": "Done",
+    "bounds": [
+     680,
+     525,
+     144,
+     144
+    ],
+    "said": "Done. Check box"
+   },
+   {
+    "key": "compose:19:17",
+    "label": null,
+    "bounds": [
+     824,
+     525,
+     144,
+     144
+    ],
+    "said": "Off. Notify. Switch"
+   },
+   {
+    "key": "compose:19:19",
+    "label": null,
+    "bounds": [
+     968,
+     525,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:19:21",
+    "label": null,
+    "bounds": [
+     1112,
+     525,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "compose:24:25",
+    "label": null,
+    "bounds": [
+     0,
+     693,
+     1280,
+     192
+    ],
+    "said": "Item 2 (compose)"
+   },
+   {
+    "key": "compose:24:27",
+    "label": "Done",
+    "bounds": [
+     680,
+     717,
+     144,
+     144
+    ],
+    "said": "checked. Done. Check box"
+   },
+   {
+    "key": "compose:24:28",
+    "label": null,
+    "bounds": [
+     824,
+     717,
+     144,
+     144
+    ],
+    "said": "Off. Notify. Switch"
+   },
+   {
+    "key": "compose:24:30",
+    "label": null,
+    "bounds": [
+     968,
+     717,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:24:32",
+    "label": null,
+    "bounds": [
+     1112,
+     717,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "compose:29:36",
+    "label": null,
+    "bounds": [
+     0,
+     885,
+     1280,
+     192
+    ],
+    "said": "Item 3 (compose)"
+   },
+   {
+    "key": "compose:29:38",
+    "label": "Done",
+    "bounds": [
+     680,
+     909,
+     144,
+     144
+    ],
+    "said": "Done. Check box"
+   },
+   {
+    "key": "compose:29:39",
+    "label": null,
+    "bounds": [
+     824,
+     909,
+     144,
+     144
+    ],
+    "said": "Notify. Switch"
+   },
+   {
+    "key": "compose:29:41",
+    "label": null,
+    "bounds": [
+     968,
+     909,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:29:43",
+    "label": null,
+    "bounds": [
+     1112,
+     909,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "compose:34:47",
+    "label": null,
+    "bounds": [
+     0,
+     1077,
+     1280,
+     192
+    ],
+    "said": "Item 4 (compose)"
+   },
+   {
+    "key": "compose:34:49",
+    "label": "Done",
+    "bounds": [
+     680,
+     1101,
+     144,
+     144
+    ],
+    "said": "checked. Done. Check box"
+   },
+   {
+    "key": "compose:34:50",
+    "label": null,
+    "bounds": [
+     824,
+     1101,
+     144,
+     144
+    ],
+    "said": "Off. Notify. Switch"
+   },
+   {
+    "key": "compose:34:52",
+    "label": null,
+    "bounds": [
+     968,
+     1101,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:34:54",
+    "label": null,
+    "bounds": [
+     1112,
+     1101,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "compose:39:58",
+    "label": null,
+    "bounds": [
+     0,
+     1269,
+     1280,
+     192
+    ],
+    "said": "Item 5 (compose)"
+   }
+  ],
+  "S4": [
+   {
+    "key": "compose:11:5",
+    "label": "S4: LazyColumn with AndroidView rows",
+    "bounds": [
+     48,
+     192,
+     1158,
+     84
+    ],
+    "start": true
+   },
+   {
+    "key": "compose:11:7",
+    "label": null,
+    "bounds": [
+     0,
+     312,
+     1280,
+     192
+    ],
+    "said": "Item 0 (compose)"
+   },
+   {
+    "key": "compose:11:9",
+    "label": "Done",
+    "bounds": [
+     680,
+     336,
+     144,
+     144
+    ],
+    "said": "checked. Done. Check box"
+   },
+   {
+    "key": "compose:11:10",
+    "label": null,
+    "bounds": [
+     824,
+     336,
+     144,
+     144
+    ],
+    "said": "On. Notify. Switch"
+   },
+   {
+    "key": "compose:11:12",
+    "label": null,
+    "bounds": [
+     968,
+     336,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:11:14",
+    "label": null,
+    "bounds": [
+     1112,
+     336,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "view:12",
+    "label": null,
+    "bounds": [
+     0,
+     504,
+     1280,
+     192
+    ],
+    "said": "Item 1 (view)"
+   },
+   {
+    "key": "view:14",
+    "label": "Done",
+    "bounds": [
+     628,
+     528,
+     196,
+     144
+    ],
+    "said": "Done. Check box"
+   },
+   {
+    "key": "view:15",
+    "label": "Notify",
+    "bounds": [
+     824,
+     528,
+     144,
+     144
+    ],
+    "said": "off. Notify. Switch"
+   },
+   {
+    "key": "view:16",
+    "label": "More info",
+    "bounds": [
+     968,
+     528,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "view:17",
+    "label": null,
+    "bounds": [
+     1112,
+     528,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "compose:11:19",
+    "label": null,
+    "bounds": [
+     0,
+     696,
+     1280,
+     192
+    ],
+    "said": "Item 2 (compose)"
+   },
+   {
+    "key": "compose:11:21",
+    "label": "Done",
+    "bounds": [
+     680,
+     720,
+     144,
+     144
+    ],
+    "said": "checked. Done. Check box"
+   },
+   {
+    "key": "compose:11:22",
+    "label": null,
+    "bounds": [
+     824,
+     720,
+     144,
+     144
+    ],
+    "said": "Off. Notify. Switch"
+   },
+   {
+    "key": "compose:11:24",
+    "label": null,
+    "bounds": [
+     968,
+     720,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:11:26",
+    "label": null,
+    "bounds": [
+     1112,
+     720,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "view:20",
+    "label": null,
+    "bounds": [
+     0,
+     888,
+     1280,
+     192
+    ],
+    "said": "Item 3 (view)"
+   },
+   {
+    "key": "view:22",
+    "label": "Done",
+    "bounds": [
+     628,
+     912,
+     196,
+     144
+    ],
+    "said": "Done. Check box"
+   },
+   {
+    "key": "view:23",
+    "label": "Notify",
+    "bounds": [
+     824,
+     912,
+     144,
+     144
+    ],
+    "said": "off. Notify. Switch"
+   },
+   {
+    "key": "view:24",
+    "label": "More info",
+    "bounds": [
+     1004,
+     948,
+     72,
+     72
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "view:25",
+    "label": "Delete",
+    "bounds": [
+     1112,
+     912,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "compose:11:31",
+    "label": null,
+    "bounds": [
+     0,
+     1080,
+     1280,
+     192
+    ],
+    "said": "Item 4 (compose)"
+   },
+   {
+    "key": "compose:11:33",
+    "label": "Done",
+    "bounds": [
+     680,
+     1104,
+     144,
+     144
+    ],
+    "said": "checked. Done. Check box"
+   },
+   {
+    "key": "compose:11:34",
+    "label": null,
+    "bounds": [
+     824,
+     1104,
+     144,
+     144
+    ],
+    "said": "Notify. Switch"
+   },
+   {
+    "key": "compose:11:36",
+    "label": null,
+    "bounds": [
+     968,
+     1104,
+     144,
+     144
+    ],
+    "said": "More info. Button"
+   },
+   {
+    "key": "compose:11:38",
+    "label": null,
+    "bounds": [
+     1112,
+     1104,
+     144,
+     144
+    ],
+    "said": "Delete. Button"
+   },
+   {
+    "key": "view:27",
+    "label": null,
+    "bounds": [
+     0,
+     1272,
+     1280,
+     192
+    ],
+    "said": "Item 5 (view)"
+   }
+  ],
+  "D1": [
+   {
+    "key": "compose:26:4",
+    "label": null,
+    "bounds": [
+     292,
+     1306,
+     144,
+     144
+    ],
+    "start": true
+   },
+   {
+    "key": "compose:26:6",
+    "label": null,
+    "bounds": [
+     436,
+     1306,
+     144,
+     144
+    ],
+    "said": "Add to favorites. Button"
+   },
+   {
+    "key": "view:17",
+    "label": null,
+    "bounds": [
+     292,
+     1450,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "view:18",
+    "label": "Edit",
+    "bounds": [
+     436,
+     1450,
+     144,
+     144
+    ],
+    "said": "Edit. Button"
+   },
+   {
+    "key": "view:19",
+    "label": "Close",
+    "bounds": [
+     724,
+     1594,
+     264,
+     144
+    ],
+    "said": "Close. Button"
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "view:14",
+    "label": "Share item",
+    "bounds": [
+     292,
+     1201,
+     292,
+     81
+    ],
+    "said": "Share item. Heading"
+   },
+   {
+    "key": "compose:26:4",
+    "label": null,
+    "bounds": [
+     292,
+     1306,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "compose:26:6",
+    "label": null,
+    "bounds": [
+     436,
+     1306,
+     144,
+     144
+    ],
+    "said": "Add to favorites. Button"
+   },
+   {
+    "key": "view:17",
+    "label": null,
+    "bounds": [
+     292,
+     1450,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "view:18",
+    "label": "Edit",
+    "bounds": [
+     436,
+     1450,
+     144,
+     144
+    ],
+    "said": "Edit. Button"
+   },
+   {
+    "key": "view:19",
+    "label": "Close",
+    "bounds": [
+     724,
+     1594,
+     264,
+     144
+    ],
+    "said": "Close. Button"
+   },
+   {
+    "edge": true
+   }
+  ],
+  "D2": [
+   {
+    "key": "compose:17:14",
+    "label": "Share item",
+    "bounds": [
+     482,
+     1284,
+     315,
+     84
+    ],
+    "start": true
+   },
+   {
+    "key": "compose:17:16",
+    "label": null,
+    "bounds": [
+     482,
+     1368,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "compose:17:18",
+    "label": null,
+    "bounds": [
+     626,
+     1368,
+     144,
+     144
+    ],
+    "said": "Add to favorites. Button"
+   },
+   {
+    "key": "compose:17:20",
+    "label": null,
+    "bounds": [
+     482,
+     1512,
+     182,
+     144
+    ],
+    "said": "Close. Button"
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "compose:17:14",
+    "label": "Share item",
+    "bounds": [
+     482,
+     1284,
+     315,
+     84
+    ],
+    "said": "Share item. Heading"
+   },
+   {
+    "key": "compose:17:16",
+    "label": null,
+    "bounds": [
+     482,
+     1368,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "compose:17:18",
+    "label": null,
+    "bounds": [
+     626,
+     1368,
+     144,
+     144
+    ],
+    "said": "Add to favorites. Button"
+   },
+   {
+    "key": "compose:17:20",
+    "label": null,
+    "bounds": [
+     482,
+     1512,
+     182,
+     144
+    ],
+    "said": "Close. Button"
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "compose:17:14",
+    "label": "Share item",
+    "bounds": [
+     482,
+     1284,
+     315,
+     84
+    ],
+    "said": "Share item. Heading"
+   },
+   {
+    "key": "compose:17:16",
+    "label": null,
+    "bounds": [
+     482,
+     1368,
+     144,
+     144
+    ],
+    "said": "Button"
+   },
+   {
+    "key": "compose:17:18",
+    "label": null,
+    "bounds": [
+     626,
+     1368,
+     144,
+     144
+    ],
+    "said": "Add to favorites. Button"
+   }
+  ],
+  "launcher": [
+   {
+    "key": "compose:7:10",
+    "label": "A11yProbe",
+    "bounds": [
+     48,
+     210,
+     322,
+     84
+    ],
+    "start": true
+   },
+   {
+    "key": "compose:7:20",
+    "label": null,
+    "bounds": [
+     0,
+     348,
+     1280,
+     216
+    ],
+    "said": "▶ All scenarios (lint everything). every BAD/GOOD variant on one scrollable screen. In list"
+   },
+   {
+    "key": "compose:7:31",
+    "label": null,
+    "bounds": [
+     0,
+     567,
+     1280,
+     216
+    ],
+    "said": "Icon button label. MissingContentDescription · a11y.label.missing"
+   },
+   {
+    "key": "compose:7:42",
+    "label": null,
+    "bounds": [
+     0,
+     786,
+     1280,
+     216
+    ],
+    "said": "Touch target size. AccessibilityTouchTarget · a11y.touch_target.small"
+   },
+   {
+    "key": "compose:7:53",
+    "label": null,
+    "bounds": [
+     0,
+     1005,
+     1280,
+     216
+    ],
+    "said": "Text contrast. AccessibilityTextContrast · a11y.contrast.low"
+   },
+   {
+    "key": "compose:7:64",
+    "label": null,
+    "bounds": [
+     0,
+     1224,
+     1280,
+     216
+    ],
+    "said": "Switch state desc. MissingStateDescription · a11y.label.missing"
+   },
+   {
+    "key": "compose:7:75",
+    "label": null,
+    "bounds": [
+     0,
+     1443,
+     1280,
+     216
+    ],
+    "said": "Checkbox state desc. MissingStateDescription · a11y.label.missing"
+   },
+   {
+    "key": "compose:7:86",
+    "label": null,
+    "bounds": [
+     0,
+     1662,
+     1280,
+     216
+    ],
+    "said": "Image label. MissingContentDescription · a11y.image.no_description"
+   },
+   {
+    "key": "compose:7:97",
+    "label": null,
+    "bounds": [
+     0,
+     1881,
+     1280,
+     216
+    ],
+    "said": "Decorative image. RedundantDecorativeLabel"
+   },
+   {
+    "key": "compose:7:108",
+    "label": null,
+    "bounds": [
+     0,
+     2100,
+     1280,
+     216
+    ],
+    "said": "Custom clickable role. MissingRole · a11y.role.missing_on_clickable"
+   },
+   {
+    "key": "compose:7:119",
+    "label": null,
+    "bounds": [
+     0,
+     2319,
+     1280,
+     216
+    ],
+    "said": "Traversal order. BrokenTraversalOrder"
+   },
+   {
+    "key": "compose:7:130",
+    "label": null,
+    "bounds": [
+     0,
+     2538,
+     1280,
+     216
+    ],
+    "said": "List item semantics. BrokenTraversalOrder · a11y.label.missing"
+   },
+   {
+    "key": "compose:7:141",
+    "label": null,
+    "bounds": [
+     0,
+     2568,
+     1280,
+     216
+    ],
+    "said": "Section heading. MissingHeading"
+   },
+   {
+    "key": "compose:7:152",
+    "label": null,
+    "bounds": [
+     0,
+     351,
+     1280,
+     216
+    ],
+    "said": "Redundant label. RedundantLabelText · a11y.label.redundant"
+   },
+   {
+    "key": "compose:7:163",
+    "label": null,
+    "bounds": [
+     0,
+     570,
+     1280,
+     216
+    ],
+    "said": "Desc duplicates text. ContentDescDuplicatesText · a11y.label.redundant"
+   },
+   {
+    "key": "compose:7:174",
+    "label": null,
+    "bounds": [
+     0,
+     789,
+     1280,
+     216
+    ],
+    "said": "Form field label. MissingFormLabel · a11y.label.missing"
+   },
+   {
+    "key": "compose:7:185",
+    "label": null,
+    "bounds": [
+     0,
+     1008,
+     1280,
+     216
+    ],
+    "said": "Tiny fixed text size. TinyTextSize"
+   },
+   {
+    "key": "compose:7:196",
+    "label": null,
+    "bounds": [
+     0,
+     1227,
+     1280,
+     216
+    ],
+    "said": "Merged vs stolen focus. MergedDescendantsFocus · a11y.touch_target.small"
+   },
+   {
+    "key": "compose:7:206",
+    "label": null,
+    "bounds": [
+     0,
+     1446,
+     1280,
+     216
+    ],
+    "said": "Disabled control. MissingDisabledState"
+   },
+   {
+    "key": "compose:7:216",
+    "label": null,
+    "bounds": [
+     0,
+     1665,
+     1280,
+     216
+    ],
+    "said": "Live region. MissingLiveRegion"
+   },
+   {
+    "key": "compose:7:227",
+    "label": null,
+    "bounds": [
+     0,
+     1884,
+     1280,
+     216
+    ],
+    "said": "Duplicate labels. DuplicateClickableBounds · a11y.label.missing"
+   },
+   {
+    "key": "compose:7:238",
+    "label": null,
+    "bounds": [
+     0,
+     2103,
+     1280,
+     216
+    ],
+    "said": "Custom toggle state. MissingStateDescription · a11y.state.not_exposed"
+   },
+   {
+    "key": "compose:7:249",
+    "label": null,
+    "bounds": [
+     0,
+     2322,
+     1280,
+     216
+    ],
+    "said": "Classic View screen (XML). exercises the View extraction path"
+   },
+   {
+    "key": "compose:7:259",
+    "label": null,
+    "bounds": [
+     0,
+     2541,
+     1280,
+     216
+    ],
+    "said": "S1: RecyclerView of ComposeView cells. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:269",
+    "label": null,
+    "bounds": [
+     0,
+     2568,
+     1280,
+     216
+    ],
+    "said": "S2: RecyclerView of classic View cells. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:279",
+    "label": null,
+    "bounds": [
+     0,
+     1470,
+     1280,
+     216
+    ],
+    "said": "S3: RecyclerView of mixed cells. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:289",
+    "label": null,
+    "bounds": [
+     0,
+     1689,
+     1280,
+     216
+    ],
+    "said": "S4: LazyColumn with AndroidView rows. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:299",
+    "label": null,
+    "bounds": [
+     0,
+     1908,
+     1280,
+     216
+    ],
+    "said": "S5: Compose > AndroidView > RecyclerView > cells. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:309",
+    "label": null,
+    "bounds": [
+     0,
+     2127,
+     1280,
+     216
+    ],
+    "said": "S6: RecyclerView grid of View cells. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:319",
+    "label": null,
+    "bounds": [
+     0,
+     2346,
+     1280,
+     216
+    ],
+    "said": "D1: DialogFragment over a View screen. mixed View/Compose hierarchy"
+   },
+   {
+    "key": "compose:7:329",
+    "label": null,
+    "bounds": [
+     0,
+     2565,
+     1280,
+     216
+    ],
+    "said": "D2: Compose Dialog over a Compose screen. mixed View/Compose hierarchy"
+   },
+   {
+    "edge": true
+   },
+   {
+    "key": "compose:7:10",
+    "label": "A11yProbe",
+    "bounds": [
+     48,
+     210,
+     322,
+     84
+    ],
+    "said": "A11yProbe. Out of list"
+   },
+   {
+    "key": "compose:7:216",
+    "label": null,
+    "bounds": [
+     0,
+     348,
+     1280,
+     24
+    ],
+    "said": "Unlabelled. In list"
+   },
+   {
+    "key": "compose:7:227",
+    "label": null,
+    "bounds": [
+     0,
+     375,
+     1280,
+     216
+    ],
+    "said": "Duplicate labels. DuplicateClickableBounds · a11y.label.missing"
+   }
+  ]
+ }
+}

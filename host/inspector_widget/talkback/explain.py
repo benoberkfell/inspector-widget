@@ -1,3 +1,6 @@
+# Portions of this file are derived from google/talkback (https://github.com/google/talkback)
+# at commit 229212f (TalkBack 16.2), licensed under the Apache License, Version 2.0.
+# Reimplemented in Python and modified for Inspector Widget; see NOTICE.
 """Why a node is, or is not, a TalkBack focus stop, and how focus reaches it.
 
 Reason codes (stable strings; a ``:<key>`` suffix names the node responsible):
@@ -31,8 +34,8 @@ Edges (the ``via`` of a :func:`~.order.simulate` step)
 Ghost stops (``ghost`` on an explained stop): a stop TalkBack lands on with little or nothing to
 show for it. ``unlabelled`` (it says "Unlabelled" or only a role), ``invisible_children_only``
 (it speaks only through invisible children, UT/AccessibilityNodeInfoUtils.java:1109),
-``clipped:<scrollable>`` (a sliver of an item scrolled almost out of its list: it touches the
-scrollable's edge and is under half the height of its siblings, or under 48 px).
+``clipped:<scrollable>`` (a sliver of an item scrolled almost out of its list: it reaches or
+passes the scrollable's edge and is under half the height of its siblings, or under 48 px).
 """
 
 from __future__ import annotations
@@ -107,7 +110,7 @@ def ghost_reasons(rules: Rules, n: TbNode) -> List[str]:
     scroller = next((a for a in n.ancestors() if rules.is_scrollable(a)), None)
     if scroller is not None:
         r, s = n.rect, scroller.rect
-        at_edge = abs(r.top - s.top) <= 1 or abs(r.bottom - s.bottom) <= 1
+        at_edge = r.top <= s.top + 1 or r.bottom >= s.bottom - 1  # reaches or passes an edge
         siblings = sorted(c.rect.height for c in (n.parent.children if n.parent else [])
                           if c is not n and c.visible and not c.rect.is_empty())
         typical = siblings[len(siblings) // 2] if siblings else 0
