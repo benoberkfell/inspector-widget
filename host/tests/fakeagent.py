@@ -54,7 +54,15 @@ Properties.kt, Capture.kt, ComposeInspector.kt, AccessibilityInspector.kt):
   their semantics id as ``virtual_id``;
 * Hello reports ``viewspector-0.1+<sha256 of the payload.jar it was loaded
   from>`` (the build handshake). ``build_id=None`` models an agent from before
-  the handshake, which reports plain ``viewspector-0.1``.
+  the handshake, which reports plain ``viewspector-0.1``;
+* every a11y window carries a ``WindowInfo`` (``Scene.windows``: title, type,
+  flags; frame = the root's bounds, z = its index);
+* ``a11y_focus`` / ``a11y_act`` mirror A11yFocus.kt and A11yEventTap.kt: the
+  event tap is a ring of 512 records with seq from 1 (``FakeA11yTap``); a
+  long-poll waits WITHOUT the device lock and takes it only for the read; the
+  focused node is ``FakeAgent.a11y_focus`` (set it with ``set_a11y_focus``,
+  now or after a delay, which records the focus events as the platform does);
+  accessibility focus actions are refused while ``touch_exploration`` is off.
 
 Every agent takes a ``behaviour(req) -> (delay_s, action)`` hook, where action
 is a ``pb.Response`` (sent), ``None`` (no reply), ``"close"`` (drop the
@@ -190,6 +198,8 @@ class Scene:
     background: Tuple[int, int, int] = (250, 250, 250)
     paint: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int]]] = field(default_factory=list)
     skp: Optional[bytes] = None  # CaptureSkp payload; None -> "empty SKP"
+    # root_view_id -> WindowInfo fields (title, layout_title, window_type, wm_flags)
+    windows: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
     def all_views(self) -> List[ViewSpec]:
         return [v for r in self.roots for v in r.walk()]
@@ -381,6 +391,12 @@ def default_scene() -> Scene:
     )
     return Scene(
         roots=[decor, popup],
+        windows={
+            1001: {"title": "A11yProbe", "window_type": 1, "wm_flags": 0x81810100,
+                   "layout_title": f"{DEFAULT_PACKAGE}/{DEFAULT_PACKAGE}.MainActivity"},
+            # FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL: a non-modal popup.
+            2001: {"window_type": 1000, "wm_flags": 0x00000028, "layout_title": "PopupWindow:5f2e1c"},
+        },
         paint=[
             ((16, 80, 120, 48), (30, 60, 200)),     # the OK button: R != B, so a swap shows
             ((16, 176, 200, 56), (98, 0, 238)),     # Compose "Submit"
@@ -536,6 +552,124 @@ def encode_a11y_virtual(st: StringTable, host_id: int, n: ComposeNodeSpec, out: 
                             include_rendering_info)
 
 
+def encode_window_info(st: StringTable, scene: "Scene", root: ViewSpec, out: "pb.WindowInfo") -> None:
+    """WindowInfos.of: the scene's per-window fields, frame = the root's bounds, z = its index."""
+    meta = scene.windows.get(root.id, {})
+    out.root_view_id = root.id
+    out.title = st.intern(meta.get("title"))
+    out.layout_title = st.intern(meta.get("layout_title"))
+    out.window_type = meta.get("window_type", 1)
+    flags = meta.get("wm_flags", 0) & 0xFFFFFFFF
+    out.wm_flags = flags - (1 << 32) if flags >= 1 << 31 else flags  # a Kotlin Int on the wire
+    _set_bounds(out.frame, root.bounds)
+    out.z = scene.roots.index(root) if root in scene.roots else -1
+    out.has_window_focus = out.z == 0
+    for name, ins in (("status_bars", (0, 24, 0, 0)), ("navigation_bars", (0, 0, 0, 48)),
+                      ("ime", (0, 0, 0, 0)), ("display_cutout", (0, 0, 0, 0))):
+        i = getattr(out, name)
+        i.left, i.top, i.right, i.bottom = ins
+        i.visible = name in ("status_bars", "navigation_bars")
+
+
+def _mark_a11y_focus(node: "pb.A11yNode", focus: Optional[Tuple[int, int]]) -> None:
+    """Set accessibility_focused on the node that holds focus (as the platform reports it)."""
+    if focus is None:
+        return
+    if (node.host_view_id, node.virtual_id) == focus:
+        node.accessibility_focused = True
+    for c in node.children:
+        _mark_a11y_focus(c, focus)
+
+
+def _prune(node: "pb.A11yNode", depth: int) -> None:
+    """Keep ``depth`` levels of children (A11yFocusCommand.subtree_depth)."""
+    if depth <= 0:
+        del node.children[:]
+        return
+    for c in node.children:
+        _prune(c, depth - 1)
+
+
+# AccessibilityEvent types / AccessibilityNodeInfo action ids the fake emits.
+TYPE_VIEW_CLICKED = 0x00000001
+TYPE_VIEW_SCROLLED = 0x00001000
+TYPE_WINDOW_CONTENT_CHANGED = 0x00000800
+TYPE_VIEW_ACCESSIBILITY_FOCUSED = 0x00008000
+TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED = 0x00010000
+_NODE_ACTION_IDS = {
+    pb.NODE_ACTION_ACCESSIBILITY_FOCUS: 0x40, pb.NODE_ACTION_CLEAR_ACCESSIBILITY_FOCUS: 0x80,
+    pb.NODE_ACTION_CLICK: 0x10, pb.NODE_ACTION_LONG_CLICK: 0x20,
+    pb.NODE_ACTION_SCROLL_FORWARD: 0x1000, pb.NODE_ACTION_SCROLL_BACKWARD: 0x2000,
+    pb.NODE_ACTION_SHOW_ON_SCREEN: 0x0102003D, pb.NODE_ACTION_FOCUS: 0x1,
+    pb.NODE_ACTION_CLEAR_FOCUS: 0x2, pb.NODE_ACTION_SET_TEXT: 0x200000,
+    pb.NODE_ACTION_EXPAND: 0x40000, pb.NODE_ACTION_COLLAPSE: 0x80000,
+    pb.NODE_ACTION_DISMISS: 0x100000,
+}
+
+
+class FakeA11yTap:
+    """A11yEventTap: a ring of ``CAPACITY`` records (seq from 1) and the condition a
+    long-poll waits on. Records are ``pb.A11yEventRecord`` with raw strings kept aside
+    (``_text``) and interned per response."""
+
+    CAPACITY = 512
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.ring: List[Tuple["pb.A11yEventRecord", Dict[str, Optional[str]]]] = []
+        self.seq = 0
+        self.focus_seq = 0
+        self.last_event = 0.0
+        self.closed = False
+
+    def record(self, type_: int, root_view_id: int, host_view_id: int = 0, virtual_id: int = -1,
+               text: Optional[str] = None, pane_title: Optional[str] = None,
+               class_name: Optional[str] = None, host_class: Optional[str] = None,
+               **ints: int) -> int:
+        with self.cond:
+            self.seq += 1
+            rec = pb.A11yEventRecord(seq=self.seq, uptime_ms=int(time.monotonic() * 1000),
+                                     type=type_, root_view_id=root_view_id,
+                                     host_view_id=host_view_id, virtual_id=virtual_id, **ints)
+            self.ring.append((rec, {"text": text, "pane_title": pane_title,
+                                    "class_name": class_name, "host_class": host_class}))
+            del self.ring[:-self.CAPACITY]
+            if type_ == TYPE_VIEW_ACCESSIBILITY_FOCUSED:
+                self.focus_seq = self.seq
+            self.last_event = time.monotonic()
+            self.cond.notify_all()
+            return self.seq
+
+    def await_focus(self, after_seq: int, timeout: float) -> bool:
+        with self.cond:
+            self.cond.wait_for(lambda: self.focus_seq > after_seq or self.closed, timeout)
+            return self.focus_seq > after_seq
+
+    def await_quiet(self, quiet: float, until: float) -> None:
+        with self.cond:
+            while not self.closed:
+                now = time.monotonic()
+                since = now - self.last_event
+                if not self.last_event or since >= quiet or now >= until:
+                    return
+                self.cond.wait(min(quiet - since, until - now))
+
+    def events_after(self, after_seq: int, max_events: int, up_to: int):
+        with self.cond:
+            newest = min(up_to, self.seq)
+            oldest_kept = max(1, self.seq - self.CAPACITY + 1)
+            dropped = max(0, min(oldest_kept, newest + 1) - (after_seq + 1))
+            out = [r for r in self.ring if after_seq < r[0].seq <= newest]
+            if max_events > 0:
+                out = out[-max_events:]
+            return out, newest, dropped
+
+    def close(self) -> None:
+        with self.cond:
+            self.closed = True
+            self.cond.notify_all()
+
+
 def error_response(req_id: int, message: str) -> "pb.Response":
     return pb.Response(id=req_id, status=pb.Response.ERROR, error=message)
 
@@ -584,6 +718,11 @@ class FakeAgent:
         self.linger_after_stop = False
         self.lingering = False
         self.inspection_enabled = False  # ComposeInspector.enableInspection is sticky
+        # A11yFocus.kt / A11yEventTap.kt state (see set_a11y_focus).
+        self.a11y_tap = FakeA11yTap()
+        self.a11y_focus: Optional[Tuple[int, int]] = None  # (host_view_id, virtual_id)
+        self.touch_exploration = False  # TalkBack off: accessibility focus actions refused
+        self.services_enabled = False
         self.running = True
         self.requests: List["pb.Request"] = []
         self.log: List[Tuple[int, str]] = []  # (connection id, command)
@@ -652,8 +791,9 @@ class FakeAgent:
                     return  # Server.stop() raced this read: the session is over
                 command = req.WhichOneof("command") or "<unset>"
                 self._record(cid, req, command)
-                locked = (command not in ("hello", "shutdown")
-                          or self.hello_waits_for_other_clients)
+                # a11y_focus long-polls outside the lock and takes it for its read.
+                locked = (command not in ("hello", "shutdown", "a11y_focus")
+                          or (self.hello_waits_for_other_clients and command != "a11y_focus"))
                 if locked:
                     self._handle_lock.acquire()
                 try:
@@ -724,6 +864,9 @@ class FakeAgent:
         _close(self._srv)
         if self.close_clients_on_stop:
             self.kill_clients()
+        # Server.run's finally, after stop() disconnected the clients: A11yEventTap.shutdown()
+        # wakes any long-poll (its reply then has nowhere to go).
+        self.a11y_tap.close()
         if self.on_stop is not None:
             self.on_stop(self)
 
@@ -847,9 +990,176 @@ class FakeAgent:
             w = resp.dump_a11y.windows.add()
             w.root_view_id = r.id
             encode_a11y_view(st, r, w.root, cmd.include_extras, cmd.include_rendering_info)
+            _mark_a11y_focus(w.root, self.a11y_focus)
+            encode_window_info(st, self.scene, r, w.info)
             diag.append(f"root#{r.id} query-from-app-process")
         st.fill(resp.dump_a11y.strings)
         resp.dump_a11y.diagnostics = "; ".join(diag)
+        return resp
+
+    # ---- accessibility focus / event tap ------------------------------------ #
+    def _root_of(self, host_view_id: int) -> Optional[ViewSpec]:
+        for r in self.scene.roots:
+            if any(v.id == host_view_id for v in r.walk()):
+                return r
+        return None
+
+    def _virtual(self, host: ViewSpec, virtual_id: int) -> Optional[ComposeNodeSpec]:
+        stack = list(host.semantics.children) if host.semantics is not None else []
+        while stack:
+            n = stack.pop()
+            if n.id == virtual_id:
+                return n
+            stack.extend(n.children)
+        return None
+
+    def set_a11y_focus(self, host_view_id: Optional[int], virtual_id: int = -1,
+                       delay: float = 0.0) -> None:
+        """Move accessibility focus (None clears it) the way TalkBack's action does: a
+        FOCUS_CLEARED event for the old node, then VIEW_ACCESSIBILITY_FOCUSED for the new
+        one. With ``delay`` it happens on a timer thread (to exercise the long-poll)."""
+        if delay:
+            threading.Timer(delay, self.set_a11y_focus, (host_view_id, virtual_id)).start()
+            return
+        old = self.a11y_focus
+        if old is not None:
+            root = self._root_of(old[0])
+            self.a11y_tap.record(TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED, root.id if root else 0,
+                                 old[0], old[1])
+        self.a11y_focus = None if host_view_id is None else (host_view_id, virtual_id)
+        if host_view_id is not None:
+            root = self._root_of(host_view_id)
+            host = self.scene.find_view(host_view_id)
+            self.a11y_tap.record(TYPE_VIEW_ACCESSIBILITY_FOCUSED, root.id if root else 0,
+                                 host_view_id, virtual_id,
+                                 host_class=(host.a11y.get("provider_class") if host else None))
+
+    def _focus_proto(self, st: StringTable, out: "pb.A11yFocus", host_view_id: int,
+                     virtual_id: int, depth: int, source: str) -> None:
+        host = self.scene.find_view(host_view_id)
+        root = self._root_of(host_view_id)
+        out.root_view_id = root.id if root else 0
+        out.host_view_id = host_view_id
+        out.virtual_id = virtual_id
+        out.source = source
+        if host is None:
+            out.stale = True
+            return
+        out.host_class = st.intern(host.a11y.get("provider_class")
+                                   or f"{host.package_name}.{host.class_name}")
+        if root is not None:
+            encode_window_info(st, self.scene, root, out.window)
+        if virtual_id == HOST_VIEW_ID:
+            encode_a11y_view(st, host, out.node, True, False)
+        else:
+            n = self._virtual(host, virtual_id)
+            if n is None:
+                out.stale = True
+                return
+            encode_a11y_virtual(st, host.id, n, out.node, True, False)
+        _mark_a11y_focus(out.node, self.a11y_focus)
+        _prune(out.node, depth)
+        out.bounds.CopyFrom(out.node.bounds)
+
+    def _h_a11y_focus(self, req_id, cmd):
+        tap = self.a11y_tap
+        start = time.monotonic()
+        after = cmd.after_seq
+        note = None
+        if after > tap.seq:
+            note = f"after_seq {after} is ahead of the event tap ({tap.seq}): waiting for new events"
+            after = tap.seq
+        seen = tap.focus_seq > after
+        wait = min(max(cmd.wait_ms, 0), 30000) / 1000.0
+        if wait > 0:
+            seen = tap.await_focus(after, wait)
+            if seen and cmd.quiet_ms > 0:
+                tap.await_quiet(min(cmd.quiet_ms, 5000) / 1000.0,
+                                start + wait + min(cmd.quiet_ms, 5000) / 1000.0)
+        waited = int((time.monotonic() - start) * 1000)
+        st = StringTable()
+        resp = self._ok(req_id)
+        out = resp.a11y_focus
+        with self._handle_lock:  # Dispatcher.handleA11yFocus: the read runs under the lock
+            seq = tap.seq
+            diag = [f"roots={len(self.scene.roots)}"]
+            if self.a11y_focus is not None:
+                self._focus_proto(st, out.a11y, *self.a11y_focus, cmd.subtree_depth, "view-root")
+            else:
+                diag.append("no accessibility focus in the app's windows")
+            if cmd.include_input_focus:
+                diag.append("no input focus")
+        events, newest, dropped = tap.events_after(cmd.after_seq, cmd.max_events, seq)
+        for rec, strs in events:
+            e = out.events.add()
+            e.CopyFrom(rec)
+            for k, v in strs.items():
+                setattr(e, k, st.intern(v))
+        diag.append("read=120us")
+        if cmd.wait_ms > 0:
+            diag.append(f"waited={waited}ms")
+        if note:
+            diag.append(note)
+        out.seq = seq
+        out.dropped = dropped
+        out.focus_event = seen
+        out.timed_out = wait > 0 and not seen
+        out.waited_ms = waited if wait > 0 else 0
+        out.read_us = 120
+        out.read_uptime_ms = int(time.monotonic() * 1000)
+        out.touch_exploration = self.touch_exploration
+        out.services_enabled = self.services_enabled
+        out.diagnostics = "; ".join(diag)
+        st.fill(out.strings)
+        return resp
+
+    def _h_a11y_act(self, req_id, cmd):
+        st = StringTable()
+        resp = self._ok(req_id)
+        out = resp.a11y_act
+        out.seq_before = self.a11y_tap.seq
+        action_id = (cmd.raw_action_id if cmd.action == pb.NODE_ACTION_RAW
+                     else _NODE_ACTION_IDS.get(cmd.action, 0))
+        out.action_id = action_id
+        host = self.scene.find_view(cmd.host_view_id)
+        error = None
+        if not action_id:
+            error = f"unknown action {cmd.action} (raw_action_id {cmd.raw_action_id})"
+        elif host is None:
+            error = (f"no View with host_view_id {cmd.host_view_id} in the app's windows "
+                     "(the key is from an older dump, or its window closed)")
+        elif action_id in (0x40, 0x80) and not self.touch_exploration:
+            error = ("touch exploration is off: accessibility focus exists only while a screen "
+                     "reader such as TalkBack runs (View.requestAccessibilityFocus and Compose "
+                     "refuse the action otherwise). Turn TalkBack on first.")
+        elif cmd.virtual_id != HOST_VIEW_ID and host.semantics is None:
+            error = (f"View {cmd.host_view_id} serves no virtual nodes, so virtual id "
+                     f"{cmd.virtual_id} does not exist (use -1 for the View itself)")
+        elif cmd.virtual_id != HOST_VIEW_ID and self._virtual(host, cmd.virtual_id) is None:
+            error = (f"virtual id {cmd.virtual_id} no longer resolves under View "
+                     f"{cmd.host_view_id} (the node is gone; take a fresh dump)")
+        if error is None:
+            out.performed = True
+            root = self._root_of(cmd.host_view_id)
+            if action_id == 0x40:
+                self.set_a11y_focus(cmd.host_view_id, cmd.virtual_id)
+            elif action_id == 0x80:
+                if self.a11y_focus == (cmd.host_view_id, cmd.virtual_id):
+                    self.set_a11y_focus(None)
+            elif action_id == 0x10:
+                self.a11y_tap.record(TYPE_VIEW_CLICKED, root.id if root else 0,
+                                     cmd.host_view_id, cmd.virtual_id)
+            elif action_id in (0x1000, 0x2000):
+                self.a11y_tap.record(TYPE_VIEW_SCROLLED, root.id if root else 0,
+                                     cmd.host_view_id, cmd.virtual_id,
+                                     scroll_delta_y=120 if action_id == 0x1000 else -120)
+        else:
+            out.error = error
+        if self.a11y_focus is not None:
+            self._focus_proto(st, out.after, *self.a11y_focus, cmd.subtree_depth, "view-root")
+        out.seq = self.a11y_tap.seq
+        out.diagnostics = f"roots={len(self.scene.roots)}; via=query-connection"
+        st.fill(out.strings)
         return resp
 
     def _h_capture_skp(self, req_id, cmd):

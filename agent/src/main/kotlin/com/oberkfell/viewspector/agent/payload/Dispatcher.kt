@@ -13,6 +13,10 @@
  *                     PropertyGroup per visited view and/or a screenshot
  *   GET_PROPERTIES -> find view by id (walk roots) + Properties.forView
  *   SCREENSHOT     -> Capture.screenshot
+ *   DUMP_A11Y      -> AccessibilityInspector.dump (main thread, event tap lifted)
+ *   A11Y_FOCUS     -> A11yFocus.await (long-poll, this thread, no device lock) then
+ *                     A11yFocus.read (main thread) + the event tap's records
+ *   A11Y_ACT       -> A11yFocus.act (main thread)
  *   SHUTDOWN       -> ShutdownResponse; the Server stops after writing it
  *
  * The reference SessionHandler (ui-inspector SessionHandler.kt:96-160) is the
@@ -34,8 +38,13 @@ import com.oberkfell.viewspector.proto.ViewInspection
  * SHUTDOWN only builds the reply: the [Server] writes it and then stops.
  * (Stopping here, before the write, closed the requester's socket first, so
  * the host never saw the ShutdownResponse.)
+ *
+ * [deviceLock] is the Server's lock that serializes device work across
+ * connections. The Server takes it around [handle] unless [takesDeviceLock]
+ * says no: HELLO and SHUTDOWN touch no UI, and A11Y_FOCUS takes it itself
+ * only after its long-poll, so a waiting client never holds up the others.
  */
-class Dispatcher {
+class Dispatcher(private val deviceLock: Any = Any()) {
 
     private companion object {
         const val TAG = "ViewSpector"
@@ -48,6 +57,15 @@ class Dispatcher {
         // Default screenshot scale when a DumpTreeCommand leaves it unset (0f).
         const val DEFAULT_SCREENSHOT_SCALE = 1.0f
     }
+
+    /** False for the commands the Server must run without holding [deviceLock]. */
+    fun takesDeviceLock(req: ViewInspection.Request): Boolean =
+        when (req.commandCase) {
+            ViewInspection.Request.CommandCase.HELLO,
+            ViewInspection.Request.CommandCase.SHUTDOWN,
+            ViewInspection.Request.CommandCase.A11Y_FOCUS -> false
+            else -> true
+        }
 
     /**
      * Dispatches [req] to the right handler and returns the response. Any
@@ -71,6 +89,10 @@ class Dispatcher {
                     handleCaptureSkp(id, req.captureSkp)
                 ViewInspection.Request.CommandCase.DUMP_A11Y ->
                     handleDumpA11y(id, req.dumpA11Y)
+                ViewInspection.Request.CommandCase.A11Y_FOCUS ->
+                    handleA11yFocus(id, req.a11YFocus)
+                ViewInspection.Request.CommandCase.A11Y_ACT ->
+                    handleA11yAct(id, req.a11YAct)
                 ViewInspection.Request.CommandCase.SHUTDOWN -> handleShutdown(id)
                 ViewInspection.Request.CommandCase.COMMAND_NOT_SET ->
                     error(id, "No command set in request")
@@ -239,7 +261,13 @@ class Dispatcher {
         val (windows, diag) =
             MainThread.run {
                 val roots: List<View> = selectRootViews(rootId)
-                AccessibilityInspector.dump(roots, strings, includeExtras, includeRenderingInfo)
+                // The event tap's delegate on each root would make the root report itself
+                // important for accessibility; dump what the app has (A11yEventTap).
+                A11yEventTap.withoutTap {
+                    AccessibilityInspector.dump(
+                        roots, strings, includeExtras, includeRenderingInfo, RootsDetector.rootViews(),
+                    )
+                }
             }
 
         val resp =
@@ -249,6 +277,68 @@ class Dispatcher {
                 .setDiagnostics(diag)
                 .build()
         return ok(id).setDumpA11Y(resp).build()
+    }
+
+    /**
+     * A11Y_FOCUS: where accessibility focus is, plus the events the tap recorded after
+     * after_seq. With wait_ms > 0 this (server) thread first long-polls for the next focus
+     * event WITHOUT the device lock (A11yFocus.await); the read itself is one main-thread hop
+     * under the lock. The seq returned is the tap's seq at the moment of the read, so a focus
+     * event after the read is always newer than it (the next long-poll sees it).
+     */
+    private fun handleA11yFocus(
+        id: Int,
+        cmd: ViewInspection.A11yFocusCommand,
+    ): ViewInspection.Response {
+        val wait = A11yFocus.await(cmd)
+        val strings = StringTable()
+        val read = synchronized(deviceLock) {
+            MainThread.run { A11yFocus.read(strings, cmd.subtreeDepth, cmd.includeInputFocus) }
+        }
+        val snap = A11yEventTap.eventsAfter(cmd.afterSeq, cmd.maxEvents, read.seq)
+        val resp = ViewInspection.A11yFocusResponse.newBuilder()
+        read.a11y?.let { resp.setA11Y(it) }
+        read.input?.let { resp.setInput(it) }
+        for (r in snap.events) resp.addEvents(A11yEventTap.toProto(r, strings))
+        val diag = StringBuilder(read.diagnostics)
+        diag.append("; read=${read.readUs}us")
+        if (cmd.waitMs > 0) diag.append("; waited=${wait.waitedMs}ms")
+        wait.note?.let { diag.append("; ").append(it) }
+        if (snap.dropped > 0) diag.append("; events-dropped=${snap.dropped}")
+        resp.setSeq(read.seq)
+            .setDropped(snap.dropped)
+            .setFocusEvent(wait.focusEvent)
+            .setTimedOut(wait.timedOut)
+            .setWaitedMs(wait.waitedMs)
+            .setReadUs(read.readUs)
+            .setReadUptimeMs(read.uptimeMs)
+            .setTouchExploration(read.touchExploration)
+            .setServicesEnabled(read.servicesEnabled)
+            .setDiagnostics(diag.toString())
+            .setStrings(strings.build())
+        return ok(id).setA11YFocus(resp).build()
+    }
+
+    /**
+     * A11Y_ACT: perform one accessibility action on a node (A11yFocus.act) and report the
+     * focus right after it. A refusal is an OK response with performed=false and error set.
+     */
+    private fun handleA11yAct(
+        id: Int,
+        cmd: ViewInspection.A11yActCommand,
+    ): ViewInspection.Response {
+        val strings = StringTable()
+        val act = MainThread.run { A11yFocus.act(cmd, strings) }
+        val resp = ViewInspection.A11yActResponse.newBuilder()
+            .setPerformed(act.performed)
+            .setActionId(act.actionId)
+            .setSeqBefore(act.seqBefore)
+            .setSeq(act.seq)
+            .setDiagnostics(act.diagnostics)
+        act.error?.let { resp.setError(it) }
+        act.after?.let { resp.setAfter(it) }
+        resp.setStrings(strings.build())
+        return ok(id).setA11YAct(resp).build()
     }
 
     /** Read the SKP version int from a serialized SkPicture: "skiapict" magic then LE uint32. */
