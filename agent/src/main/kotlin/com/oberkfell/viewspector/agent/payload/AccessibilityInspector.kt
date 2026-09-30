@@ -743,12 +743,19 @@ object AccessibilityInspector {
             node.getBoundsInScreen(r)
         } catch (_: Throwable) {
         }
+        // A node clipped away by an ancestor (an off-screen pager page, a row scrolled out
+        // of its list) comes back inverted: View.getBoundsOnScreen clamps each edge to every
+        // parent separately, so right < left or bottom < top (seen: h=-2159). Clamp the size
+        // to 0 (a zero-area node) and flag it rather than send a negative extent.
+        val clipped = r.right < r.left || r.bottom < r.top
         b.bounds = ViewInspection.Bounds.newBuilder()
             .setLayout(
                 ViewInspection.Rect.newBuilder()
-                    .setX(r.left).setY(r.top).setW(r.width()).setH(r.height()),
+                    .setX(r.left).setY(r.top)
+                    .setW(maxOf(0, r.width())).setH(maxOf(0, r.height())),
             )
             .build()
+        if (clipped) b.boundsClipped = true
 
         // --- boolean state flags ----------------------------------------------
         b.clickable = bool { node.isClickable }
