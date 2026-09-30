@@ -8,17 +8,21 @@
 #           runtime (e.g. 5.x) raises at import time.
 # mcp:      preferred — the Model Context Protocol SDK (stdio server). The MCP
 #           server falls back to a built-in JSON-RPC-over-stdio implementation
-#           when this is absent, but installing it is recommended.
+#           when this is absent, but installing it is recommended. Both SDK
+#           generations are supported (1.x decorator API, 2.x constructor-handler
+#           API); `--self-check` fails if the installed SDK fits neither.
+# Pillow:   required for every overlay tool (compose_overlay, a11y_overlay,
+#           inspect --overlay) and the component_image screenshot-crop fallback.
+#           png.py alone can fall back to a stdlib encoder, but overlays cannot.
+# grpcio:   talks to Google's skiaparser for per-component SKP images. Without it
+#           component_image falls back to a screenshot crop.
 #
 # adb is invoked via subprocess and is NOT a Python dependency.
-#
-# Optional: Pillow gives a faster/native PNG encoder in png.py. The module falls
-# back to a pure-stdlib (zlib+struct) encoder when Pillow is absent, so this is
-# not required.
-# Pillow>=10.0
 
 protobuf>=6.33.5,<7
-mcp>=1.0
+mcp>=1.19,<3
+Pillow>=10.0
+grpcio>=1.60
 
 # --- test/dev (optional) ---
 # pytest powers the device-free host test suite under host/tests (run via
