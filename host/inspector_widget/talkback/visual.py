@@ -29,12 +29,16 @@ def _bbox(rects: Sequence[Rect]) -> Rect:
 
 
 def _gaps(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Whitespace gaps between the merged [start, end) spans: (gap start, gap size)."""
+    """Whitespace gaps between the merged [start, end) spans: (gap start, gap size).
+
+    Spans that merely touch (the usual LinearLayout / ScrollView case) yield a zero-size
+    gap, so abutting rows and columns still get a cut.
+    """
     spans = sorted(spans)
     out: List[Tuple[int, int]] = []
     end = spans[0][1]
     for s, e in spans[1:]:
-        if s > end:
+        if s >= end:
             out.append((end, s - end))
         end = max(end, e)
     return out
@@ -48,7 +52,8 @@ def _cut(items: List[_Item]) -> List[_Item]:
         at, _ = max(ygaps, key=lambda g: (g[1], -g[0]))
         top = [it for it in items if it[0].bottom <= at]
         rest = [it for it in items if it[0].bottom > at]
-        return _cut(top) + _cut(rest)
+        if top and rest:  # a zero-size item on the boundary can make one side empty
+            return _cut(top) + _cut(rest)
     xgaps = _gaps([(r.left, r.right) for r, _ in items])
     if xgaps:
         at, _ = max(xgaps, key=lambda g: (g[1], -g[0]))

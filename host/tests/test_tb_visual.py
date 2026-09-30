@@ -103,3 +103,19 @@ def test_order_items_takes_plain_boxes():
     assert tb.visual.order_items(items) == ["a1", "a2", "b1", "b2", "popup"]
     boxed = [dict(it, container=it["key"][1]) for it in items[:4]]  # rows as containers
     assert tb.visual.order_items(boxed) == ["a1", "b1", "a2", "b2"]
+
+
+from inspector_widget.talkback.visual import order_items  # noqa: E402
+
+
+def test_abutting_grid_reads_row_major():
+    """Rows and columns that touch (no whitespace) still split: a 2x2 grid reads a, b, c, d."""
+    items = [{"key": "a", "bounds": (0, 0, 100, 50)}, {"key": "b", "bounds": (150, 0, 100, 50)},
+             {"key": "c", "bounds": (0, 50, 100, 50)}, {"key": "d", "bounds": (150, 50, 100, 50)}]
+    assert order_items(items) == ["a", "b", "c", "d"]
+
+
+def test_zero_height_item_on_a_row_boundary_terminates():
+    """A zero-size gap that would leave one side of the cut empty is skipped, not recursed on."""
+    items = [{"key": "a", "bounds": (0, 0, 100, 50)}, {"key": "z", "bounds": (0, 50, 100, 0)}]
+    assert sorted(order_items(items)) == ["a", "z"]
