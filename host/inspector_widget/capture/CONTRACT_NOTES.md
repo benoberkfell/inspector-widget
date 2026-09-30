@@ -322,3 +322,37 @@ with every consumer.
   - Cursors are `<capture>:l:<hash8 of args>:<offset>`. A cursor from other
     arguments or another capture is `bad_args`.
   - `lint_summary(ix)` returns the `lint` and `issues` one-liners for `capture()`.
+
+## Images (C9, `capture/images.py`)
+
+- **One additive `LoadedCapture` method for C2: `derived_path(name) -> str`.** It
+  returns the absolute path where derived artifact `name` lives, whether or not it
+  exists yet. Images check it to reuse a PNG without reading it back.
+  - A name under `img/` (e.g. `img/n22-p16-1a2b3c4d.png`) lives in the capture's
+    `img/` directory. Any other name (e.g. `lint.1a2b3c4d.json`) lives in
+    `derived/`.
+  - `put_derived(name, data)` writes atomically (temp, then replace) and returns
+    that same path. `derived(name)` returns the bytes or None.
+  - `tests/loaded_fakes.FakeLoaded` implements exactly this.
+- Images also read `meta`, `index()` and `shot(root)`.
+- Outputs are named by a parameter hash: `img/<ref>-p<pad>-<hash>.png` for
+  crops, `img/ov-<kind>-<hash>.png` for overlays, `img/w_<udid>.png` and
+  `img/base-*.png` for the pictures underneath, and
+  `img/pdiff-<a>-<hash>.png` (under b's capture) for pixel diffs.
+- An overlay's hash includes its labels and colours, so issues added later (for
+  example contrast) never serve a stale overlay.
+- Crops, `inline()` and the PNG codec work without Pillow.
+- `overlay()` and `pixel_diff()` raise `OpError("unsupported")` without Pillow.
+- A missing window screenshot raises `facet_unavailable`. A node with no pixels
+  (zero size, or an unlinked slot) raises `bad_args`.
+- With neither `window` nor `ref`, an overlay covers the whole screen,
+  composited from every window in z order. With `ref` it is drawn on that node's
+  crop.
+- `overlay(loaded, ix, kind, marks, *, window, ref, pad, max_side)` hands
+  `overlay.render_items` coordinates already in image pixels (`scale=1.0`), with
+  `color_idx` 1 for error, 3 for warn, 0 for info and 2 for no issue. That works
+  with both main's `render_items` and the a11y branches' version.
+- `pixel_diff(la, lb, a, b, *, refs=None, threshold=24, max_side=1024,
+  max_boxes=20)`: `refs` (for example the changed refs from `diff()`) chooses
+  which boxes are drawn. Otherwise it boxes the deepest nodes whose pixels
+  changed.
