@@ -1,8 +1,17 @@
+import com.android.build.api.artifact.ScopedArtifact
+import com.android.build.api.variant.ScopedArtifacts
 import com.google.protobuf.gradle.id
 import com.google.protobuf.gradle.proto
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.commons.ClassRemapper
+import org.objectweb.asm.commons.Remapper
 import java.io.File
 import java.util.Properties
+import java.util.jar.JarFile
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 // ViewSpector — agent module.
 //
@@ -174,4 +183,179 @@ dependencies {
     // Lite runtime only — no androidx.inspection, no Google inspector jars
     // (CONTRACT §8). This is the *sole* third-party dep that ends up in the dex.
     implementation("com.google.protobuf:protobuf-javalite:3.25.5")
+}
+
+// --- Classloader isolation: relocate the bundled libraries -------------------
+// Bootstrap loads payload.jar in a DexClassLoader whose parent is the APP
+// classloader, and class loading is parent-first, so any class the app also
+// defines resolves to the app's copy, not ours. Most apps bundle the Kotlin
+// stdlib and many bundle protobuf-lite, usually another version, and R8 strips
+// whatever the app itself does not call. On an R8-shrunk app the payload then
+// dies on its first line (NoSuchMethodError: Intrinsics.checkNotNullParameter),
+// or later with IllegalAccessError from package-private access between our
+// classes and the app's copies of the same package.
+//
+// So every library class in the payload moves under payloadShadedRoot before
+// dexing: kotlin.Unit becomes com.oberkfell.viewspector.shaded.kotlin.Unit, and
+// so on. The payload then defines only com.oberkfell.viewspector.* classes,
+// which no app defines, so nothing it links against can be replaced. The
+// framework (android.*, java.*) still comes from the boot classloader, and the
+// app's own types (androidx.*, Compose, *$InspectionCompanion) are reached only
+// by reflection through the view's own classloader, as before.
+//
+// Why relocation rather than a child-first loader (DelegateLastClassLoader, API
+// 27+): child-first keeps the payload's copies first but under the same names
+// as the app's, so a lookup of any class the payload does not bundle (the
+// stdlib's reflective probe for kotlin-reflect, a class a newer stdlib added)
+// still falls through to the app's copy, which links against the app's half of
+// that package. Relocated names cannot collide under any loader order, a
+// dex-level check proves it (scripts/shadow_check.py), and Bootstrap and the
+// attach path stay exactly as they are.
+//
+// String constants inside the relocated library classes are rewritten too: they
+// name classes the libraries load reflectively (the stdlib's
+// "kotlin.reflect.jvm.internal.ReflectionFactoryImpl", protobuf's
+// "com.google.protobuf.ExtensionRegistry" and other full-runtime probes). Left
+// alone, Class.forName would find the APP's copy and hand our relocated code an
+// instance of the app's class. Strings in our own classes are never rewritten:
+// they name app classes on purpose. Kotlin types never cross into app code: the
+// payload talks to the app through java.* / android.* types and reflection only.
+//
+// This runs as an AGP whole-program class transform (every class of the
+// variant, project and dependencies) just before dexing, so the APK that
+// scripts/build.sh unpacks into payload.jar already carries the relocated dex.
+// scripts/shadow_check.py and host/tests/test_payload_isolation.py check it.
+
+/** Library packages bundled in the payload that must not resolve against the app. */
+val payloadRelocatedPackages = listOf(
+    "kotlin/",
+    "kotlinx/",
+    "org/jetbrains/annotations/",
+    "org/intellij/lang/annotations/",
+    "com/google/protobuf/",
+)
+
+/** Where [payloadRelocatedPackages] go; must stay inside com/oberkfell/viewspector/. */
+val payloadShadedRoot = "com/oberkfell/viewspector/shaded/"
+
+abstract class RelocatePayloadClassesTask : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val allJars: ListProperty<RegularFile>
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val allDirectories: ListProperty<Directory>
+
+    /** Internal-name prefixes (with a trailing slash) to relocate. */
+    @get:Input
+    abstract val packages: ListProperty<String>
+
+    /** Internal-name prefix (with a trailing slash) the packages move under. */
+    @get:Input
+    abstract val shadedRoot: Property<String>
+
+    @get:OutputFile
+    abstract val output: RegularFileProperty
+
+    /** Maps relocated type names everywhere, and string constants only inside relocated classes. */
+    private class Relocator(private val packages: List<String>, private val root: String) : Remapper() {
+        private val dottedPackages = packages.map { it.replace('/', '.') }
+        private val dottedRoot = root.replace('/', '.')
+
+        /** True while remapping a class that is itself being relocated (a library class). */
+        var inLibraryClass = false
+
+        fun relocates(internalName: String): Boolean = packages.any { internalName.startsWith(it) }
+
+        override fun map(internalName: String): String =
+            if (relocates(internalName)) root + internalName else internalName
+
+        override fun mapValue(value: Any?): Any? {
+            if (value !is String) return super.mapValue(value)
+            if (!inLibraryClass) return value
+            for (i in packages.indices) {
+                if (value.startsWith(packages[i])) return root + value
+                if (value.startsWith(dottedPackages[i])) return dottedRoot + value
+            }
+            return value
+        }
+    }
+
+    @TaskAction
+    fun relocate() {
+        val root = shadedRoot.get()
+        require(root.endsWith("/") && root.startsWith("com/oberkfell/viewspector/")) {
+            "shadedRoot must be an internal-name prefix inside com/oberkfell/viewspector/, got '$root'"
+        }
+        val relocator = Relocator(packages.get(), root)
+        // Sorted, first wins, fixed timestamps: the jar (and so the dex and
+        // BUILD_ID) is reproducible.
+        val classes = sortedMapOf<String, ByteArray>()
+        var relocated = 0
+
+        fun add(entryName: String, bytes: ByteArray) {
+            // Only classes: payload.jar carries dex alone, so resources never reach the device.
+            if (!entryName.endsWith(".class")) return
+            if (entryName.startsWith("META-INF/") || entryName.endsWith("module-info.class")) return
+            val internalName = entryName.removeSuffix(".class")
+            val library = relocator.relocates(internalName)
+            val outName = relocator.map(internalName) + ".class"
+            if (classes.containsKey(outName)) return
+            relocator.inLibraryClass = library
+            val writer = ClassWriter(0)
+            ClassReader(bytes).accept(ClassRemapper(writer, relocator), 0)
+            classes[outName] = writer.toByteArray()
+            if (library) relocated++
+        }
+
+        allJars.get().forEach { jar ->
+            JarFile(jar.asFile).use { jf ->
+                jf.entries().asSequence().filter { !it.isDirectory }.forEach { e ->
+                    add(e.name, jf.getInputStream(e).use { it.readBytes() })
+                }
+            }
+        }
+        allDirectories.get().forEach { dir ->
+            val base = dir.asFile
+            base.walkTopDown().filter { it.isFile }.forEach { f ->
+                add(f.relativeTo(base).invariantSeparatorsPath, f.readBytes())
+            }
+        }
+
+        val out = output.get().asFile
+        out.parentFile.mkdirs()
+        ZipOutputStream(out.outputStream().buffered()).use { zip ->
+            for ((name, bytes) in classes) {
+                val entry = ZipEntry(name)
+                entry.time = 0L
+                zip.putNextEntry(entry)
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+        }
+        logger.lifecycle(
+            "payload: relocated $relocated library classes under ${root.replace('/', '.')} " +
+                "(${classes.size} classes in all)"
+        )
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val relocate = tasks.register<RelocatePayloadClassesTask>(
+            "relocate${variant.name.replaceFirstChar { it.uppercase() }}PayloadClasses"
+        ) {
+            packages.set(payloadRelocatedPackages)
+            shadedRoot.set(payloadShadedRoot)
+        }
+        variant.artifacts.forScope(ScopedArtifacts.Scope.ALL)
+            .use(relocate)
+            .toTransform(
+                ScopedArtifact.CLASSES,
+                RelocatePayloadClassesTask::allJars,
+                RelocatePayloadClassesTask::allDirectories,
+                RelocatePayloadClassesTask::output,
+            )
+    }
 }
