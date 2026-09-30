@@ -296,3 +296,61 @@ with every consumer.
   `S`, `A`, `scene()`), re-keys them (`rekey`, `shift_udids`, `key_space`), and
   `Chain` publishes a sequence the way the store will (plan, annotate, apply,
   merge tombstones).
+
+## Diff (C8, `capture/diff.py`)
+
+- **`diff(a, b, *, within=None, include=None, min_move_px=4, limit=40,
+  max_bytes=4000, cursor=None, image=False, props_a=None, props_b=None,
+  pixel_diff=None, resolve=None, preview=None) -> dict`**. `a` and `b` are
+  ref-space indexes of one lineage (different lineages raise
+  `OpError("bad_args")`, as do bad argument values). Nodes compare by ref.
+- **What the section 10 signature leaves to the caller** (injected, so diff stays
+  pure):
+  - `props_a` / `props_b`: `node -> {name: value}` (or None) for each capture.
+    Pass them only when both captures have properties; values may be the brief
+    `{value, source?}` form.
+  - `pixel_diff(a, b, refs) -> dict` (C9 through S1, e.g. a lambda around
+    `images.pixel_diff(la, lb, a, b)`). It runs when `image=True` or `include`
+    has `pixels`; its result is returned under `image`.
+  - `resolve(ix, sel) -> UNode` for `within` (C6's `resolve_selector`). Without
+    it, `within` takes refs, keys and aliases. It is looked up in `b`, then `a`.
+  - `preview(ix, root) -> list[str]` for the "new screen" outline (C6's outline
+    lines). The built-in fallback is a depth-2 walk of the ui tree.
+- **`include`**: None means the spec's six defaults, plus `props` when both
+  accessors are given and `params` when both captures have slot nodes. A list
+  or comma string replaces the defaults; `+x` tokens add to them. Asking for
+  something neither capture has adds a note instead of failing.
+- **Result**: `{a: "id @label", b, dt_s, same_pid, within?, summary, notes?,
+  lines, issues?, image?, truncated?, next}`.
+  - `summary` partitions b's nodes in scope: `changed`, `moved`, `unchanged`
+    (shared refs) plus `added` and `rebound` (the latter only when non-zero);
+    `removed` counts a's nodes that are gone.
+  - Lines: `~ <ref Type #rid @tag "label">: <change>` first, then
+    `~ <ref> <change>` for more changes of the same node. The label is left out
+    of the name when the change is the label itself. `> ...: <old parent> -> <new
+    parent>` or `reordered in <parent> (i -> j)` (a longest increasing
+    subsequence keeps the minimum set of siblings in place). `+`/`-` lines are
+    outline lines with `+N` descendants. A rebound pair is `~ <new>: rebound, was
+    <old ref> "<old label>" (+k inside)`. A pure translation is `shifted by
+    dx,dy to [x,y wxh]`; descendants that shift with their parent are counted
+    `(+k inside)`, and three or more siblings shifting together share one line
+    `~ N nodes in <parent> shifted by dx,dy: n1 n2 n3 +k`.
+  - Order: b's pre-order for changed, moved, added and rebound nodes, then the
+    removals in a's pre-order.
+  - `issues`: `{resolved, new}`, each `"<rule> ×N: n1 n2 n3 +k"` (at most 6
+    rules). An issue change alone does not make a node "changed". When only one
+    capture ran `lint=full`, `a11y.contrast*` rules are not compared (noted);
+    when one ran `lint=none`, issues are not compared at all (noted).
+  - Slot nodes are compared only when both captures have a slot table.
+  - Volatile properties (`pressed`, `hovered`) are ignored. At most 6 property or
+    param lines per node, then `props +N more`.
+- **Verdict**: when shared refs are under 40% of the union of ui refs (a rebound
+  pair counts as shared), the result is `{..., verdict: "new screen", shared:
+  "6 of 20 refs (30%)", summary: {added, removed, kept, rebound?}, outline,
+  next: ["outline(capture=...)"]}` with no `lines`.
+- **Budget and cursor**: at most `limit` (1..200) lines and `max_bytes` (0 =
+  unlimited, else 500..32,000, clamped above) bytes of compact JSON. Pages
+  always make progress. The cursor is `<b id>:d:<hash8>:<offset>`; the hash
+  covers a, b, within, the effective include and min_move_px (not limit or
+  max_bytes). A cursor used with other arguments raises `bad_args`. The
+  continuation hint is `diff(a=..., b=..., [within=...,] cursor=...)`.
