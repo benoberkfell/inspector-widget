@@ -35,6 +35,9 @@ def session():
     if PACKAGE not in packages:
         pytest.skip(f"{PACKAGE} not installed/debuggable on {SERIAL}")
 
+    # Other device tests (the a11y goldens) force-stop the app when they finish.
+    from inspector_widget import adb
+    adb.shell(SERIAL, f"am start -W -n {PACKAGE}/.MainActivity", check=False)
     sess = inspector_widget.attach(SERIAL, PACKAGE)
     try:
         yield sess
