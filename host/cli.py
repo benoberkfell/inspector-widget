@@ -229,13 +229,13 @@ def cmd_a11y(args) -> int:
                     f.write(text)
                 print(f"wrote a11y JSON to {args.json}", file=sys.stderr)
         else:
-            order = [e for e in data.get("focus_order", []) if e.get("is_focus_stop")]
+            order = data.get("focus_order", [])
             if not order:
                 print("(no screen-reader focus stops found)")
             for e in order:
-                b = e.get("bounds") or {}
-                print(f"{e['order']:>3}. {e.get('speakable') or '<no label>'} "
-                      f"({b.get('x',0)},{b.get('y',0)} {b.get('w',0)}x{b.get('h',0)})")
+                print(f"{e['order']:>3}. {e.get('speak') or '<no label>'}  [{e.get('key')}]")
+            for diag in data.get("reading_order_diagnostics", []):
+                print(f"a11y: reading order: {diag.get('message')}", file=sys.stderr)
 
         if args.overlay:
             findings = None

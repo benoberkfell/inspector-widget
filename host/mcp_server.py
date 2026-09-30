@@ -1233,8 +1233,12 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "in one tree. Each node has its host_view_id+virtual_id key (ties back to dump_tree/"
             "dump_compose), text/contentDescription/stateDescription/role, all a11y state flags, "
             "on-screen bounds, decoded actions (CLICK/SCROLL_FORWARD/SET_PROGRESS/...), collection/"
-            "range info and extras. Also returns the host-computed TalkBack reading order "
-            "(focus_order) honoring traversal_before/after + geometry. Auto-attaches."
+            "range info and extras. Every node has a typed node_key (view:<id> | "
+            "compose:<acvId>:<semanticsId>) usable with inspect_node. Also returns the "
+            "host-computed TalkBack reading order (focus_order: [{order, key, speak}] — what "
+            "TalkBack announces at each stop, e.g. 'Delete, button'), built from the ANI child "
+            "order + traversal_before/after, with reading_order_diagnostics for cycles and "
+            "dangling targets. Auto-attaches."
         ),
         "schema": {
             "type": "object",
