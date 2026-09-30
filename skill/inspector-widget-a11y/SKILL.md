@@ -352,10 +352,11 @@ already loaded in the app, else injecting it) and disconnects when it is done.
 Only the Compose key registry outlives it (a small file per app process), so a
 `compose:` key from `a11y-lint` still resolves in a later `inspect-node`. That
 makes it slower for iterative work but perfect for a single deterministic
-command. The 13 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a11y`
+command. The 16 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a11y`
 (dump + `--overlay`/`--lint` ≈ `dump_accessibility` + `a11y_overlay`),
 `inspect-node`, `component-image`, `inspect`, `compose`, `dump`,
-`get-properties`, `screenshot`, `devices`, `packages`, `attach`, `detach`. See
+`get-properties`, `screenshot`, `devices`, `packages`, `attach`, `detach`,
+`talkback`, `tb-walk`, `tb-scenario`. See
 **[tools.md](tools.md)** for the full MCP↔CLI mapping and exact invocations.
 
 ---

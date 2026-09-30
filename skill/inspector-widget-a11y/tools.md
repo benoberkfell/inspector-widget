@@ -1,7 +1,7 @@
 # Inspector Widget — tools (MCP) and CLI reference
 
 The Inspector Widget MCP server (codename `viewspector`, at `host/mcp_server.py`)
-exposes 15 tools. The host CLI (`host/cli.py`) mirrors them in 13 subcommands
+exposes 18 tools. The host CLI (`host/cli.py`) mirrors them in 16 subcommands
 for scripting. This is the reference for the accessibility workflow plus the
 View/Compose tools you may reach for, and the MCP↔CLI mapping.
 

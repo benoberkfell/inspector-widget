@@ -8,7 +8,7 @@
   abstract socket, and speaks the framed protobuf protocol from
   `proto/view_inspection.proto`. (Built by the host-driver module.)
 - **`mcp_server.py`** — an [MCP](https://modelcontextprotocol.io) server that
-  exposes Inspector Widget to an LLM agent as 15 tools, built on top of
+  exposes Inspector Widget to an LLM agent as 18 tools, built on top of
   `inspector_widget`.
 
 The wire protocol, packages, socket names, and screenshot encoding are fixed by
@@ -71,7 +71,7 @@ device artifacts are looked up (a missing artifact is a warning, not a failure).
 
 ```
 Inspector Widget MCP server — self check
-  tools (15): list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image
+  tools (18): list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image, talkback, tb_walk, tb_scenario
   inspector_widget: OK
   view_inspection_pb2: OK
   mcp SDK: 1.30.0 OK (real MCP transport)
