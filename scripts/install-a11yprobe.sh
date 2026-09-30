@@ -13,8 +13,10 @@
 #   3. ./gradlew -p testapps/a11yprobe :app:installDebug
 #   4. am start the launcher MainActivity (or one scenario, with --scenario)
 #
-# Usage: scripts/install-a11yprobe.sh [SERIAL] [--no-launch] [--scenario ID]
+# Usage: scripts/install-a11yprobe.sh [SERIAL] [--no-launch] [--scenario ID] [--compose-bom V]
 #   SERIAL defaults to $SERIAL, then $ANDROID_SERIAL, then emulator-5554.
+#   --compose-bom V builds against Compose BOM V instead of 2024.09.00 (ui 1.7.0), e.g.
+#   2025.06.00 (ui 1.8.2) to exercise the agent's Compose 1.8+ traversal-order path.
 #   --scenario ID launches that scenario directly: a Compose id (icon_button, ...,
 #   or "all"), view_xml, or an interop id S1..S6 / D1 / D2. See the top of
 #   testapps/a11yprobe/app/src/main/kotlin/com/oberkfell/a11yprobe/MainActivity.kt.
@@ -42,10 +44,13 @@ die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # ----------------------------------------------------------------- args
 SERIAL="${SERIAL:-${ANDROID_SERIAL:-emulator-5554}}"
 SCENARIO=""
+GRADLE_PROPS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-launch) LAUNCH=0 ;;
         --scenario)  [ $# -ge 2 ] || die "--scenario needs an id"; SCENARIO="$2"; shift ;;
+        --compose-bom) [ $# -ge 2 ] || die "--compose-bom needs a version"
+                     GRADLE_PROPS+=("-Pa11yprobe.composeBom=$2"); shift ;;
         -*)          die "Unknown flag: $1" ;;
         *)           SERIAL="$1" ;;
     esac
@@ -86,7 +91,7 @@ GRADLEW="$APP_DIR/gradlew"
 
 # --------------------------------------------------------------------- build+install
 log "Building & installing :app:installDebug to $SERIAL ..."
-ANDROID_SERIAL="$SERIAL" "$GRADLEW" -p "$APP_DIR" --no-daemon :app:installDebug \
+ANDROID_SERIAL="$SERIAL" "$GRADLEW" -p "$APP_DIR" --no-daemon ${GRADLE_PROPS[@]+"${GRADLE_PROPS[@]}"} :app:installDebug \
     || die "Gradle :app:installDebug failed."
 ok "Installed $PACKAGE on $SERIAL."
 

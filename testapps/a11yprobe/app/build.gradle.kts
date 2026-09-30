@@ -2,7 +2,8 @@
 // app/build.gradle.kts (testapps/a11yprobe)
 // Compose + classic-View test app. Toolchain pinned to match the viewspector
 // host exactly (testapps.md §1): compileSdk 36, minSdk 29, Java 17 bytecode
-// (builds on any JDK 17-23), debuggable, Compose BOM 2024.09.00, Kotlin-2.0
+// (builds on any JDK 17-23), debuggable, Compose BOM 2024.09.00 (see
+// a11yprobe.composeBom below), Kotlin-2.0
 // compose compiler plugin.
 // ============================================================================
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -51,8 +52,14 @@ kotlin {
     }
 }
 
+// The Compose BOM. The default (ui 1.7.0) exercises the agent's instance
+// setTraversalValues path; -Pa11yprobe.composeBom=2025.06.00 (ui 1.8.2) builds the same
+// app on Compose's static _androidKt.setTraversalValues path (ComposeTraversal.kt), which
+// every Compose from 1.8 to 1.12 uses. Newer BOMs need AGP 9 and compileSdk 37.
+val composeBomVersion = (project.findProperty("a11yprobe.composeBom") as String?) ?: "2024.09.00"
+
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
+    val composeBom = platform("androidx.compose:compose-bom:$composeBomVersion")
     implementation(composeBom)
 
     // Compose UI + Material3.
