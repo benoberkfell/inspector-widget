@@ -97,12 +97,17 @@ Run two tools:
   It also returns the host-computed **TalkBack reading order** (`focus_order`),
   honoring `traversalBefore`/`traversalAfter` plus geometry. Read this to
   understand what gets announced and in what order.
-- **`a11y_lint(serial, package)`** — the rule engine. Returns `findings[]`, each
-  with a `rule` id, `severity` (`error` | `warn` | `info`), the `node`
-  (`{id, name, role, source}`), `bounds` (px) and `bounds_dp` (dp), a
-  remediation `message`, and `evidence`. Also a `summary` of counts by severity
-  and by rule. By default it samples a screenshot to run the one contrast rule;
-  pass `include_contrast=false` to skip it (tree-only rules still run).
+- **`a11y_lint(serial, package)`** — the rule engine (R1..R18). It lints the
+  same unified tree as `dump_accessibility`, so classic View screens, Compose,
+  RecyclerView cells, AndroidView-in-Compose and dialogs are all covered in one
+  call. Returns `findings[]`, each with a `rule` id and `alias` (`R1`..),
+  `severity` (`error` | `warn` | `info`), a typed `node_key`
+  (`view:<id>` / `compose:<acvId>:<semId>`), the `node` (label, role, class,
+  testTag, source), `bounds` (px) and `bounds_dp` (dp), `window`, `collection`
+  (list/row position), a remediation `message`, and `evidence`. Also a `summary`
+  (counts by severity and by rule) and `diagnostics`: read them before trusting
+  a clean result. By default it screenshots each window to run the one contrast
+  rule; pass `include_contrast=false` to skip it (tree-only rules still run).
 
 Read the lint `summary` first to triage: fix **errors** before **warns** before
 **info**. Group findings by `rule` so you apply one canonical fix pattern across
@@ -112,7 +117,9 @@ remediation is in **[rules.md](rules.md)** — keep it open while you work.
 Useful `a11y_lint` arguments:
 
 - `rules: ["a11y.label.missing", ...]` — run only a subset (great for the
-  VERIFY step: re-run just the rule you fixed).
+  VERIFY step: re-run just the rule you fixed). Aliases (`"R1"`) and ATF check
+  names (`"TouchTargetSize"`) work too; an unknown id is an error listing the
+  valid ones.
 - `wcag_mode: true` — use WCAG target sizes (44dp) instead of Material (48dp)
   for the touch-target rule.
 - `include_contrast: false` — skip the pixel-sampling contrast rule when you
@@ -140,7 +147,8 @@ For each finding you intend to fix, call **`inspect_node`** to get the full
 element dossier. Select the node by whichever id you have from the lint /
 overlay / a11y dump:
 
-- `node_key` — `"view:<uniqueDrawingId>"` or `"compose:<semanticsId>"`
+- `node_key` — `"view:<uniqueDrawingId>"` or `"compose:<acvId>:<semanticsId>"`
+  (exactly the finding's `node_key`)
 - `view_id` — a View's `uniqueDrawingId`
 - `semantics_id` — a Compose node's semantics id
 - `bounds` — `{x, y, w, h}` in screen px (resolves to the deepest covering
@@ -212,6 +220,9 @@ name the modifier, the file, and the line. Common fixes:
   vs "Open profile") or group for context.
 - **Fixed text scaling** (`a11y.text.fixed_scaling`): size text in `sp`
   (`fontSize = 16.sp`), not `dp`/`px`, so it honors the user's font-scale.
+- **ATF-style checks** (R13–R18: duplicate clickable bounds, contentDescription
+  on a text field, unclear link text, unlabeled form field, traversal cycles,
+  tiny text): see [rules.md](rules.md) for each fix.
 
 Each finding's `message` already contains the targeted remediation for that exact
 node — quote and adapt it. You generally do **not** apply the source edit
@@ -247,12 +258,16 @@ Every finding has the same shape:
 
 ```json
 {
-  "rule": "a11y.touch_target.small",
+  "rule": "a11y.touch_target.small", "alias": "R2",
   "severity": "warn",
-  "node": { "id": 42, "name": "IconButton", "role": "Button", "source": "Player.kt:88" },
+  "node_key": "compose:1234:42",
+  "node": { "id": 5299989643306, "key": "compose:1234:42", "name": "IconButton",
+            "role": "Button", "label": "Play", "test_tag": "play", "source": null },
   "bounds": { "x": 24, "y": 880, "w": 96, "h": 96 },
   "bounds_dp": { "x": 9.1, "y": 335, "w": 36.6, "h": 36.6 },
-  "message": "Touch target is 36.6x36.6dp (< 48dp); enlarge to …",
+  "window": { "index": 0, "root_view_id": 77 },
+  "collection": null,
+  "message": "Touch target is 36.6x36.6dp (< 48dp). Make the touchable area …",
   "evidence": { "w_dp": 36.6, "h_dp": 36.6, "min_dp": 48, "standard": "material" }
 }
 ```
@@ -260,10 +275,11 @@ Every finding has the same shape:
 - **`severity`** drives priority: errors are real breakage (unlabeled actionable
   element, clickable image with no description, contrast far below the floor);
   warns are likely defects; infos are structure/quality nudges.
-- **`node.id`** is the selector you feed to `inspect_node` (as `view_id` for
-  View nodes or `semantics_id` for Compose nodes — `node.source` and the dump
-  tell you which layer it came from). When unsure, pass the finding's `bounds`
-  to `inspect_node` directly.
+- **`node_key`** is the selector you feed to `inspect_node(node_key=...)`:
+  `view:<id>` for a View, `compose:<acvId>:<semId>` for a Compose node. Compose
+  keys go stale when the UI recomposes, so re-lint after the UI changes; the
+  finding's `bounds` also work as a selector. `node.id` is the a11y node id used
+  by `dump_accessibility` and the overlay.
 - **`message`** is the canonical remediation for *that* node — it already names
   the modifier/attribute and the corrected value. Use it verbatim as the basis
   of your proposed fix.
@@ -309,16 +325,16 @@ invocations.
 2.  list_processes("emulator-5554")                → package = com.example.player
 3.  attach("emulator-5554", "com.example.player")   → agent live, 1 window
 4.  a11y_lint(serial, package)                      → 2 error, 3 warn, 1 info
-      • a11y.label.missing  on IconButton id=42  (play/pause button)
-      • a11y.contrast.low   on Text id=51        (caption, 2.9:1)
-5.  a11y_overlay(serial, package)                   → view PNG: id=42 box is RED
-6.  inspect_node(serial, package, view_id=42)       → compose.file = Player.kt:88,
+      • a11y.label.missing  compose:1234:42  (play/pause IconButton)
+      • a11y.contrast.low   compose:1234:51  (caption, 2.9:1)
+5.  a11y_overlay(serial, package)                   → view PNG: that box is RED
+6.  inspect_node(serial, package, node_key="compose:1234:42") → compose.file = Player.kt:88,
       a11y label empty, component_image shows a bare ▶ glyph
 7.  PROPOSE: in Player.kt:88, add contentDescription = if (playing) "Pause" else "Play"
       to the IconButton's Icon (or Modifier.semantics { contentDescription = … }).
    (developer rebuilds + redeploys)
 8.  a11y_lint(serial, package, rules=["a11y.label.missing"]) → 0 findings ✓
-9.  a11y_overlay(serial, package)                   → id=42 box is now GREEN ✓
+9.  a11y_overlay(serial, package)                   → that box is now GREEN ✓
 10. detach(serial, package)                         → free the device session
 ```
 
@@ -331,13 +347,17 @@ invocations.
   debug build.
 - **Re-lint against the rebuilt app**, not a stale dump. The tools read the live
   process; verification only counts after redeploy.
-- **Pixel rules need pixels.** `a11y.contrast.low` only runs when a screenshot is
-  sampled (default on). Tree-only rules run regardless. Lower `scale` (e.g.
-  `0.5`) to speed the contrast sample on huge screens; bounds are scaled
-  accordingly.
-- **Off-screen / below-the-fold nodes are skipped** by the lint (no real bounds →
-  no meaningful touch target or pixels). Scroll the content into view, then
-  re-dump, to lint it.
+- **Pixel rules need pixels.** `a11y.contrast.low` only runs when screenshots are
+  sampled (default on, one per window). Tree-only rules run regardless. The sample
+  is fast at `scale=1.0`; a lower `scale` only loses precision on thin text.
+- **Text size needs rendering info.** The text-size rules (R11, R18) and
+  large-text contrast use View ExtraRenderingInfo, which the lint requests by
+  default. Compose text never reports a size, so Compose contrast uses the
+  normal-text threshold and a `diagnostics` entry says so.
+- **Off-screen / below-the-fold nodes are skipped** by the lint (not visible to
+  the user → no meaningful touch target or pixels). A row cut off at a scroll edge
+  gets an `info` touch-target finding saying it is probably clipped. Scroll the
+  content into view, then re-lint.
 - **Compose `file:line` comes from the slot table**, which is empty until Compose
   inspection is enabled: `dump_compose(enable_inspection=true)` (CLI
   `compose --enable-inspection`). That hot-reloads every composition and **resets
