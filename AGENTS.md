@@ -153,13 +153,26 @@ not exist, has the wrong signature, or the wrong unit. This has bitten the proje
 (`adb.display_density`, `a11y.lint_a11y`, `overlay.render_integrated_overlay`, a dpi-vs-ratio
 density, an ARGB red/blue swap). Defend against it on **every** change:
 
-1. **Symbol-parity test** — `host/tests/test_symbol_parity.py` AST-scans `cli.py` and
-   `mcp_server.py` and asserts every `adb.*` / `a11y.*` / `a11y_lint.*` / `overlay.*` / `png.*`
-   / `correlate.*` access resolves. Run it; if you add a cross-module call, it must pass.
-2. **Live-verify on the emulator**, not just pytest. Launch the test app
+1. **Symbol-parity test** — `host/tests/test_symbol_parity.py` AST-scans `cli.py`,
+   `mcp_server.py` and the device-path package modules. It asserts every `adb.*` / `a11y.*` /
+   `a11y_lint.*` / `overlay.*` / `png.*` / `correlate.*` / `inject.*` / `client.*` access resolves,
+   and it binds every resolvable call into `inspector_widget` against the real signature
+   (kwargs, arity, Session/Client/Injection methods, proto fields, `getattr` probes). Run it;
+   if you add a cross-module call, it must pass.
+2. **Offline end-to-end harness** — `host/tests/test_e2e_fake_agent.py` runs every CLI
+   subcommand and MCP tool against `host/tests/fakeagent.py`. Only the adb subprocess is faked
+   (`adb._run`), so the real inject/Session/Client/framing code talks VWSPCT01 over TCP to a
+   fake agent that encodes replies the way the Kotlin payload does. Use the conftest fixtures
+   (`fake_device`, `warm_agent`, `run_cli`, `mcp`) and assert on both the wire
+   (`fake_device.requests("dump_tree")`) and the output. Add an e2e test with every new
+   subcommand or tool; the coverage guards fail otherwise. Open ledger bugs are strict xfails
+   carrying the ledger id: fixing one flips it to XPASS, so remove the marker in the same change.
+   If you change the agent's wire behaviour, update the fake to match.
+3. **Live-verify on the emulator**, not just pytest. Launch the test app
    (`adb shell am start -n com.oberkfell.a11yprobe/.MainActivity`) and actually run the CLI /
-   MCP paths you touched. Offline-green ≠ works-on-device.
-3. **Keep CLI ↔ MCP ↔ Session at parity.** A capability reachable one way but not the other is
+   MCP paths you touched. Offline-green ≠ works-on-device: the fake encodes what we *believe*
+   the agent sends.
+4. **Keep CLI ↔ MCP ↔ Session at parity.** A capability reachable one way but not the other is
    a bug. If you add an MCP tool, add the CLI subcommand (and vice versa).
 
 **Conventions:**
