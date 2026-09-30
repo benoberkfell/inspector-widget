@@ -676,8 +676,7 @@ def _state_words(n: Dict[str, Any], role: Optional[str]) -> List[str]:
         out.append("expanded")
     if "heading" in fl:
         out.append("heading")
-    actionable = {"clickable", "long_clickable", "checkable", "editable"} & fl
-    if actionable and fl and "enabled" not in fl:
+    if {"clickable", "long_clickable", "checkable", "editable"} & fl and "enabled" not in fl:
         out.append("disabled")
     if n.get("error"):
         out.append(f"error: {n['error']}")
@@ -685,7 +684,7 @@ def _state_words(n: Dict[str, Any], role: Optional[str]) -> List[str]:
 
 
 def _describe(n: Dict[str, Any], focus: _Focus, by_key: Dict[int, Dict[str, Any]],
-              is_root: bool, depth: int = 0) -> Tuple[List[str], bool]:
+              depth: int = 0) -> Tuple[List[str], bool]:
     """TalkBack-style description of ``n``: (parts, has_label)."""
     parts: List[str] = []
     has_label = False
@@ -712,7 +711,7 @@ def _describe(n: Dict[str, Any], focus: _Focus, by_key: Dict[int, Dict[str, Any]
             for c in n.get("children") or []:
                 if not focus.visible(c) or focus.focusable(c):
                     continue
-                cparts, clab = _describe(c, focus, by_key, False, depth + 1)
+                cparts, clab = _describe(c, focus, by_key, depth + 1)
                 parts.extend(cparts)
                 has_label = has_label or clab
     role = _role_word(n)
@@ -724,8 +723,13 @@ def _describe(n: Dict[str, Any], focus: _Focus, by_key: Dict[int, Dict[str, Any]
 
 def announcement(n: Dict[str, Any], focus: _Focus,
                  by_key: Dict[int, Dict[str, Any]]) -> Tuple[str, bool]:
-    """What TalkBack would say for focus stop ``n``; (text, unlabeled)."""
-    parts, has_label = _describe(n, focus, by_key, True)
+    """What TalkBack would say for focus stop ``n``; (text, unlabeled).
+
+    An approximation of TalkBack's default verbosity: label parts, then role, then
+    state. ``unlabeled`` means no text/contentDescription/hint/labeled-by reached the
+    announcement (TalkBack says "Unlabeled" or only the role/state).
+    """
+    parts, has_label = _describe(n, focus, by_key)
     parts = [p.strip() for p in parts if p and p.strip()]
     unlabeled = not has_label
     if unlabeled:
