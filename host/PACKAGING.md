@@ -94,7 +94,10 @@ is runnable without re-running `protoc`:
 - `inspector_widget/skia_grpc/*.py`  — `skia_pb2.py`, `skia_pb2_grpc.py` (gRPC stubs)
 
 Regenerate the protobuf bindings with `make proto` (or `./generate_proto.sh`)
-if `proto/view_inspection.proto` changes.
+if `proto/view_inspection.proto` changes. Both need protoc 33.x: the script reads
+the protoc release from the checked-in gencode header and refuses a different
+major, since protoc 34+ emits gencode the `<7` runtime pin can't import.
+`make clean` only removes build/test byproducts, never the tracked bindings.
 
 ## Runtime artifacts are NOT package data
 

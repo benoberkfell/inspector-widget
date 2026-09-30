@@ -20,24 +20,25 @@ responses into agent-friendly JSON (string-table ids resolved to text).
 
 ## 1. Build
 
-Everything (native `.so`, `bootstrap.dex`, `payload.jar`, and the generated
-Python protobuf module) is produced by the top-level build script:
+The device artifacts (native `.so`, `bootstrap.dex`, `payload.jar`) are
+produced by the top-level build script:
 
 ```bash
 # from the repo root
 scripts/build.sh
 ```
 
-`scripts/build.sh` is responsible for:
+`scripts/build.sh` builds `libviewspector.so`, `bootstrap.dex` and
+`payload.jar` into `build-out/`.
 
-1. Generating Python protobuf bindings into `host/inspector_widget/proto`:
-   ```bash
-   protoc --proto_path=proto --python_out=host/inspector_widget/proto proto/view_inspection.proto
-   # -> host/inspector_widget/proto/view_inspection_pb2.py
-   ```
-   the package imports it via `from .proto import view_inspection_pb2`.
-2. Building the device artifacts into `build-out/`:
-   `libviewspector.so`, `bootstrap.dex`, `payload.jar`.
+The Python protobuf bindings (`host/inspector_widget/proto/view_inspection_pb2.py`,
+imported via `from .proto import view_inspection_pb2`) are checked in. After
+changing `proto/view_inspection.proto`, regenerate them with
+`host/generate_proto.sh` (or `make -C host proto`). It requires **protoc 33.x**,
+the release the checked-in gencode and the `protobuf>=6.33.5,<7` runtime pin
+expect, and refuses any other major (protoc 34+ emits 7.x gencode that the pinned
+runtime can't import). `PROTOC="python -m grpc_tools.protoc"` with
+`grpcio-tools==1.81.0` provides protoc 33.5 without a system install.
 
 ### Python environment
 

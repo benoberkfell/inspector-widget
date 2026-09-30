@@ -172,7 +172,8 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
 - One screenshot decoder of record: `inspector_widget.png._decode_to_rgba` (handles RGB_565 /
   ABGR_8888 / ARGB_8888, the last needs an R/B swap). Don't fork it; `mcp_server` delegates to it.
 - protobuf runtime must be **>= 6.33.5, < 7** (the checked-in gencode's floor). Pinning lower
-  makes the proto module unimportable on install.
+  makes the proto module unimportable on install. Regenerate the bindings only with
+  `host/generate_proto.sh` (or `make -C host proto`): it requires protoc 33.x and refuses others.
 - The wheel ships `cli.py` and `mcp_server.py` as top-level py-modules so the console scripts
   work after `pip install` (not just editable installs). See `host/PACKAGING.md`.
 
