@@ -68,6 +68,16 @@ class StringTableBuilder:
         return strings
 
 
+@pytest.fixture(autouse=True)
+def _private_capture_store(monkeypatch, tmp_path):
+    """Every test gets its own capture store (INSPECTOR_WIDGET_CAPTURE_DIR), so
+    nothing ever reads or writes the user's cache (captures, the default session,
+    spill files), and the default MCP toolset (not the developer's)."""
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(tmp_path / "capture-store"))
+    monkeypatch.delenv("INSPECTOR_WIDGET_TOOLSET", raising=False)
+    monkeypatch.delenv("INSPECTOR_WIDGET_CAPTURE_PERSIST", raising=False)
+
+
 @pytest.fixture
 def strings_builder() -> StringTableBuilder:
     return StringTableBuilder()
@@ -244,6 +254,8 @@ def fake_device(monkeypatch, tmp_path):
     dev.tmpdir = tmp_path / "tmp"
     dev.tmpdir.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(dev.tmpdir))
+    # attach records the default session in the capture store: this test's own.
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(tmp_path / "store"))
     cache = mcp_server.SessionCache()
     monkeypatch.setattr(mcp_server, "SESSIONS", cache)
     # A test that runs the exit cleanup leaves the server "closing" (no more

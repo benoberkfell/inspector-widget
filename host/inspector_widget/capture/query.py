@@ -2038,6 +2038,16 @@ class _Part:
     detail: str = ""
 
 
+def _key_in_ids(n: UNode) -> bool:
+    """Whether ``n.key`` is spelled by its ``ids`` (``view:16`` = ``ids.view`` 16,
+    ``sem:82:448`` = ``ids.sem`` "82:448", ``a11y:34:21`` = ``ids.a11y`` for an
+    a11y-only node), so node() need not repeat it."""
+    ids = n.ids or {}
+    prefix = {"view": "view", "compose": "sem", "a11y": "a11y"}.get(n.kind)
+    return prefix is not None and ids.get(prefix) is not None \
+        and n.key == f"{prefix}:{ids[prefix]}"
+
+
 def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, raw: bool,
                 ancestors: bool, children: bool, props_fn: PropsFn | None, idx: int,
                 image: Any, issue_fmt: Callable[[Issue], str] | None,
@@ -2054,7 +2064,9 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
         core.append(("label", nz.cap(n.label, VALUE_MAX)))
     if n.b:
         core.append(("b", list(n.b)))
-    extra: list[tuple[str, Any]] = [("key", n.key)]
+    extra: list[tuple[str, Any]] = []
+    if not _key_in_ids(n):  # else ids says it (view:16 is ids.view 16)
+        extra.append(("key", n.key))
     if n.rid and n.sel != "#" + L.ident(n.rid):
         extra.append(("rid", n.rid))
     if n.tag and n.sel != "@" + L.ident(n.tag):

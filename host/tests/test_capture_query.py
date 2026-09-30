@@ -762,9 +762,11 @@ def test_node_n22_dossier(launcher):
 
 
 def test_node_facet_priority_and_omitted(launcher):
+    # 683: the node's core is 17 B smaller since node() stopped repeating the key
+    # its ids already spell ("key":"sem:82:448"); the packing below is unchanged
     d = q.node(launcher, None, ["n22"], facets="all", ancestors=True, children=True,
-               max_bytes=700)
-    assert nbytes(d) <= 700
+               max_bytes=683)
+    assert nbytes(d) <= 683
     # issues come first (cut to fit, with a "+N more" marker), then a11y; the rest
     # is listed in omitted (short form here, since the long one does not fit)
     assert d["issues"][-1].endswith("more") and "a11y" in d

@@ -1,0 +1,1206 @@
+"""Capture-and-walk operations: the tool functions both surfaces call (WP S1).
+
+``capture`` snapshots one moment of one app once (views and properties, Compose
+semantics and slot table, the unified accessibility tree, one screenshot per
+window, lint and render signals), publishes it to the on-disk store the CLI and
+the MCP server share, and answers with a short summary. ``outline``, ``find``,
+``node``, ``image``, ``lint`` and ``diff`` then walk a stored capture with small,
+budgeted queries; they never touch the device. ``captures`` lists and manages
+the store. Spec: docs/design/capture-and-walk.md sections 5-7 and 10.
+
+Every function takes an :class:`OpContext` (the store, a session provider and the
+caller) plus the tool's arguments, and returns a JSON-ready dict. Failures raise
+:class:`~inspector_widget.capture.model.OpError`; :func:`run` maps every
+exception to the error envelope ``{"error": {code, message, hint, candidates?}}``.
+
+The capture order follows ``capture/CONTRACT_NOTES.md`` ("Capture order"): fetch,
+``build_index``, ``analyze`` and the previous capture's index load happen before
+the store lock; ``refs.assign``, ``apply_refs`` and ``publish`` happen under it,
+which serializes every publish of every process for milliseconds only.
+
+Session defaulting (spec 5.1): explicit ``serial``/``package``, then the lineage
+of a capture argument, then the store's default session (the last attach or
+capture from either surface), then the single running debuggable app on the
+single device. Query tools stop before the last step: they never call adb.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import shutil
+import threading
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from .capture import analyzers, fetch, images, index, lines, query, refs
+from .capture import diff as cdiff
+from .capture.model import (
+    CaptureOptions,
+    Index,
+    OpError,
+    UNode,
+    is_capture_id,
+    is_valid_label,
+)
+from .capture.store import RESERVED_LABELS, CaptureStore, LoadedCapture
+from .output import dumps, utf8_len
+
+TOOL_NAMES = ("capture", "captures", "outline", "find", "node", "image", "lint", "diff")
+
+# --------------------------------------------------------------------------- #
+# Budgets and defaults (spec section 7)
+# --------------------------------------------------------------------------- #
+CAPTURE_MAX_BYTES = 3000
+CAPTURES_MAX_BYTES = 2000
+IMAGE_MAX_BYTES = 600
+OUTLINE_LINES = 20          # capture preview: at most this many outline lines ...
+PREVIEW_BYTES = 800         # ... and this many bytes of them
+PREVIEW_BYTES_DIFF = 400    # smaller when the capture also reports a diff
+PREVIEW_DEPTH = 2
+ON_SCREEN_MAX = 3           # labelled stops hidden by the preview, shown by name
+DIFF_LINES = 10             # capture(diff_from=...) diff lines
+DIFF_MAX_BYTES = 1200
+DIAGNOSTICS_MAX = 3
+DIAGNOSTIC_CHARS = 120
+STALE_AGE_S = 120
+CAPTURES_LIMIT = 20
+CAPTURE_ACTIONS = ("list", "show", "pin", "unpin", "label", "drop", "export", "gc")
+EXPORT_WHAT = ("nodes", "views", "compose", "slots", "a11y", "props", "lint", "raw", "all")
+EXPORT_FORMATS = ("jsonl", "json", "legacy", "raw")
+IMAGE_SOURCES = ("auto", "screenshot", "skp")
+MEMORY_ONLY_NOTE = ("memory-only store (INSPECTOR_WIDGET_CAPTURE_PERSIST=0): this capture "
+                    "lives only in this process; the CLI cannot read it")
+
+#: Error code for a failure that is a bug here (never an OpError the library raised).
+INTERNAL = "internal"
+
+
+# --------------------------------------------------------------------------- #
+# Context and session providers
+# --------------------------------------------------------------------------- #
+class SessionProvider(Protocol):
+    """How the ops layer reaches a live app. MCP: the server's session cache;
+    CLI: ``inspector_widget.attach`` and ``Session.close()`` at exit (never
+    SHUTDOWN). Optional extras, read with getattr: ``live_pid(serial, package)``
+    (a cached session's pid, without device I/O) and ``device(serial)`` ({dpi,
+    font_scale})."""
+
+    def get(self, serial: str, package: str) -> Any: ...
+
+    def close_all(self) -> None: ...
+
+
+class AttachProvider:
+    """A provider that attaches with :func:`inspector_widget.attach` and keeps
+    one session per app until :meth:`close_all`, which disconnects them (the
+    agents keep running for the next caller). The CLI's provider, and the one
+    the offline tests use."""
+
+    def __init__(self, build_out: str | None = None, force: bool = False,
+                 attach: Callable[..., Any] | None = None) -> None:
+        self.build_out = build_out
+        self.force = bool(force)
+        self._attach = attach
+        self._sessions: dict[tuple[str, str], Any] = {}
+        self._lock = threading.Lock()
+
+    def get(self, serial: str, package: str) -> Any:
+        key = (serial, package)
+        with self._lock:
+            session = self._sessions.get(key)
+        if session is not None:
+            return session
+        attach = self._attach
+        if attach is None:
+            import inspector_widget as iw
+            attach = iw.attach
+        session = attach(serial, package, build_out=self.build_out,
+                         force_reinject=self.force)
+        with self._lock:
+            self._sessions[key] = session
+        return session
+
+    def live_pid(self, serial: str, package: str) -> int | None:
+        with self._lock:
+            session = self._sessions.get((serial, package))
+        return getattr(session, "pid", None) if session is not None else None
+
+    def close_all(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            close = getattr(session, "close", None) or getattr(session, "disconnect", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+
+
+@dataclass
+class OpContext:
+    """What every tool function needs: the store, the session provider and who
+    is calling (``"cli"`` or ``"mcp"``; the responses are identical)."""
+
+    store: CaptureStore
+    sessions: SessionProvider | None = None
+    caller: str = "mcp"
+    #: Compose generation per (serial, package, pid): bumped by a hot reload
+    #: (capture(slots="enable") or the legacy dump_compose(enable_inspection)).
+    generations: dict[tuple[str, str, int], int] = field(default_factory=dict)
+    _metrics: dict[str, dict] = field(default_factory=dict)
+
+    def bump_generation(self, serial: str, package: str, pid: int | None) -> None:
+        """Record a hot reload that did not go through capture(): semantics ids
+        were re-minted, so the next capture must not carry refs by device id."""
+        if pid is None:
+            return
+        key = (str(serial), str(package), int(pid))
+        self.generations[key] = self.generations.get(key, 0) + 1
+
+    def device(self, serial: str) -> dict[str, Any]:
+        """``{dpi, font_scale}`` of the device (the provider's, else adb's), cached."""
+        if serial not in self._metrics:
+            probe = getattr(self.sessions, "device", None)
+            metrics = probe(serial) if callable(probe) else None
+            if not metrics:
+                from . import adb
+                metrics = {"dpi": adb.display_density(serial), "font_scale": adb.font_scale(serial)}
+            self._metrics[serial] = {k: v for k, v in dict(metrics).items() if v is not None}
+        return dict(self._metrics[serial])
+
+
+# --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
+def _bad(message: str, hint: str | None = None, candidates: list | None = None) -> OpError:
+    return OpError("bad_args", message, hint=hint, candidates=candidates)
+
+
+def error_envelope(exc: BaseException) -> dict[str, Any]:
+    """The error envelope for any exception a tool raised (spec 5.1)."""
+    if isinstance(exc, OpError):
+        return exc.to_dict()
+    from . import adb
+    from .client import AgentTimeoutError, ClientError, TransportError
+    from .inject import InjectionError
+
+    msg = str(exc) or type(exc).__name__
+    hint = getattr(exc, "hint", None)
+    hint = hint if isinstance(hint, str) and hint else None
+    if isinstance(exc, adb.DeviceError):
+        code, hint = "no_session", hint or "Pass serial (see list_devices), or connect one device."
+    elif isinstance(exc, AgentTimeoutError):
+        code = "agent_error"
+    elif isinstance(exc, TransportError):
+        code = "device_lost"
+    elif isinstance(exc, ClientError):
+        code = "agent_error"
+    elif isinstance(exc, InjectionError):
+        code = "agent_error"
+    elif isinstance(exc, (adb.AdbError, OSError)):
+        code = "device_lost"
+    else:
+        return {"error": {"code": INTERNAL, "message": f"{type(exc).__name__}: {msg}",
+                          "hint": "A bug in Inspector Widget; INSPECTOR_WIDGET_LOG=DEBUG "
+                                  "shows the traceback."}}
+    return OpError(code, msg, hint=hint).to_dict()
+
+
+def is_error(doc: Any) -> bool:
+    return isinstance(doc, dict) and isinstance(doc.get("error"), dict)
+
+
+# --------------------------------------------------------------------------- #
+# Session and capture resolution
+# --------------------------------------------------------------------------- #
+def _explicit(v: Any) -> str | None:
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _spec_lineage(store: CaptureStore, spec: Any) -> tuple[str, str] | None:
+    """The lineage of a capture argument that names one capture (an id or a
+    label that resolves on its own), else None."""
+    s = _explicit(spec)
+    if s is None or s == "prev" or re.match(r"^latest(~\d+)?$", s):
+        return None
+    try:
+        cid = store.resolve(s, None)
+    except OpError:
+        return None
+    try:
+        return tuple(store.load(cid).meta.lineage)  # type: ignore[return-value]
+    except OpError:
+        return None
+
+
+def query_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
+                  specs: Iterable[Any] = ()) -> tuple[str, str] | None:
+    """The lineage a query resolves ``latest``/``prev`` in (no device I/O):
+    explicit serial and package, then the lineage of a capture argument that
+    names one capture, then the store's default session. A lone serial or
+    package picks the one lineage of the store that matches it. None: resolve
+    across the whole store."""
+    store = ctx.store
+    serial, package = _explicit(serial), _explicit(package)
+    if serial and package:
+        return serial, package
+    named = next((lin for lin in (_spec_lineage(store, s) for s in specs) if lin), None)
+    if not serial and not package:
+        return named or store.default_session()
+    for cand in (named, store.default_session()):
+        if cand and serial in (None, cand[0]) and package in (None, cand[1]):
+            return cand
+    hits = [lin for lin in store.lineages()
+            if serial in (None, lin[0]) and package in (None, lin[1])]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        what = package if package else f"any app on {serial}"
+        raise OpError("capture_not_found", f"no captures of {what} yet",
+                      hint="Run capture() first.")
+    raise OpError("ambiguous", f"{serial or package} matches {len(hits)} apps in the store",
+                  hint="Pass both serial and package.",
+                  candidates=[f"{s}/{p}" for s, p in hits])
+
+
+def device_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
+                   specs: Iterable[Any] = ()) -> tuple[str, str]:
+    """The app a device tool (capture) targets: :func:`query_lineage`'s chain,
+    then the single running debuggable app on the single device (honouring
+    ``$ANDROID_SERIAL``). ``no_session`` with candidates otherwise."""
+    store = ctx.store
+    serial, package = _explicit(serial), _explicit(package)
+    if serial and package:
+        return serial, package
+    if not serial and not package:
+        for spec in specs:
+            lin = _spec_lineage(store, spec)
+            if lin is not None:
+                return lin
+    default = store.default_session()
+    if default and serial in (None, default[0]) and package in (None, default[1]):
+        return default
+    from . import adb
+    try:
+        serial = adb.resolve_serial(serial)
+    except adb.DeviceError as exc:
+        raise OpError("no_session", str(exc), hint="Pass serial and package, or attach() first."
+                      ) from None
+    if package:
+        return serial, package
+    import inspector_widget as iw
+    procs = iw.list_processes(serial)
+    running = [p["package"] for p in procs if p.get("running")]
+    if len(running) == 1:
+        return serial, running[0]
+    if running:
+        raise OpError("no_session", f"{len(running)} debuggable apps are running on {serial}",
+                      hint="Pass package (or attach() first).", candidates=sorted(running))
+    raise OpError("no_session", f"no debuggable app is running on {serial}",
+                  hint="Start the app, then pass package (or attach() first).",
+                  candidates=sorted(p["package"] for p in procs))
+
+
+def remember_session(ctx: OpContext, serial: str, package: str) -> None:
+    """Make (serial, package) the default session (after an attach)."""
+    with contextlib.suppress(Exception):  # the default is a convenience, never a failure
+        ctx.store.set_default_session(serial, package)
+
+
+def _load(ctx: OpContext, spec: Any, lineage: tuple[str, str] | None) -> LoadedCapture:
+    return ctx.store.load(ctx.store.resolve(_explicit(spec) or "latest", lineage))
+
+
+def _loaded_for_query(ctx: OpContext, p: dict[str, Any], cursor_key: str = "cursor"
+                      ) -> LoadedCapture:
+    """Pop ``capture``/``serial``/``package`` from ``p`` and load the capture a
+    query reads (a cursor names its own capture)."""
+    spec = p.pop("capture", None)
+    serial, package = p.pop("serial", None), p.pop("package", None)
+    if _explicit(spec) in (None, "latest"):  # the default: a cursor's own capture wins
+        spec = query.cursor_capture(p.get(cursor_key)) or spec
+    lineage = query_lineage(ctx, serial, package, [spec])
+    return _load(ctx, spec, lineage)
+
+
+def _tomb(ctx: OpContext, lc: LoadedCapture) -> dict:
+    try:
+        return ctx.store.lineage_state(*lc.meta.lineage).tomb
+    except Exception:  # noqa: BLE001 - last-seen info is a nicety
+        return {}
+
+
+# --------------------------------------------------------------------------- #
+# Staleness markers (spec 5.1)
+# --------------------------------------------------------------------------- #
+def staleness(ctx: OpContext, lc: LoadedCapture) -> dict[str, Any]:
+    """``age_s`` (over 120 s), ``stale`` (a newer capture of the lineage exists)
+    and ``pid_changed`` (the app runs under another pid now: a cached live
+    session, else the lineage's latest capture, says so)."""
+    store = ctx.store
+    out: dict[str, Any] = {}
+    age = lc.age_s()
+    if age > STALE_AGE_S:
+        out["age_s"] = round(age)
+    serial, package = lc.meta.lineage
+    latest_pid = None
+    try:
+        latest = store.lineage_state(serial, package).latest
+    except Exception:  # noqa: BLE001
+        latest = None
+    if latest and latest != lc.id and store.exists(latest):
+        with contextlib.suppress(OpError):
+            lm = store.load(latest).meta
+            dt = max(0, round(float(lm.created_at) - float(lc.meta.created_at)))
+            out["stale"] = f"{latest} is newer ({dt}s)"
+            latest_pid = lm.pid
+    live = None
+    probe = getattr(ctx.sessions, "live_pid", None)
+    if callable(probe):
+        with contextlib.suppress(Exception):
+            live = probe(serial, package)
+    now_pid = live if live is not None else latest_pid
+    if now_pid is not None and lc.meta.pid is not None and int(now_pid) != int(lc.meta.pid):
+        out["pid_changed"] = True
+    return out
+
+
+def _stamp(result: dict[str, Any], marks: Mapping[str, Any], after: str = "capture"
+           ) -> dict[str, Any]:
+    """``result`` with ``marks`` inserted right after key ``after``."""
+    if not marks:
+        return result
+    out: dict[str, Any] = {}
+    placed = False
+    for k, v in result.items():
+        out[k] = v
+        if k == after:
+            out.update(marks)
+            placed = True
+    if not placed:
+        out.update(marks)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# capture
+# --------------------------------------------------------------------------- #
+def _bool(name: str, v: Any, default: bool) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    raise _bad(f"{name} must be true or false; got {v!r}")
+
+
+def _int(name: str, v: Any, default: int, lo: int, hi: int) -> int:
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or int(v) != v:
+        raise _bad(f"{name} must be an integer; got {v!r}")
+    if not lo <= int(v) <= hi:
+        raise _bad(f"{name} must be in {lo}..{hi}; got {v}")
+    return int(v)
+
+
+def _enum(name: str, v: Any, allowed: tuple[str, ...], default: str) -> str:
+    if v is None:
+        return default
+    if v not in allowed:
+        raise _bad(f"{name} must be one of {', '.join(allowed)}; got {v!r}")
+    return v
+
+
+def _check_label(label: Any) -> str | None:
+    if label is None or label == "":
+        return None
+    if not isinstance(label, str):
+        raise _bad(f"label must be a string; got {label!r}")
+    name = label.removeprefix("@")
+    if not is_valid_label(name) or name in RESERVED_LABELS or is_capture_id(name):
+        raise _bad(f"invalid label {label!r}",
+                   hint="Labels match ^[a-z][a-z0-9_-]{0,31}$ and must not look like a "
+                        "capture id, latest or prev.")
+    return name
+
+
+def _latest(ctx: OpContext, lineage: tuple[str, str]) -> LoadedCapture | None:
+    st = ctx.store.lineage_state(*lineage)
+    if st.latest and ctx.store.exists(st.latest):
+        with contextlib.suppress(OpError):
+            return ctx.store.load(st.latest)
+    return None
+
+
+def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any = None,
+            props: Any = None, resolution_stack: Any = None, slots: Any = None,
+            screenshot: Any = None, screenshot_scale: Any = None, skp: Any = None,
+            a11y_rendering: Any = None, lint: Any = None, settle_ms: Any = None,
+            diff_from: Any = None, if_changed_since: Any = None, outline_lines: Any = None,
+            on_screen: Any = None, pin: Any = None, max_bytes: Any = None) -> dict[str, Any]:
+    """Snapshot the app once and publish it; returns the capture summary (spec 5.3)."""
+    name = _check_label(label)
+    try:
+        scale = float(1.0 if screenshot_scale is None else screenshot_scale)
+    except (TypeError, ValueError):
+        raise _bad(f"screenshot_scale must be a number in (0, 1]; got {screenshot_scale!r}"
+                   ) from None
+    opts = CaptureOptions(
+        props=_bool("props", props, True),
+        resolution_stack=_bool("resolution_stack", resolution_stack, False),
+        slots=_enum("slots", slots, ("if_available", "enable", "off"), "if_available"),
+        screenshot=_bool("screenshot", screenshot, True),
+        screenshot_scale=scale,
+        skp=_bool("skp", skp, False),
+        a11y_rendering=_bool("a11y_rendering", a11y_rendering, False),
+        lint=_enum("lint", lint, ("tree", "full", "none"), "tree"),
+        settle_ms=_int("settle_ms", settle_ms, 0, 0, 3000)).validate()
+    n_lines = _int("outline_lines", outline_lines, OUTLINE_LINES, 0, 80)
+    want_on_screen = _bool("on_screen", on_screen, True)
+    want_pin = _bool("pin", pin, False)
+    budget = query.resolve_max_bytes(max_bytes, CAPTURE_MAX_BYTES)
+    if ctx.sessions is None:
+        raise OpError("unsupported", "this surface cannot reach a device")
+
+    store = ctx.store
+    lineage = device_lineage(ctx, serial, package, [diff_from, if_changed_since])
+    base_id = _diff_base(ctx, diff_from, lineage) if diff_from is not None else None
+    session = ctx.sessions.get(*lineage)
+    if if_changed_since is not None:
+        try:
+            since: LoadedCapture | None = _load(ctx, if_changed_since, lineage)
+        except OpError as e:
+            if e.code != "capture_not_found":
+                raise
+            since = None  # nothing to compare with (e.g. the first poll): capture
+        same = fetch.unchanged_since(session, since.meta, now=store.clock) if since else None
+        if same is not None:
+            return same
+
+    prev = _latest(ctx, lineage)
+    pid = getattr(session, "pid", None)
+    gen = 0
+    if prev is not None and pid is not None and prev.meta.pid == pid:
+        gen = int(prev.meta.compose_generation or 0)
+    if pid is not None:
+        gen = max(gen, ctx.generations.get((lineage[0], lineage[1], int(pid)), 0))
+    raw = fetch.fetch(session, opts, compose_generation=gen, device=ctx.device(lineage[0]),
+                      wall_clock=store.clock)
+    if pid is not None:
+        ctx.generations[(lineage[0], lineage[1], int(pid))] = int(raw.meta.compose_generation)
+    ix = index.build_index(raw)
+    # Outside the store lock (CONTRACT_NOTES "Capture order"): analyze the
+    # key-space index (lint="full" spends seconds on contrast) and hydrate the
+    # previous capture's index.
+    analyzers.analyze(ix, raw, lint=opts.lint)
+    pix = prev.index() if prev is not None else None
+    moved_from = None
+    with store.refs_lock():  # assign + apply_refs + publish only: milliseconds
+        st = store.lineage_state(*lineage)
+        if st.latest != (prev.id if prev is not None else None):
+            prev = _latest(ctx, lineage)  # another process published meanwhile
+            pix = prev.index() if prev is not None else None
+            st = store.lineage_state(*lineage)
+        if name:
+            moved_from = st.labels.get(name)
+        same_pid, same_gen = refs.identity_flags(raw.meta, pix.meta if pix else None)
+        refmap, tomb = refs.assign(ix, pix, same_pid=same_pid, same_generation=same_gen,
+                                   alloc=store.next_refs)
+        ix = index.apply_refs(ix, refmap)
+        raw.meta.label = name
+        raw.meta.pinned = want_pin
+        cid = store.publish(raw, ix, refmap, tomb=tomb)
+    lc = store.load(cid)
+    ix = lc.index()
+
+    diff_doc = None
+    diff_next: list[str] = []
+    if base_id is not None:
+        try:
+            diff_doc, diff_next = _capture_diff(store.load(base_id), lc)
+        except OpError as e:  # the capture is published: report the diff's failure in it
+            diff_doc = {"a": base_id, "error": e.message}
+    note = getattr(session, "note", None)
+    return _summary(ctx, lc, ix, budget=budget, n_lines=n_lines, on_screen=want_on_screen,
+                    diff_doc=diff_doc, diff_next=diff_next,
+                    moved_from=moved_from if moved_from and moved_from != lc.id else None,
+                    note=note if isinstance(note, str) and note else None)
+
+
+def _diff_base(ctx: OpContext, spec: Any, lineage: tuple[str, str]) -> str:
+    """The capture ``capture(diff_from=spec)`` compares with, resolved BEFORE the
+    new capture exists (so a bad spec fails without touching the device):
+    ``prev`` is the capture before the new one, i.e. today's ``latest``, and
+    ``latest~N`` is today's ``latest~(N-1)``."""
+    s = _explicit(spec)
+    if s is None:
+        raise _bad("diff_from must name a capture (an id, a label, prev or latest~N)")
+    m = re.match(r"^latest(?:~(\d+))?$", s)
+    if m and int(m.group(1) or 0) == 0:
+        raise _bad(f"diff_from={s!r} would be this new capture itself",
+                   hint='diff_from="prev" compares with the capture before it.')
+    if s == "prev":
+        s = "latest"
+    elif m:
+        s = f"latest~{int(m.group(1)) - 1}"
+    return ctx.store.resolve(s, lineage)
+
+
+def _capture_diff(base: LoadedCapture, lc: LoadedCapture) -> tuple[dict[str, Any], list[str]]:
+    d = _diff(base, lc, limit=DIFF_LINES, max_bytes=DIFF_MAX_BYTES)
+    keep = ("a", "verdict", "shared", "summary", "notes", "lines", "issues", "truncated")
+    doc = {k: d[k] for k in keep if k in d}
+    if doc.get("issues") == {"resolved": [], "new": []}:
+        del doc["issues"]
+    nxt = [h for h in d.get("next") or [] if h.startswith("diff(")]
+    return doc, nxt
+
+
+def _device_line(m: Any) -> str:
+    dev = m.device or {}
+    screen = dev.get("screen") or []
+    parts = [f"API {m.api}" if m.api else None,
+             f"{screen[0]}x{screen[1]}" if len(screen) == 2 else None,
+             f"{dev['dpi']}dpi" if dev.get("dpi") else None,
+             f"font {dev['font_scale']}" if dev.get("font_scale") is not None else None]
+    return " ".join(p for p in parts if p)
+
+
+def _facet_summary(ix: Index, lc: LoadedCapture) -> dict[str, Any]:
+    m = lc.meta
+    kinds: dict[str, int] = {}
+    a11y = 0
+    for n in ix.nodes.values():
+        kinds[n.kind] = kinds.get(n.kind, 0) + 1
+        if "a11y" in n.ids:
+            a11y += 1
+
+    def status(name: str, count: int | None = None) -> Any:
+        entry = m.facets.get(name) or {}
+        st = entry.get("status")
+        if st == "ok" and count is not None:
+            return count
+        if st in (None, "ok"):
+            return count if count is not None else st
+        if st == "off":
+            return "off"
+        return entry.get("reason") or st
+
+    return {"views": kinds.get("view", 0), "props": status("props", kinds.get("view", 0)),
+            "compose": kinds.get("compose", 0), "a11y": status("a11y", a11y),
+            "slots": status("slots", kinds.get("slot", 0)),
+            "shots": len(lc.shot_roots()), "skp": status("skp", len(lc.skp_roots()))}
+
+
+def _diagnostics(ix: Index, lc: LoadedCapture) -> list[str]:
+    seen: list[str] = []
+    for d in [*lc.meta.diagnostics, *ix.diagnostics]:
+        if d and d not in seen:
+            seen.append(d)
+    out = [lines.cut(d, DIAGNOSTIC_CHARS) for d in seen[:DIAGNOSTICS_MAX]]
+    if len(seen) > DIAGNOSTICS_MAX:
+        out.append(f"…{len(seen) - DIAGNOSTICS_MAX} more: captures(action=\"show\")")
+    return out
+
+
+def _refs_in(text: Iterable[str]) -> set[str]:
+    return set(re.findall(r"(?:^|[\s>])(n[1-9][0-9]*)\b", " ".join(text)))
+
+
+def _cost(obj: Any) -> int:
+    return utf8_len(dumps(obj))
+
+
+def _summary(ctx: OpContext, lc: LoadedCapture, ix: Index, *, budget: int, n_lines: int,
+             on_screen: bool, diff_doc: dict | None, diff_next: list[str],
+             moved_from: str | None, note: str | None) -> dict[str, Any]:
+    """The capture() response (spec 5.3), within ``budget`` bytes: the header,
+    then the preview outline, the labelled stops the preview hides, and next."""
+    m = lc.meta
+    out: dict[str, Any] = {"capture": lc.id}
+    if m.label:
+        out["label"] = m.label
+        if moved_from:
+            out["moved_from"] = moved_from
+    if m.pinned:
+        out["pinned"] = True
+    out.update({"session": f"{m.serial}/{m.package}", "pid": m.pid, "device": _device_line(m),
+                "took_ms": m.took_ms, "consistency": m.consistency,
+                "facets": _facet_summary(ix, lc),
+                "windows": [f"{lines.crumb(w)} {lines.fmt_bounds(w.b)} z{w.z}"
+                            if w.b else f"{lines.crumb(w)} z{w.z}" for w in ix.windows()]})
+    out.update(analyzers.lint_summary(ix))
+    if m.options.slots == "enable":
+        out["warning"] = fetch.SLOTS_ENABLE_WARNING
+    diags = _diagnostics(ix, lc)
+    if diags:
+        out["diagnostics"] = diags
+    if ctx.store.memory_only:
+        out["store"] = MEMORY_ONLY_NOTE
+    if note:
+        out["note"] = note
+    if diff_doc is not None:
+        out["diff"] = diff_doc
+
+    # next, decided up front so its bytes are reserved
+    render_refs = [n.id for n in ix.nodes.values()
+                   if n.kind != "slot" and any(i.id.startswith("render.") for i in n.issues)]
+    lint_n = sum(1 for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y."))
+
+    reserve = 200 + 40  # next (<= 200 B) and its key
+    room = budget - _cost(out) - reserve
+    preview: list[str] = []
+    more_lines = 0
+    shown: set[str] = set()
+    if n_lines > 0 and room > 0:
+        pv = query.outline(ix, depth=PREVIEW_DEPTH, max_lines=n_lines, max_bytes=0)
+        cap = min(room, PREVIEW_BYTES_DIFF if diff_doc is not None else PREVIEW_BYTES)
+        used = 0
+        pv_lines = list(pv.get("lines") or [])
+        for ln in pv_lines:
+            c = utf8_len(dumps(ln)) + 1
+            if preview and used + c > cap:
+                break
+            preview.append(ln)
+            used += c
+        total = pv.get("total") or len(pv_lines)
+        more_lines = total - len(preview)
+        shown = _refs_in(preview)
+        out["outline"] = _with_marker(preview, total)
+        room -= _cost(preview) + 12
+
+    hidden: list[UNode] = []
+    if on_screen and room > 60:
+        for r in ix.reading:
+            n = ix.nodes.get(r)
+            if n is None or n.kind == "slot" or not n.label or n.id in shown:
+                continue
+            if not n.b or n.b[2] <= 0 or n.b[3] <= 0:
+                continue
+            hidden.append(n)
+        if hidden:
+            entries = [f"{n.id} {lines.jstr(lines.cut(n.label, lines.LABEL_MAX))}"
+                       for n in hidden[:ON_SCREEN_MAX]]
+            while entries and _cost(_with_marker(entries, len(hidden), READING_MORE)) + 14 > room:
+                entries.pop()
+            out["on_screen"] = _with_marker(entries, len(hidden), READING_MORE)
+
+    hints: list[str | None] = [*diff_next]
+    if more_lines > 0 or hidden:
+        hints.append("outline()")
+    if lint_n:
+        hints.append("lint()")
+    if len(render_refs) == 1:
+        hints.append(query.call("node", render_refs[0]))
+    elif render_refs:
+        hints.append(query.call("find", issue="render."))
+    nxt = query.next_hints(hints)
+    if nxt:
+        out["next"] = nxt
+    return _fit(out, budget)
+
+
+OUTLINE_MORE = "…{n} more line{s}: outline()"
+READING_MORE = "…{n} more: outline(view=\"reading\")"
+
+
+def _with_marker(items: list[str], total: int, marker: str = OUTLINE_MORE) -> list[str]:
+    """``items`` plus a ``…N more`` entry saying how to get the rest of ``total``."""
+    rest = total - len(items)
+    if rest <= 0:
+        return list(items)
+    return [*items, marker.format(n=rest, s="s" if rest > 1 else "")]
+
+
+def _fit(out: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Shed optional parts until ``out`` fits ``budget`` bytes, never the header,
+    and never silently: a cut list keeps its ``…N more`` entry."""
+    for key, marker in (("on_screen", READING_MORE), ("outline", OUTLINE_MORE),
+                        ("diagnostics", None), ("next", None)):
+        items = out.get(key)
+        if _cost(out) <= budget or not isinstance(items, list):
+            continue
+        body = [x for x in items if not x.startswith("…")]
+        total = len(body) + sum(int(m.group(1)) for x in items if x.startswith("…")
+                                for m in [re.match(r"…(\d+)", x)] if m)
+        while body and _cost(out) > budget:
+            body.pop()
+            out[key] = _with_marker(body, total, marker) if marker else body
+        if not out[key] or (marker and not body and _cost(out) > budget):
+            out.pop(key, None)
+    if _cost(out) > budget and isinstance(out.get("diff"), dict):
+        d = out["diff"]
+        while d.get("lines") and _cost(out) > budget:
+            d["lines"].pop()
+            d["cut"] = d.get("cut", 0) + 1
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Query tools
+# --------------------------------------------------------------------------- #
+def _props_ok(lc: LoadedCapture) -> bool:
+    return bool(lc.meta.options.props) and lc.meta.facet_status("props") == "ok"
+
+
+def outline(ctx: OpContext, **p: Any) -> dict[str, Any]:
+    """``outline`` (spec 5.5) over a stored capture."""
+    p = _clean(p)
+    lc = _loaded_for_query(ctx, p)
+    ix = lc.index()
+    out = query.outline(ix, loaded=lc, tomb=_tomb(ctx, lc), **p)
+    return _stamp(out, staleness(ctx, lc))
+
+
+def find(ctx: OpContext, **p: Any) -> dict[str, Any]:
+    """``find`` (spec 5.6) over a stored capture."""
+    p = _clean(p)
+    if "in_" in p:
+        p["in"] = p.pop("in_")
+    lc = _loaded_for_query(ctx, p)
+    ix = lc.index()
+    out = query.find(ix, loaded=lc, tomb=_tomb(ctx, lc), **p)
+    return _stamp(out, staleness(ctx, lc))
+
+
+def node(ctx: OpContext, ref: Any = None, refs: Any = None, **p: Any) -> dict[str, Any]:
+    """``node`` (spec 5.7): one node (``ref``) or up to 10 (``refs``)."""
+    p = _clean(p)
+    if ref is not None and refs is not None:
+        raise _bad("pass ref or refs, not both")
+    sels = refs if refs is not None else ref
+    if sels is None or sels == [] or sels == "":
+        raise _bad("node needs ref (a ref, key or selector) or refs",
+                   hint='node(ref="n23"), node(ref="#badSwitch"), node(refs=["n1","n2"])')
+    if isinstance(sels, list) and len(sels) == 1:
+        sels = sels[0]
+    lc = _loaded_for_query(ctx, p)
+    ix = lc.index()
+
+    def image_fn(n: UNode) -> Any:
+        try:
+            crop = images.crop(lc, n)
+        except OpError as e:
+            return {"error": e.message}
+        return {"path": crop["path"], "px": crop["px"]}
+
+    out = query.node(ix, lc, sels, tomb=_tomb(ctx, lc), image_fn=image_fn, **p)
+    return _stamp(out, staleness(ctx, lc))
+
+
+def lint(ctx: OpContext, **p: Any) -> dict[str, Any]:
+    """``lint`` (spec 5.9) over a stored capture; contrast on request (cached)."""
+    p = _clean(p)
+    lc = _loaded_for_query(ctx, p)
+    ix = lc.index()
+    kw = {k: p[k] for k in ("rules", "severity", "within", "contrast", "wcag", "group",
+                            "per_rule", "limit", "cursor", "max_bytes") if k in p}
+    unknown = sorted(set(p) - set(kw))
+    if unknown:
+        raise _bad(f"unknown argument(s) for lint: {', '.join(unknown)}")
+    out = analyzers.lint_view(ix, lc, **kw)
+    return _stamp(out, staleness(ctx, lc))
+
+
+def image(ctx: OpContext, ref: Any = None, window: Any = None, overlay: Any = None,
+          marks: Any = None, pad: Any = None, source: Any = None, max_side: Any = None,
+          max_bytes: Any = None, **p: Any) -> dict[str, Any]:
+    """``image`` (spec 5.8): a node's crop from its own window's screenshot, or
+    an overlay (marks, lint, reading, bounds, compose) of a window or the screen.
+    Returns the PNG's path; the MCP surface can add the pixels (inline)."""
+    p = _clean(p)
+    kind = _enum("overlay", overlay, images.OVERLAY_KINDS, "none")
+    src = _enum("source", source, IMAGE_SOURCES, "auto")
+    pad_px = _int("pad", pad, images.DEFAULT_PAD, 0, 2000)
+    side = _int("max_side", max_side, images.DEFAULT_MAX_SIDE, 64, 4096)
+    budget = query.resolve_max_bytes(max_bytes, IMAGE_MAX_BYTES)
+    mk = "auto" if marks is None else marks
+    unknown = sorted(set(p) - {"capture", "serial", "package"})
+    if unknown:
+        raise _bad(f"unknown argument(s) for image: {', '.join(unknown)}")
+    lc = _loaded_for_query(ctx, p)
+    ix = lc.index()
+    if src == "skp":
+        if not lc.skp_roots():
+            raise OpError("facet_unavailable", "this capture has no SKP",
+                          hint="capture(skp=true), then image(source=\"skp\")")
+        raise OpError("unsupported", "cutting images from a stored SKP is not implemented yet",
+                      hint='image(source="screenshot") crops the window screenshot')
+    tomb = _tomb(ctx, lc)
+    target = query.resolve_selector(ix, ref, tomb=tomb) if _explicit(ref) else None
+    win = query.resolve_selector(ix, window, tomb=tomb) if _explicit(window) else None
+    if isinstance(mk, list):
+        mk = [query.resolve_selector(ix, s, tomb=tomb).id for s in mk]
+    if kind == "none" and target is not None:
+        out = images.crop(lc, target, pad=pad_px, max_side=side)
+    else:
+        out = images.overlay(lc, ix, kind, mk, window=win.id if win else None,
+                             ref=target.id if target else None, pad=pad_px, max_side=side)
+    out = _stamp(dict(out), staleness(ctx, lc))
+    for key in ("rect", "note", "omitted", "scale"):
+        if _cost(out) <= budget:
+            break
+        out.pop(key, None)
+    return out
+
+
+def _diff(la: LoadedCapture, lb: LoadedCapture, **kw: Any) -> dict[str, Any]:
+    ia, ib = la.index(), lb.index()
+
+    def preview(ix: Index, root: str | None) -> list[str]:
+        return query.outline(ix, root=root, depth=2, max_lines=20)["lines"]
+
+    def pixels(xa: Index, xb: Index, changed: Any) -> dict[str, Any]:
+        return images.pixel_diff(la, lb, xa, xb, refs=changed)
+
+    both = _props_ok(la) and _props_ok(lb)
+
+    def props_fn(lc: LoadedCapture) -> Callable[[UNode], Any]:
+        def get(n: UNode) -> Any:
+            if n.kind != "view" or "view" not in n.ids:
+                return None
+            return lc.props(int(n.ids["view"]))
+        return get
+
+    return cdiff.diff(ia, ib, props_a=props_fn(la) if both else None,
+                      props_b=props_fn(lb) if both else None, resolve=query.resolve_selector,
+                      preview=preview, pixel_diff=pixels, **kw)
+
+
+def diff(ctx: OpContext, a: Any = None, b: Any = None, **p: Any) -> dict[str, Any]:
+    """``diff`` (spec 5.10): two captures of one app, compared by ref. ``a``
+    defaults to ``prev`` (the capture before ``b``), ``b`` to ``latest``."""
+    p = _clean(p)
+    serial, package = p.pop("serial", None), p.pop("package", None)
+    a_spec = _explicit(a) or "prev"
+    b_spec = _explicit(b)
+    if b_spec in (None, "latest"):
+        b_spec = query.cursor_capture(p.get("cursor")) or "latest"
+    lineage = query_lineage(ctx, serial, package, [b_spec, a_spec])
+    lb = _load(ctx, b_spec, lineage)
+    if a_spec == "prev":
+        prev_id = lb.meta.prev
+        if not prev_id or not ctx.store.exists(prev_id):
+            raise OpError("capture_not_found", f"{lb.id} has no earlier capture to compare with",
+                          hint="Pass a=<capture id or label> (captures() lists them).")
+        la = ctx.store.load(prev_id)
+    else:
+        la = _load(ctx, a_spec, tuple(lb.meta.lineage))  # type: ignore[arg-type]
+    out = _diff(la, lb, **p)
+    return _stamp(out, staleness(ctx, lb), after="b")
+
+
+def _clean(p: Mapping[str, Any]) -> dict[str, Any]:
+    """Arguments without explicit nulls (a null means the default)."""
+    return {k: v for k, v in p.items() if v is not None}
+
+
+# --------------------------------------------------------------------------- #
+# captures
+# --------------------------------------------------------------------------- #
+def _home(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if home and path.startswith(home + os.sep) else path
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1e6:.1f}MB"
+
+
+def _ago(s: float) -> str:
+    s = max(0, int(s))
+    if s < 120:
+        return f"{s}s ago"
+    if s < 7200:
+        return f"{s // 60}m ago"
+    if s < 172800:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def _ttl(s: float) -> str:
+    """``24h``, ``6h``, ``30m``, ``7d`` (days only from 3 days up)."""
+    s = int(s)
+    for unit, n, floor in (("d", 86400, 3 * 86400), ("h", 3600, 3600), ("m", 60, 60)):
+        if s >= floor and s % n == 0:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+def captures(ctx: OpContext, action: Any = None, id: Any = None, label: Any = None,
+             what: Any = None, format: Any = None, all: Any = None, limit: Any = None,
+             max_bytes: Any = None, serial: Any = None, package: Any = None) -> dict[str, Any]:
+    """``captures`` (spec 5.4): list, show, pin, unpin, label, drop, export, gc."""
+    act = _enum("action", action, CAPTURE_ACTIONS, "list")
+    every = _bool("all", all, False)
+    budget = query.resolve_max_bytes(max_bytes, CAPTURES_MAX_BYTES)
+    store = ctx.store
+    if act == "list":
+        n = _int("limit", limit, CAPTURES_LIMIT, 1, 200)
+        return _captures_list(ctx, n, every, serial, package, budget)
+    if act == "gc":
+        return _gc(store, every)
+    spec = _explicit(id) or ("latest" if act in ("show", "export") else None)
+    if spec is None:
+        raise _bad(f"captures(action=\"{act}\") needs id (a capture id, label, latest or prev)")
+    lineage = query_lineage(ctx, serial, package, [spec])
+    cid = store.resolve(spec, lineage)
+    if act == "show":
+        return _fit_doc(_show(ctx, store.load(cid)), budget)
+    if act in ("pin", "unpin"):
+        store.pin(cid, act == "pin")
+        return {"capture": cid, "pinned": act == "pin"}
+    if act == "label":
+        name = _check_label(label)
+        moved = store.label(cid, name)
+        out: dict[str, Any] = {"capture": cid, "label": name}
+        if moved:
+            out["moved_from"] = moved
+        return out
+    if act == "drop":
+        store.drop(cid)
+        return {"dropped": cid}
+    return _export(ctx, store.load(cid), _enum("what", what, EXPORT_WHAT, "nodes"),
+                   _enum("format", format, EXPORT_FORMATS, "jsonl"))
+
+
+def _captures_list(ctx: OpContext, limit: int, every: bool, serial: Any, package: Any,
+                   budget: int) -> dict[str, Any]:
+    store = ctx.store
+    lineage = None if every else query_lineage(ctx, serial, package)
+    metas = store.list(lineage, limit=None)
+    rows: list[str] = []
+    now = store.clock()
+    for m in metas[:limit]:
+        with contextlib.suppress(OpError):
+            lc = store.load(m.id)
+            lab = f" @{m.label}" if m.label else ""
+            pin = " pinned" if m.pinned else ""
+            nodes = lc.node_count()
+            rows.append(f"{m.id}{lab} {m.serial}/{m.package} "
+                        f"{nodes if nodes is not None else '?'} nodes {_mb(lc.nbytes())} "
+                        f"{_ago(now - float(m.created_at or 0))}{pin}")
+    s = store.summary()
+    out: dict[str, Any] = {"lines": rows}
+    if len(metas) > limit:
+        out["more"] = f"{len(metas) - limit} older: captures(limit={min(200, len(metas))})"
+    if lineage is not None:
+        others = s.get("captures", 0) - len(metas)
+        if others > 0:
+            out["others"] = f"{others} of other apps: captures(all=true)"
+    ttl = _ttl(store.ttl_s)
+    out["store"] = (f"{_home(store.root)} {_mb(int(s.get('bytes', 0)))} ttl {ttl}"
+                    + (" memory-only" if store.memory_only else ""))
+    while _cost(out) > budget and out["lines"]:
+        out["lines"].pop()
+        out["more"] = f"{len(metas) - len(out['lines'])} more: captures(limit=" \
+                      f"{max(1, len(out['lines']))},max_bytes={min(32000, budget * 2)})"
+    return out
+
+
+def _show(ctx: OpContext, lc: LoadedCapture) -> dict[str, Any]:
+    m = lc.meta
+    defaults = CaptureOptions().to_dict()
+    opts = {k: v for k, v in m.options.to_dict().items() if defaults.get(k) != v}
+    facets = {}
+    for name, entry in m.facets.items():
+        st = entry.get("status")
+        facets[name] = st if st == "ok" else f"{st}: {entry.get('reason')}" \
+            if entry.get("reason") else st
+    out: dict[str, Any] = {"capture": lc.id}
+    if m.label:
+        out["label"] = m.label
+    if m.pinned:
+        out["pinned"] = True
+    out.update({"session": f"{m.serial}/{m.package}", "pid": m.pid, "device": _device_line(m),
+                "agent": m.agent_version, "created": _ago(lc.age_s()), "took_ms": m.took_ms,
+                "consistency": m.consistency, "compose_generation": m.compose_generation,
+                "options": opts, "facets": facets, "nodes": lc.node_count(),
+                "bytes": lc.nbytes(), "prev": m.prev, "path": lc.path})
+    out = _stamp(out, staleness(ctx, lc))
+    diags = [*m.diagnostics]
+    with contextlib.suppress(Exception):
+        diags += [d for d in lc.index().diagnostics if d not in diags]
+    if diags:
+        out["diagnostics"] = [lines.cut(d, 200) for d in diags]
+    return {k: v for k, v in out.items() if v not in (None, {}, [])}
+
+
+def _fit_doc(out: dict[str, Any], budget: int) -> dict[str, Any]:
+    diags = out.get("diagnostics")
+    while isinstance(diags, list) and diags and _cost(out) > budget:
+        diags.pop()
+    if isinstance(diags, list) and not diags:
+        out.pop("diagnostics", None)
+    for key in ("options", "facets", "path"):
+        if _cost(out) <= budget:
+            break
+        out.pop(key, None)
+    return out
+
+
+def _gc(store: CaptureStore, every: bool) -> dict[str, Any]:
+    res = store.gc(all=every)
+    if every:
+        return {k: res[k] for k in ("all", "removed", "note") if k in res}
+    if "skipped" in res:
+        return {"skipped": res["skipped"]}
+    removed = res.get("removed") or []
+    out: dict[str, Any] = {"removed": len(removed)}
+    if removed:
+        out["ids"] = [f"{r.get('id')} {r.get('why')}" for r in removed[:10]]
+    for k in ("stripped", "staging_purged", "trash_purged", "spill_purged", "captures", "bytes"):
+        v = res.get(k)
+        if v:
+            out[k] = len(v) if isinstance(v, list) else v
+    return out
+
+
+def _export(ctx: OpContext, lc: LoadedCapture, what: str, fmt: str) -> dict[str, Any]:
+    """Write the capture's data as files under its ``out/`` and return their paths
+    (never the contents)."""
+    from .capture.model import index_to_jsonl
+
+    ix = lc.index()
+    parts = list(EXPORT_WHAT[:-1]) if what == "all" else [what]
+    written: list[tuple[str, int, int]] = []  # (path, rows, bytes)
+
+    def put(name: str, data: bytes, rows: int) -> None:
+        path = lc.put_derived(f"out/{name}", data)
+        written.append((path, rows, len(data)))
+
+    for part in parts:
+        if part == "nodes":
+            body = index_to_jsonl(ix)
+            if fmt == "json":
+                recs = [json.loads(ln) for ln in body.decode("utf-8").splitlines()[1:] if ln]
+                put("nodes.json", dumps(recs).encode("utf-8"), len(recs))
+            else:
+                put("nodes.jsonl", body, len(ix.nodes))
+        elif part in ("views", "compose", "slots", "a11y"):
+            doc = _legacy_facet(lc, part)
+            if doc is None:
+                continue
+            put(f"{part}.json", dumps(doc).encode("utf-8"), _count_nodes(doc))
+        elif part == "props":
+            if not _props_ok(lc):
+                continue
+            recs = {}
+            for n in ix.nodes.values():
+                if n.kind == "view" and "view" in n.ids:
+                    vals = lc.props(int(n.ids["view"]))
+                    if vals:
+                        recs[n.id] = vals
+            put("props.json", dumps(recs).encode("utf-8"), len(recs))
+        elif part == "lint":
+            recs = [{"ref": n.id, **i.to_dict()} for n in ix.nodes.values() for i in n.issues]
+            body = ("\n".join(dumps(r) for r in recs) + "\n").encode("utf-8") if recs else b""
+            put("issues.jsonl", body, len(recs))
+        elif part == "raw":
+            rc = lc.raw_capture()
+            files = rc.files()
+            for rel, data in sorted(files.items()):
+                put(f"raw/{rel}", data, 1)
+            put("raw/meta.json", lc.meta.to_json(), 1)
+    if not written:
+        raise OpError("facet_unavailable", f"capture {lc.id} has no {what} to export",
+                      hint=f"captures(action=\"show\",id=\"{lc.id}\") lists its facets")
+    total = sum(b for _p, _r, b in written)
+    rows = sum(r for _p, r, _b in written)
+    first = written[0][0]
+    path = os.path.dirname(first) if len(written) > 1 else first
+    if len(written) > 1 and what in ("raw", "all"):
+        path = os.path.join(lc.path, "out")
+    out: dict[str, Any] = {"capture": lc.id, "path": path.rstrip(os.sep), "rows": rows,
+                           "bytes": total}
+    if len(written) > 1:
+        out["files"] = len(written)
+    out["hint"] = ("Read with jq or a JSON reader; deleted with the capture."
+                   if what != "raw" else "raw/*.pb are the agent's protobuf replies "
+                                         "(proto/view_inspection.proto).")
+    return out
+
+
+def _legacy_facet(lc: LoadedCapture, part: str) -> Any:
+    from .proto import view_inspection_pb2 as pb
+
+    name = {"views": "views", "compose": "compose_sem", "slots": "slots", "a11y": "a11y"}[part]
+    data = lc.raw(name)
+    if not data:
+        return None
+    if part == "views":
+        from . import strings
+        return strings.dump_tree_to_dict(pb.DumpTreeResponse.FromString(data))
+    if part in ("compose", "slots"):
+        from . import strings
+        return strings.dump_compose_to_dict(pb.DumpComposeResponse.FromString(data))
+    from . import a11y
+    return a11y.a11y_to_dict(pb.DumpA11yResponse.FromString(data))
+
+
+def _count_nodes(doc: Any) -> int:
+    n = 0
+    stack = [doc]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, dict):
+            if "children" in o:
+                n += 1
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
+    return n
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch
+# --------------------------------------------------------------------------- #
+TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
+    "capture": capture, "captures": captures, "outline": outline, "find": find, "node": node,
+    "image": image, "lint": lint, "diff": diff,
+}
+
+
+def call(ctx: OpContext, tool: str, args: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Run one tool function; exceptions propagate (see :func:`run`)."""
+    fn = TOOLS.get(tool)
+    if fn is None:
+        raise _bad(f"unknown tool {tool!r}", candidates=list(TOOLS))
+    return fn(ctx, **dict(args or {}))
+
+
+def run(ctx: OpContext, tool: str, args: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Run one tool function; every failure becomes the error envelope."""
+    try:
+        return call(ctx, tool, args)
+    except Exception as exc:  # noqa: BLE001 - mapped to the agent-facing envelope
+        return error_envelope(exc)
+
+
+__all__ = [
+    "AttachProvider",
+    "OpContext",
+    "SessionProvider",
+    "TOOLS",
+    "TOOL_NAMES",
+    "call",
+    "capture",
+    "captures",
+    "device_lineage",
+    "diff",
+    "error_envelope",
+    "find",
+    "image",
+    "is_error",
+    "lint",
+    "node",
+    "outline",
+    "query_lineage",
+    "remember_session",
+    "run",
+    "staleness",
+]
