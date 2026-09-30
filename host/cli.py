@@ -127,6 +127,8 @@ def cmd_attach(args) -> int:
         )
         print(f"socket=@{session.injection.socket_name} forwarded tcp:{session.injection.local_port}")
     return 0
+
+
 def cmd_dump(args) -> int:
     with _session(args) as session:
         want_screenshot = bool(args.screenshot)
@@ -158,6 +160,8 @@ def cmd_dump(args) -> int:
             w, h = pngmod.write_png(resp.screenshot, args.screenshot)
             print(f"wrote screenshot {w}x{h} to {args.screenshot}", file=sys.stderr)
     return 0
+
+
 def _compose_text_summary(node, out, depth=0):
     a = node.get("attrs", {}) or {}
     txt = a.get("Text") or a.get("ContentDescription")
@@ -216,8 +220,10 @@ def cmd_compose(args) -> int:
                   f"({summary['boxes']} boxes, {summary['labels']} labels)", file=sys.stderr)
     return 0
 
-# --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Accessibility subcommands
+# --------------------------------------------------------------------------- #
 def cmd_a11y(args) -> int:
     from inspector_widget import a11y as a11ymod
     from inspector_widget import overlay as ovmod
@@ -274,6 +280,8 @@ def cmd_a11y(args) -> int:
                   f"({summary['boxes']} boxes, {summary['flagged']} flagged, "
                   f"{summary['flagged_by_bounds']} by finding bounds)", file=sys.stderr)
     return 0
+
+
 def cmd_a11y_lint(args) -> int:
     from inspector_widget import a11y_lint as lintmod
     try:
@@ -317,6 +325,7 @@ def cmd_a11y_lint(args) -> int:
                   f"{ov['flagged']} flagged; {s['error']} error, {s['warn']} warn, "
                   f"{s['info']} info)", file=sys.stderr)
     return 0
+
 
 # --------------------------------------------------------------------------- #
 # Integrated inspector subcommands (mirror the MCP tools: inspect / inspect_node /
@@ -379,6 +388,8 @@ def cmd_inspect(args) -> int:
         else:
             print(json.dumps(merged.get("summary", {}), indent=2))
     return 0
+
+
 def cmd_inspect_node(args) -> int:
     from inspector_widget import correlate
     node_key, view_id, semantics_id, bounds = _node_selector(args)
@@ -401,6 +412,8 @@ def cmd_inspect_node(args) -> int:
         else:
             print(json.dumps(dossier, indent=2, default=str))
     return 0
+
+
 def cmd_component_image(args) -> int:
     from inspector_widget import correlate
     node_key, view_id, semantics_id, bounds = _node_selector(args)
@@ -425,6 +438,8 @@ def cmd_component_image(args) -> int:
             return 1
         print(json.dumps(img, indent=2, default=str))
     return 0
+
+
 def cmd_screenshot(args) -> int:
     with _session(args) as session:
         resp = session.screenshot(root_id=0, scale=args.scale)
@@ -434,6 +449,8 @@ def cmd_screenshot(args) -> int:
         w, h = pngmod.write_png(resp.screenshot, args.out)
         print(f"wrote screenshot {w}x{h} to {args.out}", file=sys.stderr)
     return 0
+
+
 def cmd_get_properties(args) -> int:
     with _session(args) as session:
         resp = session.get_properties(
@@ -444,6 +461,8 @@ def cmd_get_properties(args) -> int:
         else:
             print(json.dumps(data, indent=2, default=str))
     return 0
+
+
 def cmd_detach(args) -> int:
     """Stop the agent in ``--package`` for every client. Never injects: with no
     agent running there is nothing to stop."""
@@ -461,6 +480,8 @@ def cmd_detach(args) -> int:
     print(f"hint: retry detach, or restart the app: adb -s {args.serial} shell am force-stop "
           f"{args.package}", file=sys.stderr)
     return 1
+
+
 def _add_serial_arg(sp):
     sp.add_argument("--serial", default=None,
                     help="device serial (default: $ANDROID_SERIAL, else the only attached device)")
@@ -485,6 +506,7 @@ def _add_selector_args(sp):
                     help="absolute screen-px box; resolves to the deepest covering element")
 
 
+# --------------------------------------------------------------------------- #
 # Argument parsing
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -550,7 +572,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_compose)
-
 
     sp = sub.add_parser("a11y", help="dump the unified accessibility tree (Views + Compose) + TalkBack reading order")
     _add_serial_arg(sp)
