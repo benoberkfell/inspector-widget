@@ -34,9 +34,21 @@ Properties.kt, Capture.kt, ComposeInspector.kt, AccessibilityInspector.kt):
 * screenshots are ``bitmap_type=2`` (ABGR_8888: in-memory bytes R,G,B,A), a
   9-byte little-endian header, deflated (Capture.kt:291-294);
 * SHUTDOWN replies, then calls ``stop()``, which closes the server socket and
-  ALL client connections (Server.stop()). Agents built before that fix
-  stopped before writing the reply, so the requester only saw EOF;
-  ``reply_to_shutdown = False`` models them;
+  shuts down ALL client connections, so every client sees EOF at once
+  (Server.stop()). Agents built before that fix only close()d the other
+  clients' sockets, which on Linux doesn't wake a thread blocked reading one:
+  those clients stayed connected (and listed in /proc/net/unix) until they
+  next sent something; ``close_clients_on_stop = False`` models them. Agents
+  built before the reply fix stopped before writing the reply, so the
+  requester only saw EOF; ``reply_to_shutdown = False`` models them;
+* device work is serialized across connections (Server.kt ``handleLock``),
+  but Hello and SHUTDOWN are answered without waiting for it, so a client is
+  never told the app is frozen just because another client's request is
+  slow; ``hello_waits_for_other_clients = True`` models agents from before
+  that fix;
+* /proc/net/unix lists each bound name as a listening entry (Flags
+  00010000) and each open client connection as a connected entry under the
+  same name (Flags 0, St 03), as Linux does;
 * Hello reports ``viewspector-0.1+<sha256 of the payload.jar it was loaded
   from>`` (the build handshake). ``build_id=None`` models an agent from before
   the handshake, which reports plain ``viewspector-0.1``.
@@ -54,6 +66,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import shlex
 import socket
 import struct
@@ -556,6 +569,12 @@ class FakeAgent:
         self.on_stop = on_stop
         self.build_id = build_id  # None: an agent from before the build handshake
         self.reply_to_shutdown = True  # False: an agent from before the reply fix
+        # False: an agent from before the stop fix, whose other clients stayed
+        # connected (unreadable) after it stopped. See the module docstring.
+        self.close_clients_on_stop = True
+        # True: an agent from before Hello/SHUTDOWN skipped handleLock.
+        self.hello_waits_for_other_clients = False
+        self._handle_lock = threading.Lock()  # Server.kt handleLock
         # True: an agent from before the accept fix. Server.stop() closed the
         # LocalServerSocket, but the thread blocked in accept() kept the name
         # bound until one more connection arrived (seen live on API 37).
@@ -630,13 +649,21 @@ class FakeAgent:
                     return  # Server.stop() raced this read: the session is over
                 command = req.WhichOneof("command") or "<unset>"
                 self._record(cid, req, command)
-                delay, action = self.behaviour(req)
-                if delay:
-                    _real_sleep(delay)
+                locked = (command not in ("hello", "shutdown")
+                          or self.hello_waits_for_other_clients)
+                if locked:
+                    self._handle_lock.acquire()
+                try:
+                    delay, action = self.behaviour(req)
+                    if delay:
+                        _real_sleep(delay)
+                    if action == "hang":
+                        self._release.wait()
+                        return
+                finally:
+                    if locked:
+                        self._handle_lock.release()
                 if action == "close":
-                    return
-                if action == "hang":
-                    self._release.wait()
                     return
                 if action is None:
                     continue
@@ -683,14 +710,17 @@ class FakeAgent:
             _close(c)
 
     def stop(self) -> None:
-        """Server.stop(): close the server socket and ALL client connections."""
+        """Server.stop(): close the server socket and shut down ALL client
+        connections (or, with ``close_clients_on_stop = False``, leave them
+        connected until each client next sends something, as older agents did)."""
         with self._lock:
             if not self.running:
                 return
             self.running = False
         self._release.set()
         _close(self._srv)
-        self.kill_clients()
+        if self.close_clients_on_stop:
+            self.kill_clients()
         if self.on_stop is not None:
             self.on_stop(self)
 
@@ -867,6 +897,9 @@ class FakeApp:
     package: str
     pid: Optional[int]
     debuggable: bool = True
+    # Frozen by the cached-apps freezer (in the background): attach-agent is
+    # only queued, and cgroup.events says "frozen 1".
+    frozen: bool = False
 
     @property
     def data_dir(self) -> str:
@@ -1054,6 +1087,13 @@ class FakeDevice:
         return 1, "", f"adb: unknown command {verb}"
 
     def shell(self, cmd: str) -> Tuple[int, str, str]:
+        frozen_probe = re.search(r"/proc/(\d+)/cgroup\)/cgroup\.events", cmd)
+        if frozen_probe:
+            pid = int(frozen_probe.group(1))
+            app = next((a for a in self.apps.values() if a.pid == pid), None)
+            if app is None:
+                return 0, "", ""
+            return 0, f"populated 1\nfrozen {int(app.frozen)}\n", ""
         toks = shlex.split(cmd)
         if not toks:
             return 0, "", ""
@@ -1091,11 +1131,23 @@ class FakeDevice:
         return 127, "", f"/system/bin/sh: {toks[0]}: inaccessible or not found"
 
     def _proc_net_unix(self, grep: str) -> str:
+        # Num RefCount Protocol Flags Type St Inode Path: a listener has Flags
+        # 00010000 (__SO_ACCEPTCON); the agent's end of each client connection
+        # is listed under the same name with Flags 0 and St 03 (connected), for
+        # as long as it is open, even after the listener has gone.
+        with self._lock:
+            names = [n for n, a in self.sockets.items() if a.running or a.lingering] \
+                + list(self.foreign_sockets)
+            agents = list(self.agents)
+        entries = [(name, True) for name in ["jdwp-control", "adbd", *names]]
+        for agent in agents:
+            entries += [(agent.socket_name, False)] * agent.open_connections
         lines = []
-        names = [n for n, a in self.sockets.items() if a.running or a.lingering] \
-            + list(self.foreign_sockets)
-        for i, name in enumerate(["jdwp-control", "adbd", *names]):
-            line = f"0000000000000000: 00000002 00000000 00010000 0001 01 {40000 + i} @{name}"
+        for i, (name, listening) in enumerate(entries):
+            if listening:
+                line = f"0000000000000000: 00000002 00000000 00010000 0001 01 {40000 + i} @{name}"
+            else:
+                line = f"0000000000000000: 00000003 00000000 00000000 0001 03 {40000 + i} @{name}"
             if grep in line:  # grep is a substring match
                 lines.append(line)
         return "".join(line + "\n" for line in lines)
@@ -1140,6 +1192,9 @@ class FakeDevice:
         call = {"package": package, "so": so_path, "bootstrap": boot, "payload": payload,
                 "socket_name": socket_name}
         self.attach_calls.append(call)
+        if app.frozen:
+            call["result"] = "queued until the app is unfrozen"
+            return 0, "", ""
 
         def staged(path: str, name: str, mode: str) -> bool:
             entry = self.staged.get((package, name))

@@ -31,7 +31,9 @@ if _HERE not in sys.path:
 
 import inspector_widget as iw  # noqa: E402
 from inspector_widget import adb  # noqa: E402
+from inspector_widget import inject  # noqa: E402
 from inspector_widget import png as pngmod  # noqa: E402
+from inspector_widget.client import AgentTimeoutError  # noqa: E402
 from inspector_widget import strings as stringsmod  # noqa: E402
 
 DEFAULT_PACKAGE = "com.oberkfell.a11yprobe"
@@ -78,8 +80,11 @@ def _session(args):
     Leaving the block disconnects and keeps the agent running (only ``detach``
     stops it), so a concurrent MCP session on the same app is left alone.
     """
-    return iw.attach(args.serial, args.package, build_out=args.build_out,
-                     force_reinject=getattr(args, "force", False))
+    session = iw.attach(args.serial, args.package, build_out=args.build_out,
+                        force_reinject=getattr(args, "force", False))
+    if session.note:
+        print(f"warning: {session.note}", file=sys.stderr)
+    return session
 
 
 def _remove_quietly(path):
@@ -434,9 +439,15 @@ def cmd_detach(args) -> int:
         print(f"no agent running in {args.package} on {args.serial}; nothing to detach",
               file=sys.stderr)
         return 0
-    session.shutdown()
-    print(f"detached {args.package} on {args.serial} (agent stopped)", file=sys.stderr)
-    return 0
+    if session.shutdown():
+        print(f"detached {args.package} on {args.serial} (agent stopped)", file=sys.stderr)
+        return 0
+    print(f"error: the agent in {args.package} on {args.serial} was asked to stop but its "
+          f"socket is still there (it may be finishing another client's request, or the app "
+          f"is frozen)", file=sys.stderr)
+    print(f"hint: retry detach, or restart the app: adb -s {args.serial} shell am force-stop "
+          f"{args.package}", file=sys.stderr)
+    return 1
 def _add_serial_arg(sp):
     sp.add_argument("--serial", default=None,
                     help="device serial (default: $ANDROID_SERIAL, else the only attached device)")
@@ -622,6 +633,9 @@ def build_parser() -> argparse.ArgumentParser:
                                        "never injects)")
     _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
+    # Accepted (and ignored) so older scripts that passed it keep working:
+    # detach never injects, so it needs no artifacts.
+    sp.add_argument("--build-out", metavar="DIR", default=None, help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_detach)
 
     return p
@@ -640,8 +654,15 @@ def main(argv=None) -> int:
         if level.upper() in ("DEBUG", "TRACE"):
             import traceback
             traceback.print_exc()
-        print(f"error: {e}", file=sys.stderr)
         hint = getattr(e, "hint", None)
+        frozen = None
+        if isinstance(e, AgentTimeoutError) and getattr(args, "package", None):
+            frozen = inject.frozen_note(getattr(args, "serial", None), args.package)
+        if frozen:
+            print(f"error: {str(e).rstrip('.')}. {frozen}", file=sys.stderr)
+            hint = inject.FROZEN_HINT
+        else:
+            print(f"error: {e}", file=sys.stderr)
         if hint:
             print(f"hint: {hint}", file=sys.stderr)
         return 1

@@ -161,6 +161,9 @@ class Injection:
     warm: bool  # True if we connected to an already-attached agent
     hello: Any = None  # the agent's HelloResponse (agent_version / api_level / abi)
     closed: bool = False
+    # Set when the connection works but something about it deserves a warning,
+    # e.g. a stale-build agent kept because other clients are using it.
+    note: Optional[str] = None
 
     @property
     def agent_version(self) -> Optional[str]:
@@ -172,21 +175,86 @@ class Injection:
         """sha256 of the payload.jar the agent runs; ``None`` for pre-handshake agents."""
         return split_agent_version(getattr(self.hello, "agent_version", None))[1]
 
-    def close(self) -> None:
-        """Close the socket and remove the adb forward. Idempotent; the agent keeps running."""
+    def close(self, close_socket: bool = True) -> None:
+        """Shut the socket down, close it, and remove the adb forward.
+        Idempotent; the agent keeps running.
+
+        Shutting down first matters: a plain close() doesn't wake a thread
+        blocked reading the socket (a request in flight), which would wait out
+        its whole deadline. ``close_socket=False`` leaves the close to that
+        thread (see ``Client.abort``).
+        """
         if self.closed:
             return
         self.closed = True
         try:
-            self.sock.close()
+            if close_socket:
+                _shutdown_and_close(self.sock)
+            else:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
         finally:
             adb.remove_forward(self.serial, self.local_port)
 
 
-class InjectionError(RuntimeError):
-    """Injecting or connecting failed; ``hint`` says where to look next."""
+def _shutdown_and_close(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
-    hint = f"Check `{LOGCAT_HINT}` for agent-side errors."
+
+# Where to look when the agent itself misbehaved (it attached, or should have).
+AGENT_LOG_HINT = f"Check `{LOGCAT_HINT}` for agent-side errors."
+
+
+class InjectionError(RuntimeError):
+    """Injecting or connecting failed. ``hint`` is the next step to take, or
+    ``None`` when the message already says it."""
+
+    def __init__(self, message: str, hint: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
+def _restart_hint(serial: str, package: str) -> str:
+    return (f"Restart the app: `adb -s {serial} shell am force-stop {package}`, launch it "
+            f"again, then retry.")
+
+
+def _launch_hint(serial: str, package: str) -> str:
+    return (f"Launch it, e.g. `adb -s {serial} shell monkey -p {package} "
+            f"-c android.intent.category.LAUNCHER 1`, then retry.")
+
+
+FROZEN_HINT = "Bring the app to the foreground, then retry."
+
+
+def frozen_note(serial: Optional[str], package: str) -> Optional[str]:
+    """Why a request to ``package`` may have gone unanswered: a sentence saying
+    the app is frozen in the background, or ``None``. Best-effort (for errors)."""
+    try:
+        serial = adb.resolve_serial(serial)
+        pid = adb.pidof(serial, package)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return None
+    return _frozen_message(serial, package, pid) if pid is not None else None
+
+
+def _frozen_message(serial: str, package: str, pid: int) -> Optional[str]:
+    """A sentence explaining that ``pid`` is frozen, or ``None`` if it isn't
+    (or the state can't be read)."""
+    if not adb.process_frozen(serial, pid):
+        return None
+    app = f"'{package}' (pid {pid})" if package else f"pid {pid}"
+    return (f"{app} is frozen: Android freezes apps in the background, and a frozen app "
+            f"runs nothing, the agent included, until it is in the foreground again.")
 
 
 def _artifact_path(build_out: str, name: str) -> str:
@@ -202,14 +270,19 @@ def _artifact_path(build_out: str, name: str) -> str:
     return path
 
 
-def _connect_forward(serial: str, socket_name: str, local_port: int,
-                     connect_timeout: float = 5.0) -> socket.socket:
-    """Set up the adb forward and open a TCP socket to the agent.
+def _connect_forward(serial: str, socket_name: str,
+                     connect_timeout: float = 5.0) -> Tuple[socket.socket, int]:
+    """Forward a local port (adb picks it) to the agent's socket and connect.
 
+    Returns ``(socket, local_port)``; on failure the forward is removed again.
     The Client sets a per-request deadline on the socket before each request.
     """
-    port = adb.forward(serial, local_port, socket_name)
-    return socket.create_connection(("127.0.0.1", port), timeout=connect_timeout)
+    port = adb.forward(serial, 0, socket_name)
+    try:
+        return socket.create_connection(("127.0.0.1", port), timeout=connect_timeout), port
+    except BaseException:
+        adb.remove_forward(serial, port)
+        raise
 
 
 def _try_warm_connect(serial: str, pid: int, package: str = "") -> Optional[Injection]:
@@ -224,27 +297,35 @@ def _try_warm_connect(serial: str, pid: int, package: str = "") -> Optional[Inje
     socket_name = socket_name_for_pid(pid)
     if not adb.socket_exists(serial, socket_name):
         return None
-    local_port = adb.free_local_port()
     try:
-        sock = _connect_forward(serial, socket_name, local_port)
+        sock, local_port = _connect_forward(serial, socket_name)
     except OSError:
-        adb.remove_forward(serial, local_port)
         return None
     # PING via Hello to confirm the agent is live and speaks our protocol.
     client = Client(sock, owns_socket=False)
+    ok = False
     try:
         hello = client.hello()
+        ok = True
     except AgentTimeoutError as exc:
-        sock.close()
-        adb.remove_forward(serial, local_port)
+        frozen = _frozen_message(serial, package, pid)
+        if frozen:
+            raise InjectionError(
+                f"the agent on @{socket_name} did not answer Hello: {frozen}",
+                hint=FROZEN_HINT) from exc
         raise InjectionError(
-            f"an agent holds @{socket_name} but did not answer Hello ({exc}). The app may be "
-            f"frozen (breakpoint, ANR); resume it, or restart the app to start over."
+            f"an agent holds @{socket_name} but did not answer Hello ({exc}). Either the "
+            f"app is frozen (a breakpoint, an ANR) or the agent is busy with another "
+            f"client's long request.",
+            hint=(f"Retry in a moment; if it keeps failing, resume the app or restart it "
+                  f"(`adb -s {serial} shell am force-stop {package}`, then launch it)."),
         ) from exc
     except Exception:
-        sock.close()
-        adb.remove_forward(serial, local_port)
         return None
+    finally:
+        if not ok:  # also on KeyboardInterrupt / SystemExit: never leak the forward
+            _shutdown_and_close(sock)
+            adb.remove_forward(serial, local_port)
     return Injection(
         serial=serial,
         package=package,
@@ -276,19 +357,20 @@ STOP_WAIT = 5.0
 
 def stop_agent(injection: Injection, wait: Optional[float] = None) -> bool:
     """Send SHUTDOWN over ``injection``, close it, and wait for the agent's
-    abstract socket to disappear. Returns True once the socket is gone."""
+    abstract socket to disappear. Returns True once nothing listens on it."""
     wait = STOP_WAIT if wait is None else wait
     try:
         Client(injection.sock, owns_socket=False).shutdown(timeout=wait if wait > 0 else None)
     except TransportError:
-        pass
+        pass  # unanswered or undeliverable: the socket check below decides
     finally:
         injection.close()
     return _wait_for_socket_gone(injection.serial, injection.socket_name, wait)
 
 
 def _wait_for_socket_gone(serial: str, socket_name: str, wait: float) -> bool:
-    """Poll /proc/net/unix until ``socket_name`` is gone (True) or ``wait`` passes.
+    """Poll /proc/net/unix until nothing listens on ``socket_name`` (True) or
+    ``wait`` passes (False). Other clients' connections to the name don't count.
 
     Agents built before the accept fix close their LocalServerSocket on stop,
     but a thread blocked in accept() keeps the socket bound until one more
@@ -313,16 +395,17 @@ def _wait_for_socket_gone(serial: str, socket_name: str, wait: float) -> bool:
 
 def _kick(serial: str, socket_name: str) -> None:
     """Open and close one connection to ``socket_name`` (best-effort)."""
-    local_port = adb.free_local_port()
     try:
-        with _connect_forward(serial, socket_name, local_port, connect_timeout=2.0) as sock:
+        sock, local_port = _connect_forward(serial, socket_name, connect_timeout=2.0)
+    except OSError:
+        return
+    try:
+        with sock:
             sock.settimeout(0.5)
             try:
                 sock.recv(1)  # the stopped server accepts and drops it: EOF at once
             except OSError:
                 pass
-    except OSError:
-        pass
     finally:
         adb.remove_forward(serial, local_port)
 
@@ -335,7 +418,8 @@ def _check_debuggable(serial: str, package: str) -> None:
         detail = said.splitlines()[0]
         raise InjectionError(
             f"package '{package}' is not debuggable, so the agent can't be injected "
-            f"(run-as said: {detail}). Install a debug build (android:debuggable=true)."
+            f"(run-as said: {detail}).",
+            hint="Install a debug build of the app (android:debuggable=true), then retry.",
         )
 
 
@@ -366,8 +450,9 @@ def _push_and_stage(serial: str, package: str, build_out: str):
 
 
 def _wait_for_socket(serial: str, socket_name: str,
-                     max_attempts: int = 15, initial_delay: float = 0.1) -> None:
-    """Poll /proc/net/unix until the agent's abstract socket appears.
+                     max_attempts: int = 15, initial_delay: float = 0.1,
+                     package: str = "", pid: Optional[int] = None) -> None:
+    """Poll /proc/net/unix until the agent listens on its abstract socket.
 
     Exponential backoff capped at 1s (mirrors ui-inspector waitForAgentSocket).
     """
@@ -377,10 +462,15 @@ def _wait_for_socket(serial: str, socket_name: str,
             return
         time.sleep(delay)
         delay = min(delay * 2, 1.0)
-    raise InjectionError(
-        f"timed out waiting for agent socket '{socket_name}'. "
-        f"Check 'adb logcat -s ViewSpector' for agent-side errors."
-    )
+    frozen = _frozen_message(serial, package, pid) if pid is not None else None
+    if frozen:
+        raise InjectionError(
+            f"timed out waiting for agent socket '{socket_name}': {frozen} The attach is "
+            f"queued and runs when the app next wakes.",
+            hint=FROZEN_HINT,
+        )
+    raise InjectionError(f"timed out waiting for agent socket '{socket_name}'.",
+                         hint=AGENT_LOG_HINT)
 
 
 def inject_and_connect(
@@ -411,10 +501,8 @@ def inject_and_connect(
     serial = adb.resolve_serial(serial)
     pid = adb.pidof(serial, package)
     if pid is None:
-        raise InjectionError(
-            f"package '{package}' is not running on {serial}. "
-            f"Launch the app, then retry."
-        )
+        raise InjectionError(f"package '{package}' is not running on {serial}.",
+                             hint=_launch_hint(serial, package))
 
     # Enable attribute resolution-stack tracking, exactly as Android Studio's
     # Layout Inspector does. Best-effort: stacks only populate for views inflated
@@ -431,16 +519,36 @@ def inject_and_connect(
     if warm is not None:
         if not force_reinject and build_matches(warm.build_id, want):
             return warm
-        # --force, or the agent runs another build (a rebuild, or an agent from
-        # before the handshake): stop it so the new payload can bind the name.
+        if not force_reinject:
+            # The agent runs another build (a rebuild, a second checkout, or an
+            # agent from before the handshake). Replacing it would cut off any
+            # other client using it (an MCP server, say) and, with two builds
+            # in use, every call would evict the other's agent. So only replace
+            # it when nobody else is connected; otherwise keep it and say so.
+            others = adb.socket_connections(serial, socket_name) - 1
+            if others > 0:
+                warm.note = (
+                    f"the running agent is build {_short(warm.build_id)} but the local "
+                    f"payload.jar is {_short(want)}; kept it because {others} other "
+                    f"client(s) are connected to it (an MCP server, say). Attach with "
+                    f"--force (MCP: force=true) to replace it for everyone.")
+                return warm
+        # --force, or a stale agent nobody else uses: stop it so the new payload
+        # can bind the name.
         if not stop_agent(warm):
             raise InjectionError(
-                f"the running agent on @{socket_name} did not stop after SHUTDOWN, so a new "
-                f"one can't bind the name; restart the app (adb shell am force-stop {package}, "
-                f"then launch it) and retry"
+                f"the running agent on @{socket_name} did not stop within {STOP_WAIT:g}s of "
+                f"SHUTDOWN, so a new one can't bind the name. It may still be finishing "
+                f"another client's request.",
+                hint=f"Retry in a moment; if it keeps failing: {_restart_hint(serial, package)}",
             )
 
     _check_debuggable(serial, package)
+    frozen = _frozen_message(serial, package, pid)
+    if frozen:
+        # attach-agent would only be queued until the app wakes, and then start
+        # an agent nobody is waiting for.
+        raise InjectionError(frozen, hint=FROZEN_HINT)
     app_so, app_boot, app_payload = _push_and_stage(serial, package, build_dir)
 
     # Native agent option string: bootstrapDexPath:payloadPath:socketName.
@@ -448,23 +556,23 @@ def inject_and_connect(
     options = f"{app_boot}:{app_payload}:{socket_name}"
     adb.attach_agent(serial, package, app_so, options)
 
-    _wait_for_socket(serial, socket_name)
+    _wait_for_socket(serial, socket_name, package=package, pid=pid)
 
-    local_port = adb.free_local_port()
     # Give the LocalServerSocket a brief moment to start accept()-ing.
     last_err: Optional[Exception] = None
     sock: Optional[socket.socket] = None
+    local_port = 0
     for attempt in range(10):
         try:
-            sock = _connect_forward(serial, socket_name, local_port)
+            sock, local_port = _connect_forward(serial, socket_name)
             break
         except OSError as e:
             last_err = e
-            adb.remove_forward(serial, local_port)
             time.sleep(0.2)
     if sock is None:
         raise InjectionError(
-            f"could not connect to agent socket '{socket_name}': {last_err}"
+            f"could not connect to agent socket '{socket_name}': {last_err}",
+            hint=AGENT_LOG_HINT,
         )
 
     inj = Injection(
@@ -480,9 +588,12 @@ def inject_and_connect(
     client = Client(sock, owns_socket=False)
     try:
         inj.hello = client.hello()
-    except Exception as e:
+    except BaseException as e:  # KeyboardInterrupt / SystemExit too: never leak the forward
         inj.close()
-        raise InjectionError(f"agent attached but Hello failed: {e}") from e
+        if not isinstance(e, Exception):
+            raise
+        raise InjectionError(f"agent attached but Hello failed: {e}",
+                             hint=AGENT_LOG_HINT) from e
     if not build_matches(inj.build_id, want):
         # The payload we just pushed didn't bind the socket (another agent still
         # holds it, e.g. one we couldn't reach to stop), so this is not our agent.
@@ -490,7 +601,11 @@ def inject_and_connect(
         raise InjectionError(
             f"the agent answering on @{socket_name} is not the one just injected (it runs "
             f"build {inj.build_id or 'from before the build handshake'}, build-out has "
-            f"{want}). Restart the app (adb shell am force-stop {package}, then launch it) "
-            f"and retry."
+            f"{want}).",
+            hint=_restart_hint(serial, package),
         )
     return inj
+
+
+def _short(build_id: Optional[str]) -> str:
+    return build_id[:12] if build_id else "(from before the build handshake)"

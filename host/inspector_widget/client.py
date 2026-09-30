@@ -104,12 +104,19 @@ class SessionLostError(TransportError):
     the server, the app restarted, or another client sent SHUTDOWN."""
 
 
+class NotSentError(SessionLostError):
+    """The request was never delivered: the client was already closed, or the
+    write failed. Unlike a lost reply, the agent certainly didn't act on it."""
+
+
 class AgentTimeoutError(TransportError, TimeoutError):
     """The agent did not reply before the deadline (a frozen main thread, a
     breakpoint, an ANR). Retrying straight away would only wait again."""
 
-    hint = (f"If the app is just slow, raise the deadline with {TIMEOUT_ENV}=<seconds> "
-            f"(0 disables it); otherwise check whether the app is frozen and `{LOGCAT_HINT}`.")
+    hint = (f"If the app is just slow, raise the deadline: set {TIMEOUT_ENV}=<seconds> "
+            f"(0 disables it) in the environment of the CLI, or of the MCP server process "
+            f"(its launch config; the server reads it at each request). Otherwise check "
+            f"whether the app is frozen, and `{LOGCAT_HINT}`.")
 
 
 _LOST = "agent session lost (idle timeout, app restart, or the agent was shut down)"
@@ -173,17 +180,48 @@ class Client:
             self._lock.release()
 
     def _poison(self, reason: str) -> None:
-        """Mark the client unusable and close the socket (whoever owns it)."""
+        """Mark the client unusable and close the socket (whoever owns it).
+
+        Only for the thread that holds the request lock (or when no request can
+        be in flight); from any other thread use :meth:`abort`.
+        """
         if self._broken is None:
             self._broken = reason
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        self._close_socket()
+
+    def _close_socket(self) -> None:
         try:
             self._sock.close()
         except OSError:
             pass
+
+    def abort(self, reason: str = "disconnected") -> bool:
+        """Mark the client unusable and end the connection, from any thread.
+
+        A request in flight on another thread fails at once with
+        :class:`SessionLostError`: shutting the socket down wakes its read, and
+        that thread closes the socket on its way out. (Closing it from here
+        instead can leave that thread polling a closed descriptor until its
+        deadline.) Returns True if the socket was closed here, False if the
+        in-flight request's thread will close it.
+        """
+        if self._broken is None:
+            self._broken = reason
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._close_socket()
+        finally:
+            self._lock.release()
+        return True
 
     # ------------------------------------------------------------------ #
     # Core send/recv
@@ -194,49 +232,71 @@ class Client:
         Raises :class:`ClientError` for an agent ERROR reply (the connection
         stays usable), :class:`AgentTimeoutError` when the deadline passes and
         :class:`SessionLostError` for any other transport failure; those two
-        close the client. ``timeout`` overrides the base deadline for this call.
+        close the client. A request that never left the host (the client was
+        already closed, or the write failed) raises :class:`NotSentError`, a
+        :class:`SessionLostError`. ``timeout`` overrides the base deadline for
+        this call.
         """
-        command = request.WhichOneof("command") or "<unset>"
         with self._lock:
-            if self._broken:
-                raise SessionLostError(f"{_LOST}: {self._broken}")
-            req_id = next(self._ids)
-            request.id = req_id
-            limit = request_timeout(request, timeout if timeout is not None else self._timeout)
-            deadline = None if limit is None else time.monotonic() + limit
             try:
-                self._sock.settimeout(limit)
-                framing.write_message(self._sock, request.SerializeToString())
-                raw = framing.read_message(self._sock, deadline=deadline)
-            except (socket.timeout, framing.FrameTimeout) as exc:
-                self._poison(f"no reply to {command} within {limit:g}s")
-                raise AgentTimeoutError(
-                    f"the agent did not reply to {command} within {limit:g}s (is the app's "
-                    f"main thread frozen?); the connection was closed"
-                ) from exc
-            except (OSError, framing.FramingError) as exc:
-                self._poison(f"{type(exc).__name__}: {exc}")
-                raise SessionLostError(f"{_LOST}: {exc}") from exc
-            response = pb.Response()
-            try:
-                response.ParseFromString(raw)
-            except DecodeError as exc:
-                self._poison(f"undecodable reply to {command}")
-                raise SessionLostError(f"{_LOST}: undecodable reply ({exc})") from exc
-            if response.id != req_id:
-                if response.id == 0 and response.status == pb.Response.ERROR:
-                    # The agent couldn't parse the request, so it answered with
-                    # id 0; one reply per frame means the stream is still in step.
-                    raise ClientError(f"agent error (request id {req_id}): {response.error}")
-                self._poison(f"reply id {response.id} for request {req_id}")
-                raise SessionLostError(
-                    f"{_LOST}: response id mismatch: expected {req_id}, got {response.id} "
-                    f"(the stream is out of sync)")
-            if response.status == pb.Response.ERROR:
-                raise ClientError(
-                    f"agent error (request id {req_id}): {response.error}"
-                )
-            return response
+                return self._send_locked(request, timeout)
+            finally:
+                if self._broken:
+                    # Closed from elsewhere (abort) while this request ran: the
+                    # socket is ours to close now.
+                    self._close_socket()
+
+    def _send_locked(self, request: "pb.Request", timeout: Optional[float]) -> "pb.Response":
+        """The body of :meth:`send`; the caller holds ``self._lock``."""
+        command = request.WhichOneof("command") or "<unset>"
+        if self._broken:
+            raise NotSentError(f"{_LOST}: {self._broken}")
+        req_id = next(self._ids)
+        request.id = req_id
+        limit = request_timeout(request, timeout if timeout is not None else self._timeout)
+        deadline = None if limit is None else time.monotonic() + limit
+        try:
+            self._sock.settimeout(limit)
+            framing.write_message(self._sock, request.SerializeToString())
+        except socket.timeout as exc:
+            self._poison(f"could not send {command} within {limit:g}s")
+            raise AgentTimeoutError(
+                f"the agent did not take {command} within {limit:g}s (is the app's main "
+                f"thread frozen?); the connection was closed") from exc
+        except OSError as exc:
+            self._poison(f"{type(exc).__name__}: {exc}")
+            raise NotSentError(f"{_LOST}: could not send {command} ({exc})") from exc
+        try:
+            raw = framing.read_message(self._sock, deadline=deadline)
+        except (socket.timeout, framing.FrameTimeout) as exc:
+            self._poison(f"no reply to {command} within {limit:g}s")
+            raise AgentTimeoutError(
+                f"the agent did not reply to {command} within {limit:g}s (is the app's "
+                f"main thread frozen?); the connection was closed"
+            ) from exc
+        except (OSError, framing.FramingError) as exc:
+            self._poison(f"{type(exc).__name__}: {exc}")
+            raise SessionLostError(f"{_LOST}: {exc}") from exc
+        response = pb.Response()
+        try:
+            response.ParseFromString(raw)
+        except DecodeError as exc:
+            self._poison(f"undecodable reply to {command}")
+            raise SessionLostError(f"{_LOST}: undecodable reply ({exc})") from exc
+        if response.id != req_id:
+            if response.id == 0 and response.status == pb.Response.ERROR:
+                # The agent couldn't parse the request, so it answered with
+                # id 0; one reply per frame means the stream is still in step.
+                raise ClientError(f"agent error (request id {req_id}): {response.error}")
+            self._poison(f"reply id {response.id} for request {req_id}")
+            raise SessionLostError(
+                f"{_LOST}: response id mismatch: expected {req_id}, got {response.id} "
+                f"(the stream is out of sync)")
+        if response.status == pb.Response.ERROR:
+            raise ClientError(
+                f"agent error (request id {req_id}): {response.error}"
+            )
+        return response
 
     # ------------------------------------------------------------------ #
     # Convenience commands
@@ -327,20 +387,22 @@ class Client:
         return self.send(req).capture_skp
 
     def shutdown(self, timeout: Optional[float] = None) -> "pb.ShutdownResponse":
-        """Stop the agent, for every client (not just this connection).
+        """Ask the agent to stop, for every client (not just this connection).
 
         Agents built before the reply fix close the connection before writing
-        the reply; that EOF after sending counts as success. The client is
-        closed afterwards either way. Raises :class:`SessionLostError` if the
-        client was already closed (nothing was sent) and
-        :class:`AgentTimeoutError` if a busy agent never answers.
+        the reply, so EOF after the request went out is taken as delivered;
+        only the agent's socket going away proves it stopped (see
+        ``inject.stop_agent``). The client is closed afterwards either way.
+        Raises :class:`NotSentError` if the request never went out (the client
+        was already closed, possibly while waiting behind another request) and
+        :class:`AgentTimeoutError` if the agent never answered.
         """
-        if self._broken:
-            raise SessionLostError(f"{_LOST}: {self._broken}")
         req = pb.Request()
         req.shutdown.SetInParent()
         try:
             return self.send(req, timeout=timeout).shutdown
+        except NotSentError:
+            raise
         except SessionLostError:
             return pb.ShutdownResponse()
         finally:

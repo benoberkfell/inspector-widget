@@ -10,6 +10,7 @@ lookup order is: explicit ``build_out`` (CLI ``--build-out``) >
 
 from __future__ import annotations
 
+import argparse
 import os
 
 import pytest
@@ -205,7 +206,11 @@ def test_cli_without_flag_uses_env(monkeypatch, tmp_path, argv):
 
 
 def test_every_injecting_subcommand_is_covered():
-    """devices/packages/detach never inject; every other subcommand must take --build-out."""
+    """devices/packages/detach never inject; every other subcommand must take --build-out.
+
+    detach still accepts --build-out (older scripts pass it), but hides it from
+    --help: it would be a no-op.
+    """
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
     never_inject = ("devices", "packages", "detach")
@@ -215,8 +220,16 @@ def test_every_injecting_subcommand_is_covered():
         opts = {o for a in sub.choices[name]._actions for o in a.option_strings}
         assert "--build-out" in opts, f"{name} lacks --build-out"
     for name in never_inject:
-        opts = {o for a in sub.choices[name]._actions for o in a.option_strings}
-        assert "--build-out" not in opts, f"{name} never injects, so --build-out would be a no-op"
+        shown = {o for a in sub.choices[name]._actions for o in a.option_strings
+                 if a.help != argparse.SUPPRESS}
+        assert "--build-out" not in shown, f"{name} never injects, so --build-out would be a no-op"
+
+
+def test_detach_still_accepts_build_out(monkeypatch, tmp_path):
+    seen = _stub_cold_inject(monkeypatch)
+    monkeypatch.setattr(inject, "connect_existing", lambda serial, package: None)
+    assert cli.main(["detach", "--build-out", str(tmp_path)]) == 0
+    assert "build_out" not in seen
 
 
 def test_cli_detach_never_stages_artifacts(monkeypatch):

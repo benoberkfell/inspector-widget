@@ -334,7 +334,7 @@ def test_an_agent_that_ignores_shutdown_is_reported(fake_device, run_cli, monkey
         if req.WhichOneof("command") == "shutdown" else stubborn.default_behaviour(req))
     monkeypatch.setattr(inject, "STOP_WAIT", 0.2)
     res = run_cli("dump")
-    assert res.rc == 1 and "did not stop after SHUTDOWN" in res.err
+    assert res.rc == 1 and "did not stop within 0.2s of SHUTDOWN" in res.err
     assert "am force-stop" in res.err and not fake_device.pushed
 
 

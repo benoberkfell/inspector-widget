@@ -615,10 +615,16 @@ def _png_scratch(serial: str, package: str, tag: str) -> Iterator[str]:
 
 def _cleanup_at_exit() -> None:
     """Disconnect cached sessions (removing their adb forwards; agents keep
-    running for the next start) and delete this process's PNG directory."""
+    running for the next start), remove any other forward this process still
+    holds (an attach cut short), and delete this process's PNG directory."""
     try:
         SESSIONS.close_all()
     except Exception:  # noqa: BLE001 - exit cleanup is best-effort
+        pass
+    try:
+        from inspector_widget import adb
+        adb.remove_own_forwards()
+    except Exception:  # noqa: BLE001
         pass
     with _TMP_LOCK:
         dirs = list(_TMP_DIRS.values())
@@ -685,10 +691,11 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
     # get_windows confirms the agent answers real commands (not just Hello).
     try:
         windows = _session_get_windows(session)
-    except _transport_error() as exc:
+    except _session_lost_error() as exc:
         # The connection died between the liveness check and now (the agent
         # idled out or dropped us): re-attach once. A second failure is real.
-        # The failed client closed itself, so get_or_attach replaces it.
+        # The failed client closed itself, so get_or_attach replaces it. A
+        # timeout is not retried: it would only wait out the deadline again.
         log.info("get_windows after attach failed (%s); re-attaching once", exc)
         session = SESSIONS.get_or_attach(serial, package)
         windows = _session_get_windows(session)
@@ -709,7 +716,7 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
         "root_ids": root_ids,
         "session": f"{serial}/{package}",
     }
-    note = _stale_build_note(info.get("build_id"))
+    note = getattr(session, "note", None) or _stale_build_note(info.get("build_id"))
     if note:
         result["note"] = note
     return result
@@ -813,20 +820,32 @@ def tool_detach(serial: Optional[str], package: str, shutdown: bool = True) -> D
     server's cached connection and leave the agent running."""
     _require(package, "package")
     serial = _serial(serial)
-    session = SESSIONS.drop(serial, package)
+    cached = SESSIONS.drop(serial, package)
     if not shutdown:
-        if session is None:
+        if cached is None:
             return {"serial": serial, "package": package, "detached": False,
                     "note": "no cached session for this (serial, package)"}
-        _disconnect(session)
+        _disconnect(cached)
         return {"serial": serial, "package": package, "detached": True, "agent_stopped": False}
+    session = cached
+    if session is not None and not _session_alive(session):
+        # A dead connection, or the app restarted under a new pid: stopping
+        # through it would reach nothing. Find the agent that runs now, as the
+        # CLI's detach does.
+        _disconnect(session)
+        session = None
     if session is None:
         session = HOST.connect_existing(serial, package)
         if session is None:
-            return {"serial": serial, "package": package, "detached": False,
+            return {"serial": serial, "package": package, "detached": cached is not None,
                     "note": "no agent is running in this app; nothing to stop"}
     stopped = bool(session.shutdown())
-    return {"serial": serial, "package": package, "detached": True, "agent_stopped": stopped}
+    result = {"serial": serial, "package": package, "detached": True, "agent_stopped": stopped}
+    if not stopped:
+        result["note"] = ("the agent was asked to stop but its socket is still there; it may "
+                          "be finishing another client's request, or the app is frozen. Retry "
+                          "detach, or force-stop the app (adb shell am force-stop <package>).")
+    return result
 
 
 def tool_dump_compose(
@@ -1043,6 +1062,11 @@ def _a11y_lint_context(session: Any, serial: str, want_image: bool, scale: float
                 ctx.screenshot_w = w
                 ctx.screenshot_h = h
                 ctx.screenshot_scale = float(shot.screenshot.scale) or scale
+        except _transport_error():
+            # A lost or timed-out session is not "no screenshot": let _run_tool
+            # report it (and retry a lost session) instead of linting half-blind
+            # on a closed connection.
+            raise
         except Exception:
             log.debug("a11y_lint screenshot decode failed; running tree-only", exc_info=True)
     return ctx, density, fscale
@@ -1764,9 +1788,33 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             log.exception("tool %s failed", name)
         out = {"error": f"{type(exc).__name__}: {exc}", "tool": name}
         hint = getattr(exc, "hint", None)
+        frozen = _frozen_note(exc, args)
+        if frozen:
+            out["error"] = f"{out['error'].rstrip('.')}. {frozen}"
+            hint = _frozen_hint()
         if isinstance(hint, str) and hint:
             out["hint"] = hint
         return out
+
+
+def _frozen_note(exc: BaseException, args: Dict[str, Any]) -> Optional[str]:
+    """For a timeout: whether the app sits frozen in the background (the likely
+    cause, and not one the generic timeout hint names)."""
+    try:
+        from inspector_widget import inject
+        from inspector_widget.client import AgentTimeoutError
+    except Exception:  # pragma: no cover - host package missing
+        return None
+    package = args.get("package") if isinstance(args, dict) else None
+    if not isinstance(exc, AgentTimeoutError) or not isinstance(package, str) or not package:
+        return None
+    serial = args.get("serial")
+    return inject.frozen_note(serial if isinstance(serial, str) and serial else None, package)
+
+
+def _frozen_hint() -> str:
+    from inspector_widget import inject
+    return inject.FROZEN_HINT
 
 
 def _session_lost_error() -> type:
@@ -1961,10 +2009,12 @@ def _build_mcp_server() -> Any:
 
 def _serve_with_mcp() -> bool:
     """Try to serve using the real `mcp` SDK. Returns True if it ran."""
+    global _SDK_TRANSPORT
     server = _build_mcp_server()
     if server is None:
         return False
     from mcp.server.stdio import stdio_server
+    _SDK_TRANSPORT = True
 
     async def _main() -> None:
         async with stdio_server() as (read_stream, write_stream):
@@ -2165,6 +2215,33 @@ def _dist_version(dist: str) -> str:
         return "unknown version"
 
 
+# True while the mcp SDK's stdio transport serves (see _on_sigterm).
+_SDK_TRANSPORT = False
+
+
+def _on_sigterm(signum: int, frame: Any) -> None:
+    """SIGTERM: clean up (forwards, PNGs) and exit now, whichever transport runs.
+
+    With the fallback transport, SystemExit unwinds the main thread (closing
+    any half-made connection) and atexit cleans up. The SDK transport reads
+    stdin on a worker thread that keeps the process alive until stdin closes,
+    so SystemExit alone would leave the server running (and a later SIGKILL
+    would skip the cleanup): clean up here, then exit at once. Tool calls run
+    on worker threads there, so this handler never interrupts one holding the
+    locks the cleanup takes.
+    """
+    if not _SDK_TRANSPORT:
+        raise SystemExit(0)
+    try:
+        run_exit_hooks = getattr(atexit, "_run_exitfuncs", None)
+        if run_exit_hooks is not None:
+            run_exit_hooks()  # _cleanup_at_exit and any other exit hook
+        else:  # pragma: no cover - not CPython
+            _cleanup_at_exit()
+    finally:
+        os._exit(0)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="inspector-widget-mcp",
@@ -2197,13 +2274,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     _log_startup_health()
     # Remove this server's adb forwards and PNG directory however it exits
-    # (stdin closed, an error, or SIGTERM, which is turned into SystemExit so
-    # atexit handlers run). Agents keep running for the next start.
+    # (stdin closed, an error, or SIGTERM; see _on_sigterm). Agents keep
+    # running for the next start.
     atexit.register(_cleanup_at_exit)
     try:
         import signal
 
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        signal.signal(signal.SIGTERM, _on_sigterm)
     except (ImportError, ValueError, OSError):  # not the main thread / unsupported
         pass
 

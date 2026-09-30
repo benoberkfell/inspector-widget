@@ -11,6 +11,8 @@ Public surface:
 
 from __future__ import annotations
 
+from typing import Optional
+
 __version__ = "1.0.0"
 
 # Re-export the most commonly used entry points for convenience. Submodules that
@@ -104,6 +106,9 @@ class Session:
         self.build_id = injection.build_id
         self.api_level = hello.api_level if hello is not None else None
         self.abi = hello.abi if hello is not None else None
+        # A warning worth passing on (e.g. a stale-build agent kept because
+        # other clients use it), or None.
+        self.note = getattr(injection, "note", None)
         self.client = Client(injection.sock, owns_socket=False)
 
     # ------------------------------------------------------------------ #
@@ -185,40 +190,53 @@ class Session:
     # ------------------------------------------------------------------ #
     def disconnect(self) -> None:
         """Drop this connection (socket + adb forward). The agent keeps running,
-        so the next attach is a cheap warm connect. Idempotent."""
-        self.client.close()
-        self.injection.close()
+        so the next attach is a cheap warm connect. Idempotent.
+
+        A request in flight on another thread fails at once with
+        :class:`~inspector_widget.client.SessionLostError` rather than waiting
+        out its deadline.
+        """
+        closed = self.client.abort("disconnected")
+        # If a request is in flight, its thread closes the socket as it fails;
+        # closing it under that thread could leave it waiting out its deadline.
+        self.injection.close(close_socket=closed)
 
     close = disconnect
 
-    def shutdown(self, wait: float = 5.0) -> bool:
+    def shutdown(self, wait: Optional[float] = None) -> bool:
         """Stop the agent for EVERY client (SHUTDOWN), then disconnect.
 
-        If this connection is already dead, a fresh connection to the same pid
-        delivers the SHUTDOWN. Waits up to ``wait`` seconds for the agent's
-        socket to go. Returns True if an agent was told to stop.
+        If this connection can't carry the SHUTDOWN (it is already closed), a
+        fresh connection to the same pid does. Returns True once nothing
+        listens on the agent's socket any more (within ``wait`` seconds,
+        default ``inject.STOP_WAIT``), False if the agent is still there (it
+        didn't stop, or couldn't be reached).
         """
         from . import inject
-        from .client import TransportError
-        stopped = False
-        if not self.client.broken:
-            try:
-                self.client.shutdown(timeout=wait)
-                stopped = True
-            except TransportError:
-                pass
+        from .client import AgentTimeoutError, ClientError, NotSentError
+        wait = inject.STOP_WAIT if wait is None else wait
+        sent = False
+        try:
+            self.client.shutdown(timeout=wait)
+            sent = True
+        except NotSentError:
+            pass
+        except AgentTimeoutError:
+            sent = True  # delivered but unanswered (a busy agent may still stop)
+        except ClientError:
+            self.disconnect()
+            return False  # the agent answered with an error: it did not stop
         self.disconnect()
-        if not stopped:
-            try:
-                fresh = inject._try_warm_connect(self.serial, self.pid, self.package)
-            except Exception:
-                fresh = None
-            if fresh is None:
-                return False
-            inject.stop_agent(fresh, wait=wait)
-            return True
-        inject._wait_for_socket_gone(self.serial, self.injection.socket_name, wait)
-        return True
+        if sent:
+            return inject._wait_for_socket_gone(self.serial, self.injection.socket_name, wait)
+        try:
+            fresh = inject._try_warm_connect(self.serial, self.pid, self.package)
+        except Exception:
+            fresh = None
+        if fresh is None:
+            # Nothing answered: stopped already, unless something still listens.
+            return not adb.socket_exists(self.serial, self.injection.socket_name)
+        return inject.stop_agent(fresh, wait=wait)
 
     # Old name: detach() always meant "send SHUTDOWN". Prefer shutdown().
     detach = shutdown
