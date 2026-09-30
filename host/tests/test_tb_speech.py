@@ -299,3 +299,41 @@ def test_empty_description_falls_back_to_the_events_text():
     a = say(scroll)
     assert a.text == "Hidden intro, Body, Chart" and a.parts[0]["kind"] == "event"
     assert not a.unlabelled
+
+
+@pytest.mark.parametrize("name", ["traversal", "S1", "S4", "D1", "D2", "launcher"])
+def test_tb17_p6_utterances_are_exact(name):
+    # Every press whose node is in the dump: the model's 17.0 announcement at the node TalkBack
+    # actually focused equals TalkBack's ttsOutput, character for character.
+    from test_tb_order import TB17_WALKS, tb17_tree, walk_node
+
+    walk = TB17_WALKS[name]
+    tree = tb17_tree(name)
+    nav = tb.Navigator(tree)
+    state = S.SpeechState()
+    start, _ = walk_node(tree, walk[0])
+    S.announce(nav, start, state)  # focus was there before the first press
+    exact = compared = 0
+    pre_scroll = []
+    for entry in walk[1:]:
+        if entry.get("edge"):
+            continue
+        node, moved = walk_node(tree, entry)
+        if node is None:
+            continue  # scrolled in (launcher): not in the dump
+        said = S.announce(nav, node, state).text
+        if moved:
+            pre_scroll.append((said, entry["said"]))
+            continue
+        compared += 1
+        exact += said == entry["said"]
+        assert said == entry["said"]
+    assert exact == compared > 0
+    if name == "launcher":
+        # "Section heading" was a clipped sliver when the walk began; TalkBack scrolled it into
+        # view (SHOW_ON_SCREEN) and Compose composed its text before TalkBack spoke it.
+        assert pre_scroll == [("Unlabelled", "Section heading. MissingHeading")]
+        walk_model = tb.simulate(tree, start=start, until="steps", max_steps=12)
+        assert walk_model.stops[11].get("speak_conf") == "pre_scroll"
+    else:
+        assert pre_scroll == []
