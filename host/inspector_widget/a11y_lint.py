@@ -329,7 +329,7 @@ class _Node:
         "traversal_before", "traversal_after", "text_size_px", "text_size_unit",
         "test_tag", "source", "compose", "compose_label", "provider_class",
         "render_node_id", "range_info", "children", "parent", "depth", "order",
-        "focus_ancestor", "collection_ctx", "clip",
+        "focus_ancestor", "collection_ctx", "clip", "layout_w", "layout_h",
     )
 
     def __init__(self) -> None:
@@ -373,6 +373,10 @@ class _Node:
         self.focus_ancestor: Optional["_Node"] = None
         self.collection_ctx: Optional[Tuple["_Node", "_Node"]] = None
         self.clip: Optional["_Node"] = None
+        # Compose virtual nodes: the LayoutNode's measured size (px) from the agent's
+        # layout_size; 0 = unknown. Their bounds are touch bounds (widened to 48dp).
+        self.layout_w = 0
+        self.layout_h = 0
 
     # -- geometry ---------------------------------------------------------- #
     @property
@@ -538,6 +542,9 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         n.label_for = int(d.get("label_for") or 0)
         n.traversal_before = int(d.get("traversal_before") or 0)
         n.traversal_after = int(d.get("traversal_after") or 0)
+        if vid != -1:
+            ls = d.get("layout_size") or {}
+            n.layout_w, n.layout_h = int(ls.get("w") or 0), int(ls.get("h") or 0)
         tsp = d.get("text_size_px")
         n.text_size_px = float(tsp) if tsp else 0.0
         if n.text_size_px > 0:
@@ -1114,13 +1121,37 @@ def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
     bx, bdp = run.bounds_pair(n)
     min_dp = 44 if run.ctx.wcag_mode else 48
     w_dp, h_dp = bdp["w"], bdp["h"]
-    if w_dp >= min_dp and h_dp >= min_dp:
-        return []
-    small = {ax for ax, v in (("w", w_dp), ("h", h_dp)) if v < min_dp}
-    clipped = _clipped_axes(n, run)
+    # A 48dp target lands on 116-118px at a fractional density (edges are rounded
+    # separately), so allow 1px before calling a dimension small.
+    min_px = min_dp * run.ctx.dpi / DP_BASE
+    small = {ax for ax in ("w", "h") if bx[ax] + 1 < min_px}
     std = "wcag" if run.ctx.wcag_mode else "material"
     ev = {"w_dp": w_dp, "h_dp": h_dp, "min_dp": min_dp, "floor_dp": 24, "standard": std,
           "bounds_source": "a11y boundsInScreen (touch bounds)"}
+    if not small and n.kind == "compose" and n.layout_w and n.layout_h:
+        # Compose widens the a11y (touch) bounds of every clickable to 48dp and extends
+        # hit-testing to match, but only a layout of that size reserves the area: without
+        # it a neighbouring target or a clip takes the extra, and the visible control stays
+        # small. Material controls reserve it (minimumInteractiveComponentSize), so their
+        # LayoutNode is 48dp; a bare Modifier.size(24.dp).clickable is not.
+        lay = {"w": n.layout_w, "h": n.layout_h}
+        small = {ax for ax in ("w", "h") if lay[ax] + 1 < min_px}
+        if not small:
+            return []
+        w_dp, h_dp = run.dp(lay["w"]), run.dp(lay["h"])
+        ev.update({"w_dp": w_dp, "h_dp": h_dp, "touch_w_dp": bdp["w"], "touch_h_dp": bdp["h"],
+                   "bounds_source": "Compose layout size (touch bounds are widened to 48dp)"})
+        return [run.finding(
+            "a11y.touch_target.small", "warn", n,
+            f"Laid out at {w_dp}x{h_dp}dp. Compose widens its touch bounds to "
+            f"{bdp['w']}x{bdp['h']}dp for hit-testing, but the layout does not reserve that "
+            f"area, so a neighbouring target or a clip can take it and the visible control "
+            f"stays small. Reserve {min_dp}dp: Modifier.minimumInteractiveComponentSize() or "
+            f"Modifier.sizeIn(minWidth = {min_dp}.dp, minHeight = {min_dp}.dp) on the "
+            f"clickable element.", ev)]
+    if not small:
+        return []
+    clipped = _clipped_axes(n, run)
     if small <= clipped:
         ev["clipped_axes"] = sorted(clipped)
         return [run.finding(

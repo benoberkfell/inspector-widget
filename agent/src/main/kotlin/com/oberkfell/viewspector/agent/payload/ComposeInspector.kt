@@ -281,9 +281,18 @@ object ComposeInspector {
      * Per-AndroidComposeView facts the accessibility walk needs but AccessibilityNodeInfo does not
      * carry. [rootSemanticsId] is the unmerged root SemanticsNode id (Compose exposes it as the
      * AndroidComposeView's own node, virtual id HOST_VIEW_ID); [traversalGroups] holds the ids of
-     * unmerged SemanticsNodes whose config sets IsTraversalGroup = true.
+     * unmerged SemanticsNodes whose config sets IsTraversalGroup = true. [layoutSizes] maps each
+     * unmerged SemanticsNode id to the measured size of its LayoutNode (px, [packSize]): the space
+     * the node reserves in layout, including Modifier.minimumInteractiveComponentSize() padding,
+     * unlike its a11y boundsInScreen, which Compose widens to the 48dp touch size for any clickable.
      */
-    internal class SemanticsIndex(val rootSemanticsId: Int, val traversalGroups: Set<Int>)
+    internal class SemanticsIndex(
+        val rootSemanticsId: Int,
+        val traversalGroups: Set<Int>,
+        val layoutSizes: Map<Int, Long>,
+    )
+
+    internal fun packSize(w: Int, h: Int): Long = (w.toLong() shl 32) or (h.toLong() and 0xFFFFFFFFL)
 
     /**
      * Build the [SemanticsIndex] for [composeView] by walking its UNMERGED semantics tree (the one
@@ -296,19 +305,28 @@ object ComposeInspector {
             val root = invoke(owner, "getUnmergedRootSemanticsNode") ?: return null
             val rootId = invoke(root, "getId") as? Int ?: return null
             val groups = HashSet<Int>()
-            collectTraversalGroups(root, groups, 0)
-            SemanticsIndex(rootId, groups)
+            val sizes = HashMap<Int, Long>()
+            collectUnmerged(root, groups, sizes, 0)
+            SemanticsIndex(rootId, groups, sizes)
         } catch (t: Throwable) {
             Log.w(TAG, "semantics index failed", t)
             null
         }
     }
 
-    private fun collectTraversalGroups(node: Any, out: MutableSet<Int>, depth: Int) {
+    private fun collectUnmerged(node: Any, groups: MutableSet<Int>, sizes: MutableMap<Int, Long>, depth: Int) {
         if (depth > MAX_DEPTH) return
-        if (configFlag(node, "IsTraversalGroup")) (invoke(node, "getId") as? Int)?.let { out.add(it) }
+        val id = invoke(node, "getId") as? Int
+        if (id != null) {
+            if (configFlag(node, "IsTraversalGroup")) groups.add(id)
+            // SemanticsNode.layoutInfo is the node's LayoutNode (public LayoutInfo width/height).
+            val info = invoke(node, "getLayoutInfo")
+            val w = intOf(info, "getWidth")
+            val h = intOf(info, "getHeight")
+            if (w != null && h != null && w > 0 && h > 0) sizes[id] = packSize(w, h)
+        }
         (invoke(node, "getChildren") as? List<*>)?.forEach { child ->
-            if (child != null) collectTraversalGroups(child, out, depth + 1)
+            if (child != null) collectUnmerged(child, groups, sizes, depth + 1)
         }
     }
 

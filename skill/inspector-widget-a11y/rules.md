@@ -76,10 +76,17 @@ description), else its `labeledBy` target. A descendant that takes its own focus
 
 ### R2 `a11y.touch_target.small` — touch target below the minimum  (ATF TouchTargetSize)
 - **Flags:** a visible, enabled, actionable node whose **accessibility (touch)
-  bounds** are `< 48dp` (Material) or `< 44dp` (`wcag_mode`) in width or height.
-  Compose touch bounds already include `minimumInteractiveComponentSize`, so a stock
-  M3 Checkbox or IconButton passes. The WCAG inline-link exception (an unroled link
-  inside a run of text) is skipped.
+  bounds** are `< 48dp` (Material) or `< 44dp` (`wcag_mode`) in width or height,
+  with 1px of slack for rounding (a 48dp target measures 116-118px at 2.4375x).
+  The WCAG inline-link exception (an unroled link inside a run of text) is skipped.
+- **Compose:** Compose widens the touch bounds of *every* clickable to 48dp, so they
+  alone cannot tell a stock M3 control from a `Modifier.size(24.dp).clickable`. The
+  agent also reports each Compose node's layout size (its LayoutNode, `layout_size`
+  in the a11y dump). Stock M3 Checkbox/IconButton/Switch reserve 48dp there
+  (`minimumInteractiveComponentSize`) and pass; a clickable laid out smaller is a
+  `warn` with `bounds_source` "Compose layout size" and `touch_w_dp`/`touch_h_dp`
+  in the evidence: the extra touch area is not reserved, so a neighbour or a clip
+  can take it and the visible control stays small.
 - **Clipping:** a dimension where the node touches the edge of a scroll container
   (or runs into the window's right/bottom edge) is probably clipped. If only clipped
   dimensions are small the finding is `info` ("scroll it into view and re-lint").
@@ -91,7 +98,8 @@ description), else its `labeledBy` target. A descendant that takes its own focus
   it is applied *after* (inside) `clickable`. View: `android:minWidth/minHeight` or
   padding on the clickable view itself. A `TouchDelegate` helps users but is not
   reflected in accessibility bounds, so this rule still reports it.
-- **Evidence:** `w_dp`, `h_dp`, `min_dp`, `floor_dp`, `standard`, `clipped_axes`.
+- **Evidence:** `w_dp`, `h_dp`, `min_dp`, `floor_dp`, `standard`, `clipped_axes`,
+  `bounds_source` (and `touch_w_dp`/`touch_h_dp` for the Compose layout case).
 
 ### R3 `a11y.contrast.low` — text contrast below WCAG 1.4.3  (ATF TextContrast; the one pixel rule)
 - **Flags:** a visible, enabled, non-password node with its own text whose

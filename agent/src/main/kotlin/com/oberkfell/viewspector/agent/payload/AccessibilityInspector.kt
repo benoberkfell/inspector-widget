@@ -709,6 +709,10 @@ object AccessibilityInspector {
         b.a11YDataSensitive = bool { node.isAccessibilityDataSensitive }
         b.requestInitialFocus = bool { node.hasRequestInitialAccessibilityFocus() }
         b.isTraversalGroup = traversalGroup(node, ident, ctx)
+        composeLayoutSize(ident, ctx)?.let { (w, h) ->
+            b.layoutSizeW = w
+            b.layoutSizeH = h
+        }
 
         // importantForAccessibility — from the backing View for a real View node; for a
         // virtual node (no View of its own) fall back to the ANI predicate.
@@ -913,15 +917,34 @@ object AccessibilityInspector {
                 false
             }
         }
-        val view = ident.view ?: return false
-        if (!ComposeInspector.isAndroidComposeView(view)) return false
-        val index = if (ctx.composeIndex.containsKey(view)) {
+        val index = composeIndexOf(ident, ctx) ?: return false
+        val semId = if (ident.virtualId == HOST_VIEW_ID) index.rootSemanticsId else ident.virtualId
+        return semId in index.traversalGroups
+    }
+
+    /** The semantics index of the AndroidComposeView behind [ident], or null for other nodes. */
+    private fun composeIndexOf(ident: Ident, ctx: Ctx): ComposeInspector.SemanticsIndex? {
+        val view = ident.view ?: return null
+        if (!ComposeInspector.isAndroidComposeView(view)) return null
+        return if (ctx.composeIndex.containsKey(view)) {
             ctx.composeIndex[view]
         } else {
             ComposeInspector.semanticsIndex(view).also { ctx.composeIndex[view] = it }
-        } ?: return false
-        val semId = if (ident.virtualId == HOST_VIEW_ID) index.rootSemanticsId else ident.virtualId
-        return semId in index.traversalGroups
+        }
+    }
+
+    /**
+     * layout_size_w/h for a Compose virtual node: the measured size of its LayoutNode (px). A
+     * Compose node reports no ExtraRenderingInfo, and its boundsInScreen are its touch bounds,
+     * which Compose widens to the minimum touch size for any clickable; this is the space the
+     * node actually reserves (Modifier.minimumInteractiveComponentSize() included), so the lint
+     * can tell a 48dp Material control from a 24dp clickable. Null for View nodes, the
+     * AndroidComposeView's own node, and Compose's synthetic role/contentDescription nodes.
+     */
+    private fun composeLayoutSize(ident: Ident, ctx: Ctx): Pair<Int, Int>? {
+        if (ident.virtualId == HOST_VIEW_ID) return null
+        val packed = composeIndexOf(ident, ctx)?.layoutSizes?.get(ident.virtualId) ?: return null
+        return (packed ushr 32).toInt() to packed.toInt()
     }
 
     // ------------------------------------------------------------ reflection helpers

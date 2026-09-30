@@ -1012,3 +1012,27 @@ def test_r1_bare_switch_that_only_speaks_its_state_is_unlabeled():
                  b=(39, 686, 127, 117))
     rep2 = lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[named]))))
     assert of(rep2, "a11y.label.missing") == []
+
+
+def test_r2_48dp_target_rounded_to_116px_passes():
+    b = comp(20, 39, flags=CLICK, cd="Delete", b=(1940, 1060, 116, 116))
+    rep = lint(screen(decor(1, view(20, ACV, b=(0, 0, 2076, 2152), kids=[b]))), density=390)
+    assert of(rep, "a11y.touch_target.small") == []
+
+
+def test_r2_compose_small_layout_behind_widened_touch_bounds_warns():
+    # Modifier.size(32.dp).clickable: touch bounds widened to 48dp, layout 32dp.
+    bare = comp(20, 29, flags=CLICK, cd="32dp button", b=(20, 666, 117, 117),
+                layout_size={"w": 78, "h": 78})
+    # Material IconButton / Checkbox: minimumInteractiveComponentSize reserves 48dp.
+    material = comp(20, 25, flags=CLICK, cd="Add", b=(20, 900, 117, 117),
+                    layout_size={"w": 117, "h": 117})
+    host = view(20, ACV, b=(0, 0, 2076, 2152), kids=[bare, material], provider_class=ACV)
+    f = of(lint(screen(decor(1, host)), density=390), "a11y.touch_target.small")
+    assert [(x.node_key, x.severity) for x in f] == [("compose:20:29", "warn")]
+    assert f[0].evidence["w_dp"] == 32.0 and f[0].evidence["touch_w_dp"] == 48.0
+    assert "minimumInteractiveComponentSize" in f[0].message
+    # a View's layout_size (LayoutParams) never overrides its real touch bounds
+    v = view(30, "android.widget.ImageButton", flags=CLICK, cd="Info", b=(20, 1200, 117, 117),
+             layout_size={"w": 59, "h": 59})
+    assert of(lint(screen(decor(1, v)), density=390), "a11y.touch_target.small") == []
