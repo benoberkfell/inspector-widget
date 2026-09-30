@@ -1051,6 +1051,9 @@ class FakeDevice:
         self.logcats: List["FakeProcess"] = []
         self.on_input: Optional[Callable[[List[str]], None]] = None
         self.on_broadcast: Optional[Callable[[str], None]] = None
+        self.files: Dict[str, str] = {}             # /sdcard files (uiautomator dumps)
+        self.uiautomator_while_on = 0               # UiAutomation while TalkBack ran
+        self.uinputs: List["FakeUinput"] = []
 
     # ---- setup ------------------------------------------------------------- #
     def add_app(self, package: str, pid: Optional[int], debuggable: bool = True) -> FakeApp:
@@ -1282,8 +1285,23 @@ class FakeDevice:
             self.input_log.append(toks[1:])
             if toks[1:] == ["keyevent", "KEYCODE_BACK"]:
                 self.back()
+            elif toks[1:2] == ["tap"] and tb is not None and self.top == tb.PREFS:
+                tb.prefs_tap(int(toks[2]), int(toks[3]))
             if self.on_input is not None:
                 self.on_input(toks[1:])
+            return 0, "", ""
+        if toks[:2] == ["uiautomator", "dump"] and len(toks) == 3:
+            if tb is not None and tb.running:
+                self.uiautomator_while_on += 1  # a UiAutomation connection suppresses TalkBack
+                tb.set_focus(None)
+            self.files[toks[2]] = tb.ui_xml() if tb is not None else "<hierarchy/>"
+            return 0, f"UI hierchary dumped to: {toks[2]}\n", ""
+        if toks[:1] == ["cat"] and len(toks) == 2 and toks[1].startswith("/sdcard/"):
+            if toks[1] not in self.files:
+                return 1, "", f"cat: {toks[1]}: No such file or directory"
+            return 0, self.files[toks[1]], ""
+        if toks[:2] == ["rm", "-f"] and len(toks) == 3:
+            self.files.pop(toks[2], None)
             return 0, "", ""
         if toks[:2] == ["am", "broadcast"]:
             args = " ".join(toks[2:])
@@ -1296,11 +1314,18 @@ class FakeDevice:
             if comp in self.activity_stack:
                 self.activity_stack.remove(comp)
             self.activity_stack.append(comp)
+            if tb is not None and comp == tb.PREFS:
+                tb.prefs_screen = "dev"
             return 0, f"Starting: Intent {{ cmp={comp} }}\n", ""
         return None
 
     def back(self) -> None:
-        """System BACK: pops the top activity (never the last one)."""
+        """System BACK: closes an open settings dialog, else pops the top activity
+        (never the last one)."""
+        tb = self.talkback
+        if tb is not None and self.top == tb.PREFS and tb.prefs_screen != "dev":
+            tb.prefs_screen = "dev"
+            return
         if len(self.activity_stack) > 1:
             self.activity_stack.pop()
 
@@ -1487,10 +1512,12 @@ class FakeDevice:
             agent.serve(conn)
 
     def popen(self, args: List[str]) -> "FakeProcess":
-        if args == ["shell", "uinput", "-"]:
+        if args in (["shell", "uinput", "-"], ["shell", "-T", "uinput", "-"]):
             if not self.uinput_available:
                 return FakeProcess.exited(127, b"/system/bin/sh: uinput: inaccessible or not found")
-            return FakeUinput(self).proc
+            u = FakeUinput(self)
+            self.uinputs.append(u)
+            return u.proc
         if args[:1] == ["logcat"]:
             proc = FakeProcess(None)
             self.logcats.append(proc)
@@ -1629,8 +1656,8 @@ class FakeUinput:
                 obj, _ = dec.raw_decode(text)
                 self.commands.append(obj)
                 reply = self.handle(obj)
-                if reply is not None:
-                    proc.emit((json.dumps(reply) + "\n").encode())
+                if reply is not None:  # like uinput: a bare object, no newline
+                    proc.emit(json.dumps(reply).encode())
         finally:
             with self.device._lock:
                 for name in self.names.values():
@@ -1647,7 +1674,7 @@ class FakeUinput:
             for i in range(0, len(ev), 3):
                 self._event(ev[i], ev[i + 1], ev[i + 2])
         elif cmd == "sync":
-            return {"id": obj["id"], "result": "sync", "syncToken": obj["syncToken"]}
+            return {"reason": "sync", "id": obj["id"], "syncToken": obj["syncToken"]}
         return None
 
     def _event(self, etype: str, code: str, value: int) -> None:
@@ -1710,11 +1737,15 @@ class FakeTalkBack:
     PACKAGE = "com.google.android.marvin.talkback"
     COMPONENT = f"{PACKAGE}/com.google.android.marvin.talkback.TalkBackService"
     TRAINING = f"{PACKAGE}/com.google.android.accessibility.talkback.trainingcommon.TrainingActivity"
+    PERMISSION = ("com.google.android.permissioncontroller/"
+                  "com.android.permissioncontroller.permission.ui.GrantPermissionsActivity")
+    PREFS = f"{PACKAGE}/com.android.talkback.TalkBackPreferencesActivity"
+    LEVELS = ("NONE", "ASSERT", "ERROR", "WARN", "INFO", "DEBUG", "VERBOSE")
 
     def __init__(self, device: "FakeDevice", order: Sequence[Target] = (), version: str = "17.0.0",
                  installed: bool = True, keymap: str = "enhanced", pid: int = 7777,
                  verbose_log: bool = False, training_on_start: bool = False,
-                 grant_on_start: bool = False) -> None:
+                 grant_on_start: bool = False, permission_on_start: bool = True) -> None:
         self.device = device
         self.order: List[Target] = list(order)
         self.version = version
@@ -1724,6 +1755,10 @@ class FakeTalkBack:
         self.verbose_log = verbose_log
         self.training_on_start = training_on_start
         self.grant_on_start = grant_on_start
+        # The Accessibility Suite asks for POST_NOTIFICATIONS on EVERY service start.
+        self.permission_on_start = permission_on_start
+        self.log_level = "ERROR"      # Developer settings > Log output level
+        self.prefs_screen = "dev"     # dev | levels | confirm (TalkBackPreferencesActivity)
         self.focus: Optional[Target] = None
         self.edge = False
         self.presses: List[str] = []
@@ -1750,11 +1785,16 @@ class FakeTalkBack:
             s["touch_exploration_enabled"] = "1"
             if self.grant_on_start:
                 s["touch_exploration_granted_accessibility_services"] = self.COMPONENT
+            # TalkBack reads its log level when it binds.
+            self.verbose_log = self.verbose_log or self.log_level == "VERBOSE"
             if self.training_on_start and self.starts == 1:
                 self.device.activity_stack.append(self.TRAINING)
+            if self.permission_on_start:
+                self.device.activity_stack.append(self.PERMISSION)
         elif not self.running and self.was_running:
             self.was_running = False
             s["touch_exploration_enabled"] = "0"
+            self.verbose_log = False
             self.set_focus(None)
 
     def combo_action(self, mods: Tuple[str, ...], key: str) -> Optional[str]:
@@ -1766,6 +1806,56 @@ class FakeTalkBack:
             "classic": {(("LEFTALT",), "RIGHT"): "next", (("LEFTALT",), "LEFT"): "prev"},
         }[self.keymap]
         return table.get((mods, key))
+
+    # ---- TalkBack's settings screen (driven with uiautomator + input tap) --- #
+    def _ui_elements(self) -> List[Tuple[str, Tuple[int, int, int, int], bool, int]]:
+        """(text, (x1, y1, x2, y2), checked, group) of what the screen shows."""
+        els = [("Developer settings", (48, 300, 900, 400), False, 0),
+               ("Diagnosis mode", (48, 600, 900, 660), False, 1),
+               ("Log output level", (48, 2610, 700, 2660), False, 9),
+               (self.log_level, (48, 2670, 400, 2720), False, 9)]
+        if self.prefs_screen == "levels":
+            els.append(("Log output level", (100, 1150, 900, 1230), False, 20))
+            for i, lv in enumerate(self.LEVELS):
+                els.append((lv, (100, 1250 + i * 100, 1180, 1340 + i * 100), lv == self.log_level, 21))
+        elif self.prefs_screen == "confirm":
+            els += [("Verbose logs may contain personal information. Do you want to enable "
+                     "verbose logging?", (100, 1200, 1180, 1400), False, 30),
+                    ("Yes, enable verbose logging", (600, 1450, 1180, 1550), False, 30),
+                    ("Cancel", (100, 1450, 500, 1550), False, 30)]
+        return els
+
+    def ui_xml(self) -> str:
+        if self.device.top != self.PREFS:
+            return '<?xml version="1.0"?><hierarchy rotation="0"><node text="" bounds="[0,0][1280,2856]"/></hierarchy>'
+        groups: Dict[int, List[str]] = {}
+        for text, (x1, y1, x2, y2), checked, g in self._ui_elements():
+            groups.setdefault(g, []).append(
+                f'<node text="{text}" checked="{str(checked).lower()}" bounds="[{x1},{y1}][{x2},{y2}]"/>')
+        body = "".join(f'<node text="" bounds="[0,0][1280,2856]">{"".join(v)}</node>'
+                       for v in groups.values())
+        return f'<?xml version="1.0"?><hierarchy rotation="0">{body}</hierarchy>'
+
+    def prefs_tap(self, x: int, y: int) -> None:
+        hits = [(t, g) for t, (x1, y1, x2, y2), _c, g in self._ui_elements()
+                if x1 <= x < x2 and y1 <= y < y2]
+        if self.prefs_screen == "dev":
+            if any(t == "Log output level" for t, _g in hits):
+                self.prefs_screen = "levels"
+        elif self.prefs_screen == "levels":
+            picked = [t for t, g in hits if g == 21]
+            if picked:
+                if picked[0] == "VERBOSE" and self.log_level != "VERBOSE":
+                    self.prefs_screen = "confirm"
+                else:
+                    self.log_level = picked[0]
+                    self.prefs_screen = "dev"
+        elif self.prefs_screen == "confirm":
+            if any(t.startswith("Yes, enable verbose") for t, _g in hits):
+                self.log_level = "VERBOSE"
+                self.prefs_screen = "dev"
+            elif any(t == "Cancel" for t, _g in hits):
+                self.prefs_screen = "dev"
 
     # ---- focus ------------------------------------------------------------ #
     def set_focus(self, target: Optional[Target]) -> None:

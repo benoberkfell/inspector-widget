@@ -75,8 +75,11 @@ PROBE_ACTION = "next"
 # unconsumed, Meta+Right and Alt+Right just move input focus in the app.
 PROBES = frozenset({ENHANCED[PROBE_ACTION], CLASSIC[PROBE_ACTION]})
 
-HOLD_MS = 30      # key down -> up
-GAP_MS = 15       # between modifier and key transitions
+# Zero by default: one inject carries the whole combo. Measured on TalkBack 17 (50
+# presses each): zero gaps moved focus 50/50 with a 1-3ms ack; 25ms gaps also moved
+# 50/50 but took ~100ms to ack. Non-zero values split the combo into timed injects.
+HOLD_MS = 0       # key down -> up
+GAP_MS = 0        # between modifier and key transitions
 REGISTER_WAIT_S = 5.0
 SYNC_TIMEOUT_S = 3.0
 
@@ -176,14 +179,22 @@ class Injector:
         pass
 
     def __enter__(self) -> "Injector":
-        return self.open()
+        # open_injector() hands back an injector that is already open.
+        return self if self.registered_ms is not None else self.open()
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
 
 class _UinputProcess:
-    """One ``uinput -`` process: JSON commands in, sync acks out."""
+    """One ``uinput -`` process: JSON commands in, sync acks out.
+
+    uinput writes its replies as bare JSON objects with NO trailing newline
+    (``{"reason":"sync","id":1,"syncToken":"s1"}``), so the reader decodes a
+    byte stream with ``raw_decode`` instead of reading lines. ``register`` is
+    not acknowledged at all: :meth:`start` polls ``dumpsys input`` for the name.
+    A sync must carry the device's own id.
+    """
 
     def __init__(self, serial: str, dev_id: int, name: str) -> None:
         self.serial = serial
@@ -197,7 +208,7 @@ class _UinputProcess:
     def start(self, register: Dict[str, Any], wait_s: float = REGISTER_WAIT_S) -> int:
         t0 = time.monotonic()
         try:
-            self.proc = device.popen(self.serial, ["shell", "uinput", "-"])
+            self.proc = device.popen(self.serial, ["shell", "-T", "uinput", "-"])
         except OSError as exc:
             raise InjectorError(f"could not start adb for uinput: {exc}") from exc
         threading.Thread(target=self._reader, name=f"uinput-{self.dev_id}", daemon=True).start()
@@ -335,12 +346,21 @@ class UinputKeyboard(Injector):
         t0 = time.monotonic()
         d = KEYBOARD_ID
         cmds: List[Dict[str, Any]] = [{"id": d, "command": "updateTimeBase"}]
-        for m in mods:
-            cmds += [_inject(d, ["EV_KEY", m, 1] + _SYN), _delay(d, self.gap_ms)]
-        cmds += [_inject(d, ["EV_KEY", key, 1] + _SYN), _delay(d, self.hold_ms),
-                 _inject(d, ["EV_KEY", key, 0] + _SYN), _delay(d, self.gap_ms)]
-        for m in reversed(mods):
-            cmds += [_inject(d, ["EV_KEY", m, 0] + _SYN), _delay(d, self.gap_ms)]
+        if not (self.gap_ms or self.hold_ms):
+            events: List[Any] = []
+            for m in mods:
+                events += ["EV_KEY", m, 1] + _SYN
+            events += ["EV_KEY", key, 1] + _SYN + ["EV_KEY", key, 0] + _SYN
+            for m in reversed(mods):
+                events += ["EV_KEY", m, 0] + _SYN
+            cmds.append(_inject(d, events))
+        else:
+            for m in mods:
+                cmds += [_inject(d, ["EV_KEY", m, 1] + _SYN), _delay(d, self.gap_ms)]
+            cmds += [_inject(d, ["EV_KEY", key, 1] + _SYN), _delay(d, self.hold_ms),
+                     _inject(d, ["EV_KEY", key, 0] + _SYN), _delay(d, self.gap_ms)]
+            for m in reversed(mods):
+                cmds += [_inject(d, ["EV_KEY", m, 0] + _SYN), _delay(d, self.gap_ms)]
         self._dev.send(cmds)
         self._dev.sync()
         ms = int((time.monotonic() - t0) * 1000)

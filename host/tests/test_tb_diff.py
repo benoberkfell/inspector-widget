@@ -243,3 +243,21 @@ def test_compact_stays_within_the_byte_budget_with_long_speech():
     out = tbwalk.compact(rec, max_lines=60, max_bytes=5000)
     assert len(json.dumps(out, ensure_ascii=False).encode()) <= 5000
     assert out["steps"] == 60 and len(out["lines"]) <= 60
+
+
+def test_a_reminted_lazy_id_still_counts_as_the_predicted_stop():
+    items = _column(3)
+    steps = [step(0, items[0][0], items[0][1], items[0][2], via="start"),
+             step(1, "compose:7:759", items[1][1], items[1][2], pkey=items[1][0]),
+             step(2, items[2][0], items[2][1], items[2][2]), edge(3, items[2][0])]
+    res = diff.analyze(record(steps, [pstop(*it) for it in items], ended="edge"))
+    assert res["findings"] == [] and res["vs_model"]["agree"] == 2
+
+
+def test_same_node_by_signature_where_boxes_overlap():
+    from inspector_widget.talkback import walk as w
+    assert w.same_node("compose:7:141", "View|Row 3", (0, 100, 300, 80),
+                       "compose:7:759", "View|Row 3", (0, 102, 300, 80))
+    assert not w.same_node("compose:7:141", "View|Row 3", (0, 100, 300, 80),
+                           "compose:7:759", "View|Row 3", (0, 400, 300, 80))
+    assert not w.same_node("compose:7:1", "View|", (0, 0, 10, 10), "compose:7:2", "View|", (0, 0, 10, 10))

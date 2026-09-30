@@ -193,6 +193,11 @@ def _lis(seq: List[int]) -> List[int]:
 # --------------------------------------------------------------------------- #
 # The walk's first lap
 # --------------------------------------------------------------------------- #
+def _pk(s: Dict[str, Any]) -> Optional[str]:
+    """The model's key for a step: ``pkey`` when Compose re-minted the node's id."""
+    return s.get("pkey") or s.get("key")
+
+
 def _moves(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [s for s in steps if s.get("moved") and s.get("key") and not s.get("edge")
             and s.get("via") != "left_app"]
@@ -232,9 +237,9 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
     step = 1 if walk.get("direction", "next") == "next" else -1
     agree = differ = 0
     first = None
-    pos: Optional[int] = P.index(lap[0]["key"]) if lap and lap[0]["key"] in P else None
+    pos: Optional[int] = P.index(_pk(lap[0])) if lap and _pk(lap[0]) in P else None
     for s in lap[1:]:
-        k = s["key"]
+        k = _pk(s)
         exp_i = pos + step if pos is not None else None
         expected = P[exp_i] if exp_i is not None and 0 <= exp_i < len(P) else None
         if expected is not None and k == expected:
@@ -246,8 +251,8 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
                 first = (f"step {s['i']}: model " + (f"{exp['ref']} {_q(exp['label'])}" if exp else "(end)")
                          + f", actual {_name(s)}")
         pos = P.index(k) if k in P else None
-    visited = {s["key"] for s in _moves(walk["steps"])}
-    unpredicted = [s for s in lap if s["key"] not in P]
+    visited = {_pk(s) for s in _moves(walk["steps"])}
+    unpredicted = [s for s in lap if _pk(s) not in P]
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     unvisited = _unvisited(walk, P, visited, covered)
     vs = {"agree": agree, "differ": differ, "model": walk.get("model")}
@@ -288,7 +293,7 @@ def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows
 def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     P = [p["key"] for p in walk.get("predicted") or []]
     pref = {p["key"]: p for p in walk.get("predicted") or []}
-    visited = {s["key"] for s in _moves(walk["steps"])}
+    visited = {_pk(s) for s in _moves(walk["steps"])}
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     miss = _unvisited(walk, P, visited, covered)
     if not miss:

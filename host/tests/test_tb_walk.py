@@ -656,3 +656,17 @@ def test_walk_keys_are_the_a11y_node_keys():
         stack.extend(reversed(n.get("children") or []))
     assert [n.key for n in idx.order] == want
     assert any(k.startswith("compose:") for k in want)
+
+
+def test_remodel_matches_a_reminted_id_by_signature():
+    m = tbwalk.Model()
+    m.stops = [tbwalk.PStop("compose:7:141", "Row 3", "Row 3", (0, 100, 300, 80), 1, "View")]
+    assert m.match("compose:7:759", "View|Row 3", (0, 101, 300, 80)).key == "compose:7:141"
+    assert m.match("compose:7:760", "View|Row 3", (0, 900, 300, 80)) is None
+
+
+def test_utterance_logcat_turns_verbose_logging_on_and_back_off(probe):
+    res = walk(probe, utterance="logcat")
+    assert res["utterance"].startswith("logcat ")
+    assert probe.talkback.log_level == "ERROR" and probe.uiautomator_while_on == 0
+    assert res["lines"][2] == '2. view:1020 Button "Item 0. Button"'

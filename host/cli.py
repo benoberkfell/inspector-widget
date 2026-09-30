@@ -467,7 +467,8 @@ def cmd_detach(args) -> int:
 def cmd_talkback(args) -> int:
     """TalkBack status / on / off / restore (device-wide)."""
     from inspector_widget.talkback import device as tbdevice
-    out = tbdevice.action(args.serial, args.action, package=args.package)
+    out = tbdevice.action(args.serial, args.action, package=args.package,
+                          verbose_log=args.verbose_log)
     print(json.dumps(out, indent=2, default=str))
     if args.action == "on" and out.get("changed"):
         print("note: TalkBack stays on (device-wide) until `inspector-widget talkback restore`",
@@ -736,6 +737,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_serial_arg(sp)
     sp.add_argument("--package", default=None,
                     help="on: the app that must stay in the foreground")
+    sp.add_argument("--verbose-log", action="store_true",
+                    help="on: set TalkBack's log level to VERBOSE first (restore puts it back)")
     sp.set_defaults(func=cmd_talkback)
 
     sp = sub.add_parser("tb-walk", help="drive the real TalkBack (DEVICE-WIDE) through the app and "

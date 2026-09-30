@@ -18,7 +18,10 @@ Node identity: bounds are NOT part of it (they change while a list scrolls).
 With the agent's per-View ids the key is the typed node key (``view:<id>``,
 ``compose:<host>:<semanticsId>``); an agent that still reports the root's id
 for every node (ledger A1) gets ``legacy:<window>:<host>:<virtual>:<class>:<label>``.
-:func:`node_key` is the one place to change when captures supply refs.
+:func:`node_key` is the one place to change when captures supply refs. Compose
+re-mints the semantics ids of lazy items it re-creates (scrolled away and
+back), so a node the model knows under another key is matched by its
+signature (class + label) where the boxes overlap (:func:`same_node`).
 
 Utterances: TalkBack's verbose logcat (Developer settings > Log output level:
 Verbose, set in TalkBack's own UI) carries the exact announcement
@@ -86,6 +89,10 @@ class Node:
     def simple_cls(self) -> str:
         return self.cls.rsplit(".", 1)[-1].rsplit("$", 1)[-1]
 
+    @property
+    def sig(self) -> str:
+        return signature(self.cls, self.label)
+
     def ancestors(self) -> Iterator["Node"]:
         p = self.parent
         while p is not None:
@@ -125,6 +132,31 @@ def _label(text: str, cd: str, kids: Sequence[Tuple[str, str]]) -> str:
     if own:
         return own
     return " | ".join(t for t in ((kt or kc) for kt, kc in kids) if t)
+
+
+def iou(a: Rect, b: Rect) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    w = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    h = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = w * h
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def signature(cls: str, label: str) -> str:
+    """Identity without ids or bounds: the class and the label."""
+    return f"{cls.rsplit('.', 1)[-1]}|{label}"
+
+
+def same_node(key_a: Optional[str], sig_a: str, box_a: Rect,
+              key_b: Optional[str], sig_b: str, box_b: Rect, min_iou: float = 0.8) -> bool:
+    """The same node: the same key, or (a re-minted Compose id) the same
+    signature where the boxes overlap."""
+    if key_a is not None and key_a == key_b:
+        return True
+    labelled = bool(sig_a) and not sig_a.endswith("|")  # unlabelled nodes all look alike
+    return labelled and sig_a == sig_b and iou(box_a, box_b) >= min_iou
 
 
 def node_key(window: int, host: int, virtual: int, cls: str, label: str,
@@ -422,6 +454,10 @@ class PStop:
     window: int
     cls: str
 
+    @property
+    def sig(self) -> str:
+        return signature(self.cls, self.label)
+
 
 def _window_of(roots: List[Tuple[int, Dict[str, Any]]]) -> Dict[int, int]:
     out: Dict[int, int] = {}
@@ -521,6 +557,7 @@ class Model:
         self.source = ""
         self.remodels = 0
         self.covered_windows: Dict[int, int] = {}
+        self.aliases: Dict[str, str] = {}  # a re-minted key -> the key the model has
 
     def build(self, resp: Any, legacy: bool) -> None:
         self.stops, self.source, meta = predict(resp, legacy)
@@ -535,16 +572,33 @@ class Model:
         keys = [s.key for s in self.stops]
         prev: Optional[str] = None
         for s in new:
-            if s.key not in keys:
-                at = keys.index(prev) + 1 if prev in keys else len(keys)
-                keys.insert(at, s.key)
-                self.stops.insert(at, s)
+            known = self.match(s.key, s.sig, s.bounds)
+            if known is not None:
+                if known.key != s.key:
+                    self.aliases[s.key] = known.key
+                prev = known.key
+                continue
+            at = keys.index(prev) + 1 if prev in keys else len(keys)
+            keys.insert(at, s.key)
+            self.stops.insert(at, s)
             prev = s.key
 
+    def match(self, key: Optional[str], sig: str, box: Rect) -> Optional[PStop]:
+        """The model's stop for a node: by key (or alias), else by signature + overlap."""
+        key = self.aliases.get(key, key) if key else key
+        for s in self.stops:
+            if s.key == key:
+                return s
+        for s in self.stops:
+            if same_node(None, sig, box, None, s.sig, s.bounds):
+                return s
+        return None
+
     def keys(self) -> List[str]:
-        return [s.key for s in self.stops]
+        return [s.key for s in self.stops] + list(self.aliases)
 
     def get(self, key: str) -> Optional[PStop]:
+        key = self.aliases.get(key, key)
         for s in self.stops:
             if s.key == key:
                 return s
@@ -597,8 +651,11 @@ class Driver:
         self._lock_cm = device.device_lock(self.serial, self.what)
         self._lock_cm.__enter__()
         try:
-            self.enabled = device.enable(self.serial, self.package)
+            self.enabled = device.enable(self.serial, self.package,
+                                         verbose_log=self.utterance == "logcat")
             self.turned_on = bool(self.enabled.get("changed"))
+            if isinstance(self.enabled.get("log_level"), str):
+                self.notes.append(f"log level {self.enabled['log_level']}")
             if self.enabled.get("warning_foreground"):
                 self.notes.append(self.enabled["warning_foreground"])
             self._wait_services_on()
@@ -770,7 +827,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
         prev_idx = cur.index
         transitions: Dict[Tuple[Optional[str], Optional[str]], int] = {}
         last_edge_at = -1
-        first_key = cur.key
+        first: Optional[Node] = cur.focus  # the lap is complete when focus is back here
         no_moves = 0
         for i in range(max_steps):
             if time.monotonic() >= deadline:
@@ -795,7 +852,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                 elif cur.key is not None:
                     steps.append(Step(len(steps), pre.key, via="stolen", node=pre.focus, t=pre.t))
                 cur, prev_idx = pre, pre.index
-                first_key = first_key or cur.key
+                first = first or cur.focus
             t_sent, _send_ms = drv.press(direction)
             w = drv.wait(cur.key, t_sent)
             new = w.snap
@@ -845,8 +902,10 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             seen_at = transitions.get(tr)
             transitions[tr] = len(steps) - 1
             cur, prev_idx = new, new.index
-            first_key = first_key or cur.key
-            if until == "wrap" and last_edge_at >= 0 and new.key == first_key:
+            first = first or cur.focus
+            if until == "wrap" and last_edge_at >= 0 and first is not None and new.focus is not None \
+                    and same_node(first.key, first.sig, first.bounds,
+                                  new.key, new.focus.sig, new.focus.bounds):
                 ended = "wrap"
                 break
             if seen_at is not None and until != "steps":
@@ -1024,7 +1083,7 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
         if s.i in tts:
             speak, utt = tts[s.i], "logcat"
         elif s.key is not None:
-            p = model.get(s.key)
+            p = model.match(s.key, s.node.sig, s.node.bounds) if s.node else model.get(s.key)
             speak = (p.speak if p is not None else "") or (s.node.speech() if s.node else "")
         rect = None
         if s.node is not None:
@@ -1035,6 +1094,11 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
                 win_rects[s.node.window] = root.bounds
             rect = win_rects[s.node.window]
         rec = _step_record(s, ref_of(s.key), speak, utt, rect)
+        if s.node is not None:
+            rec["sig"] = s.node.sig
+            known = model.match(s.key, s.node.sig, s.node.bounds)
+            if known is not None and known.key != s.key:
+                rec["pkey"] = known.key  # the model's key for this node (a re-minted id)
         if rec.get("covered_by"):
             rec["covered_by"]["ref"] = ref_of(rec["covered_by"]["overlay"])
         if s.node is not None and s.node.window in model.covered_windows:

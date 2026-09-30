@@ -137,7 +137,8 @@ def test_restore_that_does_not_stick_keeps_the_snapshot(tb_env, monkeypatch):
 def test_tutorial_is_dismissed_with_back(tb_env):
     tb_env.talkback.training_on_start = True
     out = tbdevice.enable(SERIAL, fakeagent.DEFAULT_PACKAGE)
-    assert out["dismissed"] == [fakeagent.FakeTalkBack.TRAINING]
+    # the POST_NOTIFICATIONS dialog (every start) sits on the tutorial (first start)
+    assert out["dismissed"] == [fakeagent.FakeTalkBack.PERMISSION, fakeagent.FakeTalkBack.TRAINING]
     assert tb_env.top.startswith(fakeagent.DEFAULT_PACKAGE + "/")
     assert ["keyevent", "KEYCODE_BACK"] in tb_env.input_log
 
@@ -153,7 +154,7 @@ def test_app_not_in_front_after_enable_rolls_back(tb_env):
 
 
 def test_app_covered_during_enable_is_brought_back_to_front(tb_env, monkeypatch):
-    def covered(serial, top_before=None, tries=3):
+    def covered(serial, top_before=None):
         tb_env.activity_stack.append("com.example.popup/.Nag")
         return []
 
@@ -230,6 +231,7 @@ def test_uinput_keyboard_registers_and_next_reaches_talkback(tb_env):
         inj.press("next")
     assert tb_env.key_log == [("LEFTMETA", "RIGHT", True)]
     assert tb_env.talkback.focus == fakeagent.TB_TITLE
+    assert len(tb_env.uinputs) == 1  # one uinput process per injector
     assert tbinject.KEYBOARD_NAME not in tb_env.input_devices  # closed: device removed
     assert tbdevice.INJECTOR_STATUS[SERIAL]["uinput"].startswith("ok")
     assert fakeagent.key_safety_violations(tb_env) == []
@@ -312,3 +314,68 @@ def test_mutation_lone_meta_is_caught(tb_env, monkeypatch):
         inj.mark_proven()
         inj._send_combo((), "KEY_LEFTMETA", None)
     assert fakeagent.key_safety_violations(tb_env) == ["1 lone Meta tap(s)"]
+
+
+# --------------------------------------------------------------------------- #
+# uinput protocol details seen on the device
+# --------------------------------------------------------------------------- #
+def test_a_press_is_one_zero_gap_inject_and_syncs_on_the_device_id(tb_env):
+    _on(tb_env)
+    with tbinject.open_injector(SERIAL) as inj:
+        inj.press("next")
+    [u] = tb_env.uinputs
+    injects = [c for c in u.commands if c["command"] == "inject"]
+    assert injects == [{"id": 1, "command": "inject", "events": [
+        "EV_KEY", "KEY_LEFTMETA", 1, "EV_SYN", "SYN_REPORT", 0,
+        "EV_KEY", "KEY_RIGHT", 1, "EV_SYN", "SYN_REPORT", 0,
+        "EV_KEY", "KEY_RIGHT", 0, "EV_SYN", "SYN_REPORT", 0,
+        "EV_KEY", "KEY_LEFTMETA", 0, "EV_SYN", "SYN_REPORT", 0]}]
+    assert not [c for c in u.commands if c["command"] == "delay"]
+    assert all(c["id"] == 1 for c in u.commands if c["command"] == "sync")
+    assert ["popen", "shell", "-T", "uinput", "-"] in tb_env.adb_log
+
+
+# --------------------------------------------------------------------------- #
+# TalkBack's log level, through its settings screen (TalkBack off only)
+# --------------------------------------------------------------------------- #
+def test_on_with_verbose_log_sets_the_level_first_and_restore_puts_it_back(tb_env, monkeypatch):
+    seen = {}
+    real_tap = tbdevice._tap
+
+    def tap(serial, node):
+        seen.setdefault("snap_at_first_tap", json.load(open(_state_file(tb_env))))
+        seen.setdefault("running_at_first_tap", tb_env.talkback.running)
+        real_tap(serial, node)
+
+    monkeypatch.setattr(tbdevice, "_tap", tap)
+    out = tbdevice.action(SERIAL, "on", verbose_log=True)
+    assert out["log_level"] == {"before": "ERROR", "after": "VERBOSE"}
+    # crash-safe: the old level is on disk before the first tap, with TalkBack still off
+    assert seen["snap_at_first_tap"]["log_level"] == "ERROR"
+    assert seen["running_at_first_tap"] is False
+    assert tb_env.talkback.verbose_log is True        # read when the service bound
+    assert tb_env.uiautomator_while_on == 0
+    assert tb_env.top.startswith(fakeagent.DEFAULT_PACKAGE + "/")
+    assert tbdevice.status(SERIAL)["saved"]["log_level"] == "ERROR"
+    assert tbdevice.action(SERIAL, "restore")["restored"] is True
+    assert tb_env.talkback.log_level == "ERROR" and tb_env.uiautomator_while_on == 0
+    assert not os.path.exists(_state_file(tb_env))
+
+
+def test_log_level_is_never_changed_while_talkback_runs(tb_env):
+    tbdevice.action(SERIAL, "on")
+    with pytest.raises(tbdevice.TalkBackError) as err:
+        tbdevice.set_log_level(SERIAL, "VERBOSE")
+    assert err.value.code == "talkback_on"
+    out = tbdevice.enable(SERIAL, verbose_log=True)  # already on: level left alone
+    assert out["changed"] is False and "unchanged" in out["log_level"]
+    assert tb_env.uiautomator_while_on == 0 and tb_env.talkback.log_level == "ERROR"
+    tbdevice.action(SERIAL, "restore")
+
+
+def test_verbose_already_set_is_left_as_it_was(tb_env):
+    tb_env.talkback.log_level = "VERBOSE"
+    out = tbdevice.action(SERIAL, "on", verbose_log=True)
+    assert out["log_level"] == {"before": "VERBOSE", "after": "VERBOSE"}
+    tbdevice.action(SERIAL, "restore")
+    assert tb_env.talkback.log_level == "VERBOSE"

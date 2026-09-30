@@ -22,9 +22,14 @@ bracketed by a snapshot:
 * Snapshots this process created are restored by :func:`restore_owned`, which
   the MCP server runs at exit.
 
-Nothing here uses UiAutomation (``uiautomator dump``/``events``): while
-TalkBack runs, a UiAutomation connection suppresses it and clears its focus.
-Nothing here runs ``adb root`` either (it restarts adbd and drops every
+TalkBack's log level (Developer settings > Log output level; VERBOSE puts the
+exact announcements in logcat) is not an adb-settable preference on a user
+build. :func:`set_log_level` changes it through TalkBack's own settings screen,
+finding the rows with ``uiautomator dump``, which is ONLY safe while TalkBack
+is off (a UiAutomation connection suppresses TalkBack and clears its focus), so
+it refuses to run while TalkBack is on. The previous level goes into the same
+snapshot, before the change, and :func:`restore` puts it back after TalkBack is
+off again. Nothing here runs ``adb root`` (it restarts adbd and drops every
 forward).
 
 The long-lived processes the driver needs (``uinput -`` and ``logcat``) are
@@ -74,8 +79,16 @@ STATE_VERSION = 1
 ENABLE_WAIT_S = 5.0     # touch exploration comes on ~0.2-2.5s after the settings change
 START_SETTLE_S = 1.0    # TalkBack's own start-up (tutorial, service connection)
 RESTORE_WAIT_S = 5.0
-DISMISS_WAIT_S = 0.6    # after BACK on TalkBack's tutorial
+DISMISS_WAIT_S = 0.6    # after BACK on TalkBack's tutorial / permission dialog
+DISMISS_POLL_S = 0.4
+DISMISS_WINDOW_S = 3.0  # the permission dialog can come a second or two after start
 REFRONT_WAIT_S = 0.8    # after bringing the app back to the front
+UI_WAIT_S = 0.8         # after opening/tapping TalkBack's settings screens
+
+TB_PREFS_ACTIVITY = f"{TALKBACK_PACKAGE}/com.android.talkback.TalkBackPreferencesActivity"
+TB_DEV_FRAGMENT = "com.google.android.accessibility.talkback.preference.base.DeveloperPrefFragment"
+LOG_LEVELS = ("NONE", "ASSERT", "ERROR", "WARN", "INFO", "DEBUG", "VERBOSE")
+_UI_DUMP = "/sdcard/iw_tb_ui.xml"
 
 _FLAG_ACTIVITY_REORDER_TO_FRONT = "0x00020000"
 
@@ -120,6 +133,13 @@ def _safe(serial: str) -> str:
 
 def state_path(serial: str) -> str:
     return os.path.join(store_root(), "talkback", f"{_safe(serial)}.json")
+
+
+def _update_snapshot(serial: str, **fields: Any) -> None:
+    snap = load_snapshot(serial)
+    if snap is not None:
+        snap.update(fields)
+        _write_json_atomic(state_path(serial), snap)
 
 
 def _write_json_atomic(path: str, obj: Dict[str, Any]) -> None:
@@ -328,13 +348,18 @@ def _wait(pred, timeout_s: float, interval_s: float = 0.1) -> bool:
         time.sleep(interval_s)
 
 
-def enable(serial: str, package: Optional[str] = None) -> Dict[str, Any]:
+def enable(serial: str, package: Optional[str] = None,
+           verbose_log: bool = False) -> Dict[str, Any]:
     """Turn TalkBack on (snapshot first; append the component; wait for touch
-    exploration; dismiss TalkBack's tutorial). Returns what it did.
+    exploration; dismiss TalkBack's tutorial and permission dialog). Returns
+    what it did.
 
     ``changed`` False means TalkBack was already on and nothing was touched.
     With ``package``, checks that app is still on top afterwards and brings it
-    back to the front (without recreating it) if TalkBack covered it.
+    back to the front (without recreating it) if TalkBack covered it. With
+    ``verbose_log``, TalkBack's log level is set to VERBOSE first (TalkBack
+    reads it when it binds); that needs TalkBack off, so an already-running
+    TalkBack keeps its level (``log_level`` says so).
     """
     t0 = time.monotonic()
     before = read_settings(serial)
@@ -346,6 +371,8 @@ def enable(serial: str, package: Optional[str] = None) -> Dict[str, Any]:
                                  "Android Accessibility Suite.")
     out: Dict[str, Any] = {"serial": serial, "talkback": "on", "version": version}
     if _on(before):
+        if verbose_log:
+            out["log_level"] = "unchanged: TalkBack was already on (the level can only change while it is off)"
         out.update(changed=False, took_ms=_ms(t0))
         return out
     top_before = top_activity(serial)
@@ -353,6 +380,14 @@ def enable(serial: str, package: Optional[str] = None) -> Dict[str, Any]:
     _snapshot(serial, before)
     with _OWNED_LOCK:
         _OWNED.add(serial)
+    if verbose_log and not talkback_in(before.get(SERVICES)):
+        try:
+            out["log_level"] = set_log_level(serial, "VERBOSE", record=True)
+        except Exception:
+            with contextlib.suppress(Exception):
+                restore(serial)
+            raise
+        top_before = top_activity(serial) if top_before is None else top_before
     services = before.get(SERVICES)
     if not talkback_in(services):
         services = ":".join(services_list(services) + [TALKBACK_COMPONENT])
@@ -380,19 +415,29 @@ def enable(serial: str, package: Optional[str] = None) -> Dict[str, Any]:
     return out
 
 
-def dismiss_talkback_activities(serial: str, top_before: Optional[str] = None,
-                                tries: int = 3) -> List[str]:
-    """Send BACK while TalkBack's tutorial (or the permission dialog it raises)
-    is on top. An injected BACK reaches the activity (it is not a TalkBack key)."""
+def dismiss_talkback_activities(serial: str, top_before: Optional[str] = None) -> List[str]:
+    """Send BACK while TalkBack's tutorial (first start) or the Accessibility
+    Suite's POST_NOTIFICATIONS dialog (EVERY service start; BACK leaves the
+    permission flags unchanged) is on top. The dialog can come a second or two
+    after touch exploration is on, so this watches for DISMISS_WINDOW_S and
+    stops early once one was dismissed and the top has stayed put. An injected
+    BACK reaches the activity (it is not a TalkBack key)."""
     dismissed: List[str] = []
-    for _ in range(tries):
+    deadline = time.monotonic() + DISMISS_WINDOW_S
+    calm = 0
+    while time.monotonic() < deadline:
         top = top_activity(serial)
-        if not top or top == top_before or not top.startswith(
+        if top and top != top_before and top.startswith(
                 tuple(p + "/" for p in _DISMISSABLE_PACKAGES)):
+            adb.shell(serial, "input keyevent KEYCODE_BACK")
+            dismissed.append(top)
+            calm = 0
+            time.sleep(DISMISS_WAIT_S)
+            continue
+        calm += 1
+        if dismissed and calm >= 2:
             break
-        adb.shell(serial, "input keyevent KEYCODE_BACK")
-        dismissed.append(top)
-        time.sleep(DISMISS_WAIT_S)
+        time.sleep(DISMISS_POLL_S)
     return dismissed
 
 
@@ -446,6 +491,15 @@ def restore(serial: str, wait_s: Optional[float] = None) -> Dict[str, Any]:
     now = read_settings(serial)
     mismatch = {k: {"want": want[k], "have": now[k]} for k in SNAPSHOT_KEYS
                 if not _equivalent(k, now[k], want[k])}
+    if not mismatch and snap.get("log_level_changed") and snap.get("log_level"):
+        # TalkBack is off again, so its settings screen can be driven safely.
+        try:
+            set_log_level(serial, snap["log_level"])
+        except Exception as exc:  # noqa: BLE001 - reported; the snapshot stays for a retry
+            raise TalkBackError("restore_failed",
+                                f"settings restored on {serial}, but TalkBack's log level could "
+                                f"not be put back to {snap['log_level']}: {exc}",
+                                hint="Run talkback restore again (TalkBack must stay off).") from exc
     if mismatch:
         raise TalkBackError("restore_failed",
                             f"could not restore the accessibility settings on {serial}: "
@@ -505,6 +559,128 @@ def restore_owned() -> List[Dict[str, Any]]:
     return results
 
 
+# --------------------------------------------------------------------------- #
+# TalkBack's log level, through its own settings screen (TalkBack OFF only)
+# --------------------------------------------------------------------------- #
+def _require_off(serial: str) -> None:
+    now = read_settings(serial)
+    on = (talkback_in(now.get(SERVICES)) and now.get(A11Y_ENABLED) == "1") \
+        or now.get(TOUCH_EXPLORATION) == "1"
+    if on:
+        raise TalkBackError("talkback_on", "TalkBack's log level can only be changed while "
+                                           "TalkBack is off (uiautomator would suppress it)",
+                            hint="talkback off first, or run the walk with utterance='auto'.")
+
+
+def _ui_nodes(serial: str) -> List[Dict[str, Any]]:
+    """The current screen from ``uiautomator dump`` (TalkBack must be off)."""
+    import xml.etree.ElementTree as ET
+    adb.shell(serial, f"uiautomator dump {_UI_DUMP}", check=False)
+    raw = adb.shell(serial, f"cat {_UI_DUMP}", check=False)
+    adb.shell(serial, f"rm -f {_UI_DUMP}", check=False)
+    start = raw.find("<")
+    if start < 0:
+        return []
+    try:
+        root = ET.fromstring(raw[start:])
+    except ET.ParseError:
+        return []
+    out: List[Dict[str, Any]] = []
+
+    def visit(el: Any, parent: Optional[int]) -> None:
+        idx = None
+        if el.tag == "node":
+            nums = [int(v) for v in re.findall(r"-?\d+", el.get("bounds", ""))]
+            x1, y1, x2, y2 = (nums + [0, 0, 0, 0])[:4]
+            idx = len(out)
+            out.append({"text": el.get("text", ""), "checked": el.get("checked") == "true",
+                        "center": ((x1 + x2) // 2, (y1 + y2) // 2), "parent": parent})
+        for child in el:
+            visit(child, idx if idx is not None else parent)
+
+    visit(root, None)
+    return out
+
+
+def _find(nodes: List[Dict[str, Any]], pattern: str) -> Optional[Dict[str, Any]]:
+    rx = re.compile(pattern)
+    return next((n for n in nodes if rx.search(n["text"])), None)
+
+
+def _tap(serial: str, node: Dict[str, Any]) -> None:
+    x, y = node["center"]
+    adb.shell(serial, f"input tap {x} {y}")
+    time.sleep(UI_WAIT_S)
+
+
+def _row_level(nodes: List[Dict[str, Any]]) -> Optional[str]:
+    """The summary under the 'Log output level' row (its sibling text)."""
+    title = _find(nodes, r"^Log output level$")
+    if title is None:
+        return None
+    for n in nodes:
+        if n is not title and n["parent"] == title["parent"] and n["text"] in LOG_LEVELS:
+            return n["text"]
+    return None
+
+
+def _close_prefs(serial: str) -> None:
+    for _ in range(4):
+        top = top_activity(serial) or ""
+        if not top.startswith(TALKBACK_PACKAGE + "/"):
+            return
+        adb.shell(serial, "input keyevent KEYCODE_BACK")
+        time.sleep(DISMISS_WAIT_S)
+
+
+def set_log_level(serial: str, level: str, record: bool = False) -> Dict[str, Any]:
+    """Set TalkBack's Log output level through its Developer settings screen.
+
+    TalkBack must be off (see the module docstring). With ``record``, the level
+    it had is written into the pending snapshot BEFORE it changes, so a crash
+    leaves enough for ``talkback restore``. Returns ``{"before", "after"}``.
+    """
+    level = level.upper()
+    if level not in LOG_LEVELS:
+        raise ValueError(f"log level must be one of {', '.join(LOG_LEVELS)}")
+    _require_off(serial)
+    adb.shell(serial, f"am start -n {TB_PREFS_ACTIVITY} --es FragmentName {TB_DEV_FRAGMENT}")
+    time.sleep(UI_WAIT_S)
+    try:
+        nodes = _ui_nodes(serial)
+        for _ in range(3):  # the row sits at the bottom of the list
+            if _find(nodes, r"^Log output level$") is not None:
+                break
+            adb.shell(serial, "input swipe 500 1500 500 600 300")
+            time.sleep(UI_WAIT_S)
+            nodes = _ui_nodes(serial)
+        before = _row_level(nodes)
+        row = _find(nodes, r"^Log output level$")
+        if row is None or before is None:
+            raise TalkBackError("log_level_failed",
+                                "could not find 'Log output level' in TalkBack's developer settings")
+        if record:
+            _update_snapshot(serial, log_level=before, log_level_changed=before != level)
+        if before != level:
+            _tap(serial, row)
+            option = _find(_ui_nodes(serial), rf"^{level}$")
+            if option is None:
+                raise TalkBackError("log_level_failed", f"no {level} option in the log level list")
+            _tap(serial, option)
+            if level == "VERBOSE":
+                # The confirmation button, not the dialog message that also says
+                # "enable verbose logging".
+                confirm = _find(_ui_nodes(serial), r"^Yes, enable verbose")
+                if confirm is not None:
+                    _tap(serial, confirm)
+        after = _row_level(_ui_nodes(serial))
+        if after != level:
+            raise TalkBackError("log_level_failed", f"TalkBack's log level is {after}, not {level}")
+        return {"before": before, "after": after}
+    finally:
+        _close_prefs(serial)
+
+
 def status(serial: str) -> Dict[str, Any]:
     """Read-only: TalkBack install/enabled state, settings, pending restore, injectors."""
     settings = read_settings(serial)
@@ -527,6 +703,8 @@ def status(serial: str) -> Dict[str, Any]:
     if snap is not None:
         out["saved"] = {"path": state_path(serial), "at": snap.get("saved_at"),
                         "by_pid": snap.get("saved_by_pid"), "settings": snap.get("settings")}
+        if snap.get("log_level_changed"):
+            out["saved"]["log_level"] = snap.get("log_level")
     if enabled:
         out["warning"] = DEVICE_WIDE_WARNING
     return out
@@ -535,15 +713,19 @@ def status(serial: str) -> Dict[str, Any]:
 ACTIONS = ("status", "on", "off", "restore")
 
 
-def action(serial: str, what: str, package: Optional[str] = None) -> Dict[str, Any]:
-    """The ``talkback`` tool / subcommand: status | on | off | restore."""
+def action(serial: str, what: str, package: Optional[str] = None,
+           verbose_log: bool = False) -> Dict[str, Any]:
+    """The ``talkback`` tool / subcommand: status | on | off | restore.
+
+    ``verbose_log`` (on): set TalkBack's log level to VERBOSE first, so walks get
+    the exact announcements from logcat; restore puts the old level back."""
     if what == "status":
         return status(serial)
     if what not in ACTIONS:
         raise ValueError(f"unknown talkback action {what!r}; expected one of {', '.join(ACTIONS)}")
     with device_lock(serial, f"talkback {what}"):
         if what == "on":
-            out = enable(serial, package)
+            out = enable(serial, package, verbose_log=verbose_log)
         elif what == "off":
             out = disable(serial)
         else:

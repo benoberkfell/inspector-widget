@@ -1832,7 +1832,8 @@ def _tb_errors(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
 def _h_talkback(args: Dict[str, Any]) -> Dict[str, Any]:
     from inspector_widget.talkback import device as tbdevice
     serial = _serial(args.get("serial"))
-    return _tb_errors(lambda: tbdevice.action(serial, args["action"], package=args.get("package")))
+    return _tb_errors(lambda: tbdevice.action(serial, args["action"], package=args.get("package"),
+                                              verbose_log=bool(args.get("verbose_log"))))
 
 
 def _h_tb_walk(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1864,7 +1865,8 @@ TOOLS.update({
             "accessibility settings, append TalkBack to the enabled services (others stay), wait "
             "for touch exploration, dismiss TalkBack's tutorial; stays on until off/restore (or "
             "this server exits). off: turn TalkBack off (an exact restore when it was off before). "
-            "restore: write the snapshot back exactly and verify it."
+            "restore: write the snapshot back exactly (and TalkBack's log level, if on changed it) "
+            "and verify it."
         ),
         "schema": {
             "type": "object",
@@ -1873,6 +1875,11 @@ TOOLS.update({
                 "action": {"type": "string", "enum": ["status", "on", "off", "restore"]},
                 "package": dict(_PACKAGE, description="Optional (on): the app that must stay in "
                                                       "the foreground; brought back if covered."),
+                "verbose_log": {"type": "boolean", "default": False,
+                                "description": "on: first set TalkBack's log level to VERBOSE "
+                                               "(its settings screen, while TalkBack is still off) "
+                                               "so walks read the exact announcements from logcat; "
+                                               "restore puts the old level back."},
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -1924,9 +1931,11 @@ TOOLS.update({
                                              "seen (scrolled in)."},
                 "utterance": {"type": "string", "enum": ["auto", "model", "logcat"],
                               "default": "auto",
-                              "description": "What each step says: TalkBack's verbose logcat when "
-                                             "enabled in TalkBack's developer settings, else the "
-                                             "model announcement (flagged per step)."},
+                              "description": "What each step says. auto: TalkBack's logcat when its "
+                                             "log level is already VERBOSE, else the model "
+                                             "announcement (flagged per step). logcat: also set "
+                                             "the level to VERBOSE first (when TalkBack is off; "
+                                             "~5s more) and back afterwards."},
                 "injector": {"type": "string", "enum": ["auto", "uinput", "touch"],
                              "default": "auto"},
                 "leave_on": {"type": "boolean", "default": False,
