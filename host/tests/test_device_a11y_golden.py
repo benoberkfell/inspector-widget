@@ -505,7 +505,7 @@ def check_label_for(cap: Capture) -> None:
 VIEW_SECTION_TITLES = [
     "1. ImageButton contentDescription", "2. Touch target size", "3. Text contrast",
     "4. ImageView label", "5. Custom clickable role", "6. EditText label (labelFor)",
-    "7. Switch stateDescription", "8. Heading semantics",
+    "7. Switch stateDescription", "8. Heading semantics", "9. Password fields",
 ]
 
 
@@ -521,6 +521,95 @@ def check_view_reading_order(cap: Capture) -> None:
     deco = _node(cap, "goodDecorativeImage")  # importantForAccessibility="no"
     assert deco.get("ignored") and not _is_stop(cap, deco), describe(deco)
     assert "4. ImageView label" in speak, "the decorative image must add nothing to its section"
+
+
+# The secrets A11yProbe types into its password fields (ViewScenarioActivity.kt,
+# Scenarios.kt PasswordFieldScenario); no dump may carry them in plain text.
+VIEW_PASSWORD_SECRETS = {"passwordField": "hunter2-view-secret", "pinField": "271828",
+                         "visiblePasswordField": "hunter2-visible-secret"}
+COMPOSE_PASSWORD_SECRET = "hunter2-compose-secret"
+# PasswordFieldScenario's wrapped fields (the app's own composable takes the secret).
+COMPOSE_WRAPPED_SECRETS = ("hunter2-wrapped-secret", "hunter2-wrapped-value-secret")
+
+
+def _leaked(secrets: Iterable[str], **dumps: Any) -> List[str]:
+    import json
+    return [f"{name}: {sec!r}" for name, data in dumps.items()
+            for sec in secrets if sec in json.dumps(data, default=str)]
+
+
+def _view_nodes(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out, stack = [], list(tree.get("roots") or [])
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        stack.extend(n.get("children") or [])
+    return out
+
+
+def check_view_password_redaction(cap: Capture) -> None:
+    """Password EditTexts: the View tree and the a11y text are one bullet per character
+    and the tree flags the node TEXT_REDACTED; the secret appears in no dump."""
+    leaked = _leaked(VIEW_PASSWORD_SECRETS.values(), tree=cap.tree, a11y=cap.a11y, lint=cap.lint)
+    assert not leaked, f"password text sent in plain text: {leaked}"
+    views = _view_nodes(cap.tree)
+    for name, secret in VIEW_PASSWORD_SECRETS.items():
+        v = next((n for n in views if str(n.get("view_id_name") or "").endswith(name)), None)
+        assert v is not None, f"no View named {name} in the tree"
+        assert "TEXT_REDACTED" in (v.get("flags") or []), f"{name} not flagged TEXT_REDACTED: {v}"
+        assert v.get("text") == "\u2022" * len(secret), f"{name} text: {v.get('text')!r}"
+        a = _node(cap, name)
+        assert a.get("text") == "\u2022" * len(secret), f"{name} a11y text: {describe(a)} {a.get('text')!r}"
+
+
+def check_compose_password_redaction(cap: Capture) -> None:
+    """A Compose field with Password semantics: its secret appears in no dump."""
+    leaked = _leaked([COMPOSE_PASSWORD_SECRET, *COMPOSE_WRAPPED_SECRETS], compose=cap.compose,
+                     tree=cap.tree, a11y=cap.a11y, lint=cap.lint)
+    assert not leaked, f"Compose password text sent in plain text: {leaked}"
+    node = _compose_node_by_tag(cap, "good_password")
+    assert node is not None, "no Compose semantics node tagged good_password"
+    attrs = node.get("attrs") or {}
+    assert "Password" in attrs, f"good_password has no Password semantics: {sorted(attrs)}"
+
+
+WIRE_DEPTH_CAP = 80  # WireLimits.MAX_TREE_DEPTH: every tree is cut at this many levels
+
+
+def _tree_depth(n: Dict[str, Any]) -> int:
+    return 1 + max((_tree_depth(c) for c in n.get("children") or []), default=0)
+
+
+def _flagged(n: Dict[str, Any], flag: str) -> int:
+    return int(flag in (n.get("flags") or [])) + sum(_flagged(c, flag) for c in n.get("children") or [])
+
+
+def check_deep_tree(cap: Capture) -> None:
+    """Trees deeper than the wire cap (DeepTree.kt nests 100 levels) arrive parseable, cut
+    at exactly the cap, with the cut marked on the node and named in the diagnostics."""
+    roots = cap.tree.get("roots") or []
+    assert max(_tree_depth(r) for r in roots) == WIRE_DEPTH_CAP, "View tree not cut at the cap"
+    assert sum(_flagged(r, "CHILDREN_TRUNCATED") for r in roots) >= 1
+    assert "depth-truncated=" in (cap.tree.get("diagnostics") or ""), cap.tree.get("diagnostics")
+    wins = [w["root"] for w in cap.a11y.get("windows") or [] if w.get("root")]
+    assert max(_tree_depth(r) for r in wins) == WIRE_DEPTH_CAP, "a11y tree not cut at the cap"
+    assert sum(_flagged(r, "children_truncated") for r in wins) >= 1
+    assert "depth-truncated=" in (cap.a11y.get("diagnostics") or ""), cap.a11y.get("diagnostics")
+    comp = [w["root"] for w in cap.compose.get("windows") or [] if w.get("root")]
+    assert max(_tree_depth(r) for r in comp) == WIRE_DEPTH_CAP, "Compose tree not cut at the cap"
+    assert "semantics_truncated:" in (cap.compose.get("diagnostics") or ""), cap.compose.get("diagnostics")
+
+
+def _below_view_cut(cap: Capture, n: Dict[str, Any], views: Dict[int, Dict[str, Any]]) -> bool:
+    """n's View is missing because the agent cut the View tree at its depth cap: the nearest
+    a11y ancestor that is in the View tree has a CHILDREN_TRUNCATED View under it (the a11y
+    tree skips unimportant Views, so it reaches deeper Views than the cut View tree)."""
+    p = cap.parent.get(id(n))
+    while p is not None and p.get("host_view_id") not in views:
+        p = cap.parent.get(id(p))
+    if p is None:
+        return False
+    return _flagged(views[p["host_view_id"]], "CHILDREN_TRUNCATED") > 0
 
 
 def check_dialog_reading_order(cap: Capture) -> None:
@@ -616,6 +705,8 @@ COMPOSE_GOLDENS = [
                      bad=(E("bad_merged_inner", R1, DUPLICATE_BOUNDS),), good=(E("good_merged", *GOOD_BASE),)),
     compose_scenario("custom_toggle", "good_custom_toggle",
                      bad=(E("bad_custom_toggle", R7),), good=(E("good_custom_toggle", R1, R2, R7),)),
+    compose_scenario("password_field", "good_password", checks=(check_compose_password_redaction,)),
+    compose_scenario("deep_tree", "deep_tree", checks=(check_deep_tree,)),
 ]
 
 VIEW_GOLDEN = Golden(
@@ -625,7 +716,7 @@ VIEW_GOLDEN = Golden(
     good=(E("goodImageButton", R1, R6), E("goodTouchTarget", R1, R2), E("goodContrast", R3),
           E("goodImage", R1, R6), E("goodCustomClickable", R1, R2, R5),
           E("goodEditText", R1, FORM_LABEL)),
-    checks=(check_label_for, check_view_reading_order),
+    checks=(check_label_for, check_view_reading_order, check_view_password_redaction),
 )
 
 # --- interop: mirrors InteropFragment.kt / InteropCells.kt ------------------ #
@@ -774,7 +865,8 @@ def test_a11y_node_keys_are_unique_and_follow_the_id_contract(captures, sid):
             problems.append(f"is_virtual disagrees with virtual_id: {describe(n)}")
         host = views.get(n.get("host_view_id"))
         if host is None:
-            problems.append(f"host_view_id is not a View in the tree: {describe(n)}")
+            if not _below_view_cut(cap, n, views):
+                problems.append(f"host_view_id is not a View in the tree: {describe(n)}")
             continue
         if virtual and not str(host.get("qualified_name") or host.get("class_name")).endswith("AndroidComposeView"):
             problems.append(f"virtual node hosted by a {host.get('class_name')}, not an AndroidComposeView: {describe(n)}")

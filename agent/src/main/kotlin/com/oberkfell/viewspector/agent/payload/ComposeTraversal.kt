@@ -31,9 +31,11 @@
  */
 package com.oberkfell.viewspector.agent.payload
 
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityManager
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 
@@ -128,7 +130,10 @@ internal object ComposeTraversal {
     private fun primeOne(acv: View, result: Result) {
         val delegate = delegateOf(acv)
         if (delegate == null) {
-            result.failed++
+            // The delegate is not reachable by name (R8 renamed it: ComposeInspector finds such
+            // AndroidComposeViews structurally). With a service running, Compose computes and
+            // serves the order itself, so only without one is it lost.
+            if (servicesOn(acv)) result.byService++ else result.failed++
             return
         }
         val cls = delegate.javaClass
@@ -177,6 +182,19 @@ internal object ComposeTraversal {
             result.toClear.add(before)
             result.toClear.add(after)
         }
+    }
+
+    /**
+     * The condition Compose's delegate uses for isEnabled (ui 1.7 to 1.12): AccessibilityManager
+     * enabled AND a non-empty enabled-service list. False when it cannot be read.
+     */
+    private fun servicesOn(view: View): Boolean = try {
+        val am = view.context.getSystemService(AccessibilityManager::class.java)
+        am != null && am.isEnabled &&
+            am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK).isNotEmpty()
+    } catch (t: Throwable) {
+        logOnce("service state", t)
+        false
     }
 
     /** The AndroidComposeView's AndroidComposeViewAccessibilityDelegateCompat, found by field type. */

@@ -23,6 +23,8 @@ import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.TextView
 import com.oberkfell.viewspector.proto.ViewInspection
+import java.lang.reflect.Method
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -36,6 +38,33 @@ class TreeBuilder(val strings: StringTable) {
 
     private companion object {
         const val TAG = "ViewSpector"
+
+        /**
+         * @hide View.transformMatrixToGlobal(Matrix): the view-local -> screen matrix, with
+         * every ancestor's transform and scroll and the window position (the reference's
+         * ViewExtensions.kt:91-126 uses it for the render bounds). Reachable because the
+         * native agent disables hidden-API enforcement; null falls back to the view's own
+         * matrix around its untransformed origin.
+         */
+        val transformMatrixToGlobal: Method? =
+            try {
+                View::class.java.getMethod("transformMatrixToGlobal", Matrix::class.java)
+            } catch (t: Throwable) {
+                Log.i(TAG, "View.transformMatrixToGlobal unavailable; render quads use the own matrix only")
+                null
+            }
+
+        private const val EPS = 1e-4f
+
+        /** True when [m] only translates: the axis-aligned layout rect is then exact. */
+        fun isTranslateOnly(m: Matrix): Boolean {
+            val v = FloatArray(9)
+            m.getValues(v)
+            return abs(v[Matrix.MSCALE_X] - 1f) < EPS && abs(v[Matrix.MSCALE_Y] - 1f) < EPS &&
+                abs(v[Matrix.MSKEW_X]) < EPS && abs(v[Matrix.MSKEW_Y]) < EPS &&
+                abs(v[Matrix.MPERSP_0]) < EPS && abs(v[Matrix.MPERSP_1]) < EPS &&
+                abs(v[Matrix.MPERSP_2] - 1f) < EPS
+        }
     }
 
     // Every View visited during the most recent buildRoots(), in pre-order.
@@ -51,6 +80,13 @@ class TreeBuilder(val strings: StringTable) {
     fun viewFor(id: Long): View? = viewsById[id]
 
     /**
+     * Nodes of the last [buildRoots] at the depth cap ([WireLimits.MAX_TREE_DEPTH]) whose
+     * children were not sent (each is flagged CHILDREN_TRUNCATED).
+     */
+    var truncatedNodes: Int = 0
+        private set
+
+    /**
      * Build view-node trees for the requested root.
      *
      * @param rootId a window root's uniqueDrawingId, or 0 to build every root.
@@ -61,6 +97,7 @@ class TreeBuilder(val strings: StringTable) {
     fun buildRoots(rootId: Long): List<ViewInspection.ViewNode> {
         visitedViews.clear()
         viewsById.clear()
+        truncatedNodes = 0
 
         val roots = RootsDetector.rootViews()
         val selected =
@@ -71,17 +108,30 @@ class TreeBuilder(val strings: StringTable) {
             }
 
         return selected.mapNotNull { root ->
+            val mark = visitedViews.size
             try {
-                buildNode(root)
+                buildNode(root, 1, ancestorTransformed = false)
             } catch (t: Throwable) {
                 Log.w(TAG, "Failed to build node tree for root", t)
+                // The root is dropped: forget the Views visited under it, so [visited]
+                // (whose properties the Dispatcher reads) matches the nodes sent.
+                while (visitedViews.size > mark) {
+                    val v = visitedViews.removeAt(visitedViews.size - 1)
+                    val vid = ViewReflect.uniqueDrawingId(v)
+                    if (viewsById[vid] === v) viewsById.remove(vid)
+                }
                 null
             }
         }
     }
 
-    /** Recursively convert [view] (and any children) into a ViewNode. */
-    private fun buildNode(view: View): ViewInspection.ViewNode {
+    /**
+     * Recursively convert [view] (and any children) into a ViewNode. [depth] is 1 for a
+     * window root; a node at [WireLimits.MAX_TREE_DEPTH] keeps its fields but not its
+     * children (flagged CHILDREN_TRUNCATED): a deeper tree would make the whole response
+     * unparseable by the host's protobuf runtime.
+     */
+    private fun buildNode(view: View, depth: Int, ancestorTransformed: Boolean): ViewInspection.ViewNode {
         visitedViews.add(view)
         val id = ViewReflect.uniqueDrawingId(view)
         if (id != 0L) {
@@ -101,7 +151,10 @@ class TreeBuilder(val strings: StringTable) {
         }
 
         // bounds (ViewExtensions.kt:78-128).
-        builder.bounds = buildBounds(view)
+        // Whether this view or any ancestor has a non-identity transform: only then can
+        // the view need a render quad (ancestor rotations rotate it too).
+        val transformed = ancestorTransformed || !hasIdentityMatrix(view)
+        builder.bounds = buildBounds(view, transformed)
 
         // resource — the view's own @id (ViewExtensions.kt:74, createResource:144).
         createResource(view, safeViewId(view))?.let { res ->
@@ -124,8 +177,14 @@ class TreeBuilder(val strings: StringTable) {
         }
 
         // text_value — best-effort for TextViews (ViewExtensions.kt:136,
-        // framework/ViewExtensions.kt:37-40 getTextValue).
-        textValueOrNull(view)?.let { text -> builder.textValue = strings.intern(text) }
+        // framework/ViewExtensions.kt:37-40 getTextValue). A password field's text is
+        // masked (Redaction.kt) and flagged TEXT_REDACTED.
+        textValueOrNull(view)?.let { (text, redacted) ->
+            builder.textValue = strings.intern(text)
+            if (redacted) {
+                builder.flags = builder.flags or ViewInspection.ViewNode.Flag.TEXT_REDACTED_VALUE
+            }
+        }
 
         // children (ViewExtensions.kt:137-139).
         if (view is ViewGroup) {
@@ -136,6 +195,11 @@ class TreeBuilder(val strings: StringTable) {
                     Log.w(TAG, "ViewGroup.getChildCount() failed", t)
                     0
                 }
+            if (childCount > 0 && depth >= WireLimits.MAX_TREE_DEPTH) {
+                builder.flags = builder.flags or ViewInspection.ViewNode.Flag.CHILDREN_TRUNCATED_VALUE
+                truncatedNodes++
+                return builder.build()
+            }
             for (i in 0 until childCount) {
                 val child =
                     try {
@@ -144,7 +208,7 @@ class TreeBuilder(val strings: StringTable) {
                         Log.w(TAG, "ViewGroup.getChildAt($i) failed", t)
                         null
                     } ?: continue
-                builder.addChildren(buildNode(child))
+                builder.addChildren(buildNode(child, depth + 1, transformed))
             }
         }
 
@@ -154,10 +218,11 @@ class TreeBuilder(val strings: StringTable) {
     /**
      * Absolute on-screen bounds for [view]: an axis-aligned [ViewInspection.Rect]
      * from getLocationOnScreen()+width/height, plus a [ViewInspection.Quad] render
-     * shape only when the view carries a non-identity transform (rotation / scale
-     * / skew). Mirrors ViewExtensions.kt:78-128.
+     * shape when a rotation / scale / skew applies to the view (its own transform
+     * or an ancestor's; [transformed] says whether any exists). Mirrors
+     * ViewExtensions.kt:78-128.
      */
-    private fun buildBounds(view: View): ViewInspection.Bounds {
+    private fun buildBounds(view: View, transformed: Boolean): ViewInspection.Bounds {
         val bounds = ViewInspection.Bounds.newBuilder()
 
         val location = IntArray(2)
@@ -191,43 +256,86 @@ class TreeBuilder(val strings: StringTable) {
                 .setH(h)
                 .build()
 
-        // Render quad: only when the view's own transform matrix is non-identity.
-        // ViewExtensions.kt:91-126 uses transformMatrixToGlobal (hidden); per the
-        // module spec we use the public getMatrix() local transform instead and
-        // map the four local corners, then offset into absolute screen space by
-        // the (untransformed) location. This is a best-effort visual indicator of
-        // rotation/scale/skew, matching the reference's intent.
-        try {
-            val matrix: Matrix? = view.matrix
-            if (matrix != null && !matrix.isIdentity && w > 0 && h > 0) {
-                val corners =
-                    floatArrayOf(
-                        0f, 0f,
-                        w.toFloat(), 0f,
-                        w.toFloat(), h.toFloat(),
-                        0f, h.toFloat(),
-                    )
-                matrix.mapPoints(corners)
-                if (corners.none { it.isNaN() }) {
-                    bounds.render =
-                        ViewInspection.Quad.newBuilder()
-                            .setX0((corners[0] + x).roundToInt())
-                            .setY0((corners[1] + y).roundToInt())
-                            .setX1((corners[2] + x).roundToInt())
-                            .setY1((corners[3] + y).roundToInt())
-                            .setX2((corners[4] + x).roundToInt())
-                            .setY2((corners[5] + y).roundToInt())
-                            .setX3((corners[6] + x).roundToInt())
-                            .setY3((corners[7] + y).roundToInt())
-                            .build()
-                }
+        if (transformed && w > 0 && h > 0) {
+            try {
+                renderQuad(view, x, y, w, h)?.let { bounds.render = it }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to compute render quad", t)
             }
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to compute render quad", t)
         }
 
         return bounds.build()
     }
+
+    /**
+     * The view's four corners on screen, in drawing order (top-left, top-right,
+     * bottom-right, bottom-left), or null when the transform is a pure translation
+     * (the layout rect is then exact).
+     *
+     * getLocationOnScreen() already includes every transform (the view's own too), so
+     * the corners must not be mapped through the view matrix and then offset by that
+     * location again: that applied the view's transform twice. Preferred: map the
+     * view-local corners through transformMatrixToGlobal (all ancestors included).
+     * Fallback: the view's own matrix around its untransformed origin, which is the
+     * location minus where the matrix moves local (0,0); exact unless an ancestor is
+     * transformed too.
+     */
+    private fun renderQuad(view: View, x: Int, y: Int, w: Int, h: Int): ViewInspection.Quad? {
+        val corners =
+            floatArrayOf(
+                0f, 0f,
+                w.toFloat(), 0f,
+                w.toFloat(), h.toFloat(),
+                0f, h.toFloat(),
+            )
+        val global = globalMatrix(view)
+        if (global != null) {
+            if (isTranslateOnly(global)) return null
+            global.mapPoints(corners)
+        } else {
+            val own: Matrix = view.matrix ?: return null
+            if (isTranslateOnly(own)) return null
+            val origin = floatArrayOf(0f, 0f)
+            own.mapPoints(origin)
+            val ox = x - origin[0]
+            val oy = y - origin[1]
+            own.mapPoints(corners)
+            for (i in corners.indices step 2) {
+                corners[i] += ox
+                corners[i + 1] += oy
+            }
+        }
+        if (corners.any { it.isNaN() || it.isInfinite() }) return null
+        return ViewInspection.Quad.newBuilder()
+            .setX0(corners[0].roundToInt())
+            .setY0(corners[1].roundToInt())
+            .setX1(corners[2].roundToInt())
+            .setY1(corners[3].roundToInt())
+            .setX2(corners[4].roundToInt())
+            .setY2(corners[5].roundToInt())
+            .setX3(corners[6].roundToInt())
+            .setY3(corners[7].roundToInt())
+            .build()
+    }
+
+    /** View-local -> screen matrix via the hidden transformMatrixToGlobal, or null. */
+    private fun globalMatrix(view: View): Matrix? {
+        val m = transformMatrixToGlobal ?: return null
+        return try {
+            Matrix().also { m.invoke(view, it) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "View.transformMatrixToGlobal failed", t)
+            null
+        }
+    }
+
+    /** View.getMatrix().isIdentity, guarded (hasIdentityMatrix itself is hidden). */
+    private fun hasIdentityMatrix(view: View): Boolean =
+        try {
+            view.matrix?.isIdentity ?: true
+        } catch (t: Throwable) {
+            true
+        }
 
     /**
      * Build a [ViewInspection.Resource] for [resourceId] using [view]'s
@@ -301,16 +409,25 @@ class TreeBuilder(val strings: StringTable) {
 
     /**
      * Best-effort text for text-bearing views (framework/ViewExtensions.kt:37-40):
-     * TextView.text.toString(), or null otherwise. Guarded because subclasses can
-     * throw from getText().
+     * TextView.text.toString() paired with false, or null for other views. Guarded
+     * because subclasses can throw from getText(). getText() of a password field is
+     * the plaintext (the dots are only a TransformationMethod), so for one
+     * ([Redaction.isPasswordView]) the text is masked and paired with true.
      */
-    private fun textValueOrNull(view: View): String? {
+    private fun textValueOrNull(view: View): Pair<String, Boolean>? {
         if (view !is TextView) return null
-        return try {
-            view.text?.toString()
-        } catch (t: Throwable) {
-            Log.w(TAG, "TextView.getText() failed", t)
-            null
+        val text: CharSequence =
+            try {
+                view.text
+            } catch (t: Throwable) {
+                Log.w(TAG, "TextView.getText() failed", t)
+                null
+            } ?: return null
+        if (text.isEmpty()) return "" to false
+        return if (Redaction.isPasswordView(view)) {
+            Redaction.mask(text) to true
+        } else {
+            text.toString() to false
         }
     }
 }

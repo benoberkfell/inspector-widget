@@ -35,6 +35,9 @@ def session():
     if PACKAGE not in packages:
         pytest.skip(f"{PACKAGE} not installed/debuggable on {SERIAL}")
 
+    # Other device tests (the a11y goldens) force-stop the app when they finish.
+    from inspector_widget import adb
+    adb.shell(SERIAL, f"am start -W -n {PACKAGE}/.MainActivity", check=False)
     sess = inspector_widget.attach(SERIAL, PACKAGE)
     try:
         yield sess
@@ -58,8 +61,10 @@ def test_dump_a11y_and_lint(session):
     data = a11ymod.a11y_to_dict(resp)
     assert "windows" in data
     assert data["windows"], "expected at least one a11y window"
-    # The reading order should contain at least one focus stop.
-    assert any(e["is_focus_stop"] for e in data.get("focus_order", []))
+    # The reading order should contain at least one focus stop (a11y_to_dict lists only
+    # the stops, each with its 1-based "order"; is_focus_stop appears only with the
+    # structural nodes included).
+    assert any(e.get("order") for e in data.get("focus_order", []))
 
     compose = st.dump_compose_to_dict(
         session.dump_compose(include_semantics=True, include_slot_table=False))

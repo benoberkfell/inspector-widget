@@ -58,4 +58,9 @@ val SCENARIOS: List<Scenario> = listOf(
     Scenario("live_region", "Live region", "MissingLiveRegion", null) { LiveRegionScenario() },
     Scenario("dup_label", "Duplicate labels", "DuplicateClickableBounds", "a11y.label.missing") { DuplicateLabelScenario() },
     Scenario("custom_toggle", "Custom toggle state", "MissingStateDescription", "a11y.state.not_exposed") { CustomToggleScenario() },
+    Scenario("password_field", "Password field", "PasswordRedaction", null) { PasswordFieldScenario() },
+    Scenario("deep_tree", "Deep trees", "DumpDepthCap", null) { DeepTreeScenario() },
 )
+
+/** Scenarios [AllScenarios] leaves out: deep_tree exists to exceed the dump depth cap. */
+val NOT_IN_ALL: Set<String> = setOf("deep_tree")

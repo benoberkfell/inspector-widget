@@ -21,6 +21,7 @@ package com.oberkfell.viewspector.agent.payload
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
+import android.os.Process
 import android.util.Log
 import com.oberkfell.viewspector.proto.ViewInspection
 import java.io.IOException
@@ -47,6 +48,23 @@ class Server(private val socketName: String) {
 
         // Granularity of the idle watchdog's wakeups.
         val WATCHDOG_TICK_MS = TimeUnit.SECONDS.toMillis(5)
+
+        // accept() failing over and over (fd exhaustion, a broken socket) must not
+        // spin a core: back off from 50 ms, doubling to 5 s, reset by a success.
+        const val ACCEPT_BACKOFF_MIN_MS = 50L
+        const val ACCEPT_BACKOFF_MAX_MS = 5_000L
+
+        // Peers allowed to connect (SO_PEERCRED): adbd runs as shell (2000), or as
+        // root (0) after `adb root`; `adb forward` connections come from it. The app's
+        // own uid covers in-process callers (stop()'s wake-up connection). Any other
+        // app on the device must not be able to read this app's UI.
+        const val ROOT_UID = 0
+        const val SHELL_UID = 2000
+
+        // Refused peers are logged for the first few, then every Nth, so a hostile
+        // client can't flood the log the host tells users to read.
+        const val REFUSAL_LOG_FIRST = 5
+        const val REFUSAL_LOG_EVERY = 100
     }
 
     // True once the server has been asked to stop (shutdown command, idle
@@ -73,8 +91,16 @@ class Server(private val socketName: String) {
     private val handleLock = Any()
 
     // Live client sockets, so stop() can shut them down to unblock their reads.
+    // Also the connection cap (WireLimits.MAX_CONNECTIONS): check-and-add under its lock.
     private val activeClients =
         java.util.Collections.synchronizedSet(java.util.HashSet<LocalSocket>())
+
+    // Connections refused by the peer check or the connection cap (log throttling).
+    private var refusedPeers = 0
+    private var refusedOverCap = 0
+
+    // Names serve threads uniquely (ViewSpector-conn-N).
+    private var connectionSeq = 0
 
     /**
      * Binds the socket and runs the accept loop on the CALLING thread until a
@@ -183,32 +209,51 @@ class Server(private val socketName: String) {
     }
 
     /**
-     * Accepts connections until [stopped]. Each connection is served inline,
-     * one at a time (single-in-flight per connection is the contract; serving
-     * connections sequentially is sufficient for a synchronous inspector).
+     * Accepts connections until [stopped]. Each admitted connection is served on
+     * its own daemon thread (at most [WireLimits.MAX_CONNECTIONS] at once); device
+     * work is serialized by handleLock. A connection from a uid other than root,
+     * shell or this app is closed unanswered; one over the cap gets an ERROR reply
+     * and is closed. Persistent accept() failures back off instead of spinning.
      */
     private fun acceptLoop(server: LocalServerSocket, dispatcher: Dispatcher) {
+        var failures = 0
         while (!stopped.get()) {
             val client: LocalSocket =
                 try {
                     server.accept()
-                } catch (e: IOException) {
+                } catch (t: Throwable) {
                     if (stopped.get()) {
                         // Expected: stop() closed the socket to break us out.
                         break
                     }
-                    Log.e(TAG, "accept() failed", e)
-                    // Transient accept failure; loop and try again unless stopped.
+                    failures++
+                    val delayMs = acceptBackoffMs(failures)
+                    if (failures == 1 || failures % 20 == 0) {
+                        Log.e(TAG, "accept() failed ($failures in a row); retrying in ${delayMs}ms", t)
+                    }
+                    if (!sleepUnlessStopped(delayMs)) break
                     continue
                 }
+            failures = 0
+
+            if (stopped.get()) {
+                // stop()'s wake-up connection (or a late client): nothing to serve.
+                closeQuietly(client)
+                break
+            }
+            if (!peerAllowed(client)) {
+                closeQuietly(client)
+                continue
+            }
+            if (!admit(client)) continue
 
             touchActivity()
-            activeClients.add(client)
             Log.i(TAG, "Client connected on @$socketName")
             // Serve each connection on its own thread so a slow/idle/dead client
             // never blocks accepting the next one. Device work inside is
             // serialized by handleLock, so concurrent clients queue safely.
-            Thread({
+            // Daemon: a lingering client never keeps the app process alive.
+            val thread = Thread({
                 try {
                     serveConnection(client, dispatcher)
                 } catch (t: Throwable) {
@@ -219,8 +264,105 @@ class Server(private val socketName: String) {
                     touchActivity()
                     Log.i(TAG, "Client disconnected from @$socketName")
                 }
-            }, "ViewSpector-conn").start()
+            }, "ViewSpector-conn-${++connectionSeq}")
+            thread.isDaemon = true
+            try {
+                thread.start()
+            } catch (t: Throwable) {
+                // Out of threads/memory: drop this client rather than the server.
+                Log.e(TAG, "Could not start a connection thread; closing the client", t)
+                activeClients.remove(client)
+                closeQuietly(client)
+            }
         }
+    }
+
+    /** 50 ms after the first failure, doubling, capped at [ACCEPT_BACKOFF_MAX_MS]. */
+    private fun acceptBackoffMs(failures: Int): Long {
+        val shift = (failures - 1).coerceIn(0, 16)
+        return (ACCEPT_BACKOFF_MIN_MS shl shift).coerceAtMost(ACCEPT_BACKOFF_MAX_MS)
+    }
+
+    /** Sleeps [ms] unless the server stops first; false when stopped or interrupted. */
+    private fun sleepUnlessStopped(ms: Long): Boolean {
+        val until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ms)
+        while (!stopped.get()) {
+            val left = TimeUnit.NANOSECONDS.toMillis(until - System.nanoTime())
+            if (left <= 0) return true
+            try {
+                Thread.sleep(minOf(left, 250L))
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return false
+    }
+
+    /**
+     * SO_PEERCRED check: only root, shell (adbd, so `adb forward`) and this app's own
+     * uid may talk to the agent. Anything else, or credentials that can't be read, is
+     * refused (the caller closes the socket without a reply).
+     */
+    private fun peerAllowed(client: LocalSocket): Boolean {
+        val creds =
+            try {
+                client.peerCredentials
+            } catch (t: Throwable) {
+                logRefusal("could not read the peer credentials (${t.javaClass.simpleName}: ${t.message})")
+                return false
+            }
+        if (creds == null) {
+            logRefusal("the peer credentials are unavailable")
+            return false
+        }
+        val uid = creds.uid
+        if (uid == ROOT_UID || uid == SHELL_UID || uid == Process.myUid()) return true
+        logRefusal("uid $uid (pid ${creds.pid}) is not root, shell or this app (uid ${Process.myUid()})")
+        return false
+    }
+
+    private fun logRefusal(why: String) {
+        val n = ++refusedPeers
+        if (n <= REFUSAL_LOG_FIRST || n % REFUSAL_LOG_EVERY == 0) {
+            Log.w(TAG, "Refused a connection on @$socketName: $why (refusal #$n)")
+        }
+    }
+
+    /**
+     * Registers [client] unless [WireLimits.MAX_CONNECTIONS] are already open. Over the
+     * cap, the client gets one ERROR frame (id 0, which the host reports as an agent
+     * error) and is closed. Returns true when the client was admitted.
+     */
+    private fun admit(client: LocalSocket): Boolean {
+        synchronized(activeClients) {
+            if (activeClients.size < WireLimits.MAX_CONNECTIONS) {
+                activeClients.add(client)
+                return true
+            }
+        }
+        val n = ++refusedOverCap
+        if (n <= REFUSAL_LOG_FIRST || n % REFUSAL_LOG_EVERY == 0) {
+            Log.w(
+                TAG,
+                "Refused a connection on @$socketName: ${WireLimits.MAX_CONNECTIONS} clients are " +
+                    "already connected (refusal #$n)",
+            )
+        }
+        try {
+            writeResponse(
+                client.outputStream,
+                errorResponse(
+                    0,
+                    "the agent already serves ${WireLimits.MAX_CONNECTIONS} connections (the " +
+                        "most it accepts at once); close an idle inspector-widget session and retry",
+                ),
+            )
+        } catch (t: Throwable) {
+            // The client is gone already: nothing to tell it.
+        }
+        closeQuietly(client)
+        return false
     }
 
     /**
@@ -243,6 +385,14 @@ class Server(private val socketName: String) {
                     }
                 } catch (e: IOException) {
                     Log.i(TAG, "Connection lost while reading request: ${e.message}")
+                    return
+                } catch (e: Framing.FrameTooLargeException) {
+                    // Nothing was allocated or read for it; the stream is out of step.
+                    Log.e(
+                        TAG,
+                        "Request frame of ${e.length} bytes is over the ${e.limit}-byte limit; " +
+                            "dropping the connection",
+                    )
                     return
                 } catch (e: IllegalStateException) {
                     // Framing/magic error: unrecoverable for this stream.

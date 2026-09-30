@@ -168,6 +168,7 @@ fun AllScenarios() {
                 .testTag("all_scenarios")
         ) {
             for (sc in SCENARIOS) {
+                if (sc.id in NOT_IN_ALL) continue
                 Box(Modifier.testTag("all_${sc.id}")) { sc.content() }
                 HorizontalDivider()
             }

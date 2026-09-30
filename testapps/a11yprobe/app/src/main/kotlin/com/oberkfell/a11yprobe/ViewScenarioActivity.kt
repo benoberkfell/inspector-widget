@@ -21,6 +21,12 @@ import com.oberkfell.a11yprobe.databinding.ActivityViewScenariosBinding
 
 class ViewScenarioActivity : AppCompatActivity() {
 
+    companion object {
+        const val PASSWORD_SECRET = "hunter2-view-secret"
+        const val PIN_SECRET = "271828"
+        const val VISIBLE_PASSWORD_SECRET = "hunter2-visible-secret"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val binding = ActivityViewScenariosBinding.inflate(layoutInflater)
@@ -55,6 +61,11 @@ class ViewScenarioActivity : AppCompatActivity() {
 
         // GOOD: the labeled EditText is associated with its label via labelFor
         // in XML; nothing to wire here. (badEditText has no labelFor partner.)
+
+        // Known secrets for the redaction check: no dump may carry them in plain text.
+        binding.passwordField.setText(PASSWORD_SECRET)
+        binding.pinField.setText(PIN_SECRET)
+        binding.visiblePasswordField.setText(VISIBLE_PASSWORD_SECRET)
     }
 
     private fun applyStateDescription(

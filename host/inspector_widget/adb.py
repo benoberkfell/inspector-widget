@@ -14,13 +14,15 @@ the plain ``adb`` CLI.
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import shlex
 import socket
 import subprocess
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Kept for callers that still import it; nothing defaults to it any more. Use
 # resolve_serial(None) to pick $ANDROID_SERIAL or the single attached device.
@@ -278,7 +280,34 @@ def app_data_dir(serial: str, pkg: str) -> str:
 
 
 def device_abi(serial: str) -> str:
+    """The device's primary ABI (``ro.product.cpu.abi``), e.g. ``arm64-v8a``.
+
+    Unlike ``ro.product.cpu.abilist``, this never names an ABI the device only
+    runs through native-bridge translation (an x86_64 emulator image with ARM
+    translation lists ``arm64-v8a`` there, but its processes are x86_64).
+    """
     return shell(serial, "getprop ro.product.cpu.abi").strip()
+
+
+def process_bitness(serial: str, pkg: str, pid: int) -> Optional[int]:
+    """64 or 32: whether ``pid`` runs ``app_process64`` or ``app_process32``.
+
+    Reads ``/proc/<pid>/exe`` as the app's own uid (``run-as``), since the
+    shell user may not read another uid's exe link. ``None`` when it can't be
+    read or doesn't say (a bare ``app_process``, a non-debuggable app).
+    """
+    cmd = f"run-as {shlex.quote(pkg)} readlink /proc/{int(pid)}/exe"
+    try:
+        proc = _adb(serial, "shell", cmd, check=False)
+    except AdbError:
+        return None
+    target = (proc.stdout or "").strip().splitlines()
+    name = target[0].rsplit("/", 1)[-1] if proc.returncode == 0 and target else ""
+    if name == "app_process64":
+        return 64
+    if name == "app_process32":
+        return 32
+    return None
 
 
 def api_level(serial: str) -> int:
@@ -532,3 +561,93 @@ def process_frozen(serial: str, pid: int) -> Optional[bool]:
         if key == "frozen" and value.strip() in ("0", "1"):
             return value.strip() == "1"
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Device clock + logcat (agent start-up diagnostics)
+# --------------------------------------------------------------------------- #
+def device_time(serial: str) -> Optional[float]:
+    """The device's wall clock in seconds since the epoch (the clock ``logcat -v
+    epoch`` stamps lines with), or ``None`` if it can't be read.
+
+    Asks for nanoseconds (``date +%s.%N``); a ``date`` without ``%N`` still
+    yields whole seconds, which only makes a ``since`` filter start up to a
+    second early.
+    """
+    try:
+        out = shell(serial, "date +%s.%N", check=False, timeout=10.0).strip()
+    except AdbError:
+        return None
+    m = re.match(r"(\d+)(?:\.(\d+))?", out)
+    if not m:
+        return None
+    return float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    """One logcat line. A multi-line message (a Log.e with a stack trace) is
+    one entry per line, all with the same ``time``, ``tid`` and ``tag``."""
+
+    time: float  # seconds since the epoch, device clock
+    pid: int
+    tid: int
+    level: str  # V D I W E F
+    tag: str
+    message: str
+
+
+# threadtime with the epoch + usec modifiers:
+#   "  1727706579.756123 10709 10720 E ViewSpector: initialize: error invoking ..."
+_LOGCAT_LINE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+([VDIWEFS])\s+(.*?)\s*: ?(.*)$")
+
+
+def parse_logcat(text: str) -> List[LogEntry]:
+    """Parse ``logcat -v threadtime -v epoch -v usec`` output; other lines
+    (``--------- beginning of main``) are skipped."""
+    entries = []
+    for line in text.splitlines():
+        m = _LOGCAT_LINE.match(line)
+        if m:
+            entries.append(LogEntry(float(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                    m.group(4), m.group(5), m.group(6)))
+    return entries
+
+
+def logcat(serial: str, *, pid: Optional[int] = None, since: Optional[float] = None,
+           specs: Iterable[str] = ("*:V",), timeout: float = 10.0) -> Optional[List[LogEntry]]:
+    """Dump (``logcat -d``) the lines matching the filterspecs ``specs`` (e.g.
+    ``("ViewSpector:E", "AndroidRuntime:E")``), optionally only ``pid``'s and
+    only those stamped at or after ``since`` (device clock, see
+    :func:`device_time`).
+
+    For diagnostics, so it never raises: ``None`` when adb or logcat failed
+    (as opposed to ``[]``, nothing logged).
+    """
+    specs = list(specs)
+    argv = ["logcat", "-d", "-v", "threadtime", "-v", "epoch", "-v", "usec"]
+    if pid is not None:
+        argv.append(f"--pid={int(pid)}")
+    floor = None
+    if since is not None:
+        # logcat stamps to the microsecond; "-t <secs>.<frac>" is a start time
+        # (pure digits would be a line count, so the fraction is always there).
+        floor = math.floor(since * 1000) / 1000
+        argv += ["-t", f"{floor:.3f}"]
+    if not any(s.startswith("*:") for s in specs):
+        argv.append("-s")
+    argv += specs
+    try:
+        proc = _adb(serial, "shell", " ".join(shlex.quote(a) for a in argv),
+                    check=False, timeout=timeout)
+    except AdbError:
+        return None
+    if proc.returncode != 0:
+        return None
+    entries = parse_logcat(proc.stdout or "")
+    if pid is not None:
+        entries = [e for e in entries if e.pid == pid]
+    if floor is not None:
+        entries = [e for e in entries if e.time >= floor]
+    return entries
