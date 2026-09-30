@@ -36,7 +36,7 @@ host (python) ──adb push/run-as/attach-agent/forward──► libviewspector
                                                              └► DexClassLoader(payload, parent=appCL)
                                                                 └► payload (Kotlin): LocalServerSocket
 host socket client ◄── VWSPCT01 framed protobuf (view_inspection.proto) ──► Dispatcher
-mcp_server.py ── exposes 15 tools to an LLM agent over the host driver
+mcp_server.py ── exposes 18 tools to an LLM agent over the host driver
 ```
 See `CONTRACT.md` for the fixed identifiers, framing, and build matrix.
 
@@ -70,9 +70,10 @@ claude mcp list                  # expect: inspector-widget ... ✓ Connected
 claude mcp add inspector-widget -- \
   env PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
 ```
-Tools (15): `list_devices`, `list_processes`, `attach`, `dump_tree`, `get_properties`,
+Tools (18): `list_devices`, `list_processes`, `attach`, `dump_tree`, `get_properties`,
 `screenshot`, `dump_compose`, `compose_overlay`, `dump_accessibility`, `a11y_lint`,
-`a11y_overlay`, `inspect`, `inspect_node`, `component_image`, `detach`.
+`a11y_overlay`, `inspect`, `inspect_node`, `component_image`, `detach`, and the device-wide
+TalkBack tools `talkback`, `tb_walk`, `tb_scenario`.
 
 Compose (CLI):
 ```bash
@@ -82,7 +83,7 @@ PYTHONPATH=host host/.venv/bin/python host/cli.py compose \
 ```
 
 ## Status: working end-to-end
-Verified on `emulator-5554` (API 36, arm64), all reachable through the 15 MCP tools: the live
+Verified on `emulator-5554` (API 36, arm64), all reachable through the MCP tools: the live
 **View tree** with typed properties + resolution stacks, the **Compose** semantics tree and slot
 table (parameters/modifiers + `file:line`), the unified **accessibility tree** with TalkBack reading
 order plus lint + severity-colored overlay, per-component **SKP images**, and the **integrated

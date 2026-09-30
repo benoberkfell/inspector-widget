@@ -38,7 +38,7 @@ host (python) ──adb push/run-as/attach-agent/forward──► libviewspector
                                                              └► DexClassLoader(payload, parent=appCL)
                                                                 └► payload (Kotlin): LocalServerSocket
 host socket client ◄── VWSPCT01-framed protobuf (proto/view_inspection.proto) ──► Dispatcher
-cli.py / mcp_server.py ── drive the host; mcp_server exposes 15 tools to an LLM agent
+cli.py / mcp_server.py ── drive the host; mcp_server exposes 18 tools to an LLM agent
 ```
 
 - **Wire**: 8-byte magic `VWSPCT01` + 4-byte big-endian length + protobuf. Abstract socket
@@ -66,8 +66,8 @@ host/                         Python host driver + entry points
   inspector_widget/           the package (adb, inject, framing, client, png, strings,
                               a11y, a11y_lint, overlay, correlate, skiaparser, skia_client,
                               proto/, skia_grpc/, _cli.py/_mcp.py console-script wrappers)
-  cli.py                      CLI entry point (13 subcommands)
-  mcp_server.py               MCP server (15 tools) + `--self-check`
+  cli.py                      CLI entry point (16 subcommands)
+  mcp_server.py               MCP server (18 tools) + `--self-check`
   tests/                      device-free pytest suite (+ @device smoke and a11y golden tests)
   pyproject.toml              packaging (wheel ships cli.py + mcp_server.py as py-modules)
   README.md  PACKAGING.md     host driver + packaging docs
@@ -139,7 +139,7 @@ listed under the same `@viewspector_<pid>` for as long as it is open (`adb.socke
 # or manually, from the repo root so $PWD expands to your checkout:
 claude mcp add inspector-widget -- \
   env PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
-host/mcp_server.py --self-check                  # prints proto status + the 15 tools
+host/mcp_server.py --self-check                  # prints proto status + the 18 tools
 ```
 
 **Test**:
@@ -181,7 +181,7 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 
 ## 5. Capabilities (CLI ↔ MCP parity)
 
-13 CLI subcommands / 15 MCP tools. Keep them at parity (see §6).
+16 CLI subcommands / 18 MCP tools. Keep them at parity (see §6).
 
 | Group | MCP tools | CLI subcommands |
 |---|---|---|
@@ -190,6 +190,7 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 | Compose | `dump_compose`, `compose_overlay` | `compose` (+`--overlay`) |
 | Accessibility | `dump_accessibility`, `a11y_lint`, `a11y_overlay` | `a11y` (+`--lint`/`--overlay`), `a11y-lint` |
 | Integrated | `inspect`, `inspect_node`, `component_image` | `inspect`, `inspect-node`, `component-image` |
+| TalkBack (device-wide; needs TalkBack installed) | `talkback`, `tb_walk`, `tb_scenario` | `talkback status\|on\|off\|restore`, `tb-walk`, `tb-scenario` |
 
 Every subcommand routes through `inspector_widget.attach() -> Session` (the same facade the MCP
 uses); the older ones then drive `session.client` directly (works; their bodies are not yet shared
