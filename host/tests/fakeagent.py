@@ -948,7 +948,8 @@ class FakeAgent:
         """Dispatcher.handle(): exactly one Response per request."""
         command = req.WhichOneof("command")
         try:
-            if command is None:
+            if command is None or (self.legacy_a11y_ids and command in ("a11y_focus", "a11y_act")):
+                # An A1-era agent predates A11yFocus/A11yAct: the field is unknown to it.
                 return error_response(req.id, "No command set in request")
             return getattr(self, f"_h_{command}")(req.id, getattr(req, command))
         except Exception as exc:  # handler failure -> ERROR with the request id

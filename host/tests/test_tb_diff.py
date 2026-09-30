@@ -48,16 +48,22 @@ def codes(res):
 # --------------------------------------------------------------------------- #
 # Geometry helpers
 # --------------------------------------------------------------------------- #
-def test_xy_cut_rows_columns_and_a_single_row():
+def test_visual_order_rows_columns_and_a_single_row():
+    def v(items):
+        return diff.visual_order(items)[0]
+
     grid = [("a", (0, 0, 100, 50)), ("b", (120, 0, 100, 50)), ("c", (0, 60, 100, 50)),
             ("d", (120, 60, 100, 50))]
-    assert diff.xy_cut(grid) == ["a", "b", "c", "d"]
+    assert v(grid) == ["a", "b", "c", "d"]
+    touching = [("a", (0, 0, 100, 50)), ("b", (150, 0, 100, 50)), ("c", (0, 50, 100, 50)),
+                ("d", (150, 50, 100, 50))]
+    assert v(touching) == ["a", "b", "c", "d"]  # rows that abut (the View layout case)
     # Two columns whose cards have different heights (rows overlap): read per column.
     cols = [("a1", (0, 0, 100, 120)), ("b1", (120, 0, 100, 100)), ("a2", (0, 130, 100, 160)),
             ("b2", (120, 110, 100, 140)), ("a3", (0, 300, 100, 100)), ("b3", (120, 260, 100, 180))]
-    assert diff.xy_cut(cols) == ["a1", "a2", "a3", "b1", "b2", "b3"]
+    assert v(cols) == ["a1", "a2", "a3", "b1", "b2", "b3"]
     row = [("r", (200, 0, 50, 50)), ("l", (0, 5, 50, 40))]
-    assert diff.xy_cut(row) == ["l", "r"]
+    assert v(row) == ["l", "r"]
 
 
 def test_lis():

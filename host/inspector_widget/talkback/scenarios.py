@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .. import adb
 from . import device
 from .walk import (Driver, Node, Snapshot, STEP_TIMEOUT_MS, SETTLE_MS, WalkError, _match,
-                   _seek_start, _walk_id, predict, walks_dir)
+                   _seek_start, _walk_id, predict, predict_initial, walks_dir)
 
 KINDS = ("focus_after", "restore", "survive")
 ACTIONS = ("activate", "back", "tap")
@@ -229,7 +229,11 @@ def _focus_after(drv: Driver, cur: Snapshot, action: str, wait_s: float, legacy:
     new_windows = [w for w in _windows(after) if w not in _windows(cur)]
     new_screen = bool(new_windows) or top1 != top0
     f0, f1 = cur.focus, after.focus
-    first = _first_stop(after, legacy, new_windows[-1] if new_windows else None)
+    # The model's initial-focus rule for the new window (it skips a first stop that
+    # reads as the window's title), else the new window's first predicted stop.
+    model = predict_initial(after.resp, new_windows[-1] if new_windows else None)
+    first = (model or {}).get("key") or _first_stop(after, legacy,
+                                                    new_windows[-1] if new_windows else None)
     if f1 is None:
         verdict = "none"
     elif f0 is not None and f1.key == f0.key:
@@ -248,6 +252,9 @@ def _focus_after(drv: Driver, cur: Snapshot, action: str, wait_s: float, legacy:
         "after": {"top": top1, "windows": len(_windows(after)), "panes": _panes(after)},
         "timeline": events[:12], "focus": _desc(f1, legacy), "verdict": verdict,
     }
+    if model is not None:
+        res["model"] = {"initial": model.get("key"), "how": model.get("how"),
+                        "title": model.get("title"), "skipped": model.get("skipped") or []}
     bad = verdict in ("none", "on_close_or_unlabeled", "behind_overlay") or \
         (new_screen and verdict == "stayed_on_opener")
     if bad:

@@ -13,7 +13,6 @@ Codes: ``tb.out_of_order``, ``tb.loop``, ``tb.edge_stuck``, ``tb.skipped``,
 from __future__ import annotations
 
 import bisect
-import importlib
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -106,69 +105,11 @@ def _intersects(a: Rect, b: Rect) -> bool:
     return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
 
 
-def _bands(items: List[Tuple[str, Rect]], axis: int) -> List[List[Tuple[str, Rect]]]:
-    """Split items into bands separated by whitespace along ``axis`` (1 = y, 0 = x)."""
-    ordered = sorted(items, key=lambda it: (it[1][axis], it[1][1 - axis]))
-    bands: List[List[Tuple[str, Rect]]] = []
-    end = None
-    for it in ordered:
-        lo, hi = it[1][axis], it[1][axis] + it[1][axis + 2]
-        if end is None or lo >= end:
-            bands.append([it])
-            end = hi
-        else:
-            bands[-1].append(it)
-            end = max(end, hi)
-    return bands
-
-
-def xy_cut(items: List[Tuple[str, Rect]]) -> List[str]:
-    """A heuristic visual reading order: blocks by horizontal whitespace, top to
-    bottom; inside a block, columns (only when each has 2+ stops) left to right,
-    else a row read left to right."""
-    if len(items) <= 1:
-        return [k for k, _ in items]
-    rows = _bands(items, 1)
-    if len(rows) > 1:
-        return [k for band in rows for k in xy_cut(band)]
-    cols = _bands(items, 0)
-    if len(cols) > 1 and all(len(c) >= 2 for c in cols):
-        return [k for col in cols for k in xy_cut(col)]
-    return [k for k, _ in sorted(items, key=lambda it: (it[1][0], it[1][1]))]
-
-
-_T1_VISUAL: List[Any] = []
-
-
-def _t1_order_items() -> Optional[Any]:
-    """T1's talkback.visual.order_items, when it reads a grid of touching rows
-    row by row (walk boxes from Views usually touch: row n ends where n+1 starts)."""
-    if not _T1_VISUAL:
-        fn = None
-        try:
-            fn = importlib.import_module("inspector_widget.talkback.visual").order_items
-            grid = [{"key": k, "bounds": b, "window": 0} for k, b in (
-                ("a", (0, 0, 100, 50)), ("b", (150, 0, 100, 50)),
-                ("c", (0, 50, 100, 50)), ("d", (150, 50, 100, 50)))]
-            if fn(grid) != ["a", "b", "c", "d"]:
-                fn = None
-        except Exception:  # noqa: BLE001 - not merged, or broken: use xy_cut
-            fn = None
-        _T1_VISUAL.append(fn)
-    return _T1_VISUAL[0]
-
-
 def visual_order(items: List[Tuple[str, Rect]]) -> Tuple[List[str], str]:
-    """V: T1's talkback.visual XY-cut when it is merged and sound, else :func:`xy_cut`."""
-    fn = _t1_order_items()
-    if fn is not None:
-        try:
-            keys = fn([{"key": k, "bounds": r, "window": 0} for k, r in items])
-            if isinstance(keys, list) and set(keys) == {k for k, _ in items}:
-                return keys, "talkback.visual"
-        except Exception:  # noqa: BLE001
-            pass
-    return xy_cut(items), "xy_cut"
+    """V: talkback.visual's XY-cut over plain boxes (blocks by whitespace, top to
+    bottom; columns only when each holds two or more stops, else a row)."""
+    from .visual import order_items
+    return order_items([{"key": k, "bounds": r, "window": 0} for k, r in items]), "talkback.visual"
 
 
 def _lis(seq: List[int]) -> List[int]:
@@ -326,6 +267,8 @@ def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
             reasons.append("tiny")
         elif _dp(min(w, h), density) < SLIVER_DP:
             reasons.append("sliver")
+    if s.get("under_system_bar"):
+        reasons.append("under a system bar")  # outside the window's interactive region
     cov = s.get("covered_by")
     if cov and not s.get("_escape"):
         reasons.append(f"occluded by {cov.get('ref') or cov.get('overlay')}")
