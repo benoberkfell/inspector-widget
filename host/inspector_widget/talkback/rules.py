@@ -381,6 +381,16 @@ class Rules:
         is not clickable is skipped (the list scrolls, its items are stops). A child already
         visited in this search ends it (the Java's loop guard, :1061). Otherwise, invisible
         children with text count too (:1097)."""
+        found = self._visible_speaking_child(n, cache, visited)
+        if found is not None:
+            return found
+        return self.has_invisible_non_actionable_speaking_children(n)
+
+    def _visible_speaking_child(self, n: TbNode, cache: Optional[Dict[int, bool]],
+                                visited: Set[int]) -> Optional[bool]:
+        """The visible-children loop of hasNonActionableSpeakingChildren (:1053-1091): True
+        when a child speaks for ``n``, False when the loop guard ends the search, None when no
+        visible child speaks."""
         for child in n.children:
             if id(child) in visited:
                 return False
@@ -395,7 +405,23 @@ class Rules:
                 continue
             if self.is_speaking_node(child, cache, visited):
                 return True
-        return self.has_invisible_non_actionable_speaking_children(n)
+        return None
+
+    def speech_source(self, n: TbNode) -> Optional[str]:
+        """Which isSpeakingNode branch makes ``n`` speak: ``text``, ``state``, ``checkable``,
+        ``children`` (visible non-actionable children), ``invisible_children`` (only children
+        that are not visible, :1109) or None."""
+        if self.has_text(n):
+            return "text"
+        if self.has_state_description(n):
+            return "state"
+        if n.has("checkable"):
+            return "checkable"
+        if self._visible_speaking_child(n, self.cache, set()):
+            return "children"
+        if self.has_invisible_non_actionable_speaking_children(n):
+            return "invisible_children"
+        return None
 
     def has_invisible_non_actionable_speaking_children(self, n: TbNode) -> bool:
         """hasInvisibleNonActionableSpeakingChildren (:1097-1127): an INVISIBLE child that is

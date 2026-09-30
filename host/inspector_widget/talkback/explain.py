@@ -15,7 +15,9 @@ Non-stops (:func:`why_not`)
     ``hidden_by:<key>`` (importantForAccessibility=noHideDescendants on it or an ancestor),
     ``covered_by:<window root id>`` / ``not_touchable`` / ``skipped`` (its window is not
     reported), ``hidden`` (not visible to the user: alpha, visibility, hideFromAccessibility,
-    or ``hidden(holder)`` for an AndroidView holder while a service runs), ``offscreen`` (not
+    or ``hidden(holder)`` for an AndroidView holder while a service runs),
+    ``obscured_by_system_bar`` (wholly under a system bar: outside the window's interactive
+    region, which the platform reports to TalkBack as not visible; ASSUMED), ``offscreen`` (not
     visible and outside its window; ``reachable`` says whether auto-scroll can bring it in),
     ``window_wrapper`` (the size of its window, has children, not focusable),
     ``silent_container`` (focusable, but only its focusable children speak: they are the stops),
@@ -23,15 +25,24 @@ Non-stops (:func:`why_not`)
 
 Edges (the ``via`` of a :func:`~.order.simulate` step)
     ``tree``, ``bounds_swap``, ``chain``, ``before:<key>``, ``before_of:<key>``,
-    ``after:<key>``, ``window:<index>``, ``wrap``; an edge step is the pause at the end.
+    ``after:<key>``, ``window:<index>``, ``wrap``, ``initial:<how>``; an edge step is the pause
+    at the end.
+
+Ghost stops (``ghost`` on an explained stop): a stop TalkBack lands on with little or nothing to
+show for it. ``unlabelled`` (it says "Unlabelled" or only a role), ``invisible_children_only``
+(it speaks only through invisible children, UT/AccessibilityNodeInfoUtils.java:1109),
+``clipped:<scrollable>`` (a sliver of an item scrolled almost out of its list: it touches the
+scrollable's edge and is under half the height of its siblings, or under 48 px).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .rules import Rules
 from .tree import Excluded, TbNode, TbTree, build
+
+GHOST_SLIVER_PX = 48
 
 STOP_CODES = ("click", "longclick", "focusable", "srf", "scroll_item", "leaf", "text_orphan",
               "web", "pip")
@@ -72,6 +83,8 @@ def why_not(rules: Rules, n: TbNode) -> Optional[str]:
     if branch == "not_visible":
         if "holder_invisible_with_service" in n.corrections:
             return "hidden(holder)"
+        if "obscured_by_system_bar" in n.corrections:
+            return "obscured_by_system_bar"
         w = n.window.bounds
         if n.rect.is_empty() or not n.rect.intersects(w):
             return "offscreen"
@@ -80,6 +93,28 @@ def why_not(rules: Rules, n: TbNode) -> Optional[str]:
         anc = rules.focusable_ancestor(n)
         return f"merged_into:{anc.key}" if anc is not None else "no_speech"
     return branch  # window_wrapper, silent_container, no_speech
+
+
+def ghost_reasons(rules: Rules, n: TbNode) -> List[str]:
+    """Why a stop is a ghost stop (see the module docstring); empty for a healthy stop."""
+    from .speech import announce
+
+    out: List[str] = []
+    if announce(rules, n, transitions=False).unlabelled:
+        out.append("unlabelled")
+    if rules.speech_source(n) == "invisible_children":
+        out.append("invisible_children_only")
+    scroller = next((a for a in n.ancestors() if rules.is_scrollable(a)), None)
+    if scroller is not None:
+        r, s = n.rect, scroller.rect
+        at_edge = abs(r.top - s.top) <= 1 or abs(r.bottom - s.bottom) <= 1
+        siblings = sorted(c.rect.height for c in (n.parent.children if n.parent else [])
+                          if c is not n and c.visible and not c.rect.is_empty())
+        typical = siblings[len(siblings) // 2] if siblings else 0
+        thin = r.height < GHOST_SLIVER_PX or (typical and r.height * 2 < typical)
+        if at_edge and thin:
+            out.append(f"clipped:{scroller.key}")
+    return out
 
 
 def _offscreen_reach(rules: Rules, n: TbNode) -> str:
@@ -117,12 +152,13 @@ def explain(tree: Any, ref: Any, rules: Optional[Rules] = None) -> Dict[str, Any
     stop = why_stop(rules, n)
     if stop is not None:
         out: Dict[str, Any] = {"key": n.key, "stop": True, "why": stop}
-        ghosts = rules.invisible_speaking_children(n)
-        if ghosts and not any(rules.is_visible(c) and not rules.is_focusable_or_clickable(c)
-                              and rules.is_speaking_node(c, rules.cache, set())
-                              for c in n.children):
+        ghost = ghost_reasons(rules, n)
+        if ghost:
+            out["ghost"] = ghost
+        if "invisible_children_only" in ghost:
+            invisible = rules.invisible_speaking_children(n)
             out["detail"] = ("speaks only through invisible children "
-                             + ", ".join(c.key for c in ghosts[:5]))
+                             + ", ".join(c.key for c in invisible[:5]))
         return out
     why = why_not(rules, n) or "no_speech"
     out = {"key": n.key, "stop": False, "why": why}

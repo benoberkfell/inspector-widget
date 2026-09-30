@@ -19,6 +19,13 @@ request that flag (res/xml-v33/accessibilityservice.xml), so the platform serves
   (AndroidComposeView.addAndroidView: ``info.isVisibleToUser = false`` when the delegate
   ``isEnabled``). A dump taken with no service on shows the holder visible; the projection
   applies the correction so the model sees what TalkBack would (``services``).
+* A node wholly outside its window's interactive region (the part of the window not covered by
+  other windows, e.g. under the status bar of an edge-to-edge window) is served with
+  isVisibleToUser=false (AOSP AccessibilityInteractionController.adjustIsVisibleToUserIfNeeded,
+  from memory: not in the scratch AOSP copy). Our in-process connection passes no interactive
+  region, so the dump says visible. Given the system bars (``obscured``), the projection
+  applies the correction. [ASSUMED, TODO confirm: seen on TalkBack 17.0 / API 37, where
+  "1. ImageButton contentDescription" under the status bar was never evaluated.]
 * Windows: TalkBack gets no window below an open modal window (AOSP AccessibilityWindowManager
   drops covered windows) and no window that is neither touchable nor focusable
   (windowMattersToAccessibilityLocked). a11y-core's :func:`~inspector_widget.a11y.apply_window_meta`
@@ -119,6 +126,20 @@ class Rect:
         return (self.left <= o.left and self.top <= o.top
                 and self.right >= o.right and self.bottom >= o.bottom)
 
+    def intersect(self, o: "Rect") -> "Rect":
+        return Rect(max(self.left, o.left), max(self.top, o.top),
+                    min(self.right, o.right), min(self.bottom, o.bottom))
+
+    def minus(self, o: "Rect") -> List["Rect"]:
+        """The parts of this rect outside ``o`` (up to four rects)."""
+        if self.is_empty() or not self.intersects(o):
+            return [] if self.is_empty() else [self]
+        out = [Rect(self.left, self.top, self.right, o.top),
+               Rect(self.left, o.bottom, self.right, self.bottom),
+               Rect(self.left, max(self.top, o.top), o.left, min(self.bottom, o.bottom)),
+               Rect(o.right, max(self.top, o.top), self.right, min(self.bottom, o.bottom))]
+        return [r for r in out if not r.is_empty()]
+
     def union(self, o: "Rect") -> "Rect":
         return Rect(min(self.left, o.left), min(self.top, o.top),
                     max(self.right, o.right), max(self.bottom, o.bottom))
@@ -151,6 +172,7 @@ class TbWindow:
         self.modal: Optional[bool] = meta.get("modal")
         self.covered_by = meta.get("covered_by")
         self.title: Optional[str] = meta.get("title") or None
+        self.obscured: List[Rect] = [_rect(r) for r in meta.get("obscured") or ()]
         self.a11y_type = a11y_window_type(self.lp_type)
         self.root: Optional[TbNode] = None
         frame = meta.get("frame")
@@ -220,6 +242,14 @@ class TbNode:
             kind = "virtual" if self.facet == "virtual" else "compose"
             return f"{kind}:{int(h)}:{v}"
         return f"id:{self.id}"
+
+    @property
+    def signature(self) -> Tuple[str, str, str, str]:
+        """Identity without ids or bounds: (facet, class, label, resource id). Compose re-mints
+        semantics ids when lazy items scroll, and bounds change while scrolling, so a node seen in
+        two captures (or a live walk) is matched by this, not by its key."""
+        return (self.facet, self.class_name, self.content_description or self.text,
+                self.raw.get("view_id_resource_name") or "")
 
     @property
     def virtual_id(self) -> int:
@@ -373,14 +403,17 @@ def _is_compose_host(raw: Dict[str, Any]) -> bool:
 
 
 def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[str] = None,
-          skip: Optional[set] = None) -> TbTree:
+          skip: Optional[set] = None, obscured: Optional[List[Any]] = None) -> TbTree:
     """Project a dump onto the tree TalkBack sees.
 
     ``dump`` is :func:`inspector_widget.a11y.a11y_to_dict` output (``{"windows": [...]}``), a
     list of window root dicts, or one root dict. ``services`` ("on"/"off") overrides the
     dump's ``a11y-services=`` diagnostics token; with "off" the service-on corrections are
     applied. ``skip`` holds window indices to treat as unreachable (a11y.reading_order's
-    parameter of the same name). The dump is not modified.
+    parameter of the same name). ``obscured``: screen rects other windows cover in every window
+    (the system bars: e.g. ``[(0, 0, 1280, 156)]`` as x, y, w, h), added to each window's own
+    ``obscured`` meta; nodes wholly inside them are hidden as TalkBack would get them. The dump
+    is not modified.
     """
     windows_meta, diag = _windows_of(dump)
     if diagnostics is not None:
@@ -408,6 +441,7 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
     skip = set(skip or ())
     for wi, meta in enumerate(windows_meta):
         win = TbWindow(wi, meta)
+        win.obscured.extend(_rect(r) for r in obscured or ())
         if wi in skip and win.dropped is None:
             win.dropped = "skipped"
         tree.windows.append(win)
@@ -433,6 +467,7 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
             "message": (f"{len(dupes)} nodes share a node key with an earlier node; links to "
                         "them resolve to the first one."),
         })
+    _apply_interactive_region(tree)
     if tree.services == "off":
         holders = [n for n in tree.nodes if n.facet == "interop" and n.visible]
         for n in holders:
@@ -511,3 +546,92 @@ def iter_reported(tree: TbTree) -> Iterator[TbNode]:
 
 
 NodePredicate = Callable[[TbNode], bool]
+
+
+def _rect(r: Any) -> Rect:
+    """A Rect from a Rect, an (x, y, w, h) tuple or a bounds dict."""
+    if isinstance(r, Rect):
+        return r
+    if isinstance(r, (tuple, list)):
+        x, y, w, h = r
+        return Rect(x, y, x + w, y + h)
+    return Rect.of(r)
+
+
+def _apply_interactive_region(tree: TbTree) -> None:
+    """Hide the nodes outside their window's interactive region (see the module docstring).
+
+    The platform tests Region.quickReject(boundsInScreen), which is conservative: it rejects a
+    node only when it misses the region's bounding box. So a node under a system bar along the
+    window's edge is hidden, but one inside a hole in the middle of the region (under a
+    floating window) is not. Only runs where the covered parts are known."""
+    hidden = 0
+    for w in tree.windows:
+        if w.root is None or not w.obscured:
+            continue
+        region = [w.bounds]
+        for o in w.obscured:
+            region = [p for part in region for p in part.minus(o)]
+        if not region:
+            continue
+        box = region[0]
+        for part in region[1:]:
+            box = box.union(part)
+        for n in w.root.iter():
+            if n.visible and not n.rect.intersects(box):
+                n.visible = False
+                n.corrections.append("obscured_by_system_bar")
+                hidden += 1
+    if hidden:
+        tree.diagnostics.append({
+            "kind": "obscured_by_system_bar", "count": hidden, "conf": "assumed",
+            "message": (f"{hidden} node(s) lie wholly under a system bar; the platform serves "
+                        "them to TalkBack as not visible, so TalkBack skips them."),
+        })
+
+
+# View classes whose onPopulateAccessibilityEvent adds text: TextView (and every subclass) its
+# text, else its hint; ImageView (and subclasses) its contentDescription.
+def populated_text(raw: Dict[str, Any]) -> List[str]:
+    """The text a View subtree puts into an AccessibilityEvent it sends
+    (ViewGroup.dispatchPopulateAccessibilityEventInternal: every VISIBLE descendant, important
+    for accessibility or not, in accessibility child order). Views only: a provider host (a
+    ComposeView, a WebView) adds nothing and is not descended into."""
+    from .rules import is_instance
+
+    out: List[str] = []
+    stack = [raw]
+    while stack:
+        n = stack.pop()
+        if int(n.get("virtual_id", _a11y.HOST_VIEW_ID)) != _a11y.HOST_VIEW_ID:
+            continue
+        cls = n.get("class_name") or ""
+        if is_instance(cls, "android.widget.TextView"):
+            t = n.get("text") or n.get("hint_text")
+            if t and "password" not in (n.get("flags") or ()):
+                out.append(t)
+        elif is_instance(cls, "android.widget.ImageView") and n.get("content_description"):
+            out.append(n["content_description"])
+        if n.get("provider_class"):
+            continue
+        stack.extend(reversed(n.get("children") or ()))
+    return out
+
+
+def window_title(tree: TbTree, window: TbWindow) -> Tuple[Optional[str], Optional[str]]:
+    """The title TalkBack keeps for a window, and where it came from.
+
+    WindowEventInterpreter.getWindowTitleInternal (UT/input/WindowEventInterpreter.java:385):
+    the window's own title (AccessibilityWindowInfo.getTitle; from the dump's ``title`` meta)
+    when it has one, else the first text of the window's TYPE_WINDOW_STATE_CHANGED event
+    (getTextFromWindowStateChange, :990), which is the first populated text of its View tree.
+    The activity window's title (its label) is not in the dump, so only a dialog or popup
+    window gets a derived title.
+    """
+    if window.title:
+        return window.title, "window"
+    base_activity = window.lp_type == 1 or (window.lp_type is None and window.index == 0)
+    if window.root is None or base_activity:
+        return None, None
+    texts = populated_text(window.root.raw)
+    return (texts[0], "event") if texts else (None, None)

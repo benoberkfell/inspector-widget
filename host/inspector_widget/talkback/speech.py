@@ -25,6 +25,18 @@ accessibility/talkback/``, @229212f):
 English strings are TalkBack's (res/values/strings_compositor.xml). Settings are the defaults:
 speak roles, speak collection info, no element ids, no custom labels, no image captions. Hints
 ("Double-tap to activate") are separate utterances and are not modelled.
+
+When the node's own description comes out empty (or the node is "Unlabelled"), TalkBack speaks
+the focus event's text instead (EventTypeViewAccessibilityFocusedFeedbackRule :207-225): for a
+View, the text its whole subtree populates into the event. That is how a focusable ScrollView that
+speaks only through an invisible child reads the entire screen in one utterance.
+
+:data:`VERSIONS` holds what differs between the 16.2 source and TalkBack 17.0 as observed on
+emulator-5554 (ttsOutput in the verbose log): 17.0 joins the parts with ". " (the
+``usePeriodAsSeparator`` feature flag, a stub returning false in the open 16.2 source,
+TB/flags/FeatureFlagReader.java:328). Everything else checked so far matches: no "not checked"
+for an unchecked Checkbox in either toolkit, "off. Notify. Switch" for a View Switch,
+"On. Notify. Switch" for Compose, "Button" for an unlabelled Compose button.
 """
 
 from __future__ import annotations
@@ -33,9 +45,25 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import rules as R
 from .rules import Rules
-from .tree import TbNode
+from .tree import TbNode, populated_text
 
 SEP = ", "
+
+# What TalkBack speaks differently by version. "16.2": the open source @229212f. "17.0": the
+# Play build observed on emulator-5554 (TALKBACK_DESIGN.md part 9).
+VERSIONS: Dict[str, Dict[str, Any]] = {
+    "16.2": {"separator": ", "},
+    "17.0": {"separator": ". "},
+}
+DEFAULT_VERSION = "17.0"
+
+
+def separator(version: Optional[str]) -> str:
+    try:
+        return VERSIONS[version or DEFAULT_VERSION]["separator"]
+    except KeyError:
+        raise ValueError(f"unknown TalkBack version {version!r}; known: {sorted(VERSIONS)}") \
+            from None
 
 # Role.getRole -> the role word (AccessibilityNodeFeedbackUtils.getNodeRoleName :263).
 ROLE_WORDS = {
@@ -52,16 +80,16 @@ ROLE_WORDS = {
 NAVIGATE_NONE, NAVIGATE_ENTER, NAVIGATE_EXIT, NAVIGATE_INTERIOR = 0, 1, 2, 3
 
 # Part kinds that name a node (as opposed to its role or state).
-_NAMING_KINDS = {"name", "child", "name(fake)", "label", "hint", "hint(child)", "error"}
+_NAMING_KINDS = {"name", "child", "name(fake)", "label", "hint", "hint(child)", "error", "event"}
 
 
 class _Seg:
     """One spoken piece: text, the node it came from, what it is, and how it joins the text
-    before it (", " normally, " " for the "for <label>" template)."""
+    before it (None: the version's separator; " " for the "for <label>" template)."""
 
     __slots__ = ("text", "node", "kind", "glue")
 
-    def __init__(self, text: str, node: TbNode, kind: str, glue: str = SEP):
+    def __init__(self, text: str, node: TbNode, kind: str, glue: Optional[str] = None):
         self.text, self.node, self.kind, self.glue = text, node, kind, glue
 
 
@@ -69,10 +97,10 @@ class Announcement:
     """``text``: the utterance; ``parts``: [{"text", "from", "kind"}]; ``unlabelled``: TalkBack
     found nothing to name the node with (it says "Unlabelled" or only a role word)."""
 
-    def __init__(self, segs: Sequence[_Seg], unlabelled: bool):
+    def __init__(self, segs: Sequence[_Seg], unlabelled: bool, sep: str = SEP):
         text = ""
         for s in segs:
-            text = s.text if not text else text + s.glue + s.text
+            text = s.text if not text else text + (sep if s.glue is None else s.glue) + s.text
         self.text = text
         self.parts: List[Dict[str, Any]] = [
             {"text": s.text, "from": s.node.key, "kind": s.kind} for s in segs]
@@ -106,10 +134,11 @@ def node_text(n: TbNode) -> str:
 
 
 class _Composer:
-    def __init__(self, rules: Rules, focused: TbNode, selection_mode: int):
+    def __init__(self, rules: Rules, focused: TbNode, selection_mode: int, sep: str = SEP):
         self.r = rules
         self.focused = focused
         self.selection_mode = selection_mode
+        self.sep = sep
 
     # -- AccessibilityNodeFeedbackUtils --------------------------------------------------------
     def state_description(self, n: TbNode) -> str:
@@ -138,7 +167,7 @@ class _Composer:
             t = (lab.get("content_description") or lab.get("text") or "") if lab else ""
             if t and t not in out:
                 out.append(t)
-        return SEP.join(out)
+        return self.sep.join(out)
 
     def needs_label(self, n: TbNode) -> bool:
         """TalkBackLabelManager.needsLabel (TB/labeling/TalkBackLabelManager.java:56): enabled,
@@ -189,7 +218,7 @@ class _Composer:
                         pieces.append(f"{k} character" + ("" if k == 1 else "s"))
                     else:
                         pieces.append(n.text)
-                name = SEP.join(pieces)
+                name = self.sep.join(pieces)
             else:
                 name = n.text or n.content_description
             role_word = self.role_description(n)
@@ -432,7 +461,7 @@ def _collection_name(root: TbNode) -> str:
     return root.get("container_title") or node_text(root)
 
 
-def _collection_transition(r: Rules, st: SpeechState) -> str:
+def _collection_transition(r: Rules, st: SpeechState, sep: str = SEP) -> str:
     """getCollectionTransitionDescription (:54), for lists, grids and pagers without a
     roleDescription."""
     if st.root is None or st.transition not in (NAVIGATE_ENTER, NAVIGATE_EXIT):
@@ -451,12 +480,12 @@ def _collection_transition(r: Rules, st: SpeechState) -> str:
         vertical = rows >= cols
         count = rows if vertical else cols
         if rows > -1 and cols > -1 and count >= 0:
-            return f"{head}{SEP}{_plural(count, 'item')}"
+            return f"{head}{sep}{_plural(count, 'item')}"
         return head
     if kind == "grid":
         extra = [x for x in ((_plural(rows, "row") if rows > -1 else ""),
                              (_plural(cols, "column") if cols > -1 else "")) if x]
-        return SEP.join([head, *extra])
+        return sep.join([head, *extra])
     return head
 
 
@@ -494,14 +523,30 @@ def _item_transition(r: Rules, st: SpeechState, n: TbNode) -> List[str]:
 # --------------------------------------------------------------------------------------------
 
 
+def event_text(node: TbNode) -> str:
+    """getEventContentDescriptionOrEventAggregateText for the focus event ``node`` sends: its
+    contentDescription, else the populated text of its View subtree joined the way
+    AccessibilityEventUtils.getEventAggregateText does (", " after a letter or digit, else " ").
+    Only Views: a Compose node's event carries its own text, already in its description."""
+    if node.facet not in ("view", "interop"):
+        return ""
+    if node.content_description:
+        return node.content_description
+    out = ""
+    for t in populated_text(node.raw):
+        out = t if not out else out + (", " if out[-1].isalnum() else " ") + t
+    return out
+
+
 def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = None, *,
-             transitions: bool = True) -> Announcement:
+             transitions: bool = True, version: Optional[str] = None) -> Announcement:
     """What TalkBack says when ``node`` takes accessibility focus.
 
     ``nav_or_rules``: a :class:`~.order.Navigator` or :class:`~.rules.Rules`. ``state`` carries
     the collection / container / window TalkBack was in (updated in place); without it the
     announcement is the one for a first focus. ``transitions=False`` leaves out the collection,
-    container and window transitions (the node's own description only).
+    container and window transitions (the node's own description only). ``version``: a key of
+    :data:`VERSIONS` (default :data:`DEFAULT_VERSION`).
     """
     rules: Rules = getattr(nav_or_rules, "rules", nav_or_rules)
     st = state if state is not None else SpeechState()
@@ -510,12 +555,17 @@ def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = Non
     sel = 0
     if st.root is not None and st.item is not None:
         sel = int((st.root.get("collection_info") or {}).get("selection_mode", 0) or 0)
-    comp = _Composer(rules, node, sel)
+    sep = separator(version)
+    comp = _Composer(rules, node, sel, sep)
 
     unl = comp.unlabelled(node)
     segs: List[_Seg] = list(unl) if unl else _mark_descendants(comp.aggregate(node), node)
+    if unl or not segs:  # viewAccessibilityFocusedDescription (:207-225): the event's text
+        ev = event_text(node)
+        if ev:
+            segs = [_Seg(ev, node, "event")]
     # Nothing names the node: "Unlabelled", or only role / state words were found.
-    unlabelled = bool(unl) or not any(s.kind in _NAMING_KINDS for s in segs)
+    unlabelled = not any(s.kind in _NAMING_KINDS for s in segs)
 
     item = _item_transition(rules, st, node) if transitions else []
     if item:
@@ -524,7 +574,7 @@ def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = Non
         segs.append(_Seg(node.get("role_description") or "Heading", node, "heading"))
 
     if transitions:
-        coll = _collection_transition(rules, st)
+        coll = _collection_transition(rules, st, sep)
         if coll:
             segs.append(_Seg(coll, st.root or node, "collection"))
         else:
@@ -541,4 +591,4 @@ def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = Non
         if st.window is not None and st.window != win.index and win.title:
             segs.append(_Seg(f"Window {win.title}", node, "window"))
         st.window = win.index
-    return Announcement([s for s in segs if s.text], unlabelled)
+    return Announcement([s for s in segs if s.text], unlabelled, sep)

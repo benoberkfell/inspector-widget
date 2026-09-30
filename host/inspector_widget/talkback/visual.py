@@ -138,3 +138,28 @@ def _spoken(nav: Any, n: TbNode) -> str:
     from .speech import announce
 
     return announce(nav, n, transitions=False).text
+
+
+def order_items(items: Sequence[Dict[str, Any]]) -> List[str]:
+    """The same XY-cut over plain boxes, for callers without a TalkBack view (a live walk).
+
+    ``items``: ``[{"key": str, "bounds": (x, y, w, h), "window": int}]``, plus an optional
+    ``"container"`` (any hashable) to keep items together. Windows are read top to bottom, then
+    left to right, by the box around their items. Returns the keys in reading order.
+    """
+    by_window: Dict[Any, List[Tuple[Rect, Dict[str, Any]]]] = {}
+    for it in items:
+        x, y, w, h = it["bounds"]
+        by_window.setdefault(it.get("window", 0), []).append((Rect(x, y, x + w, y + h), it))
+    boxes = {w: _bbox([r for r, _ in members]) for w, members in by_window.items()}
+    out: List[str] = []
+    for w in sorted(by_window, key=lambda w: (boxes[w].top, boxes[w].left)):
+        groups: Dict[Any, List[Tuple[Rect, Dict[str, Any]]]] = {}
+        for r, it in by_window[w]:
+            groups.setdefault(it.get("container", id(it)), []).append((r, it))
+        blocks = []
+        for members in groups.values():
+            inner = [it for _, its in _cut([(r, [it]) for r, it in members]) for it in its]
+            blocks.append((_bbox([r for r, _ in members]), inner))
+        out.extend(it["key"] for _, its in _cut(blocks) for it in its)
+    return out
