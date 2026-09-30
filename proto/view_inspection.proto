@@ -260,7 +260,8 @@ message A11yNode {
   // getBoundsInScreen came back inverted (right < left or bottom < top: the node is
   // clipped away by an ancestor, e.g. an off-screen pager page); w/h are clamped to 0.
   bool bounds_clipped = 72;
-  // The node sits at the depth cap (80 levels) and has children that were not sent.
+  // The node has children that were not sent: it sits at the depth cap (80 levels
+  // in a dump; subtree_depth in an A11yFocus read).
   bool children_truncated = 73;
 
   repeated A11yNode children = 80;
