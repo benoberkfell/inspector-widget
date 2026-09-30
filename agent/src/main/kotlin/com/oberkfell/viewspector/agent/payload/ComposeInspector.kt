@@ -43,6 +43,22 @@
  * one, so the host must key the root as composeview:<acvId>, never as compose:<id>. Semantics ids
  * are re-minted on recomposition (e.g. the hot reload enable_inspection triggers), so a key is
  * only valid for the dump that produced it.
+ *
+ * VALUES: semantics values, composable parameters and modifier arguments are app objects; they are
+ * stringified by [SafeString], which never runs an arbitrary toString(). Every semantics entry,
+ * node and slot-table group is guarded on its own, so one bad value costs that value, never the
+ * ComposeView; the failures are counted in the diagnostics.
+ *
+ * DIAGNOSTICS (tokens separated by "; ", stable prefixes for the host to match):
+ *   found N AndroidComposeView(s) [(M nested in interop Views)]; bounds=screen
+ *   semantics_failed: view#<acvId> <reason>   reason = owner_unreachable | root_unreachable |
+ *       error=<Throwable>   (no semantics tree for that ComposeView)
+ *   semantics_partial: view#<acvId> nodes_failed=N values_failed=M   (the tree is there; N nodes
+ *       lost a part, M attribute values read "<error:...>")
+ *   slot_failed: view#<acvId> error=<Throwable>
+ *   slot_partial: view#<acvId> groups_failed=N
+ *   slot table empty (inspection_slot_table_set not populated) for N/M view(s)
+ *   view#<acvId>[,view#<acvId>...] produced no compose nodes
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -50,17 +66,41 @@ import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import com.oberkfell.viewspector.proto.ViewInspection
+import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
 object ComposeInspector {
 
     private const val TAG = "ViewSpector"
     private const val ANDROID_COMPOSE_VIEW = "androidx.compose.ui.platform.AndroidComposeView"
+
     private const val MAX_DEPTH = 400
+
+    // Entries read from one SemanticsConfiguration (a real one holds a few dozen).
+    private const val MAX_CONFIG_ENTRIES = 256
+
+    /** Per-ComposeView counters and log throttling for one dump. */
+    private class WalkCtx {
+        var semNodeFailures = 0
+        var semValueFailures = 0
+        var slotGroupFailures = 0
+        private val logged = HashSet<String>()
+
+        /** Log the first failure of each [kind] (per ComposeView), without a second failure. */
+        fun log(kind: String, t: Throwable) {
+            if (!logged.add(kind)) return
+            try {
+                Log.w(TAG, "compose: $kind failed (further failures counted only)", t)
+            } catch (_: Throwable) {
+                Log.w(TAG, "compose: $kind failed: ${SafeString.errorName(t)}")
+            }
+        }
+    }
 
     /**
      * Build a Compose window per AndroidComposeView found under [rootViews]. Call on the main thread.
-     * Returns the windows plus a human diagnostics string describing what was reachable.
+     * Returns the windows plus a diagnostics string describing what was reachable (the tokens are
+     * listed in the header, DIAGNOSTICS).
      */
     fun dump(
         rootViews: List<View>,
@@ -76,15 +116,16 @@ object ComposeInspector {
         if (nested[0] > 0) diag.append(" (${nested[0]} nested in interop Views)")
         diag.append("; bounds=screen")
 
-        // Per-view problems are aggregated (a RecyclerView of ComposeView cells can mean dozens of
-        // windows) and listed by view id at the end.
-        val semUnreachable = ArrayList<Long>()
+        // Per-view problems: one token per ComposeView (a RecyclerView of ComposeView cells can
+        // mean dozens of windows), aggregated lists at the end.
+        val tokens = ArrayList<String>()
         val slotEmpty = ArrayList<Long>()
         val noNodes = ArrayList<Long>()
 
         val windows = ArrayList<ViewInspection.DumpComposeResponse.Window>()
         for (cv in composeViews) {
             val acvId = cv.uniqueDrawingId
+            val ctx = WalkCtx()
             // Window px -> screen px shift for everything Compose reports in window coordinates.
             val off = windowOriginOnScreen(cv)
             // Synthetic root: id = the AndroidComposeView's uniqueDrawingId (== Window.view_id).
@@ -97,34 +138,50 @@ object ComposeInspector {
 
             var produced = false
             if (includeSemantics) {
-                try {
-                    val semRoot = semanticsRootNode(cv)
-                    if (semRoot != null) {
-                        val n = buildSemanticsNode(semRoot, strings, 0, off)
-                        if (n != null) { rootNode.addChildren(n); produced = true }
+                val reason = try {
+                    val (semRoot, missing) = semanticsRoot(cv)
+                    if (semRoot == null) {
+                        missing
                     } else {
-                        semUnreachable.add(acvId)
+                        rootNode.addChildren(buildSemanticsNode(semRoot, strings, 0, off, ctx))
+                        produced = true
+                        null
                     }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "semantics walk failed", t)
-                    diag.append("; view#$acvId semantics error: ${t.javaClass.simpleName}")
+                    ctx.log("semantics walk", t)
+                    "error=${SafeString.errorName(t)}"
+                }
+                if (reason != null) tokens.add("semantics_failed: view#$acvId $reason")
+                if (ctx.semNodeFailures > 0 || ctx.semValueFailures > 0) {
+                    tokens.add(
+                        "semantics_partial: view#$acvId nodes_failed=${ctx.semNodeFailures} " +
+                            "values_failed=${ctx.semValueFailures}",
+                    )
                 }
             }
             if (includeSlotTable) {
                 try {
-                    val groups = slotTableGroups(cv)
+                    val groups = slotTableGroups(cv, ctx)
                     if (groups.isEmpty()) {
                         slotEmpty.add(acvId)
                     } else {
                         for (g in groups) {
-                            for (n in buildSlotChildren(g, strings, 0, off)) {
-                                rootNode.addChildren(n); produced = true
+                            try {
+                                for (n in buildSlotChildren(g, strings, 0, off, ctx)) {
+                                    rootNode.addChildren(n); produced = true
+                                }
+                            } catch (t: Throwable) {
+                                ctx.slotGroupFailures++
+                                ctx.log("slot-table composition", t)
                             }
                         }
                     }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "slot-table walk failed", t)
-                    diag.append("; view#$acvId slot-table error: ${t.javaClass.simpleName}")
+                    ctx.log("slot-table walk", t)
+                    tokens.add("slot_failed: view#$acvId error=${SafeString.errorName(t)}")
+                }
+                if (ctx.slotGroupFailures > 0) {
+                    tokens.add("slot_partial: view#$acvId groups_failed=${ctx.slotGroupFailures}")
                 }
             }
 
@@ -136,9 +193,7 @@ object ComposeInspector {
             )
             if (!produced) noNodes.add(acvId)
         }
-        if (semUnreachable.isNotEmpty()) {
-            diag.append("; semantics owner/root unreachable for view#${semUnreachable.joinToString(",view#")}")
-        }
+        for (t in tokens) diag.append("; ").append(t)
         if (slotEmpty.isNotEmpty()) {
             diag.append(
                 "; slot table empty (inspection_slot_table_set not populated) for " +
@@ -314,6 +369,8 @@ object ComposeInspector {
         }
     }
 
+    private var indexFailureLogged = false
+
     private fun collectUnmerged(node: Any, groups: MutableSet<Int>, sizes: MutableMap<Int, Long>, depth: Int) {
         if (depth > MAX_DEPTH) return
         val id = invoke(node, "getId") as? Int
@@ -326,7 +383,17 @@ object ComposeInspector {
             if (w != null && h != null && w > 0 && h > 0) sizes[id] = packSize(w, h)
         }
         (invoke(node, "getChildren") as? List<*>)?.forEach { child ->
-            if (child != null) collectUnmerged(child, groups, sizes, depth + 1)
+            // Per node: one bad subtree must not cost the index of the whole ComposeView.
+            if (child != null) {
+                try {
+                    collectUnmerged(child, groups, sizes, depth + 1)
+                } catch (t: Throwable) {
+                    if (!indexFailureLogged) {
+                        indexFailureLogged = true
+                        Log.w(TAG, "semantics index: a node was skipped (${SafeString.errorName(t)}; logged once)")
+                    }
+                }
+            }
         }
     }
 
@@ -334,37 +401,66 @@ object ComposeInspector {
     private fun configFlag(node: Any, keyName: String): Boolean {
         val config = invoke(node, "getConfig") ?: return false
         val iter = invoke(config, "iterator") as? Iterator<*> ?: return false
-        while (iter.hasNext()) {
+        var guard = 0
+        while (guard++ < MAX_CONFIG_ENTRIES && iter.hasNext()) {
             val entry = iter.next() as? Map.Entry<*, *> ?: continue
             val key = entry.key ?: continue
-            if (invoke(key, "getName") == keyName) return entry.value == true
+            // Compared as a String / Boolean: never through the app value's equals().
+            if ((invoke(key, "getName") as? String) == keyName) return (entry.value as? Boolean) == true
         }
         return false
     }
 
     // ---------------------------------------------------------------- semantics (A)
-    private fun semanticsRootNode(composeView: View): Any? {
-        val owner = invoke(composeView, "getSemanticsOwner") ?: return null
-        // Merged root == what TalkBack sees == best human labels.
-        return invoke(owner, "getRootSemanticsNode")
+    /**
+     * The merged root SemanticsNode of [composeView] (merged root == what TalkBack sees == the
+     * best human labels), or null plus the reason token: owner_unreachable (no getSemanticsOwner,
+     * or it returned null) / root_unreachable. Throws when a getter itself throws.
+     */
+    private fun semanticsRoot(composeView: View): Pair<Any?, String> {
+        val owner = invokeChecked(composeView, "getSemanticsOwner") ?: return null to "owner_unreachable"
+        val root = invokeChecked(owner, "getRootSemanticsNode") ?: return null to "root_unreachable"
+        return root to ""
     }
 
+    /**
+     * One SemanticsNode and its subtree. Each part (id, bounds, attributes, each child) is guarded
+     * on its own: a failure costs that part and is counted in [ctx], never the node's siblings or
+     * the ComposeView. Children deeper than [MAX_DEPTH] are dropped.
+     */
     private fun buildSemanticsNode(
         node: Any,
         strings: StringTable,
         depth: Int,
         off: IntArray,
-    ): ViewInspection.ComposeNode? {
-        if (depth > MAX_DEPTH) return null
+        ctx: WalkCtx,
+    ): ViewInspection.ComposeNode {
         val b = ViewInspection.ComposeNode.newBuilder()
         b.kind = ViewInspection.ComposeNode.Kind.SEMANTICS
-        (invoke(node, "getId") as? Int)?.let { b.id = it.toLong() }
+        var failed = false
+        try {
+            (invoke(node, "getId") as? Int)?.let { b.id = it.toLong() }
+        } catch (t: Throwable) {
+            failed = true
+            ctx.log("semantics id", t)
+        }
 
         // bounds: getBoundsInWindow() -> Compose Rect (window px), shifted to screen px.
-        semanticsBounds(node, off)?.let { b.bounds = it }
+        try {
+            semanticsBounds(node, off)?.let { b.bounds = it }
+        } catch (t: Throwable) {
+            failed = true
+            ctx.log("semantics bounds", t)
+        }
 
-        // attrs: iterate the SemanticsConfiguration
-        val attrs = readSemanticsConfig(node)
+        // attrs: iterate the SemanticsConfiguration (guarded per entry inside)
+        val attrs = try {
+            readSemanticsConfig(node, ctx)
+        } catch (t: Throwable) {
+            failed = true
+            ctx.log("semantics config", t)
+            LinkedHashMap()
+        }
         for ((k, v) in attrs) {
             b.addAttrs(
                 ViewInspection.ComposeNode.Attr.newBuilder()
@@ -374,9 +470,26 @@ object ComposeInspector {
         b.name = strings.intern(bestLabel(attrs))
 
         // children
-        (invoke(node, "getChildren") as? List<*>)?.forEach { child ->
-            if (child != null) buildSemanticsNode(child, strings, depth + 1, off)?.let { b.addChildren(it) }
+        val children = try {
+            invoke(node, "getChildren") as? List<*>
+        } catch (t: Throwable) {
+            failed = true
+            ctx.log("semantics children", t)
+            null
         }
+        if (children != null) {
+            for (child in children) {
+                if (child == null) continue
+                if (depth + 1 > MAX_DEPTH) continue
+                try {
+                    b.addChildren(buildSemanticsNode(child, strings, depth + 1, off, ctx))
+                } catch (t: Throwable) {
+                    ctx.semNodeFailures++
+                    ctx.log("semantics node", t)
+                }
+            }
+        }
+        if (failed) ctx.semNodeFailures++
         return b.build()
     }
 
@@ -401,38 +514,41 @@ object ComposeInspector {
             ).build()
     }
 
-    private fun readSemanticsConfig(node: Any): LinkedHashMap<String, String> {
+    /**
+     * The node's SemanticsConfiguration as name -> string. Each entry is guarded on its own: an
+     * entry whose value cannot be stringified keeps its key (presence matters: OnClick, Heading,
+     * Disabled) with the value "<error:Name>", counted as a value failure.
+     */
+    private fun readSemanticsConfig(node: Any, ctx: WalkCtx): LinkedHashMap<String, String> {
         val out = LinkedHashMap<String, String>()
         val config = invoke(node, "getConfig") ?: return out
         val iter = invoke(config, "iterator") as? Iterator<*> ?: return out
-        while (iter.hasNext()) {
-            val entry = iter.next() as? Map.Entry<*, *> ?: continue
-            val key = entry.key ?: continue
-            val name = invoke(key, "getName") as? String ?: continue
-            val value = entry.value
-            out[name] = stringifySemanticsValue(value)
+        var guard = 0
+        while (guard++ < MAX_CONFIG_ENTRIES) {
+            val raw: Any? = try {
+                if (!iter.hasNext()) break
+                iter.next()
+            } catch (t: Throwable) {
+                ctx.semValueFailures++
+                ctx.log("semantics entry", t)
+                break
+            }
+            val entry = raw as? Map.Entry<*, *> ?: continue
+            val name = try {
+                entry.key?.let { invoke(it, "getName") as? String }
+            } catch (t: Throwable) {
+                ctx.log("semantics key", t)
+                null
+            } ?: continue
+            out[name] = try {
+                entry.value?.let { SafeString.render(it) } ?: ""
+            } catch (t: Throwable) {
+                ctx.semValueFailures++
+                ctx.log("semantics value", t)
+                SafeString.errorToken(t)
+            }
         }
         return out
-    }
-
-    private fun stringifySemanticsValue(value: Any?): String {
-        if (value == null) return ""
-        return try {
-            when (value) {
-                is CharSequence -> value.toString()
-                is List<*> -> value.joinToString(", ") { annotatedOrString(it) }
-                else -> annotatedOrString(value)
-            }
-        } catch (t: Throwable) { value.toString() }
-    }
-
-    private fun annotatedOrString(v: Any?): String {
-        if (v == null) return ""
-        // AnnotatedString.getText() ; Role/ToggleableState/etc. -> toString() ; AccessibilityAction.getLabel()
-        invoke(v, "getText")?.let { if (it is CharSequence) return it.toString() }
-        invoke(v, "getLabel")?.let { if (it is CharSequence) return it.toString() }
-        invoke(v, "getCurrent")?.let { return it.toString() } // ProgressBarRangeInfo
-        return v.toString()
     }
 
     private fun bestLabel(attrs: Map<String, String>): String {
@@ -445,7 +561,7 @@ object ComposeInspector {
 
     // ---------------------------------------------------------------- slot table (B)
     @Suppress("UNCHECKED_CAST")
-    private fun slotTableGroups(composeView: View): List<Any> {
+    private fun slotTableGroups(composeView: View, ctx: WalkCtx): List<Any> {
         val cl = composeView.javaClass.classLoader ?: return emptyList()
         val tagId = slotTableTagId(composeView, cl)
         if (tagId == 0) return emptyList()
@@ -459,7 +575,10 @@ object ComposeInspector {
             try {
                 val g = asTree.invoke(null, cd)
                 if (g != null) groups.add(g)
-            } catch (t: Throwable) { /* skip */ }
+            } catch (t: Throwable) {
+                ctx.slotGroupFailures++
+                ctx.log("slot-table asTree", t)
+            }
         }
         return groups
     }
@@ -479,16 +598,6 @@ object ComposeInspector {
         } catch (_: Throwable) { 0 }
     }
 
-    // Slot-table depth cap: keep nesting well under protobuf's 100-level parse limit.
-    private const val SLOT_MAX_DEPTH = 60
-
-    /**
-     * Returns the list of NAMED-composable nodes contributed by [group] and its descendants.
-     * Anonymous/structural groups (no name) are collapsed: their named children are hoisted to
-     * the caller, which both flattens the very deep slot tree (avoiding the proto recursion limit)
-     * and yields a readable composable hierarchy. Each named node carries bounds, file:line, and
-     * its call parameters.
-     */
     // Infrastructural composable names that carry no UI meaning: collapse them like unnamed groups
     // so their modifiers/children attach to the nearest MEANINGFUL composable (Tape, Polaroid, Text…).
     private val STRUCTURAL = setOf(
@@ -502,17 +611,37 @@ object ComposeInspector {
     private fun meaningfulName(group: Any): String? =
         (invoke(group, "getName") as? String)?.takeIf { it.isNotBlank() && !isStructuralName(it) }
 
+    // Slot-table depth cap: keep nesting well under protobuf's 100-level parse limit.
+    private const val SLOT_MAX_DEPTH = 60
+
+    /**
+     * Returns the list of NAMED-composable nodes contributed by [group] and its descendants.
+     * Anonymous/structural groups (no name) are collapsed: their named children are hoisted to
+     * the caller, which both flattens the very deep slot tree (avoiding the proto recursion limit)
+     * and yields a readable composable hierarchy. Each named node carries bounds, file:line, and
+     * its call parameters. A child group that throws is counted in [ctx] (slot_partial) and its
+     * siblings still come through.
+     */
     private fun buildSlotChildren(
         group: Any,
         strings: StringTable,
         depth: Int,
         off: IntArray,
+        ctx: WalkCtx,
     ): List<ViewInspection.ComposeNode> {
         if (depth > SLOT_MAX_DEPTH) return emptyList()
         val name = meaningfulName(group)
         val childGroups = (invoke(group, "getChildren") as? Collection<*>) ?: emptyList<Any?>()
         val childNodes = ArrayList<ViewInspection.ComposeNode>()
-        for (c in childGroups) if (c != null) childNodes.addAll(buildSlotChildren(c, strings, depth + 1, off))
+        for (c in childGroups) {
+            if (c == null) continue
+            try {
+                childNodes.addAll(buildSlotChildren(c, strings, depth + 1, off, ctx))
+            } catch (t: Throwable) {
+                ctx.slotGroupFailures++
+                ctx.log("slot-table group", t)
+            }
+        }
 
         if (name == null) return childNodes // structural group: hoist children up
 
@@ -525,7 +654,11 @@ object ComposeInspector {
         // named composable. Gather modifiers from this group's owned unnamed-descendant chain,
         // stopping at the next named composable (whose modifiers belong to it).
         val mods = LinkedHashSet<String>()
-        collectOwnedModifiers(group, mods, 0)
+        try {
+            collectOwnedModifiers(group, mods, 0)
+        } catch (t: Throwable) {
+            ctx.log("slot-table modifiers", t)
+        }
         if (mods.isNotEmpty()) {
             b.addAttrs(
                 ViewInspection.ComposeNode.Attr.newBuilder()
@@ -534,9 +667,15 @@ object ComposeInspector {
             )
         }
         // Render-node (graphicsLayer) id, so the host can cut a per-component SKP image.
-        val rnid = collectRenderNodeId(group, 0)
+        val rnid = try { collectRenderNodeId(group, 0) } catch (t: Throwable) { 0L }
         if (rnid != 0L) b.renderNodeId = rnid
-        for (p in slotParameters(group)) {
+        val params = try {
+            slotParameters(group)
+        } catch (t: Throwable) {
+            ctx.log("slot-table parameters", t)
+            emptyList()
+        }
+        for (p in params) {
             b.addAttrs(
                 ViewInspection.ComposeNode.Attr.newBuilder()
                     .setKey(strings.intern(p.first)).setValue(strings.intern(p.second)).build()
@@ -614,17 +753,23 @@ object ComposeInspector {
         // InspectableValue: nameFallback + inspectableElements (Sequence<ValueElement>).
         val name = invoke(el, "getNameFallback") as? String
         val args = ArrayList<String>()
-        val seq = invoke(el, "getInspectableElements")
-        val iter = invoke(seq, "iterator") as? Iterator<*>
-        var guard = 0
-        while (iter != null && iter.hasNext() && guard < 24) {
-            guard++
-            val ve = iter.next() ?: continue
-            val vn = invoke(ve, "getName") as? String ?: continue
-            val vv = invoke(ve, "getValue")
-            args.add("$vn=${annotatedOrString(vv)}")
+        // The InspectableValue SPI evaluates the modifier's inspectorInfo block (library code, or
+        // the app's own for a custom modifier); a failure ends the argument list, not the node.
+        try {
+            val seq = invoke(el, "getInspectableElements")
+            val iter = invoke(seq, "iterator") as? Iterator<*>
+            var guard = 0
+            while (iter != null && iter.hasNext() && guard < 24) {
+                guard++
+                val ve = iter.next() ?: continue
+                val vn = invoke(ve, "getName") as? String ?: continue
+                val vv = invoke(ve, "getValue")
+                args.add("$vn=${SafeString.of(vv)}")
+            }
+        } catch (_: Throwable) {
+            args.add("…")
         }
-        val base = name ?: el.javaClass.simpleName
+        val base = name ?: SafeString.simpleNameOf(el.javaClass)
             .removeSuffix("Element").removeSuffix("Modifier").ifBlank { return null }
         return if (args.isEmpty()) base else "$base(${args.joinToString(", ")})"
     }
@@ -637,7 +782,7 @@ object ComposeInspector {
             if (p == null) continue
             val pn = invoke(p, "getName") as? String ?: continue
             val pv = invoke(p, "getValue")
-            out.add(pn to (pv?.let { annotatedOrString(it) } ?: "null"))
+            out.add(pn to SafeString.of(pv))
         }
         return out
     }
@@ -687,6 +832,20 @@ object ComposeInspector {
         if (obj == null) return null
         val m = findMethod(obj.javaClass, method) ?: return null
         return try { m.isAccessible = true; m.invoke(obj) } catch (t: Throwable) { null }
+    }
+
+    /**
+     * Like [invoke], but a getter that throws is not mistaken for a missing one: returns null only
+     * when the method is absent (or returns null) and rethrows the getter's own exception.
+     */
+    private fun invokeChecked(obj: Any, method: String): Any? {
+        val m = findMethod(obj.javaClass, method) ?: return null
+        m.isAccessible = true
+        return try {
+            m.invoke(obj)
+        } catch (e: InvocationTargetException) {
+            throw e.targetException ?: e
+        }
     }
 
     private fun intOf(obj: Any?, method: String): Int? = (invoke(obj, method) as? Number)?.toInt()
