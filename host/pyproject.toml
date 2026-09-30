@@ -39,7 +39,9 @@ dependencies = [
 mcp = ["mcp>=1.19,<3"]
 # gRPC client used by inspector_widget.skia_client to talk to the Skia parser
 # service for SKP image decoding. Optional — only the SKP image path needs it.
-images = ["grpcio>=1.60"]
+# The floor is the version skia_grpc/skia_pb2_grpc.py was generated with
+# (GRPC_GENERATED_VERSION); older grpcio makes that module raise on import.
+images = ["grpcio>=1.81.0"]
 # Pillow is required by every overlay tool (inspector_widget.overlay:
 # compose_overlay, a11y_overlay, inspect --overlay) and by the component_image
 # screenshot-crop fallback. inspector_widget.png alone falls back to a stdlib
@@ -50,7 +52,7 @@ dev = ["pytest", "ruff"]
 # Everything (convenience): mcp + images + overlay + dev.
 all = [
     "mcp>=1.19,<3",
-    "grpcio>=1.60",
+    "grpcio>=1.81.0",
     "Pillow>=10",
     "pytest",
     "ruff",
