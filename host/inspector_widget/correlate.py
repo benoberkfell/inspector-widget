@@ -794,12 +794,14 @@ def resolve_key(merged: Dict[str, Any], key: str) -> Optional[dict]:
     if len(cands) == 1:
         return cands[0]
     if len(cands) > 1:
-        listed = [{"node_key": n["node_key"], "label": _node_label(n)} for n in cands]
+        rows = {id(n): r for n, r in _compose_nodes_with_rows(merged.get("roots", []))}
+        listed = [{"node_key": n["node_key"], "label": _node_label(n), "row": rows.get(id(n))}
+                  for n in cands]
         raise NodeKeyError(
             f"compose:{t[1]} is ambiguous: semantics id {t[1]} exists in {len(cands)} "
-            "ComposeViews; use one of " + ", ".join(
-                f"{c['node_key']}" + (f" ({c['label']!r})" if c["label"] else "") for c in listed),
-            listed)
+            "ComposeViews; use one of: " + "; ".join(
+                _describe(n) + (f" (row {rows[id(n)]})" if rows.get(id(n)) is not None else "")
+                for n in cands), listed)
     return None
 
 
