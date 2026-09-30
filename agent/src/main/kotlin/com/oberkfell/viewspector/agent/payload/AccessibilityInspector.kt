@@ -352,12 +352,21 @@ object AccessibilityInspector {
         return "window type=${lp.type} flags=0x${Integer.toHexString(lp.flags)}"
     }
 
+    @Volatile private var queryResetFailureLogged = false
+
     private fun resetQueryMode(node: AccessibilityNodeInfo?, root: View) {
         if (node == null) return
         try {
             node.setQueryFromAppProcessEnabled(root, false)
         } catch (t: Throwable) {
-            Log.w(TAG, "setQueryFromAppProcessEnabled(false) failed", t)
+            // The node is sealed by the time the walk ends, so this throws "sealed instance" on
+            // every dump (seen on API 37). Nothing is left behind: the connection id lives on this
+            // discarded node, and the direct connection belongs to the ViewRootImpl
+            // (ensureDirectConnection). Say so once per process, quietly.
+            if (!queryResetFailureLogged) {
+                queryResetFailureLogged = true
+                Log.d(TAG, "setQueryFromAppProcessEnabled(false) skipped: ${t.javaClass.simpleName} (logged once)")
+            }
         }
     }
 
