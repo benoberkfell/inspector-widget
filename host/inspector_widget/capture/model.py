@@ -499,6 +499,9 @@ REF_FIELDS: dict[str, tuple[str, ...]] = {
     "compose": ("slots",),
     "slot": ("sem",),
 }
+#: Issue evidence fields that hold node ids (rewritten by remap_ids too), so the
+#: analyzers can run on a key-space index before refs are assigned.
+EVIDENCE_REF_FIELDS: tuple[str, ...] = ("clipped_by", "children_ids", "node_ids")
 
 
 @dataclass
@@ -689,7 +692,8 @@ def remap_ids(ix: Index, mapping: Mapping[str, str], *, set_refs: bool = True) -
     rewritten through ``mapping``.
 
     Ids missing from ``mapping`` stay as they are. Rewrites ``Index.nodes`` keys,
-    ``UNode.parent/children/window``, the REF_FIELDS facet links, every Tree,
+    ``UNode.parent/children/window``, the REF_FIELDS facet links, the
+    EVIDENCE_REF_FIELDS of every issue, every Tree,
     ``Index.reading`` and ``Index.by_key`` values. With ``set_refs`` a node whose
     new id is a ref gets ``UNode.ref`` set to it. ``rebound_of`` is left alone
     (it names a ref of an earlier capture).
@@ -725,7 +729,13 @@ def remap_ids(ix: Index, mapping: Mapping[str, str], *, set_refs: bool = True) -
         n2.ids = dict(node.ids)
         n2.conf = dict(node.conf)
         n2.flags = list(node.flags)
-        n2.issues = [Issue(i.id, i.sev, copy.deepcopy(i.evidence), i.conf) for i in node.issues]
+        n2.issues = []
+        for i in node.issues:
+            ev = copy.deepcopy(i.evidence)
+            for link in EVIDENCE_REF_FIELDS:
+                if link in ev:
+                    ev[link] = m_value(ev[link])
+            n2.issues.append(Issue(i.id, i.sev, ev, i.conf))
         for name in ("b", "declared_b"):
             if getattr(node, name) is not None:
                 setattr(n2, name, list(getattr(node, name)))
@@ -817,9 +827,14 @@ class LineageState:
 
 
 def lineage_file_name(serial: str, package: str) -> str:
-    """``<serial>__<package>.json`` with path-hostile characters replaced."""
+    """``<serial>__<package>-<hash8>.json``: path-hostile characters replaced, plus
+    8 hex chars of a hash of the exact serial and package, so lineages that
+    sanitize alike (``192.168.1.7:5555`` and ``192.168.1.7_5555``) or differ only
+    in case (``com.Slack``, ``com.slack`` on a case-insensitive disk) never share
+    a file."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{serial}__{package}")
-    return f"{safe}.json"
+    exact = f"{serial}\x00{package}".encode()
+    return f"{safe}-{hashlib.blake2s(exact, digest_size=4).hexdigest()}.json"
 
 
 __all__ = [
@@ -829,6 +844,7 @@ __all__ = [
     "CONSISTENCY",
     "CROCKFORD",
     "ERROR_CODES",
+    "EVIDENCE_REF_FIELDS",
     "FACET_NAMES",
     "FACET_STATUS",
     "FLAGS",

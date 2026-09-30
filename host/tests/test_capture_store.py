@@ -1130,3 +1130,194 @@ def test_default_rebuild_runs_the_analyzers(tmp_path):
     assert rebuilt.reading == ix.reading and rebuilt.reading
     assert {k: n.issues for k, n in rebuilt.nodes.items()} == \
         {k: n.issues for k, n in ix.nodes.items()}
+
+
+# --------------------------------------------------------------------------- review fixes
+def _publish_real(store, raw, ix, index, refs, prev=None):
+    with store.refs_lock():
+        same_pid, same_gen = refs.identity_flags(raw.meta, prev.meta if prev else None)
+        refmap, tomb = refs.assign(ix, prev, same_pid=same_pid, same_generation=same_gen,
+                                   alloc=store.next_refs)
+        return store.publish(raw, index.apply_refs(ix, refmap), refmap, tomb=tomb)
+
+
+def test_a_rebuild_mints_refs_for_keys_the_refmap_lacks(tmp_path, monkeypatch):
+    """A host upgrade bumps the index schema and its builder emits a node the
+    capture never had a ref for. The rebuilt index must stay in ref space (else
+    every later capture of the lineage fails), and every process must agree."""
+    from inspector_widget.capture import model as M
+
+    raw, ix, index, refs = _real_capture()
+    store = make_store(tmp_path)
+    cid = _publish_real(store, raw, ix, index, refs)
+    real = index.build_index
+
+    def newer_build_index(r):
+        out = real(r)
+        some = next(iter(out.nodes.values()))
+        extra = M.UNode(key="a11y:999:7", kind="a11y", parent=some.id, window=some.window)
+        out.nodes[extra.key] = extra
+        out.by_key[extra.key] = extra.key
+        some.children.append(extra.key)
+        return out
+
+    monkeypatch.setattr(index, "build_index", newer_build_index)
+    path = os.path.join(store.capture_dir(cid), "index.jsonl.gz")
+    with open(path, "wb") as f:
+        f.write(gzip.compress(b'{"index":999}\n'))
+    counter = store.next_refs(0)
+    rebuilt = CaptureStore(root=store.root, persist=True).load(cid).index()
+    assert all(M.is_ref(nid) for nid in rebuilt.nodes)
+    extra = rebuilt.get("a11y:999:7")
+    assert extra is not None and extra.id == f"n{counter}" and extra.match == "new"
+    assert store.load(cid).refmap()["a11y:999:7"] == extra.id  # persisted
+    again = CaptureStore(root=store.root, persist=True).load(cid).index()
+    assert again.get("a11y:999:7").id == extra.id  # the saved index, same ref
+    # the lineage can still capture: the rebuilt latest is a valid prev
+    raw2, ix2, _, _ = _real_capture()
+    cid2 = _publish_real(store, raw2, ix2, index, refs, prev=again)
+    assert store.resolve("latest", (SERIAL, APP)) == cid2
+
+
+def test_carry_over_ignores_prev_nodes_without_a_ref():
+    from inspector_widget.capture import refs
+
+    raw, ix, index, _ = _real_capture()
+    refmap, _ = refs.assign(ix, None, same_pid=True, same_generation=True,
+                            alloc=lambda n: 1)
+    prev = index.apply_refs(ix, {k: v for k, v in list(refmap.items())[:-1]})  # one left keyed
+    left = [nid for nid in prev.nodes if not nid.startswith("n")]
+    assert len(left) == 1
+    raw2, ix2, _, _ = _real_capture()
+    res = refs.plan(ix2, prev, same_pid=True, same_generation=True, alloc=lambda n: 1000)
+    assert left[0] not in res.tomb and left[0] not in res.refmap.values()
+    assert res.stats["id"] == len(prev.nodes) - 1
+
+
+def test_a_rebuild_never_runs_contrast_under_the_store_lock(tmp_path, monkeypatch):
+    from inspector_widget.capture import analyzers
+
+    raw, ix, index, refs = _real_capture()
+    raw.meta.options.lint = "full"
+    store = make_store(tmp_path)
+    cid = _publish_real(store, raw, ix, index, refs)
+    os.remove(os.path.join(store.capture_dir(cid), "index.jsonl.gz"))
+    modes = []
+    real = analyzers.analyze
+
+    def spy(ix_, loaded, *, lint="tree", **kw):
+        modes.append(lint)
+        return real(ix_, loaded, lint=lint, **kw)
+
+    monkeypatch.setattr(analyzers, "analyze", spy)
+    cold = CaptureStore(root=store.root, persist=True)
+    with cold.refs_lock():
+        cold.load(cid).index()
+    assert modes == ["tree"]
+    assert not os.path.exists(os.path.join(store.capture_dir(cid), "index.jsonl.gz"))
+    CaptureStore(root=store.root, persist=True).load(cid).index()  # outside the lock
+    assert modes == ["tree", "full"]
+    assert os.path.exists(os.path.join(store.capture_dir(cid), "index.jsonl.gz"))
+
+
+def test_analyzing_before_refs_keeps_evidence_links_in_ref_space():
+    """The capture order keeps analyze out of the store lock: it runs on the
+    key-space index, and apply_refs rewrites the node ids evidence names."""
+    from inspector_widget.capture import analyzers
+    from inspector_widget.capture import model as M
+
+    raw, ix, index, refs = _real_capture()
+    analyzers.analyze(ix, raw)
+    last = list(ix.nodes)[-1]
+    ix.nodes[last].issues.append(  # evidence as the analyzers write it, in key space
+        M.Issue("render.clipped", "info", {"clipped_by": next(iter(ix.nodes)),
+                                           "node_ids": list(ix.nodes)[:2]}))
+    refmap, _ = refs.assign(ix, None, same_pid=False, same_generation=False,
+                            alloc=lambda n: 1)
+    out = index.apply_refs(ix, refmap)
+    for n in out.nodes.values():
+        for i in n.issues:
+            for k in M.EVIDENCE_REF_FIELDS:
+                v = i.evidence.get(k)
+                for x in (v if isinstance(v, list) else [v] if v else []):
+                    assert M.is_ref(x), (i.id, k, x)
+    assert all(M.is_ref(r) for r in out.reading)
+
+
+def test_a_late_publish_does_not_become_latest(tmp_path):
+    """Two processes capture one app at once: A starts first, B publishes first.
+    latest and history follow created_at, not publish order."""
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    t0 = clock.t
+    old = publish(store, tag="old", created_at=t0 - 10)
+    b = publish(store, tag="b", created_at=t0 + 5)
+    with store.refs_lock():
+        first = store.next_refs(REFS_PER)
+        raw, ix, refmap = payload(tag="a", first_ref=first, created_at=t0)
+        a = store.publish(raw, ix, refmap, tomb={"n2": ["View", "b 1", "n2", b]})
+    st = store.lineage_state(SERIAL, APP)
+    assert st.latest == b and st.history == [b, a, old]
+    assert store.resolve("latest", (SERIAL, APP)) == b
+    assert store.resolve("prev", (SERIAL, APP)) == a
+    assert store.load(a).meta.prev == old
+    assert [m.id for m in store.list()] == st.history
+    assert "n2" not in st.tomb  # a late capture's tombstones name refs b still has
+
+
+def test_a_capture_with_an_unreadable_meta_is_still_collected(tmp_path):
+    clock = Clock()
+    store = make_store(tmp_path, clock, ttl_s=3600)
+    good = publish(store, tag="good")
+    bad = publish(store, tag="bad")
+    with open(os.path.join(store.capture_dir(bad), "meta.json"), "wb") as f:
+        f.write(b"{torn")
+    assert [m.id for m in store.list()] == [good]
+    clock.advance(2 * 3600)
+    report = store.gc()
+    assert {r["id"] for r in report["removed"]} == {good, bad}
+    assert not os.path.exists(store.capture_dir(bad))
+
+
+def test_an_unreadable_meta_counts_towards_the_byte_cap(tmp_path):
+    store = make_store(tmp_path, max_bytes=1)
+    bad = publish(store, tag="bad")
+    with open(os.path.join(store.capture_dir(bad), "meta.json"), "wb") as f:
+        f.write(b"{torn")
+    assert {r["id"] for r in store.gc()["removed"]} == {bad}
+
+
+def test_lineages_that_sanitize_alike_keep_separate_state(tmp_path):
+    store = make_store(tmp_path)
+    ids = {lin: publish(store, lin, tag=f"{lin}") for lin in (
+        ("192.168.1.7:5555", APP), ("192.168.1.7_5555", APP),
+        (SERIAL, "com.Slack"), (SERIAL, "com.slack"))}
+    assert sorted(store.lineages()) == sorted(ids)
+    for lin, cid in ids.items():
+        assert store.lineage_state(*lin).latest == cid
+        assert store.resolve("latest", lin) == cid
+
+
+def test_lineage_state_never_trusts_another_lineages_file(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    publish(store, (SERIAL, "com.Slack"))
+    monkeypatch.setattr(S, "lineage_file_name", lambda serial, package: "same.json")
+    publish(store, (SERIAL, "com.Slack"))
+    assert store.lineage_state(SERIAL, "com.slack").latest is None
+
+
+def test_gc_all_moves_captures_to_the_trash_before_deleting(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    cid = publish(store)
+    deleted_in_place = []
+    real = S._rmtree
+
+    def spy(path):
+        if os.path.dirname(os.path.abspath(path)) == os.path.abspath(store.captures_dir):
+            deleted_in_place.append(path)
+        real(path)
+
+    monkeypatch.setattr(S, "_rmtree", spy)
+    store.gc(all=True)
+    assert deleted_in_place == [] and not os.path.exists(store.capture_dir(cid))
+    assert os.listdir(os.path.join(store.root, ".trash")) == []

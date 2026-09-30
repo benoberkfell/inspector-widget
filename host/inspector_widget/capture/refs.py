@@ -443,6 +443,10 @@ class _Matcher:
         self.amb_prev: set[str] = set()
         self.nogeo_new: set[str] = set()
         self.nogeo_prev: set[str] = set()
+        # prev nodes without a ref (a rebuilt index that could not mint one) can
+        # never be matched and are never tombstoned
+        self.no_ref: set[str] = {pid for pid, n in prev.nodes.items()
+                                 if not _in_ref_space(pid, n)}
 
     # ---------------------------------------------------------------- bookkeeping
     def _pair(self, n: str, p: str, how: str) -> None:
@@ -454,7 +458,7 @@ class _Matcher:
         return n not in self.n2p and n not in self.blocked and n not in self.amb_new
 
     def _free_prev(self, p: str) -> bool:
-        return p not in self.p2n and p not in self.amb_prev
+        return p not in self.p2n and p not in self.amb_prev and p not in self.no_ref
 
     def _ambiguous(self, news: Iterable[str], prevs: Iterable[str]) -> None:
         for n in news:
@@ -482,7 +486,7 @@ class _Matcher:
             if parsed is None or parsed[0] not in IDENTITY_KEY_KINDS | WEAK_KEY_KINDS:
                 continue
             pid = prev.ix.by_key.get(n.key)
-            if pid is None or pid not in prev.nodes:
+            if pid is None or pid not in prev.nodes or pid in self.no_ref:
                 continue
             p = prev.nodes[pid]
             if p.key != n.key or p.kind != n.kind:
@@ -778,12 +782,16 @@ class _Matcher:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+def _in_ref_space(nid: str, n: UNode) -> bool:
+    return is_ref(nid) and n.ref == nid
+
+
 def _check_inputs(new: Index, prev: Index | None) -> None:
     if prev is None:
         return
-    for nid, n in prev.nodes.items():
-        if not is_ref(nid) or n.ref != nid:
-            raise ValueError(f"prev must be a ref-space index (node {nid!r} has no ref)")
+    if prev.nodes and not any(_in_ref_space(nid, n) for nid, n in prev.nodes.items()):
+        nid = next(iter(prev.nodes))
+        raise ValueError(f"prev must be a ref-space index (node {nid!r} has no ref)")
     nm, pm = new.meta, prev.meta
     if nm is not None and pm is not None and tuple(nm.lineage) != tuple(pm.lineage):
         raise OpError("bad_args",
@@ -844,7 +852,7 @@ def plan(new: Index, prev: Index | None, *, same_pid: bool, same_generation: boo
     if prev is not None and matcher is not None:
         prev_id = prev.meta.id if prev.meta is not None else None
         for pid in matcher.prev.order:
-            if pid not in matcher.p2n:
+            if pid not in matcher.p2n and pid not in matcher.no_ref:
                 out.tomb[pid] = tomb_entry(prev.nodes[pid], prev_id)
     return out
 

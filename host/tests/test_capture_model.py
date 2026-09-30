@@ -152,7 +152,16 @@ def test_lineage_state_round_trip():
                         tomb={"n9": ["Text", "Gone", "@x", "c1"]})
     assert m.LineageState.from_dict(json.loads(json.dumps(st.to_dict()))) == st
     assert m.LineageState.from_dict(None) == m.LineageState()
-    assert m.lineage_file_name("192.168.1.5:5555", "com.x") == "192.168.1.5_5555__com.x.json"
+    name = m.lineage_file_name("192.168.1.5:5555", "com.x")
+    assert name.startswith("192.168.1.5_5555__com.x-") and name.endswith(".json")
+
+
+def test_lineage_file_names_never_collide():
+    names = [m.lineage_file_name(*lin) for lin in (
+        ("192.168.1.7:5555", "com.x"), ("192.168.1.7_5555", "com.x"),
+        ("emulator-5554", "com.Slack"), ("emulator-5554", "com.slack"))]
+    # distinct even on a case-insensitive disk
+    assert len({n.lower() for n in names}) == 4
 
 
 # --------------------------------------------------------------------------- nodes and index

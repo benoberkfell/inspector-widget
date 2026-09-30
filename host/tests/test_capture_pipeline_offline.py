@@ -4,9 +4,9 @@ Every capture here goes the way the ops layer (S1) will take it, but through the
 library modules only:
 
     fetch (C3) over an in-process scene session
-      -> build_index (C4)
+      -> build_index (C4), analyze (C7) on the key-space index, prev.index()
       -> under the store's refs lock: refs.assign against the lineage's latest (C5),
-         apply_refs, analyze (C7), store.publish (C2)
+         apply_refs, store.publish (C2)
       -> store.load
 
 and is then walked with outline / find / node (C6), lint_view (C7), crop /
@@ -99,14 +99,20 @@ class Pipeline:
         raw = fetch.fetch(session, opts, compose_generation=gen, device=device,
                           sleep=lambda _s: None, wall_clock=self.clock)
         ix = index.build_index(raw)
-        with self.store.refs_lock():
-            prev = self._latest(lineage)  # re-read under the lock
-            pix = prev.index() if prev is not None else None
+        # Outside the store lock: analyze the key-space index (lint="full" runs
+        # contrast, ~4 s; apply_refs carries issues, stops, reading and evidence
+        # links over) and hydrate prev's index (a rebuild can be slow too).
+        analyzers.analyze(ix, raw, lint=raw.meta.options.lint)
+        pix = prev.index() if prev is not None else None
+        with self.store.refs_lock():  # held for assign + apply + publish only
+            latest = self.store.lineage_state(*lineage).latest
+            if latest != (prev.id if prev is not None else None):
+                prev = self._latest(lineage)  # another process published meanwhile
+                pix = prev.index() if prev is not None else None
             same_pid, same_gen = refs.identity_flags(raw.meta, pix.meta if pix else None)
             refmap, tomb = refs.assign(ix, pix, same_pid=same_pid, same_generation=same_gen,
                                        alloc=self.store.next_refs)
             ix = index.apply_refs(ix, refmap)
-            analyzers.analyze(ix, raw, lint=raw.meta.options.lint)
             raw.meta.label = label
             cid = self.store.publish(raw, ix, refmap, tomb=tomb)
         self.tick(2.0)

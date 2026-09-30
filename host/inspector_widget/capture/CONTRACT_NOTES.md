@@ -96,6 +96,11 @@ with every consumer.
 - **`publish(raw, ix, refmap, *, tomb=None) -> id`.**
   - It mutates `raw.meta`: `id`, `created_at` (when 0) and `prev` (when None; it
     becomes the lineage's latest).
+  - Out-of-order publishes (A fetched first, B published first): when the
+    lineage's latest has a newer `created_at`, the latest stays and the capture
+    goes into `history` by `created_at`; its `prev` (when None) is the next older
+    capture, and its tombstones are dropped (they name refs the newer latest
+    still holds).
   - It applies `meta.label`, moving it silently from another capture of the
     lineage. Call `label()` after publishing to learn `moved_from`.
   - It honours `meta.pinned`: `bad_args` when 20 are pinned already.
@@ -108,8 +113,12 @@ with every consumer.
   one) and pins in a `.pinned` marker. `meta.json` is written once. `load()` and
   `list()` overlay the current `label` and `pinned`. `latest` and `prev` are
   reserved and can never be labels.
-- **Lineage files** also carry `serial` and `package`, because file names are
-  sanitized. `lineage_state()` remembers its lineage, so
+- **Lineage files** are `lineages/<serial>__<package>-<hash8>.json`: the
+  sanitized names plus 8 hex chars of a hash of the exact serial and package, so
+  `192.168.1.7:5555` and `192.168.1.7_5555`, or `com.Slack` and `com.slack` on a
+  case-insensitive disk, never share a file. They also carry `serial` and
+  `package`, and `lineage_state()` ignores a file whose stored pair differs.
+  `lineage_state()` remembers its lineage, so
   `save_lineage_state(st)` needs no arguments. `save_lineage_state(st, serial,
   package)` also works. Save before `publish`, or re-read after it, because
   publish rewrites `latest` and `history`.
@@ -149,7 +158,11 @@ with every consumer.
     trash_purged, spill_purged, incomplete_purged, captures, bytes}`, where
     `why` is one of `expired`, `lineage_cap`, `count_cap` or `bytes`.
   - It returns `{"skipped": ...}` while another gc runs.
-  - `gc(all=True)` returns `{all, removed, note}`.
+  - `gc(all=True)` returns `{all, removed, note}`. It renames every capture
+    into `.trash` before deleting, as evictions do.
+  - A complete capture whose `meta.json` is unreadable is still collected: it is
+    dated by its `.complete` marker, counts towards the caps in a lineage of its
+    own and is evicted like any other (it cannot be loaded or listed).
 - **Known gap.** Refs of a lineage's *latest* capture get no tombstone when that
   capture is dropped or evicted, because no later capture was matched against
   it. Refs are still never reused: the counter is global.
@@ -899,10 +912,29 @@ with every consumer.
 ## Integration (improve/capture-core)
 
 The module branches were merged onto improve/capture-base and run end to end in
-`tests/test_capture_pipeline_offline.py` (fetch -> build_index -> under
-`refs_lock`: `refs.assign`, `apply_refs`, `analyze`, `publish` -> `load`, then every
-query, lint, image and diff call). Where two modules disagreed, this is what now
-holds:
+`tests/test_capture_pipeline_offline.py` (fetch -> build_index -> `analyze` on the
+key-space index and `prev.index()`, both outside the lock -> under `refs_lock`:
+re-check the lineage's latest, `refs.assign`, `apply_refs`, `publish` -> `load`,
+then every query, lint, image and diff call). Where two modules disagreed, this is
+what now holds:
+
+- **Capture order (S1).** `store.lock` serializes every publish, `next_refs`,
+  label, pin, drop and GC eviction of every process, so hold it for milliseconds:
+  `refs.assign`, `apply_refs` and `publish` only. Run `analyze` before taking it,
+  on the key-space index (`lint="full"` spends ~4 s on contrast):
+  `remap_ids`/`apply_refs` carry issues, stops and `reading` over and rewrite the
+  node ids in issue evidence (`model.EVIDENCE_REF_FIELDS`: `clipped_by`,
+  `children_ids`, `node_ids`). Hydrate the previous capture's index before the
+  lock too, and under it only re-read `lineage_state().latest` and reload when
+  another process published meanwhile. A rebuild the store runs while this
+  thread holds the lock never runs contrast (lint "full" runs as "tree") and is
+  not saved.
+- **Rebuilt indexes stay in ref space.** When a rebuild emits a key the refmap
+  lacks (a newer index builder), the store mints refs for it under the lock and
+  adds them to `refmap.json` (additive: existing entries never change), so the
+  next capture of the lineage can match against it. `refs.assign` also ignores
+  (never matches, never tombstones) a prev node without a ref; only a prev with
+  no ref at all is rejected.
 
 - **Test helpers.** C4 and C5 both added `tests/capture_scenes.py`. C4's protobuf
   scene builder keeps the name; C5's key-space builder is
@@ -917,8 +949,9 @@ holds:
   to the new id (on every id retry) for every node whose `match` is `new`.
 - **Default rebuild (C2 -> C4, C7).** An unreadable index is rebuilt with
   `build_index` + `apply_refs` and then `analyze(ix, raw, lint=meta.options.lint)`,
-  so issues, stops and `reading` come back. `match`/`since`/`rebound_of` are not
-  in the refmap and are not restored.
+  so issues, stops and `reading` come back (no contrast while the store lock is
+  held; see above). `match`/`since`/`rebound_of` are not in the refmap and are not
+  restored.
 - **a11y facet flags (C4 -> C6, C7).** `facets.a11y.flags` use the UNode
   vocabulary (`click`, `longclick`, `focus`, `focused`, `scroll`, `checkable`,
   `checked`, `partial`, `selected`, `disabled`, `heading`, `edit`, `password`,

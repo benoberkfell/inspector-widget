@@ -7,7 +7,7 @@ Layout under the root (``model.default_store_root()`` unless given)::
     store.lock                          flock: refs, publish, labels, pins, lineage files
     gc.lock                             flock, taken non-blocking by gc()
     session.json                        default session {serial, package, at}
-    lineages/<serial>__<package>.json   {serial, package, latest, history, labels, tomb}
+    lineages/<serial>__<package>-<h>.json {serial, package, latest, history, labels, tomb}
     captures/<id>/                      meta.json refmap.json raw/ shot/ index.jsonl.gz
                                         derived/ img/ out/ .used .complete [.pinned .stripped]
     .staging/<id>.<pid>/                captures being written
@@ -87,6 +87,8 @@ from .model import (
     is_valid_label,
     lineage_file_name,
     ref_num,
+    ref_str,
+    remap_ids,
     shot_file,
     skp_file,
 )
@@ -825,6 +827,9 @@ class CaptureStore:
         :meth:`refs_lock`, and before :meth:`publish` (which updates latest and
         history itself) or after re-reading it."""
         data = _read_json(self._lineage_path(serial, package))
+        if isinstance(data, dict) and (str(data.get("serial")), str(data.get("package"))) \
+                != (str(serial), str(package)):
+            data = None  # another lineage's file (a name collision): never trust it
         st = LineageState.from_dict(data if isinstance(data, dict) else None)
         st.__dict__["_iw_lineage"] = (str(serial), str(package))
         return st
@@ -933,7 +938,10 @@ class CaptureStore:
         lineage's latest), then writes meta.json, refmap.json, the raw facets, the
         per-window shots and index.jsonl.gz into ``.staging``, marks it complete and
         renames it into ``captures/``. Under the store lock it then makes it the
-        lineage's latest, applies ``meta.label`` (moving the label from another
+        lineage's latest (unless the latest has a newer ``created_at``: a capture
+        that started first but published last goes into ``history`` by time, its
+        ``prev`` is the next older capture, and its tombstones are dropped because
+        they name refs the newer latest holds), applies ``meta.label`` (moving the label from another
         capture of the lineage), merges ``tomb`` updates (refs present in
         ``refmap`` leave the tomb) and sets the default session. ``meta.pinned``
         pins it (bad_args when 20 are pinned already).
@@ -950,17 +958,36 @@ class CaptureStore:
             st = self.lineage_state(serial, package)
             if meta.pinned:
                 self._check_pin_room()
-            if meta.prev is None and st.latest and self.exists(st.latest):
-                meta.prev = st.latest
             if not meta.created_at:
                 meta.created_at = self.clock()
+            latest = st.latest if st.latest and self.exists(st.latest) else None
+            lmeta = self._read_meta(latest) if latest else None
+            # A capture that started first can publish last (two processes capture
+            # one app at once). The lineage follows created_at, not publish order:
+            # the newer latest stays, and this one goes into history by time.
+            late = lmeta is not None and float(lmeta.created_at or 0.0) > float(meta.created_at)
+            pos = 0
+            if late:
+                born = {h: getattr(self._read_meta(h), "created_at", 0.0) or 0.0
+                        for h in st.history}
+                pos = next((i for i, h in enumerate(st.history)
+                            if float(born[h]) <= float(meta.created_at)), len(st.history))
+                if meta.prev is None and pos < len(st.history):
+                    meta.prev = st.history[pos]
+            elif meta.prev is None and latest:
+                meta.prev = latest
             cid = self._write_capture(raw, ix, refmap)
-            st.latest = cid
-            st.history = [cid, *[h for h in st.history if h != cid]]
+            if late:
+                st.history.insert(pos, cid)
+            else:
+                st.latest = cid
+                st.history = [cid, *[h for h in st.history if h != cid]]
             if meta.label:
                 st.labels = {k: v for k, v in st.labels.items() if v != cid}
                 st.labels[meta.label] = cid
-            if tomb:
+            if tomb and not late:
+                # (a late capture was matched against the newer latest, so its
+                # tombstones name refs that latest still has)
                 for ref, info in tomb.items():
                     st.tomb.pop(ref, None)
                     st.tomb[ref] = list(info)
@@ -1342,17 +1369,21 @@ class CaptureStore:
         for cid in self._complete_ids():
             path = self.capture_dir(cid)
             meta = self._read_meta(cid)
-            if meta is None:
-                continue
+            done = _mtime(os.path.join(path, COMPLETE_MARKER)) or now
             used = _mtime(os.path.join(path, USED_MARKER))
             if used is None:
-                used = _mtime(os.path.join(path, COMPLETE_MARKER)) or now
+                used = done
             heavy = sum(_tree_size(os.path.join(path, d)) for d in HEAVY_DIRS)
             for root in self._skp_files(path):
                 with contextlib.suppress(OSError):
                     heavy += os.lstat(root).st_size
-            out.append(_Entry(cid, meta.lineage, float(meta.created_at or 0.0), used,
-                              self._is_pinned(cid), cid in labeled, _tree_size(path), heavy))
+            # A capture whose meta.json is unreadable (torn, corrupt, a newer
+            # format) cannot be loaded or listed, but it still takes space and
+            # still expires: it counts in a lineage of its own, dated by .complete.
+            lineage = meta.lineage if meta is not None else ("", "")
+            created = float(meta.created_at or 0.0) if meta is not None else float(done)
+            out.append(_Entry(cid, lineage, created, used, self._is_pinned(cid),
+                              cid in labeled, _tree_size(path), heavy))
         return out
 
     @staticmethod
@@ -1456,6 +1487,16 @@ class CaptureStore:
         glock = _lock_for(self._p("gc.lock"))
         with glock, self.refs_lock():
             ids = self._complete_ids()
+            # Captures go to .trash first (as every eviction does), so a reader
+            # racing the wipe sees capture_not_found, never a half-deleted capture.
+            try:
+                names = os.listdir(self.captures_dir)
+            except OSError:
+                names = []
+            for name in names:
+                with contextlib.suppress(OSError):
+                    os.rename(os.path.join(self.captures_dir, name),
+                              self._p(".trash", f"{name}.{os.getpid()}.{os.urandom(3).hex()}"))
             for sub in ("captures", "lineages", "spill", ".trash"):
                 self._purge_dir(sub, None)
             self._purge_dir(".staging", self.clock())
@@ -1503,27 +1544,74 @@ class CaptureStore:
             return list(self._cache)
 
     def _rebuild_index(self, loaded: LoadedCapture) -> Index:
-        """Rebuild an unreadable index from the raw facets and refmap, and save it."""
-        fn = self.rebuild or _default_rebuild
+        """Rebuild an unreadable index from the raw facets and refmap, and save it.
+
+        The default rebuild runs the analyzers with the capture's lint option, but
+        never contrast (about 4 s) while this thread holds the store lock; such an
+        index is served but not saved, so a later load outside the lock rebuilds it
+        in full. A node the refmap has no ref for (a newer index builder emits a
+        key the capture never had) gets a fresh ref from the counter, added to
+        ``refmap.json`` under the store lock, so every process agrees on it and the
+        index stays in ref space (the next capture of the lineage matches it)."""
+        locked = _lock_for(self._p("store.lock")).held
+        fn = self.rebuild
         try:
-            ix = fn(loaded.raw_capture(), loaded.refmap())
+            if fn is None:
+                ix = _default_rebuild(loaded.raw_capture(), loaded.refmap(), contrast=not locked)
+            else:
+                ix = fn(loaded.raw_capture(), loaded.refmap())
         except OpError:
             raise
         except Exception as exc:
             raise _not_found(loaded.id, self.ttl_s,
                              f"its index is unreadable and could not be rebuilt ({exc})") from exc
         ix = dataclasses.replace(ix, meta=loaded.meta)
-        with contextlib.suppress(OSError), _lock_for(os.path.join(loaded.path, CAPTURE_LOCK)):
-            if loaded.exists():
-                _atomic_write(os.path.join(loaded.path, INDEX_FILE),
-                              index_to_jsonl(ix, compress=True), durable=False)
+        missing = [nid for nid in ix.nodes if not is_ref(nid)]
+        if missing:
+            ix = self._mint_missing(loaded, ix, missing)
+        complete = all(is_ref(nid) for nid in ix.nodes)
+        partial = locked and fn is None and \
+            getattr(loaded.meta.options, "lint", "tree") == "full"
+        if complete and not partial:
+            with contextlib.suppress(OSError), \
+                    _lock_for(os.path.join(loaded.path, CAPTURE_LOCK)):
+                if loaded.exists():
+                    _atomic_write(os.path.join(loaded.path, INDEX_FILE),
+                                  index_to_jsonl(ix, compress=True), durable=False)
         return ix
 
+    def _mint_missing(self, loaded: LoadedCapture, ix: Index, missing: list[str]) -> Index:
+        """Give the rebuilt index's key-space nodes refs (see _rebuild_index)."""
+        keys = {nid: ix.nodes[nid].key or nid for nid in missing}
+        try:
+            with self.refs_lock():
+                current = loaded.refmap()  # re-read: another process may have minted
+                need = list(dict.fromkeys(k for k in keys.values() if k not in current))
+                if need:
+                    first = self.next_refs(len(need))
+                    current.update({k: ref_str(first + i) for i, k in enumerate(need)})
+                    with _lock_for(os.path.join(loaded.path, CAPTURE_LOCK)):
+                        if not loaded.exists():
+                            raise loaded._gone()
+                        _atomic_write(os.path.join(loaded.path, REFMAP_FILE),
+                                      _json_bytes(current), self.durable)
+        except OSError:
+            return ix  # served as is, and not saved
+        mapping = {nid: current[k] for nid, k in keys.items() if k in current}
+        out = remap_ids(ix, mapping)
+        for ref in mapping.values():
+            n = out.nodes[ref]
+            n.match, n.since = "new", loaded.id
+            if n.sel == n.key:
+                n.sel = ref
+        return out
 
-def _default_rebuild(raw: RawCapture, refmap: dict) -> Index:
+
+def _default_rebuild(raw: RawCapture, refmap: dict, *, contrast: bool = True) -> Index:
     """build_index + apply_refs from capture/index.py (C4), then analyze() from
     capture/analyzers.py (C7) with the capture's own lint option, so a rebuilt
     index carries the same issues, stops and reading order as the published one.
+    ``contrast=False`` runs lint "full" as "tree" (the store lock is held).
     Carry-over provenance (match, since, rebound_of) is not in the refmap and is
     not restored."""
     try:
@@ -1536,6 +1624,8 @@ def _default_rebuild(raw: RawCapture, refmap: dict) -> Index:
     except ImportError:  # pragma: no cover - analyzers ship with the index builder
         return ix
     lint = getattr(getattr(raw.meta, "options", None), "lint", "tree") or "tree"
+    if lint == "full" and not contrast:
+        lint = "tree"
     analyze(ix, raw, lint=lint)
     return ix
 
