@@ -72,7 +72,12 @@ inspector-widget-mcp = "inspector_widget._mcp:main"
 # them as top-level importable modules so the _cli/_mcp wrappers (and therefore
 # the console scripts) resolve after a wheel install. Without this they would
 # raise ModuleNotFoundError once installed away from this checkout.
-packages = ["inspector_widget", "inspector_widget.proto", "inspector_widget.skia_grpc"]
+packages = [
+    "inspector_widget",
+    "inspector_widget.capture",
+    "inspector_widget.proto",
+    "inspector_widget.skia_grpc",
+]
 py-modules = ["cli", "mcp_server"]
 
 [tool.setuptools.package-data]
