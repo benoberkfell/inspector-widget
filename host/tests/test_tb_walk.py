@@ -68,7 +68,7 @@ def test_walk_one_full_lap_from_no_focus(probe):
     assert res["ended"] == "wrap", res
     assert res["lines"][0] == "0. (no accessibility focus)"
     assert res["lines"][1] == '1. view:1003 TextView "Title"'
-    assert res["lines"][2] == '2. view:1020 Button "Item 0, Button"'
+    assert res["lines"][2] == '2. view:1020 Button "Item 0, button"'
     assert res["lines"][8] == "8. — edge"
     assert res["lines"][9] == '9. view:1003 TextView "Title" via=wrap'
     assert res["vs_model"]["agree"] == 6 and res["vs_model"]["differ"] == 0
@@ -109,8 +109,8 @@ def test_walk_backwards_returns_to_the_start_before_walking(probe):
 
 def test_walk_seeks_a_start_by_label(probe):
     res = walk(probe, start="Item 4", until="edge")
-    assert res["lines"][0] == '0. view:1024 Button "Item 4, Button"'
-    assert res["lines"][1:] == ['1. view:1025 Button "Item 5, Button"', "2. — edge"]
+    assert res["lines"][0] == '0. view:1024 Button "Item 4, button"'
+    assert res["lines"][1:] == ['1. view:1025 Button "Item 5, button"', "2. — edge"]
 
 
 def test_walk_start_not_found_is_an_error_and_still_restores(probe):
@@ -363,7 +363,7 @@ def test_compose_nodes_are_keyed_by_semantics_id(tb_env):
     tb_env.scene_factory = lambda: _scene_with(acv)
     tb_env.talkback.order = [(1006, 5), (1006, 6)]
     res = walk(tb_env)
-    assert res["lines"][1] == '1. compose:1006:5 Button "Pay, Button"'
+    assert res["lines"][1] == '1. compose:1006:5 Button "Pay, button"'
     assert res["ended"] == "wrap" and res["vs_model"]["differ"] == 0
 
 
@@ -384,7 +384,7 @@ def test_logcat_utterances_and_fast_edges(probe):
 def test_model_utterance_when_asked(probe):
     probe.talkback.verbose_log = True
     res = walk(probe, utterance="model")
-    assert res["utterance"] == "model" and res["lines"][2].endswith('"Item 0, Button"')
+    assert res["utterance"] == "model" and res["lines"][2].endswith('"Item 0, button"')
 
 
 # --------------------------------------------------------------------------- #
@@ -631,3 +631,28 @@ def test_stdio_talkback_tools_and_restore_at_exit(tmp_path, monkeypatch, transpo
     [exit_record] = exits
     # `talkback on` left it on; the server's exit hook restored the snapshot.
     assert exit_record["talkback_running"] is False and exit_record["secure"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# Identity: the walk keys nodes exactly like a11y's node_key
+# --------------------------------------------------------------------------- #
+def test_walk_keys_are_the_a11y_node_keys():
+    from inspector_widget import a11y
+    agent = fakeagent.FakeAgent()  # the default scene: Views, a ComposeView, a popup window
+    try:
+        req = fakeagent.pb.Request(id=1)
+        req.dump_a11y.SetInParent()
+        resp = agent.dispatch(req).dump_a11y
+    finally:
+        agent.stop()
+    idx = tbwalk.DumpIndex(resp)
+    assert idx.legacy is False
+    d = a11y.a11y_to_dict(resp)
+    want = []
+    stack = [w["root"] for w in reversed(d["windows"]) if w.get("root")]
+    while stack:
+        n = stack.pop()
+        want.append(n["node_key"])
+        stack.extend(reversed(n.get("children") or []))
+    assert [n.key for n in idx.order] == want
+    assert any(k.startswith("compose:") for k in want)

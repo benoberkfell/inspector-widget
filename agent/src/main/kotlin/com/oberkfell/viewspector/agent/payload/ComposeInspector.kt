@@ -21,8 +21,28 @@
  *      (getName/getBox/getLocation/getChildren). Only populated when isDebugInspectorInfoEnabled
  *      was true at composition time (Wrapper.android.kt:78). Best-effort; reported in diagnostics.
  *
- * Bounds are in window px, which equals screenshot px (we capture the window), so they overlay
- * the BITMAP screenshot directly.
+ * DISCOVERY: every AndroidComposeView under the window roots gets its own Window, including
+ * ones nested inside interop Views (AndroidView -> AndroidViewsHandler -> ... -> ComposeView),
+ * inside RecyclerView cells, and at any depth. Window.view_id is that AndroidComposeView's
+ * uniqueDrawingId, which is also the host_view_id of its accessibility node.
+ *
+ * COORDINATES: every ComposeNode bound is in SCREEN px, the same space as ViewNode.bounds and
+ * A11yNode.bounds (boundsInScreen). Compose reports semantics and slot-table bounds in window
+ * px (SemanticsNode.boundsInWindow, ui-tooling-data boundsOfLayoutNode -> positionInWindow), so
+ * each is shifted by the window's on-screen origin (getLocationOnScreen - getLocationInWindow of
+ * the AndroidComposeView). For a full-screen activity window that shift is 0; for dialogs and
+ * popups it is not.
+ *
+ * IDS: a SEMANTICS node's id is its SemanticsNode id, which is also the virtual id of the matching
+ * accessibility node under the same AndroidComposeView. Compose mints these from a process-wide
+ * counter (SemanticsModifierKt.generateSemanticsId in ui 1.7 through 1.12) but re-mints them when a
+ * LayoutNode is reused, and an id only means something relative to its own SemanticsOwner, so the
+ * host keys it as compose:<acvId>:<semanticsId>. The synthetic ROOT node of each Window (name
+ * "AndroidComposeView", kind COMPOSABLE) carries id = the AndroidComposeView's uniqueDrawingId
+ * (== Window.view_id); that number lives in a different space from semantics ids and can equal
+ * one, so the host must key the root as composeview:<acvId>, never as compose:<id>. Semantics ids
+ * are re-minted on recomposition (e.g. the hot reload enable_inspection triggers), so a key is
+ * only valid for the dump that produced it.
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -49,14 +69,28 @@ object ComposeInspector {
         includeSlotTable: Boolean,
     ): Pair<List<ViewInspection.DumpComposeResponse.Window>, String> {
         val composeViews = ArrayList<View>()
-        for (root in rootViews) collectComposeViews(root, composeViews)
+        val nested = intArrayOf(0)
+        for (root in rootViews) collectComposeViews(root, composeViews, nested, false, 0)
         val diag = StringBuilder()
         diag.append("found ${composeViews.size} AndroidComposeView(s)")
+        if (nested[0] > 0) diag.append(" (${nested[0]} nested in interop Views)")
+        diag.append("; bounds=screen")
+
+        // Per-view problems are aggregated (a RecyclerView of ComposeView cells can mean dozens of
+        // windows) and listed by view id at the end.
+        val semUnreachable = ArrayList<Long>()
+        val slotEmpty = ArrayList<Long>()
+        val noNodes = ArrayList<Long>()
 
         val windows = ArrayList<ViewInspection.DumpComposeResponse.Window>()
         for (cv in composeViews) {
+            val acvId = cv.uniqueDrawingId
+            // Window px -> screen px shift for everything Compose reports in window coordinates.
+            val off = windowOriginOnScreen(cv)
+            // Synthetic root: id = the AndroidComposeView's uniqueDrawingId (== Window.view_id).
+            // NOT a semantics id; the host keys it composeview:<acvId> (see the header, IDS).
             val rootNode = ViewInspection.ComposeNode.newBuilder()
-            rootNode.id = cv.uniqueDrawingId
+            rootNode.id = acvId
             rootNode.name = strings.intern("AndroidComposeView")
             rootNode.kind = ViewInspection.ComposeNode.Kind.COMPOSABLE
             boundsOf(cv)?.let { rootNode.bounds = it }
@@ -66,41 +100,53 @@ object ComposeInspector {
                 try {
                     val semRoot = semanticsRootNode(cv)
                     if (semRoot != null) {
-                        val n = buildSemanticsNode(semRoot, strings, 0)
+                        val n = buildSemanticsNode(semRoot, strings, 0, off)
                         if (n != null) { rootNode.addChildren(n); produced = true }
                     } else {
-                        diag.append("; semantics owner/root unreachable")
+                        semUnreachable.add(acvId)
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "semantics walk failed", t)
-                    diag.append("; semantics error: ${t.javaClass.simpleName}")
+                    diag.append("; view#$acvId semantics error: ${t.javaClass.simpleName}")
                 }
             }
             if (includeSlotTable) {
                 try {
                     val groups = slotTableGroups(cv)
                     if (groups.isEmpty()) {
-                        diag.append("; slot table empty (inspection_slot_table_set not populated)")
+                        slotEmpty.add(acvId)
                     } else {
                         for (g in groups) {
-                            for (n in buildSlotChildren(g, strings, 0)) {
+                            for (n in buildSlotChildren(g, strings, 0, off)) {
                                 rootNode.addChildren(n); produced = true
                             }
                         }
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "slot-table walk failed", t)
-                    diag.append("; slot-table error: ${t.javaClass.simpleName}")
+                    diag.append("; view#$acvId slot-table error: ${t.javaClass.simpleName}")
                 }
             }
 
             windows.add(
                 ViewInspection.DumpComposeResponse.Window.newBuilder()
-                    .setViewId(cv.uniqueDrawingId)
+                    .setViewId(acvId)
                     .setRoot(rootNode.build())
                     .build()
             )
-            if (!produced) diag.append("; view#${cv.uniqueDrawingId} produced no compose nodes")
+            if (!produced) noNodes.add(acvId)
+        }
+        if (semUnreachable.isNotEmpty()) {
+            diag.append("; semantics owner/root unreachable for view#${semUnreachable.joinToString(",view#")}")
+        }
+        if (slotEmpty.isNotEmpty()) {
+            diag.append(
+                "; slot table empty (inspection_slot_table_set not populated) for " +
+                    "${slotEmpty.size}/${composeViews.size} view(s)"
+            )
+        }
+        if (noNodes.isNotEmpty()) {
+            diag.append("; view#${noNodes.joinToString(",view#")} produced no compose nodes")
         }
         return windows to diag.toString()
     }
@@ -114,7 +160,7 @@ object ComposeInspector {
      */
     fun enableInspection(rootViews: List<View>): Int {
         val composeViews = ArrayList<View>()
-        for (root in rootViews) collectComposeViews(root, composeViews)
+        for (root in rootViews) collectComposeViews(root, composeViews, intArrayOf(0), false, 0)
         if (composeViews.isEmpty()) return 0
         val cl = composeViews.first().javaClass.classLoader ?: return 0
 
@@ -170,17 +216,130 @@ object ComposeInspector {
     }
 
     // ---------------------------------------------------------------- view discovery
-    private fun collectComposeViews(view: View, out: MutableList<View>) {
-        if (view.javaClass.canonicalName == ANDROID_COMPOSE_VIEW ||
-            isAssignableToName(view, ANDROID_COMPOSE_VIEW)
-        ) {
+    // View-hierarchy depth cap for discovery (belt and braces; real hierarchies are far shallower).
+    private const val VIEW_MAX_DEPTH = 400
+
+    /**
+     * Collect every AndroidComposeView under [view], in pre-order. We do NOT stop at an
+     * AndroidComposeView: it is a ViewGroup whose AndroidViewsHandler child hosts the interop
+     * Views of AndroidView { } (AndroidViewHolder), and those can contain further ComposeViews
+     * (and RecyclerViews of ComposeView cells) to any depth. [nested] counts the ones found inside
+     * another AndroidComposeView, for diagnostics.
+     */
+    private fun collectComposeViews(
+        view: View,
+        out: MutableList<View>,
+        nested: IntArray,
+        insideCompose: Boolean,
+        depth: Int,
+    ) {
+        if (depth > VIEW_MAX_DEPTH) return
+        val isAcv = isAndroidComposeView(view)
+        if (isAcv) {
             out.add(view)
-            // An AndroidComposeView has no child Views of interest for us; stop here.
-            return
+            if (insideCompose) nested[0]++
         }
         if (view is ViewGroup) {
-            for (i in 0 until view.childCount) collectComposeViews(view.getChildAt(i), out)
+            val n = try { view.childCount } catch (t: Throwable) { 0 }
+            for (i in 0 until n) {
+                val child = try { view.getChildAt(i) } catch (t: Throwable) { null } ?: continue
+                collectComposeViews(child, out, nested, insideCompose || isAcv, depth + 1)
+            }
         }
+    }
+
+    private val acvClassCache = HashMap<Class<*>, Boolean>()
+
+    /** True when [view] is (a subclass of) androidx.compose.ui.platform.AndroidComposeView. */
+    internal fun isAndroidComposeView(view: View): Boolean {
+        val cls = view.javaClass
+        acvClassCache[cls]?.let { return it }
+        val r = try { isAssignableToName(view, ANDROID_COMPOSE_VIEW) } catch (t: Throwable) { false }
+        acvClassCache[cls] = r
+        return r
+    }
+
+    /**
+     * The on-screen position of [view]'s window origin: getLocationOnScreen - getLocationInWindow.
+     * Adding it converts Compose's window px (boundsInWindow / positionInWindow) to screen px.
+     */
+    private fun windowOriginOnScreen(view: View): IntArray {
+        return try {
+            val onScreen = IntArray(2)
+            val inWindow = IntArray(2)
+            view.getLocationOnScreen(onScreen)
+            view.getLocationInWindow(inWindow)
+            intArrayOf(onScreen[0] - inWindow[0], onScreen[1] - inWindow[1])
+        } catch (t: Throwable) {
+            Log.w(TAG, "window origin unavailable; compose bounds stay window-relative", t)
+            intArrayOf(0, 0)
+        }
+    }
+
+    // ---------------------------------------------------------------- a11y support
+    /**
+     * Per-AndroidComposeView facts the accessibility walk needs but AccessibilityNodeInfo does not
+     * carry. [rootSemanticsId] is the unmerged root SemanticsNode id (Compose exposes it as the
+     * AndroidComposeView's own node, virtual id HOST_VIEW_ID); [traversalGroups] holds the ids of
+     * unmerged SemanticsNodes whose config sets IsTraversalGroup = true. [layoutSizes] maps each
+     * unmerged SemanticsNode id to the measured size of its LayoutNode (px, [packSize]): the space
+     * the node reserves in layout, including Modifier.minimumInteractiveComponentSize() padding,
+     * unlike its a11y boundsInScreen, which Compose widens to the 48dp touch size for any clickable.
+     */
+    internal class SemanticsIndex(
+        val rootSemanticsId: Int,
+        val traversalGroups: Set<Int>,
+        val layoutSizes: Map<Int, Long>,
+    )
+
+    internal fun packSize(w: Int, h: Int): Long = (w.toLong() shl 32) or (h.toLong() and 0xFFFFFFFFL)
+
+    /**
+     * Build the [SemanticsIndex] for [composeView] by walking its UNMERGED semantics tree (the one
+     * the accessibility delegate serves). Returns null when the semantics owner is unreachable.
+     * Call on the main thread.
+     */
+    internal fun semanticsIndex(composeView: View): SemanticsIndex? {
+        return try {
+            val owner = invoke(composeView, "getSemanticsOwner") ?: return null
+            val root = invoke(owner, "getUnmergedRootSemanticsNode") ?: return null
+            val rootId = invoke(root, "getId") as? Int ?: return null
+            val groups = HashSet<Int>()
+            val sizes = HashMap<Int, Long>()
+            collectUnmerged(root, groups, sizes, 0)
+            SemanticsIndex(rootId, groups, sizes)
+        } catch (t: Throwable) {
+            Log.w(TAG, "semantics index failed", t)
+            null
+        }
+    }
+
+    private fun collectUnmerged(node: Any, groups: MutableSet<Int>, sizes: MutableMap<Int, Long>, depth: Int) {
+        if (depth > MAX_DEPTH) return
+        val id = invoke(node, "getId") as? Int
+        if (id != null) {
+            if (configFlag(node, "IsTraversalGroup")) groups.add(id)
+            // SemanticsNode.layoutInfo is the node's LayoutNode (public LayoutInfo width/height).
+            val info = invoke(node, "getLayoutInfo")
+            val w = intOf(info, "getWidth")
+            val h = intOf(info, "getHeight")
+            if (w != null && h != null && w > 0 && h > 0) sizes[id] = packSize(w, h)
+        }
+        (invoke(node, "getChildren") as? List<*>)?.forEach { child ->
+            if (child != null) collectUnmerged(child, groups, sizes, depth + 1)
+        }
+    }
+
+    /** True when [node]'s SemanticsConfiguration maps the key named [keyName] to Boolean true. */
+    private fun configFlag(node: Any, keyName: String): Boolean {
+        val config = invoke(node, "getConfig") ?: return false
+        val iter = invoke(config, "iterator") as? Iterator<*> ?: return false
+        while (iter.hasNext()) {
+            val entry = iter.next() as? Map.Entry<*, *> ?: continue
+            val key = entry.key ?: continue
+            if (invoke(key, "getName") == keyName) return entry.value == true
+        }
+        return false
     }
 
     // ---------------------------------------------------------------- semantics (A)
@@ -190,14 +349,19 @@ object ComposeInspector {
         return invoke(owner, "getRootSemanticsNode")
     }
 
-    private fun buildSemanticsNode(node: Any, strings: StringTable, depth: Int): ViewInspection.ComposeNode? {
+    private fun buildSemanticsNode(
+        node: Any,
+        strings: StringTable,
+        depth: Int,
+        off: IntArray,
+    ): ViewInspection.ComposeNode? {
         if (depth > MAX_DEPTH) return null
         val b = ViewInspection.ComposeNode.newBuilder()
         b.kind = ViewInspection.ComposeNode.Kind.SEMANTICS
         (invoke(node, "getId") as? Int)?.let { b.id = it.toLong() }
 
-        // bounds: getBoundsInWindow() -> Compose Rect (window px == screenshot px)
-        semanticsBounds(node)?.let { b.bounds = it }
+        // bounds: getBoundsInWindow() -> Compose Rect (window px), shifted to screen px.
+        semanticsBounds(node, off)?.let { b.bounds = it }
 
         // attrs: iterate the SemanticsConfiguration
         val attrs = readSemanticsConfig(node)
@@ -211,23 +375,29 @@ object ComposeInspector {
 
         // children
         (invoke(node, "getChildren") as? List<*>)?.forEach { child ->
-            if (child != null) buildSemanticsNode(child, strings, depth + 1)?.let { b.addChildren(it) }
+            if (child != null) buildSemanticsNode(child, strings, depth + 1, off)?.let { b.addChildren(it) }
         }
         return b.build()
     }
 
-    private fun semanticsBounds(node: Any): ViewInspection.Bounds? {
+    private fun semanticsBounds(node: Any, off: IntArray): ViewInspection.Bounds? {
         val rect = invoke(node, "getBoundsInWindow") ?: return null
         val l = (invoke(rect, "getLeft") as? Float) ?: return null
         val t = (invoke(rect, "getTop") as? Float) ?: return null
         val r = (invoke(rect, "getRight") as? Float) ?: return null
         val btm = (invoke(rect, "getBottom") as? Float) ?: return null
-        val w = (r - l).toInt(); val h = (btm - t).toInt()
-        if (w <= 0 || h <= 0) return null
+        // floor/ceil like Compose's own boundsInScreen for its AccessibilityNodeInfo
+        // (AndroidComposeViewAccessibilityDelegateCompat), so the rects line up with a11y bounds.
+        val x0 = kotlin.math.floor(l).toInt() + off[0]
+        val y0 = kotlin.math.floor(t).toInt() + off[1]
+        val x1 = kotlin.math.ceil(r).toInt() + off[0]
+        val y1 = kotlin.math.ceil(btm).toInt() + off[1]
+        val w = x1 - x0; val h = y1 - y0
+        if (w <= 0 || h <= 0 || r - l <= 0f || btm - t <= 0f) return null
         return ViewInspection.Bounds.newBuilder()
             .setLayout(
                 ViewInspection.Rect.newBuilder()
-                    .setX(l.toInt()).setY(t.toInt()).setW(w).setH(h).build()
+                    .setX(x0).setY(y0).setW(w).setH(h).build()
             ).build()
     }
 
@@ -332,19 +502,24 @@ object ComposeInspector {
     private fun meaningfulName(group: Any): String? =
         (invoke(group, "getName") as? String)?.takeIf { it.isNotBlank() && !isStructuralName(it) }
 
-    private fun buildSlotChildren(group: Any, strings: StringTable, depth: Int): List<ViewInspection.ComposeNode> {
+    private fun buildSlotChildren(
+        group: Any,
+        strings: StringTable,
+        depth: Int,
+        off: IntArray,
+    ): List<ViewInspection.ComposeNode> {
         if (depth > SLOT_MAX_DEPTH) return emptyList()
         val name = meaningfulName(group)
         val childGroups = (invoke(group, "getChildren") as? Collection<*>) ?: emptyList<Any?>()
         val childNodes = ArrayList<ViewInspection.ComposeNode>()
-        for (c in childGroups) if (c != null) childNodes.addAll(buildSlotChildren(c, strings, depth + 1))
+        for (c in childGroups) if (c != null) childNodes.addAll(buildSlotChildren(c, strings, depth + 1, off))
 
         if (name == null) return childNodes // structural group: hoist children up
 
         val b = ViewInspection.ComposeNode.newBuilder()
         b.kind = ViewInspection.ComposeNode.Kind.COMPOSABLE
         b.name = strings.intern(name)
-        slotBox(group)?.let { b.bounds = it }
+        slotBox(group, off)?.let { b.bounds = it }
         slotLocation(group)?.let { b.source = strings.intern(it) }
         // Modifiers live on the LayoutNode (NodeGroup), which is an UNNAMED descendant of this
         // named composable. Gather modifiers from this group's owned unnamed-descendant chain,
@@ -467,7 +642,8 @@ object ComposeInspector {
         return out
     }
 
-    private fun slotBox(group: Any): ViewInspection.Bounds? {
+    /** Group.box is window px (ui-tooling-data boundsOfLayoutNode uses positionInWindow); shift to screen. */
+    private fun slotBox(group: Any, off: IntArray): ViewInspection.Bounds? {
         val box = invoke(group, "getBox") ?: return null
         val l = intOf(box, "getLeft") ?: return null
         val t = intOf(box, "getTop") ?: return null
@@ -476,7 +652,10 @@ object ComposeInspector {
         val w = r - l; val h = btm - t
         if (w <= 0 || h <= 0) return null
         return ViewInspection.Bounds.newBuilder()
-            .setLayout(ViewInspection.Rect.newBuilder().setX(l).setY(t).setW(w).setH(h).build())
+            .setLayout(
+                ViewInspection.Rect.newBuilder()
+                    .setX(l + off[0]).setY(t + off[1]).setW(w).setH(h).build()
+            )
             .build()
     }
 

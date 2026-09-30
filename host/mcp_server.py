@@ -1041,41 +1041,32 @@ _PACKAGE = {
 # --------------------------------------------------------------------------- #
 # Accessibility tools (dump / lint / overlay).
 # --------------------------------------------------------------------------- #
-def _a11y_lint_context(session: Any, serial: str, want_image: bool, scale: float,
-                       wcag_mode: bool):
-    """Build a LintContext: probe device density/font_scale (cached per serial),
-    and decode a screenshot to RGBA when contrast (image) rules are requested."""
-    from inspector_widget import a11y_lint, adb, png as pngmod
-    cache = _a11y_lint_context.__dict__.setdefault("_dens", {})
+def _a11y_device_metrics(serial: str):
+    """(density_dpi, font_scale) for the lint, probed once per serial and cached."""
+    from inspector_widget import adb
+    cache = _a11y_device_metrics.__dict__.setdefault("_cache", {})
     if serial not in cache:
         try:
             density = adb.display_density(serial)
         except Exception:
-            density = 420
+            density = None  # the lint assumes 420dpi and says so in its diagnostics
         try:
             fscale = adb.font_scale(serial)
         except Exception:
             fscale = 1.0
         cache[serial] = (density, fscale)
-    density, fscale = cache[serial]
-    ctx = a11y_lint.LintContext(density=density, font_scale=fscale, wcag_mode=wcag_mode)
-    if want_image:
-        try:
-            shot = session.screenshot(root_id=0, scale=scale)
-            if shot.HasField("screenshot"):
-                w, h, rgba = pngmod._decode_to_rgba(shot.screenshot)
-                ctx.screenshot_rgba = rgba
-                ctx.screenshot_w = w
-                ctx.screenshot_h = h
-                ctx.screenshot_scale = float(shot.screenshot.scale) or scale
-        except _transport_error():
-            # A lost or timed-out session is not "no screenshot": let _run_tool
-            # report it (and retry a lost session) instead of linting half-blind
-            # on a closed connection.
-            raise
-        except Exception:
-            log.debug("a11y_lint screenshot decode failed; running tree-only", exc_info=True)
-    return ctx, density, fscale
+    return cache[serial]
+
+
+def _a11y_lint_rules(rules: Any):
+    """Validate rule ids/aliases up front so a typo is a clear tool error."""
+    from inspector_widget import a11y_lint
+    if rules is not None and not isinstance(rules, (list, tuple, str)):
+        raise ToolError(f"rules must be a list of rule ids, got {type(rules).__name__}")
+    try:
+        return a11y_lint.resolve_rule_ids(rules)
+    except a11y_lint.UnknownRuleError as e:
+        raise ToolError(str(e))
 
 
 def tool_dump_accessibility(
@@ -1086,11 +1077,12 @@ def tool_dump_accessibility(
     exactly as TalkBack/UiAutomator see it, plus the host-computed reading order."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import a11y as a11ymod
+    from inspector_widget import a11y as a11ymod, correlate
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_a11y(root_id=0, include_extras=bool(include_extras),
                              include_rendering_info=bool(include_rendering_info))
     data = a11ymod.a11y_to_dict(resp)
+    correlate.record_a11y(session, data)  # its Compose keys re-resolve in inspect_node
     data.update({"serial": serial, "package": package})
     return data
 
@@ -1099,32 +1091,27 @@ def tool_a11y_lint(
     serial: str, package: str,
     include_contrast: bool = True, scale: float = 1.0,
     wcag_mode: bool = False, rules: Optional[List[str]] = None,
+    include_rendering_info: bool = True,
 ) -> Dict[str, Any]:
-    """Run the host-side accessibility lint (R1..R12) over the Compose semantics
-    tree. Returns findings (rule, severity, node, bounds, dp, message, evidence)
-    plus a summary. Contrast (the one pixel rule) samples a screenshot."""
+    """Run the host-side accessibility lint (R1..R18) over the unified a11y tree
+    (Views + Compose, joined with Compose semantics detail). Returns findings with
+    typed node keys plus a summary and diagnostics. Contrast samples each window."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import strings as st, a11y_lint
+    from inspector_widget import a11y_lint, correlate
+    enabled = _a11y_lint_rules(rules)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
-    compose = st.dump_compose_to_dict(
-        session.dump_compose(include_semantics=True, include_slot_table=False))
-    roots = [w["root"] for w in compose.get("windows", []) if w.get("root")]
-    enabled = set(rules) if rules else None
-    ctx, density, fscale = _a11y_lint_context(
-        session, serial, want_image=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode))
-    findings = a11y_lint.lint_tree(roots, ctx, enabled=enabled)
-    findings_json = [f.to_dict() for f in findings]
-    return {
-        "serial": serial, "package": package,
-        "density": density, "font_scale": fscale,
-        "wcag_mode": bool(wcag_mode),
-        "contrast_sampled": ctx.has_image,
-        "summary": a11y_lint.summarize(findings),
-        "findings": findings_json,
-        "diagnostics": compose.get("diagnostics"),
-    }
+    density, fscale = _a11y_device_metrics(serial)
+    report = a11y_lint.run_lint(
+        session, density=density, font_scale=fscale,
+        include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
+        rules=enabled, include_rendering_info=bool(include_rendering_info))
+    correlate.record_a11y(session, report.a11y_data, (report.compose_data or {}).get("windows"))
+    out = report.to_dict()
+    out.update({"serial": serial, "package": package,
+                "contrast_sampled": bool(out["stats"].get("contrast_windows"))})
+    return out
 
 
 def tool_a11y_overlay(
@@ -1136,34 +1123,36 @@ def tool_a11y_overlay(
     annotated PNG path plus the lint summary."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import (a11y as a11ymod, strings as st, a11y_lint,
-                                  overlay as ov, png as pngmod)
+    from inspector_widget import a11y as a11ymod, a11y_lint, overlay as ov
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
-    # A11y tree (for boxes + reading order) and lint findings (for colors).
-    a11y_data = a11ymod.a11y_to_dict(session.dump_a11y(root_id=0, include_extras=True))
-    compose = st.dump_compose_to_dict(
-        session.dump_compose(include_semantics=True, include_slot_table=False))
-    roots = [w["root"] for w in compose.get("windows", []) if w.get("root")]
-    ctx, density, fscale = _a11y_lint_context(
-        session, serial, want_image=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode))
-    findings = [f.to_dict() for f in a11y_lint.lint_tree(roots, ctx)]
-    shot = session.screenshot(root_id=0, scale=scale)
-    if not shot.HasField("screenshot"):
-        raise ToolError("agent returned no screenshot")
-    base_scale = float(shot.screenshot.scale) or scale
+    # One a11y dump feeds both the boxes/reading order and the lint.
+    a11y_data = a11ymod.a11y_to_dict(session.dump_a11y(
+        root_id=0, include_extras=True, include_rendering_info=True))
+    density, fscale = _a11y_device_metrics(serial)
+    report = a11y_lint.run_lint(
+        session, density=density, font_scale=fscale,
+        include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
+        a11y_data=a11y_data)
+    lint_out = report.to_dict()
+    findings = lint_out["findings"]
     with _png_scratch(serial, package, "a11y_base") as base, \
             _png_output(serial, package, "a11y_overlay") as out:
-        pngmod.write_png(shot.screenshot, base)
+        try:
+            base_scale = ov.write_screen_png(session, a11y_data, base, scale=scale)
+        except RuntimeError as exc:
+            raise ToolError(str(exc)) from None
         summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
                                          scale=base_scale)
     return {
         "serial": serial, "package": package,
         "path": out, "overlay_path": out,
         "boxes": summary["boxes"], "labels": summary["labels"],
-        "flagged": summary["flagged"], "size": summary["size"],
+        "flagged": summary["flagged"], "flagged_by_bounds": summary.get("flagged_by_bounds"),
+        "size": summary["size"],
         "finding_count": len(findings),
-        "summary": a11y_lint.summarize_dicts(findings) if hasattr(a11y_lint, "summarize_dicts") else None,
+        "summary": lint_out["summary"],
+        "lint_diagnostics": lint_out["diagnostics"],
         "diagnostics": a11y_data.get("diagnostics"),
     }
 
@@ -1183,6 +1172,7 @@ def _h_a11y_lint(args: Dict[str, Any]) -> Dict[str, Any]:
         scale=args.get("scale", 1.0),
         wcag_mode=args.get("wcag_mode", False),
         rules=args.get("rules"),
+        include_rendering_info=args.get("include_rendering_info", True),
     )
 
 
@@ -1193,6 +1183,19 @@ def _h_a11y_overlay(args: Dict[str, Any]) -> Dict[str, Any]:
         include_contrast=args.get("include_contrast", True),
         wcag_mode=args.get("wcag_mode", False),
     )
+
+
+def _load_a11y_rule_choices() -> List[str]:
+    try:
+        from inspector_widget import a11y_lint
+        return list(a11y_lint.RULE_CHOICES)
+    except Exception:  # keep the server importable even if the lint cannot load
+        return []
+
+
+_A11Y_RULE_CHOICES = _load_a11y_rule_choices()
+_A11Y_RULE_ITEMS: Dict[str, Any] = (
+    {"type": "string", "enum": _A11Y_RULE_CHOICES} if _A11Y_RULE_CHOICES else {"type": "string"})
 
 
 TOOLS: Dict[str, Dict[str, Any]] = {
@@ -1407,8 +1410,16 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "in one tree. Each node has its host_view_id+virtual_id key (ties back to dump_tree/"
             "dump_compose), text/contentDescription/stateDescription/role, all a11y state flags, "
             "on-screen bounds, decoded actions (CLICK/SCROLL_FORWARD/SET_PROGRESS/...), collection/"
-            "range info and extras. Also returns the host-computed TalkBack reading order "
-            "(focus_order) honoring traversal_before/after + geometry. Auto-attaches."
+            "range info and extras. Every node has a typed node_key (view:<id> | "
+            "compose:<acvId>:<semanticsId>) usable with inspect_node, valid for this dump's "
+            "generation (it changes when Compose re-mints ids; inspect_node re-resolves older "
+            "keys). Also returns the host-computed TalkBack reading order (focus_order: "
+            "[{order, key, speak}] — what TalkBack announces at each stop, e.g. 'Delete, "
+            "button'), built from the ANI child order + traversal_before/after over the tree "
+            "TalkBack sees: Views not important for accessibility are skipped (marked ignored; "
+            "their children read in their place) and windows under an open modal dialog are "
+            "unreachable (covered_by). reading_order_diagnostics reports cycles, dangling targets "
+            "and covered windows. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1427,14 +1438,19 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_lint": {
         "handler": _h_a11y_lint,
         "description": (
-            "Run an accessibility LINT over the app's Compose semantics tree and report violations "
-            "(missing labels on actionable elements, <48dp touch targets using real device density, "
-            "low color contrast sampled from the screenshot, redundant/duplicate labels, clickable "
-            "without a role, missing headings, toggles without state, images without descriptions, "
-            "empty focusable stops, broken traversal order). Each finding has a rule id, severity "
-            "(error/warn/info), the node + bounds (px and dp), a remediation message, and evidence. "
-            "Tree-only rules run even with no screenshot; set include_contrast=false to skip the one "
-            "pixel-sampling rule. Auto-attaches."
+            "Run an accessibility LINT (rules R1..R18) over the app's UNIFIED accessibility tree -- "
+            "classic Views, Compose, RecyclerView cells, AndroidView-in-Compose, all in one pass -- and "
+            "report violations: missing labels, <48dp touch targets (touch bounds, real density), low "
+            "text contrast sampled per window, redundant/duplicate labels (per-row list repeats are "
+            "fine), clickable without a role, images without descriptions, toggles without state, "
+            "empty focus stops, heading/grouping structure, non-scalable or tiny text, duplicate "
+            "clickable bounds, contentDescription on text fields, unlabeled form fields, unclear link "
+            "text and traversal-order cycles. Each finding has rule + alias (R#), severity "
+            "(error/warn/info), node_key (view:<id> or compose:<acvId>:<semId>, usable with "
+            "inspect_node), node, bounds (px and dp), window, collection position, a remediation "
+            "message and evidence (window.covered_by marks a window under an open dialog). Also "
+            "returns summary, diagnostics and the dump's generation. set include_contrast=false "
+            "to skip the one pixel rule. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1447,8 +1463,13 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "description": "Screenshot scale in (0,1] for the contrast sample."},
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "Use WCAG target sizes (44dp) instead of Material (48dp)."},
-                "rules": {"type": "array", "items": {"type": "string"},
-                    "description": "Optional subset of rule ids to run (e.g. 'a11y.label.missing'). Omit for all."},
+                "rules": {"type": "array", "items": _A11Y_RULE_ITEMS,
+                    "description": "Optional subset of rules to run: canonical ids (e.g. "
+                                   "'a11y.label.missing'), aliases 'R1'..'R18', or ATF names "
+                                   "(e.g. 'TouchTargetSize'). Omit for all."},
+                "include_rendering_info": {"type": "boolean", "default": True,
+                    "description": "Request per-node ExtraRenderingInfo (View text size/unit) for the "
+                                   "text-size rules R11/R18 and text-size-aware contrast."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1537,7 +1558,8 @@ def _device_density(serial: str) -> int:
 def _lint_fn():
     """Return inspector_widget.a11y_lint.lint_a11y if importable, else None.
 
-    correlate.inspect_node calls this as lint_fn(compose_roots, density_dpi) and
+    correlate.inspect_node calls this as lint_fn(roots, density_dpi) — the unified
+    a11y tree, or Compose-semantics roots for a lint that only takes those — and
     expects a list[dict] of findings.
     """
     try:
@@ -1564,21 +1586,17 @@ def tool_inspect(serial: str, package: str, include_properties: bool = False,
     }
     if include_overlay:
         from inspector_widget import overlay as ov
-        shot = session.screenshot(root_id=0, scale=1.0)
-        if shot.HasField("screenshot"):
-            base_scale = float(shot.screenshot.scale) or 1.0
-            with _png_scratch(serial, package, "integrated_base") as base:
-                _save_screenshot_png(session, shot.screenshot, base)
-                out = _tmp_png_path(serial, package, "integrated_overlay")
-                try:
-                    result["overlay"] = ov.render_integrated_overlay(
-                        base, merged, out, scale=base_scale)
-                except (RuntimeError, AttributeError) as exc:
-                    _remove_quietly(out)
-                    result["overlay_error"] = str(exc)
-                except BaseException:
-                    _remove_quietly(out)
-                    raise
+        with _png_scratch(serial, package, "integrated_base") as base:
+            out = _tmp_png_path(serial, package, "integrated_overlay")
+            try:  # every window (a dialog included), composited at its screen origin
+                base_scale = ov.write_windows_png(session, correlate.window_origins(merged), base)
+                result["overlay"] = ov.render_integrated_overlay(base, merged, out, scale=base_scale)
+            except (RuntimeError, AttributeError) as exc:
+                _remove_quietly(out)
+                result["overlay_error"] = str(exc)
+            except BaseException:
+                _remove_quietly(out)
+                raise
     return result
 
 
@@ -1595,14 +1613,20 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
     serial = _serial(serial)
     session = SESSIONS.get_or_attach(serial, package)
+    density, fscale = _a11y_device_metrics(serial)
     with contextlib.ExitStack() as stack:
         image_path = (stack.enter_context(_png_output(serial, package, "dossier"))
                       if include_image else None)
-        dossier = correlate.inspect_node(
-            session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
-            include_image=bool(include_image), image_path=image_path,
-            lint_fn=_lint_fn(), density=_device_density(serial),
-        )
+        try:
+            # lint=True: the a11y_lint report (same rules, Compose detail, rendering info,
+            # contrast of the node's window) filtered to this node.
+            dossier = correlate.inspect_node(
+                session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
+                include_image=bool(include_image), image_path=image_path,
+                lint=True, density=density or _device_density(serial), font_scale=fscale,
+            )
+        except correlate.NodeKeyError as exc:
+            raise ToolError(str(exc)) from None
         if dossier is None:
             raise ToolError("no matching element found for the given selector")
         if image_path and not (dossier.get("component_image") or {}).get("path"):
@@ -1624,12 +1648,15 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
     serial = _serial(serial)
     session = SESSIONS.get_or_attach(serial, package)
     merged = correlate.inspect_tree(session, include_properties=False)
-    node = correlate.find_node(merged, node_key=node_key, view_id=vid,
-                               semantics_id=sid, bounds=bounds)
+    try:
+        node = correlate.find_node(merged, node_key=node_key, view_id=vid,
+                                   semantics_id=sid, bounds=bounds)
+    except correlate.NodeKeyError as exc:
+        raise ToolError(str(exc)) from None
     if node is None:
         raise ToolError("no matching element found for the given selector")
     with _png_output(serial, package, "component") as out:
-        img = correlate.component_image(session, node, out_path=out)
+        img = correlate.component_image(session, node, out_path=out, merged=merged)
         if not img.get("path"):
             _remove_quietly(out)
     img.update({"serial": serial, "package": package, "node_key": node.get("node_key")})
@@ -1677,12 +1704,15 @@ TOOLS.update({
         "handler": _h_inspect,
         "description": (
             "The integrated merged tree for the whole screen: walks the View hierarchy as the "
-            "spine, grafts Compose subtrees under their AndroidComposeView host, and attaches "
-            "accessibility facets, correlated by uniqueDrawingId / Compose semanticsId / "
-            "a11y host_view_id+virtual_id (bounds-IoU fallback). Each node carries optional "
-            "view{}, compose{}, a11y{}, image_ref{} and a correlation_confidence "
-            "(exact|overlap|none), plus a summary of counts. Set include_overlay=true to also "
-            "render a labelled, color-coded overlay PNG."
+            "spine, grafts every ComposeView (RecyclerView cells and ones nested in AndroidView "
+            "included) under its AndroidComposeView, re-homes AndroidView content under the "
+            "Compose node hosting it, and attaches accessibility facets joined on (View id) / "
+            "(ComposeView id, semantics id), with a same-window one-to-one bounds fallback. "
+            "Keys: view:<id>, compose:<acvId>:<semanticsId>, composeview:<acvId>. Each node "
+            "carries optional view{}, compose{}, a11y{} (incl. its TalkBack order), list_item{} "
+            "(list + row), image_ref{} and a correlation_confidence (exact|overlap|none); the "
+            "summary carries counts and a generation that changes when Compose re-mints ids. "
+            "Set include_overlay=true to also render a labelled, color-coded overlay PNG."
         ),
         "schema": {
             "type": "object",
@@ -1701,11 +1731,19 @@ TOOLS.update({
     "inspect_node": {
         "handler": _h_inspect_node,
         "description": (
-            "Full dossier for ONE element, selected by node_key ('view:<id>' | 'compose:<id>'), "
-            "view_id (uniqueDrawingId), semantics_id (Compose), or bounds {x,y,w,h} (deepest "
-            "covering element). Returns all facets fully populated (view attributes+properties, "
-            "full a11y, compose attrs/source) plus its component image (SKP cut by graphicsLayer "
-            "layerId, else BITMAP crop) saved to a PNG path, plus focused a11y lint findings."
+            "Full dossier for ONE element, selected by node_key ('view:<id>' | "
+            "'compose:<acvId>:<semanticsId>' | 'composeview:<acvId>'), view_id (uniqueDrawingId), "
+            "semantics_id (only when a single ComposeView has it), or bounds {x,y,w,h} (deepest "
+            "covering element). Every key dump_accessibility / a11y_lint / inspect hand out "
+            "resolves (children Compose merged into a focusable parent are a11y_only, with "
+            "a11y_parent); a Compose key from an earlier dump is re-resolved after "
+            "recomposition (resolved_from) and a rebound RecyclerView cell gets a key_note. "
+            "Returns all facets (view attributes+properties, full a11y, compose semantics attrs; "
+            "compose.source file:line only when the slot table is populated), where/context "
+            "(window > list row > ComposeView > node), its component image cut from its own "
+            "window (SKP by graphicsLayer layerId, else BITMAP crop) saved to a PNG path, and "
+            "lint: exactly the a11y_lint findings for this node (and the nodes merged into it), "
+            "with lint_summary and lint_diagnostics."
         ),
         "schema": {
             "type": "object",
@@ -1713,11 +1751,15 @@ TOOLS.update({
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "node_key": {"type": "string",
-                    "description": "'view:<uniqueDrawingId>' or 'compose:<semanticsId>'."},
+                    "description": "'view:<uniqueDrawingId>', 'compose:<acvId>:<semanticsId>' or "
+                                   "'composeview:<acvId>' (node_key from inspect / "
+                                   "dump_accessibility)."},
                 "view_id": {"type": "integer",
                     "description": "A view's uniqueDrawingId (the 'id' from dump_tree/inspect)."},
                 "semantics_id": {"type": "integer",
-                    "description": "A Compose node's semantics id (the 'id' from dump_compose)."},
+                    "description": "A Compose node's semantics id (the 'id' from dump_compose); "
+                                   "ambiguous when several ComposeViews use it, so prefer "
+                                   "node_key."},
                 "bounds": _BOUNDS_SCHEMA,
                 "include_image": {"type": "boolean", "default": True,
                     "description": "Cut and save the component image (result.component_image.path)."},
@@ -1731,15 +1773,18 @@ TOOLS.update({
         "description": (
             "Cut a per-component image for one element and save it as a PNG. Uses the SKP path "
             "(skiaparser GetViewTree by the Compose graphicsLayer render-node id) when available, "
-            "else a BITMAP crop of the element's bounds from a full screenshot. Returns the PNG "
-            "path and which path produced it (source: 'skp' | 'bitmap_crop')."
+            "else a BITMAP crop of the element's bounds from a screenshot of the element's own "
+            "window (a dialog node is cut from the dialog). Returns the PNG path and which path "
+            "produced it (source: 'skp' | 'bitmap_crop', window: the root view id cropped)."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "node_key": {"type": "string", "description": "'view:<id>' | 'compose:<id>'."},
+                "node_key": {"type": "string",
+                    "description": "'view:<id>' | 'compose:<acvId>:<semanticsId>' | "
+                                   "'composeview:<acvId>'."},
                 "view_id": {"type": "integer", "description": "A view's uniqueDrawingId."},
                 "semantics_id": {"type": "integer", "description": "A Compose node's semantics id."},
                 "bounds": _BOUNDS_SCHEMA,

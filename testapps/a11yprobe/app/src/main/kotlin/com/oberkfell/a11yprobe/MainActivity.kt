@@ -1,18 +1,36 @@
 // ============================================================================
 // MainActivity.kt — launcher + per-scenario host.
 //
-// A single ComponentActivity with state-based navigation (testapps.md §4):
-//   * LauncherScreen is a LazyColumn over SCENARIOS (testTag launcher_list);
-//     every row carries testTag launch_<id>.
-//   * Tapping a row sets `selected` and the Scaffold renders that scenario's
-//     content(); the top-bar back button (a labeled GOOD example) clears it.
-//   * One extra row (launch_view_xml) starts ViewScenarioActivity, the
-//     classic-View extraction path.
-// This keeps the whole corpus reachable by a deterministic testTag path so a
-// script can `am start` + tap-by-testTag and dump each scenario in turn.
+// Launch any scenario directly (package com.oberkfell.a11yprobe):
+//
+//   # Compose scenarios (ids in ScenarioRegistry.kt), or "all" for every one stacked:
+//   adb shell am start -n com.oberkfell.a11yprobe/.MainActivity --es scenario icon_button
+//   adb shell am start -n com.oberkfell.a11yprobe/.MainActivity --es scenario all
+//
+//   # Classic-View (XML) screen:
+//   adb shell am start -n com.oberkfell.a11yprobe/.ViewScenarioActivity
+//
+//   # Mixed View/Compose screens and dialog windows (ids in InteropFragment.kt):
+//   adb shell am start -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S1
+//     S1 RecyclerView of ComposeView cells     S4 LazyColumn with AndroidView rows
+//     S2 RecyclerView of classic View cells    S5 Compose > AndroidView > RecyclerView > cells
+//     S3 RecyclerView of mixed/hybrid cells    S6 RecyclerView grid of View cells
+//     D1 DialogFragment (Views + ComposeView)  D2 Compose Dialog
+//
+// MainActivity also forwards "--es scenario view_xml" and the S*/D* ids to the
+// right Activity, so `.MainActivity --es scenario <any id>` works for all of them
+// (it finishes itself; prefer the direct component for scripted dumps).
+// Add `-S` to force-stop a running instance first, `-W` to wait for launch.
+//
+// Without an extra it is a ComponentActivity with state-based navigation
+// (testapps.md §4): LauncherScreen is a LazyColumn over SCENARIOS (testTag
+// launcher_list); every row carries testTag launch_<id>. Tapping a row sets
+// `selected` and the Scaffold renders that scenario's content(); the top-bar
+// back button (a labeled GOOD example) clears it.
 // ============================================================================
 package com.oberkfell.a11yprobe
 
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -46,6 +64,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -54,23 +73,42 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val requested = intent.getStringExtra(EXTRA_SCENARIO)
+        forwardIntent(this, requested)?.let {
+            startActivity(it)
+            finish()
+            return
+        }
         setContent {
-            MaterialTheme {
+            ProbeRoot {
                 AppRoot(
-                    onOpenViewScreen = {
-                        startActivity(Intent(this, ViewScenarioActivity::class.java))
-                    }
+                    initial = SCENARIOS.firstOrNull { it.id == requested },
+                    initialShowAll = requested == SCENARIO_ALL,
                 )
             }
+        }
+    }
+
+    companion object {
+        const val EXTRA_SCENARIO = "scenario"
+        const val SCENARIO_ALL = "all"
+        const val SCENARIO_VIEW_XML = "view_xml"
+
+        /** The Activity intent for a non-Compose scenario id, or null if MainActivity shows it. */
+        fun forwardIntent(context: Context, id: String?): Intent? = when {
+            id == SCENARIO_VIEW_XML -> Intent(context, ViewScenarioActivity::class.java)
+            interopScenario(id) != null -> Intent(context, InteropActivity::class.java)
+                .putExtra(InteropActivity.EXTRA_SCENARIO, interopScenario(id)!!.id)
+            else -> null
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppRoot(onOpenViewScreen: () -> Unit) {
-    var selected by remember { mutableStateOf<Scenario?>(null) }
-    var showAll by remember { mutableStateOf(false) }
+private fun AppRoot(initial: Scenario?, initialShowAll: Boolean) {
+    var selected by remember { mutableStateOf(initial) }
+    var showAll by remember { mutableStateOf(initialShowAll) }
     val current = selected
     Scaffold(
         topBar = {
@@ -98,7 +136,6 @@ private fun AppRoot(onOpenViewScreen: () -> Unit) {
                 showAll -> AllScenarios()
                 current == null -> LauncherScreen(
                     onPick = { selected = it },
-                    onOpenViewScreen = onOpenViewScreen,
                     onShowAll = { showAll = true },
                 )
                 else -> current.content()
@@ -128,9 +165,9 @@ fun AllScenarios() {
 @Composable
 private fun LauncherScreen(
     onPick: (Scenario) -> Unit,
-    onOpenViewScreen: () -> Unit,
     onShowAll: () -> Unit,
 ) {
+    val context = LocalContext.current
     LazyColumn(
         Modifier
             .fillMaxSize()
@@ -149,7 +186,7 @@ private fun LauncherScreen(
         items(SCENARIOS, key = { it.id }) { sc ->
             ListItem(
                 headlineContent = { Text(sc.title) },
-                supportingContent = { Text(sc.rule) },
+                supportingContent = { Text(sc.lintRule?.let { "${sc.rule} · $it" } ?: sc.rule) },
                 modifier = Modifier
                     .clickable { onPick(sc) }
                     .testTag("launch_${sc.id}")
@@ -161,19 +198,29 @@ private fun LauncherScreen(
                 headlineContent = { Text("Classic View screen (XML)") },
                 supportingContent = { Text("exercises the View extraction path") },
                 modifier = Modifier
-                    .clickable { onOpenViewScreen() }
+                    .clickable {
+                        MainActivity.forwardIntent(context, MainActivity.SCENARIO_VIEW_XML)
+                            ?.let(context::startActivity)
+                    }
                     .testTag("launch_view_xml")
             )
+            HorizontalDivider()
+        }
+        items(INTEROP_SCENARIOS, key = { it.id }) { sc ->
+            ListItem(
+                headlineContent = { Text(sc.title) },
+                supportingContent = { Text("mixed View/Compose hierarchy") },
+                modifier = Modifier
+                    .clickable {
+                        MainActivity.forwardIntent(context, sc.id)?.let(context::startActivity)
+                    }
+                    .testTag("launch_${sc.id}")
+            )
+            HorizontalDivider()
         }
     }
 }
 
-/**
- * Shared layout: a titled section with the GOOD variant on top and BAD below.
- * The section title itself is a real `heading()` so navigation between sections
- * is correct even when a scenario's BAD content omits its own heading.
- * The whole section scrolls so tall scenarios stay reachable.
- */
 /**
  * When false (set by [AllScenarios]), a [Section] does NOT take fillMaxSize or own a
  * vertical scroll — so many Sections can be stacked inside one outer scroll for a
@@ -181,6 +228,12 @@ private fun LauncherScreen(
  */
 val LocalSectionScroll = androidx.compose.runtime.compositionLocalOf { true }
 
+/**
+ * Shared layout: a titled section with the GOOD variant on top and BAD below.
+ * The section title itself is a real `heading()` so navigation between sections
+ * is correct even when a scenario's BAD content omits its own heading.
+ * The whole section scrolls so tall scenarios stay reachable.
+ */
 @Composable
 fun Section(
     title: String,

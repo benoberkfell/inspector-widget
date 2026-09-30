@@ -26,6 +26,9 @@ DOUBLE_STOP_OVERLAP = 0.6
 _ROLE_ONLY = {"button", "image", "checkbox", "switch", "edit box", "slider", "toggle button",
               "radio button", "drop down list", "unlabelled", "unlabeled", ""}
 _UNLABELLED = re.compile(r"\bunlabell?ed\b", re.I)
+_ROLE_STATE_WORDS = {"button", "switch", "checkbox", "check", "box", "image", "edit", "slider",
+                     "toggle", "radio", "on", "off", "checked", "not", "selected", "disabled",
+                     "heading", "link", "double", "tap", "to", "activate", "in", "list", "of"}
 
 FIXES = {
     "tb.out_of_order": "Group each column/card: Compose Modifier.semantics { isTraversalGroup = true } "
@@ -326,8 +329,10 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
             a, b = _rect(prev), _rect(s)
             if a and b and a != b and (_contains(a, b) or _contains(b, a)):
                 outer, inner = (prev, s) if _contains(a, b) else (s, prev)
-                ti, to = _tokens(inner.get("speak") or inner.get("label")), \
-                    _tokens(outer.get("speak") or outer.get("label"))
+                # The inner stop's own words (its label; role and state words aside)
+                # against everything the outer stop says.
+                ti = _tokens(inner.get("label") or inner.get("speak")) - _ROLE_STATE_WORDS
+                to = _tokens(f"{outer.get('speak') or ''} {outer.get('label') or ''}")
                 overlap = len(ti & to) / len(ti) if ti else 0.0
                 if overlap >= DOUBLE_STOP_OVERLAP:
                     out.append(_finding(

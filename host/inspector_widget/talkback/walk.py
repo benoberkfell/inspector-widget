@@ -436,7 +436,6 @@ def _window_of(roots: List[Tuple[int, Dict[str, Any]]]) -> Dict[int, int]:
 
 def _ordered_nodes(windows: List[Dict[str, Any]], d: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Optional[str]], str]:
     """(stop node dicts in reading order, their model announcements, the source)."""
-    from .. import a11y
     roots = [w["root"] for w in windows if w.get("root")]
     try:
         # T1's literal port of TalkBack's traversal, when it is merged.
@@ -445,6 +444,8 @@ def _ordered_nodes(windows: List[Dict[str, Any]], d: Dict[str, Any]) -> Tuple[Li
         return list(res["_nodes"]), [e.get("speak") for e in res["focus_order"]], "talkback.order"
     except Exception:  # noqa: BLE001 - not merged yet, or it could not model this dump
         pass
+    # a11y.a11y_to_dict numbers the stops on the nodes (a11y.reading_order, which
+    # leaves out windows under a modal one and Views TalkBack never sees).
     stops: List[Tuple[int, Dict[str, Any]]] = []
     stack = list(roots)
     while stack:
@@ -452,22 +453,9 @@ def _ordered_nodes(windows: List[Dict[str, Any]], d: Dict[str, Any]) -> Tuple[Li
         if isinstance(n.get("order"), int):
             stops.append((n["order"], n))
         stack.extend(n.get("children") or [])
-    if stops:  # improve/a11y-core: a11y_to_dict numbers the stops on the nodes
-        stops.sort(key=lambda t: t[0])
-        speak = {e.get("order"): e.get("speak") for e in d.get("focus_order") or []}
-        return [n for _o, n in stops], [speak.get(o) for o, _n in stops], "a11y.reading_order"
-    # main: compute_traversal_order's walk, keeping the node dicts
-    out: List[Dict[str, Any]] = []
-
-    def rec(n: Dict[str, Any]) -> None:
-        if a11y._is_focus_stop(n):
-            out.append(n)
-        for c in a11y._apply_traversal_constraints(list(n.get("children") or [])):
-            rec(c)
-
-    for r in a11y._geometry_sort(list(roots)):
-        rec(r)
-    return out, [None] * len(out), "a11y.compute_traversal_order"
+    stops.sort(key=lambda t: t[0])
+    speak = {e.get("order"): e.get("speak") for e in d.get("focus_order") or []}
+    return [n for _o, n in stops], [speak.get(o) for o, _n in stops], "a11y.reading_order"
 
 
 def predict(resp: Any, legacy: bool) -> Tuple[List[PStop], str, Dict[str, Any]]:

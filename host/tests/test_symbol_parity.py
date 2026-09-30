@@ -153,7 +153,7 @@ def test_scan_actually_finds_contract_symbols() -> None:
     expected = {
         ("adb", "display_density"),
         ("adb", "font_scale"),
-        ("a11y_lint", "lint_a11y"),
+        ("a11y_lint", "run_lint"),
         ("overlay", "render_integrated_overlay"),
         ("png", "_decode_to_rgba"),
     }
@@ -595,7 +595,7 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("correlate", "component_image"),
         ("skia_client", "per_component_images"),
         ("overlay", "render_a11y_overlay"),
-        ("a11y_lint", "LintContext"),
+        ("a11y_lint", "run_lint"),          # cli / mcp_server -> the unified lint
         ("device", "action"),               # talkback tool / subcommand
         ("walk", "run_walk"),               # tb_walk
         ("scenarios", "run_scenario"),      # tb_scenario

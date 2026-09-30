@@ -206,13 +206,44 @@ before anything touches the device, the same way on every transport.
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
 | `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
 | `compose_overlay` | `serial`, `package`, `scale=1.0`, `all_boxes=false` | `{path, boxes, …}` — screenshot with every on-screen Compose element boxed (text/role + bounds) + a flat on-screen text list |
-| `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` |
-| `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]` | `{summary, findings:[{rule, severity, node, bounds, bounds_dp, message, evidence}], density, font_scale, …}` — the detect/verify engine; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
-| `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — screenshot with every a11y node boxed + speakable label + reading-order number, colored by severity |
-| `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation; can render the integrated overlay |
-| `inspect_node` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, view?, compose?, a11y?, component_image{path}, lint[]}` — `compose` carries source `file:line` + modifiers, `view` typed properties, `lint` the element-focused findings |
-| `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source}` — cropped PNG of one element (`source`: `skp` \| `bitmap_crop`) |
+| `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` and a `generation`; nodes TalkBack never sees carry `ignored`, windows under a modal dialog `covered_by` |
+| `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]`, `include_rendering_info=true` | `{summary, findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window, collection, message, evidence}], diagnostics, stats, density, font_scale, generation, …}` — the detect/verify engine (R1..R18) over the unified a11y tree (Views + Compose), judging what TalkBack reads; `rules` takes ids, `R#` aliases or ATF names; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
+| `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — every window composited (a dialog over its activity), every a11y node boxed + what TalkBack says + reading-order number; red error, amber warn, blue info, green clean, dashed = a finding with no a11y node, drawn at its bounds |
+| `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation and `summary.generation`; can render the integrated overlay (all windows; green exact, amber overlap, grey none) |
+| `inspect_node` | `serial`, `package`, one of `node_key` (`view:<id>` \| `compose:<acvId>:<semanticsId>` \| `composeview:<acvId>`) \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, generation, where, context, view?, compose?, a11y?, list_item?, a11y_only?, a11y_parent?, resolved_from?, key_note?, component_image{path}, lint[], lint_summary, lint_diagnostics}` — `compose` carries the semantics attrs (`source` is null: `file:line` needs `dump_compose` with the slot table), `view` typed properties, `lint` exactly the `a11y_lint` findings for the element and the nodes merged into it |
+| `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source, window?}` — cropped PNG of one element, cut from its own window (`source`: `skp` \| `bitmap_crop`) |
 | `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped, note?}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach, or one in the app's new process after a restart; never injects one to stop it); `agent_stopped` is true only once nothing listens on the agent's socket; `shutdown=false` only drops this server's cached connection |
+
+### Node keys and reading order
+
+- Node keys: `view:<uniqueDrawingId>` for Views, `compose:<acvId>:<semanticsId>` for
+  Compose nodes (every AndroidComposeView — each RecyclerView cell, each ComposeView
+  nested in an AndroidView — is its own id space), `composeview:<acvId>` for a Compose
+  window's root, `virtual:<hostId>:<virtualId>` for other providers' virtual nodes.
+  `inspect` / `dump_accessibility` / `a11y_lint` hand them out; `inspect_node` /
+  `component_image` take them, and every one of them resolves (the a11y nodes Compose
+  serves for children merged into a focusable parent, and its synthetic role /
+  description nodes, are grafted as `a11y_only` with their `a11y_parent`). A bare
+  `compose:<semanticsId>` (or `semantics_id`) is accepted only when one ComposeView has
+  that id. Compose re-mints ids on recomposition: the `generation` of each dump (the same
+  value from `dump_accessibility`, `a11y_lint` and `inspect` for one UI state) changes
+  when that happens, and a key any of them handed out earlier is re-resolved by
+  ComposeView, test tag, label, list row and bounds (the dossier then carries
+  `resolved_from`; a weak or tied match is an error, never a guess). A key that still
+  exists but now names other content (a recycled cell) gets a `key_note`. The key
+  registry lives per app process in `$INSPECTOR_WIDGET_KEY_CACHE` (default
+  `<tmp>/inspector-widget-keys`, `0` = memory only), so separate CLI runs share it.
+- `dump_accessibility` gives every node a `node_key` and returns `focus_order` as
+  `[{order, key, id, speak}]`: one entry per TalkBack focus stop with what TalkBack
+  announces there (`"Delete, button"`, `"Unlabeled, checkbox, not checked"`), built
+  from the accessibility child order plus `traversal_before`/`traversal_after` applied
+  across the whole tree. It walks the tree TalkBack gets: a View that is not important
+  for accessibility is replaced by its children (`ignored: not_important`), a
+  noHideDescendants subtree is dropped (`ignored: hidden`), and the windows under the
+  topmost modal window (no `FLAG_NOT_TOUCH_MODAL` / `FLAG_NOT_FOCUSABLE`, from the
+  agent's `window type=… flags=…` token) are `covered_by` it and have no stops.
+  `reading_order_diagnostics` reports constraint cycles, targets missing from the dump,
+  linkage ids in the wrong key space and covered windows.
 
 ### Node shape (`dump_tree`)
 
