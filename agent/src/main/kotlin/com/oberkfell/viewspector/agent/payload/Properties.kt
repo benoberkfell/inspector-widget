@@ -82,6 +82,35 @@ class Properties(val strings: StringTable) {
     private val viewCache = TypeCache(provider, VIEW_FQCN, gravityMapping)
     private val layoutCache = TypeCache(provider, LAYOUT_PARAMS_FQCN, gravityMapping)
 
+    /** Views whose whole PropertyGroup failed ([forViewOrNull]); reported in diagnostics. */
+    var failedViews: Int = 0
+        private set
+
+    /** Single properties that failed to read or encode (the rest of the view still reads). */
+    var failedProperties: Int = 0
+        private set
+
+    // "<kind>:<class or property>" keys already logged, so a bad property on every row of a
+    // list logs once per dump, not once per row.
+    private val logged = HashSet<String>()
+
+    private fun logOnce(key: String, message: String, t: Throwable) {
+        if (logged.add(key)) Log.w(TAG, "$message (further failures of this kind counted only)", t)
+    }
+
+    /**
+     * [forView] that never throws: a view whose properties can't be read at all yields null
+     * (counted in [failedViews]) so one bad view never aborts a DUMP_TREE. Main thread.
+     */
+    fun forViewOrNull(view: View, includeResolutionStack: Boolean): ViewInspection.PropertyGroup? =
+        try {
+            forView(view, includeResolutionStack)
+        } catch (t: Throwable) {
+            failedViews++
+            logOnce("view:${view.javaClass.name}", "properties failed for ${view.javaClass.name}", t)
+            null
+        }
+
     /**
      * Build the [ViewInspection.PropertyGroup] for [view].
      *
@@ -341,29 +370,50 @@ class Properties(val strings: StringTable) {
         private val sourceMap: Map<Int, Int> =
             if (includeResolutionStack) safeAttributeSourceResourceMap(view) else emptyMap()
 
-        override fun readBoolean(id: Int, b: Boolean) = readAny(id, if (b) 1 else 0)
+        /**
+         * Runs one read callback so a failure drops only that property: the companion goes on
+         * reading the rest of the view (an exception escaping a readX call would otherwise end
+         * the companion's readProperties for every attribute after it).
+         */
+        private inline fun guard(id: Int, block: () -> Unit) {
+            try {
+                block()
+            } catch (t: Throwable) {
+                failedProperties++
+                val acc = props.getOrNull(id)
+                acc?.value = null
+                val name = acc?.meta?.name ?: "#$id"
+                logOnce("read:$name", "reading property $name of ${view.javaClass.name} failed", t)
+            }
+        }
 
-        override fun readByte(id: Int, b: Byte) = readAny(id, b.toInt())
+        override fun readBoolean(id: Int, b: Boolean) = guard(id) { readAny(id, if (b) 1 else 0) }
 
-        override fun readChar(id: Int, c: Char) = readAny(id, c.code)
+        override fun readByte(id: Int, b: Byte) = guard(id) { readAny(id, b.toInt()) }
 
-        override fun readDouble(id: Int, d: Double) = readAny(id, d)
+        override fun readChar(id: Int, c: Char) = guard(id) { readAny(id, c.code) }
 
-        override fun readFloat(id: Int, f: Float) = readAny(id, f)
+        override fun readDouble(id: Int, d: Double) = guard(id) { readAny(id, d) }
 
-        override fun readInt(id: Int, i: Int) = readAny(id, i)
+        override fun readFloat(id: Int, f: Float) = guard(id) { readAny(id, f) }
 
-        override fun readLong(id: Int, l: Long) = readAny(id, l)
+        override fun readInt(id: Int, i: Int) = guard(id) { readAny(id, i) }
 
-        override fun readShort(id: Int, s: Short) = readAny(id, s.toInt())
+        override fun readLong(id: Int, l: Long) = guard(id) { readAny(id, l) }
 
-        override fun readObject(id: Int, o: Any?) {
+        override fun readShort(id: Int, s: Short) = guard(id) { readAny(id, s.toInt()) }
+
+        override fun readObject(id: Int, o: Any?) = guard(id) { readObjectImpl(id, o) }
+
+        private fun readObjectImpl(id: Int, o: Any?) {
             // Runtime type refinement (SimplePropertyReader.kt:79-110). Only sets a value for the
             // recognized object kinds; anything else leaves the property unread (dropped on build).
             when (o) {
-                is String -> {
+                is CharSequence -> {
+                    // Any CharSequence, not only String: an EditText's text is an Editable,
+                    // most TextViews' a Spanned. Stringified here, on the main thread.
                     props[id].type = ViewInspection.Property.Type.STRING
-                    readAny(id, o)
+                    readAny(id, o.toString())
                 }
                 is ColorStateList -> {
                     props[id].type = ViewInspection.Property.Type.COLOR
@@ -408,16 +458,23 @@ class Properties(val strings: StringTable) {
             }
         }
 
-        override fun readColor(id: Int, color: Int) = readAny(id, color)
+        override fun readColor(id: Int, color: Int) = guard(id) { readAny(id, color) }
 
-        override fun readColor(id: Int, color: Long) = readAny(id, color)
+        // A ColorLong packs a color space and half-float components; Color.toArgb(long)
+        // converts it to the sRGB ARGB int the COLOR type carries (truncating it to Int
+        // would read the color-space bits as blue).
+        override fun readColor(id: Int, color: Long) = guard(id) { readAny(id, Color.toArgb(color)) }
 
-        override fun readColor(id: Int, color: Color?) =
-            readAny(id, color?.toArgb() ?: 0)
+        // A null Color is "no color": leave the property absent rather than claim 0x00000000.
+        override fun readColor(id: Int, color: Color?) = guard(id) {
+            if (color != null) readAny(id, color.toArgb())
+        }
 
-        override fun readGravity(id: Int, value: Int) = readIntFlag(id, value)
+        override fun readGravity(id: Int, value: Int) = guard(id) { readIntFlagImpl(id, value) }
 
-        override fun readIntEnum(id: Int, value: Int) {
+        override fun readIntEnum(id: Int, value: Int) = guard(id) { readIntEnumImpl(id, value) }
+
+        private fun readIntEnumImpl(id: Int, value: Int) {
             val meta = props[id].meta
             val mapping = meta.enumMapping
             if (mapping != null) {
@@ -432,7 +489,9 @@ class Properties(val strings: StringTable) {
             readAny(id, value)
         }
 
-        override fun readIntFlag(id: Int, value: Int) {
+        override fun readIntFlag(id: Int, value: Int) = guard(id) { readIntFlagImpl(id, value) }
+
+        private fun readIntFlagImpl(id: Int, value: Int) {
             val mapping = props[id].meta.flagMapping
             if (mapping != null) {
                 // Our proto has no FlagValue; join the set with '|' into a single string and store
@@ -445,7 +504,7 @@ class Properties(val strings: StringTable) {
             }
         }
 
-        override fun readResourceId(id: Int, value: Int) {
+        override fun readResourceId(id: Int, value: Int) = guard(id) {
             val resource = createResource(view, value)
             if (resource != null) {
                 readAny(id, resource)
@@ -485,7 +544,22 @@ class Properties(val strings: StringTable) {
          * Emit the proto [ViewInspection.Property], or null if no value was ever read for this id
          * (so unread attributes are dropped — PropertyBuilder.build returns null on a null value).
          */
-        fun build(view: View): ViewInspection.Property? {
+        fun build(view: View): ViewInspection.Property? =
+            try {
+                buildImpl()
+            } catch (t: Throwable) {
+                // A value of an unexpected runtime type (a companion that read an Integer for a
+                // STRING id, a flag mapping returning null...): drop this property only.
+                failedProperties++
+                logOnce(
+                    "build:${meta.name}",
+                    "encoding property ${meta.name} ($type) of ${view.javaClass.name} failed",
+                    t,
+                )
+                null
+            }
+
+        private fun buildImpl(): ViewInspection.Property? {
             val v = value ?: return null
             // Protobuf-(lite) generated setters return Builder (fluent), so they are NOT exposed as
             // Kotlin assignable properties — call the explicit setters.
