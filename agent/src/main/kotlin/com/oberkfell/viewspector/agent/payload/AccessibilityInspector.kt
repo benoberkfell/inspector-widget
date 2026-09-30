@@ -57,6 +57,7 @@ import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
 import com.oberkfell.viewspector.proto.ViewInspection
 import java.lang.reflect.Field
@@ -185,6 +186,23 @@ object AccessibilityInspector {
         val ctx = Ctx(rootViews, strings, includeExtras, includeRenderingInfo)
         val diag = StringBuilder("roots=${rootViews.size}; api=${Build.VERSION.SDK_INT}; ids=host-key")
         val windows = ArrayList<ViewInspection.DumpA11yResponse.Window>()
+
+        // Compose computes traversal_before/after (setTraversalValues) only while an accessibility
+        // service is on (AndroidComposeViewAccessibilityDelegateCompat.isEnabled, ui 1.7 to 1.12), so
+        // without one those fields are empty for Compose nodes. Say so; the host must not read
+        // missing linkage as "no ordering constraints".
+        val a11yOn = try {
+            rootViews.firstOrNull()?.context
+                ?.getSystemService(AccessibilityManager::class.java)?.isEnabled
+        } catch (t: Throwable) {
+            Log.w(TAG, "AccessibilityManager.isEnabled failed", t)
+            null
+        }
+        when (a11yOn) {
+            true -> diag.append("; a11y-services=on")
+            false -> diag.append("; a11y-services=off (Compose omits traversal_before/after)")
+            null -> {}
+        }
 
         buildIndex(ctx)
         if (getAccessibilityViewIdM == null) {
