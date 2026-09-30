@@ -196,3 +196,32 @@ def test_shaped_a11y_proto_feeds_build_integrated_tree(strings_builder):
     root = merged["roots"][0]
     assert root["correlation_confidence"] == "exact"
     assert root["a11y"]["speakable"] == "Tap"
+
+
+# --------------------------------------------------------------------------- #
+# A lost session is passed up, never read as "this facet is absent".
+# --------------------------------------------------------------------------- #
+import pytest  # noqa: E402
+
+from inspector_widget.client import SessionLostError  # noqa: E402
+
+
+class _LostSession:
+    """Every command fails the way a dropped connection does."""
+
+    def __getattr__(self, name):
+        def lost(*_args, **_kwargs):
+            raise SessionLostError("agent session lost: the agent closed the connection")
+        return lost
+
+
+@pytest.mark.parametrize("fetch", [
+    lambda s, tmp: correlate._shaped_compose(s),
+    lambda s, tmp: correlate._shaped_a11y(s),
+    lambda s, tmp: correlate._fetch_properties(s, 1004),
+    lambda s, tmp: correlate._full_screenshot_png(s, str(tmp / "shot.png")),
+    lambda s, tmp: correlate._capture_skp(s),
+], ids=["compose", "a11y", "properties", "screenshot", "skp"])
+def test_a_lost_session_is_raised_not_read_as_a_missing_facet(fetch, tmp_path):
+    with pytest.raises(SessionLostError):
+        fetch(_LostSession(), tmp_path)

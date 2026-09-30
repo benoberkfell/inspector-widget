@@ -93,7 +93,9 @@ def hang_on(agent, command):
 
 
 def leftovers(directory, needle):
-    return sorted(p.name for p in Path(directory).iterdir() if needle in p.name)
+    """Files under ``directory`` (recursively: the MCP server keeps its PNGs in a
+    per-process subdirectory) whose name contains ``needle``."""
+    return sorted(p.name for p in Path(directory).rglob("*") if needle in p.name and p.is_file())
 
 
 needs_pil = pytest.mark.skipif(
@@ -185,13 +187,15 @@ def test_wire_bad_magic_drops_the_connection(agent):
     assert sock.recv(64) == b""
 
 
-def test_wire_shutdown_stops_the_server_and_closes_every_client(agent):
+@pytest.mark.parametrize("replies", [True, False], ids=["current", "before-reply-fix"])
+def test_wire_shutdown_stops_the_server_and_closes_every_client(agent, replies):
+    agent.reply_to_shutdown = replies
     first, second = _client(agent), _client(agent)
     second.hello()
-    # Dispatcher.handleShutdown stops the server before the reply is written, so
-    # the requester sees EOF rather than a ShutdownResponse (see NEW-SHUTDOWN-REPLY).
-    with pytest.raises((framing.FramingError, OSError)):
-        first.shutdown()
+    # Current agents reply, then stop. Older ones stopped before writing the
+    # reply, so the requester saw EOF; Client.shutdown() counts that as done too.
+    assert first.shutdown() == pb.ShutdownResponse()
+    assert first.broken  # the client closes itself after a shutdown either way
     with pytest.raises((framing.FramingError, OSError)):
         second.hello()
     assert not agent.running
@@ -264,12 +268,10 @@ def test_app_not_running_is_reported(fake_device):
 
 
 def test_non_debuggable_app_is_reported(fake_device):
-    with pytest.raises(adb.AdbError, match="not debuggable"):
+    with pytest.raises(inject.InjectionError, match="not debuggable"):
         inject.inject_and_connect(serial=SERIAL, package="com.example.release")
 
 
-@pytest.mark.xfail(strict=True, reason="NEW-DEBUGGABLE: a non-debuggable app is only detected "
-                   "after all three artifacts are pushed, and the error is a raw quoted adb dump")
 def test_non_debuggable_app_fails_fast_with_a_clear_error(fake_device, run_cli):
     res = run_cli("attach", "--package", "com.example.release")
     assert res.rc == 1
@@ -277,8 +279,6 @@ def test_non_debuggable_app_fails_fast_with_a_clear_error(fake_device, run_cli):
     assert not fake_device.pushed
 
 
-@pytest.mark.xfail(strict=True, reason="H9/E7: a missing device is reported as 'package not "
-                   "running' (pidof runs with check=False)")
 def test_bad_serial_is_reported_as_a_missing_device(fake_device, run_cli):
     res = run_cli("attach", "--serial", "emulator-9999")
     assert res.rc == 1
@@ -286,19 +286,72 @@ def test_bad_serial_is_reported_as_a_missing_device(fake_device, run_cli):
     assert "not found" in res.err or "no device" in res.err.lower()
 
 
-@pytest.mark.xfail(strict=True, reason="H10: socket_exists is a substring match "
-                   "(viewspector_4242 matches another app's @viewspector_42421)")
 def test_socket_exists_is_an_exact_name_match(fake_device):
     fake_device.foreign_sockets.append(f"viewspector_{PID}1")
     assert adb.socket_exists(SERIAL, f"viewspector_{PID}") is False
 
 
-@pytest.mark.xfail(strict=True, reason="H4: --force re-runs attach-agent but the new payload "
-                   "server can't bind the name, so the host keeps talking to the old agent")
 def test_force_reinject_replaces_a_running_agent(fake_device, warm_agent, run_cli):
     assert run_cli("dump", "--force").rc == 0
     assert fake_device.wire[-1].generation == 2
     assert not warm_agent.running
+    assert fake_device.commands(generation=1) == ["hello", "shutdown"]
+
+
+def test_a_rebuilt_payload_replaces_the_running_agent(fake_device, warm_agent, run_cli, tmp_path):
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).write_bytes(b"payload, rebuilt")
+    res = run_cli("dump")
+    assert res.rc == 0, res
+    assert not warm_agent.running and fake_device.commands(generation=1) == ["hello", "shutdown"]
+    new = fake_device.agent()
+    assert new.generation == 2 and new.build_id == inject.local_build_id()
+    assert fake_device.commands(generation=2) == ["hello", "dump_tree"]
+
+
+def test_an_agent_from_before_the_build_handshake_is_replaced(fake_device, run_cli):
+    legacy = fake_device.start_agent(PKG, build_id=None)
+    legacy.reply_to_shutdown = False  # it also predates the shutdown-reply fix...
+    legacy.linger_after_stop = True   # ...and the accept fix: stopping leaves the name bound
+    res = run_cli("attach")
+    assert res.rc == 0, res
+    assert not legacy.running and not legacy.lingering and "(build " in res.out
+    assert fake_device.agent().generation == 2
+    assert [c.get("result") for c in fake_device.attach_calls] == ["started generation 2"]
+
+
+def test_without_a_local_payload_any_running_agent_is_reused(fake_device, run_cli, tmp_path):
+    fake_device.start_agent(PKG, build_id=None)
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).unlink()
+    res = run_cli("attach")
+    assert res.rc == 0 and "(warm/reused)" in res.out
+    assert not fake_device.attach_calls
+
+
+def test_an_agent_that_ignores_shutdown_is_reported(fake_device, run_cli, monkeypatch, tmp_path):
+    stubborn = fake_device.start_agent(PKG, build_id="0" * 64)
+    stubborn.behaviour = lambda req: (
+        (0, fakeagent.frame(stubborn.dispatch(req)))  # replies, but never stops
+        if req.WhichOneof("command") == "shutdown" else stubborn.default_behaviour(req))
+    monkeypatch.setattr(inject, "STOP_WAIT", 0.2)
+    res = run_cli("dump")
+    assert res.rc == 1 and "did not stop within 0.2s of SHUTDOWN" in res.err
+    assert "am force-stop" in res.err and not fake_device.pushed
+
+
+def test_a_stale_agent_still_holding_the_socket_after_inject_is_reported(fake_device, run_cli):
+    stale = fake_device.start_agent(PKG, build_id="0" * 64)
+    hellos = {"n": 0}
+
+    def unreachable_first(req):  # the warm connect can't reach it, so it isn't stopped
+        if req.WhichOneof("command") == "hello" and not hellos["n"]:
+            hellos["n"] += 1
+            return 0, "close"
+        return stale.default_behaviour(req)
+
+    stale.behaviour = unreachable_first
+    res = run_cli("dump")
+    assert res.rc == 1 and "is not the one just injected" in res.err
+    assert [c.get("result") for c in fake_device.attach_calls] == ["already-bound"]
 
 
 # =========================================================================== #
@@ -320,10 +373,11 @@ def test_cli_packages_lists_only_debuggable_apps(fake_device, run_cli):
 def test_cli_attach_cold(fake_device, run_cli):
     res = run_cli("attach")
     assert res.rc == 0, res
-    assert (f"attached to {PKG} pid={PID}: agent viewspector-0.1, API 36, abi arm64-v8a"
-            in res.out)
+    build = fake_device.default_build_id[:12]
+    assert (f"attached to {PKG} pid={PID}: agent viewspector-0.1 (build {build}), API 36, "
+            f"abi arm64-v8a" in res.out)
     assert "warm" not in res.out and f"socket=@viewspector_{PID}" in res.out
-    assert fake_device.commands() == ["hello", "hello"]
+    assert fake_device.commands() == ["hello"]  # the inject's Hello carries the metadata
     assert cold_injected(fake_device)
     assert fake_device.agent().running  # attach leaves the agent up...
     assert fake_device.forward_names() == []  # ...and removes its forward
@@ -342,7 +396,7 @@ def test_cli_dump_text(fake_device, run_cli):
     assert lines[0] == "DecorView (0,0 360x640) id=1001"
     assert '    TextView @id/title "Hello world" (16,24 328x40) id=1003' in lines
     assert "PopupDecorView (40,560 280x64) id=2001" in lines
-    assert fake_device.commands() == ["hello", "hello", "dump_tree"]
+    assert fake_device.commands() == ["hello", "dump_tree"]
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_screenshot) == (0, False, False)
 
@@ -426,7 +480,7 @@ def test_cli_a11y_overlay_with_lint(fake_device, run_cli, tmp_path):
     out = tmp_path / "a11y.png"
     res = run_cli("a11y", "--overlay", out, "--lint")
     assert res.rc == 0, res
-    assert fake_device.commands()[2:] == ["dump_a11y", "dump_compose", "screenshot", "screenshot"]
+    assert fake_device.commands()[1:] == ["dump_a11y", "dump_compose", "screenshot", "screenshot"]
     assert {"wm density", "settings get system font_scale"} <= set(fake_device.shell_log())
     assert png_size(out) == (360, 640)
     assert not Path(f"{out}.base.png").exists()
@@ -579,7 +633,6 @@ def test_cli_detach_shuts_down_a_running_agent(fake_device, warm_agent, run_cli)
     assert fake_device.forward_names() == []
 
 
-@pytest.mark.xfail(strict=True, reason="E4/H5: detach cold-injects the agent just to shut it down")
 def test_cli_detach_without_an_agent_does_not_inject(fake_device, run_cli):
     assert run_cli("detach").rc == 0
     assert not fake_device.pushed and not cold_injected(fake_device)
@@ -638,8 +691,6 @@ def test_mcp_attach(mcp, fake_device):
     assert mcp_server.SESSIONS.peek(SERIAL, PKG) is not None
 
 
-@pytest.mark.xfail(strict=True, reason="E9: attach returns null api_level/abi/agent_version "
-                   "(inject discards the HelloResponse)")
 def test_mcp_attach_reports_agent_metadata(mcp, fake_device):
     res = mcp("attach")
     assert (res["api_level"], res["abi"], res["agent_version"]) == (36, "arm64-v8a",
@@ -675,7 +726,7 @@ def test_mcp_dump_tree_with_properties_and_screenshot(mcp, fake_device):
     assert [g["view_id"] for g in res["properties"]] == list(range(1001, 1007))
     shot = res["screenshot"]
     assert (shot["width"], shot["height"], shot["scale"]) == (180, 320, 0.5)
-    assert Path(shot["path"]).parent == fake_device.tmpdir and png_size(shot["path"]) == (180, 320)
+    assert fake_device.tmpdir in Path(shot["path"]).parents and png_size(shot["path"]) == (180, 320)
 
 
 def test_mcp_get_properties(mcp, fake_device):
@@ -724,10 +775,17 @@ def test_mcp_screenshot(mcp, fake_device):
         assert png_pixel(res["path"], 20, 50) == OK_BUTTON_RGB
 
 
-@pytest.mark.parametrize("scale,wire", [(5, 1.0), (0, 1.0), (0.25, 0.25)])
+@pytest.mark.parametrize("scale,wire", [(0, 1.0), (0.25, 0.25), (1, 1.0)])
 def test_mcp_screenshot_scale_is_clamped(mcp, fake_device, scale, wire):
     assert "error" not in mcp("screenshot", scale=scale)
     assert fake_device.requests("screenshot")[-1].scale == wire
+
+
+def test_mcp_scale_out_of_schema_range_is_rejected_before_touching_the_device(mcp, fake_device):
+    res = mcp("screenshot", scale=5)
+    assert res == {"error": "invalid argument scale: 5 is greater than the maximum of 1.0",
+                   "tool": "screenshot"}
+    assert fake_device.adb_log == [] and fake_device.wire == []
 
 
 def test_mcp_dump_compose(mcp, fake_device):
@@ -807,6 +865,19 @@ def test_mcp_inspect(mcp, fake_device):
     assert find(host["children"], node_key="compose:6")["a11y"]["virtual_id"] == 6
 
 
+@pytest.mark.xfail(strict=True, reason="A1: the agent on this branch gives every a11y node the "
+                   "root View's host_view_id and the low 32 bits of the packed child id as its "
+                   "virtual_id, so the host's a11y joins only work with the ids of the A1-fixed "
+                   "agent (improve/a11y-agent-identity), which is what the fake sends by default. "
+                   "When that agent lands, delete FakeAgent.legacy_a11y_ids and this test.")
+def test_mcp_inspect_with_the_a11y_ids_this_branchs_agent_sends(mcp, fake_device):
+    fake_device.start_agent(PKG).legacy_a11y_ids = True
+    res = mcp("inspect")
+    assert find(res["roots"], node_key="view:1004")["a11y"]["host_view_id"] == 1004
+    host = find(res["roots"], node_key="view:1006")
+    assert find(host["children"], node_key="compose:6")["a11y"]["virtual_id"] == 6
+
+
 @needs_pil
 def test_mcp_inspect_overlay(mcp, fake_device):
     res = mcp("inspect", include_overlay=True)
@@ -870,7 +941,8 @@ def test_mcp_component_image_of_a_compose_layer_tries_skp(mcp, fake_device):
 def test_mcp_detach(mcp, fake_device):
     assert mcp("attach")["attached"]
     agent = fake_device.agent()
-    assert mcp("detach") == {"serial": SERIAL, "package": PKG, "detached": True}
+    assert mcp("detach") == {"serial": SERIAL, "package": PKG, "detached": True,
+                             "agent_stopped": True}
     assert fake_device.commands()[-1] == "shutdown" and not agent.running
     assert fake_device.forward_names() == [] and mcp_server.SESSIONS.peek(SERIAL, PKG) is None
     assert mcp("detach")["detached"] is False
@@ -921,8 +993,6 @@ def test_scenario_agent_drops_clients_then_cli_reconnects(fake_device, warm_agen
     assert not cold_injected(fake_device)
 
 
-@pytest.mark.xfail(strict=True, reason="E2/H2: a cached MCP session never goes stale; after the "
-                   "agent drops the connection every call fails with FramingError/BrokenPipe")
 def test_scenario_agent_drops_clients_then_mcp_recovers(mcp, fake_device):
     assert mcp("attach")["attached"]
     fake_device.kill_clients()
@@ -930,8 +1000,6 @@ def test_scenario_agent_drops_clients_then_mcp_recovers(mcp, fake_device):
     assert "error" not in res and res["root_count"] == 2
 
 
-@pytest.mark.xfail(strict=True, reason="E2/H2: after the payload idle watchdog stops the server, "
-                   "the cached MCP session is reused instead of re-injecting")
 def test_scenario_idle_timeout_then_mcp_reattaches(mcp, fake_device):
     assert mcp("attach")["attached"]
     fake_device.idle_timeout()
@@ -940,16 +1008,12 @@ def test_scenario_idle_timeout_then_mcp_reattaches(mcp, fake_device):
     assert len(fake_device.attach_calls) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="E2: re-attach after the agent dropped returns "
-                   "attached:true with window_count:null (the get_windows error is swallowed)")
 def test_scenario_mcp_attach_after_the_agent_dropped_is_live(mcp, fake_device):
     assert mcp("attach")["window_count"] == 2
     fake_device.kill_clients()
     assert mcp("attach")["window_count"] == 2
 
 
-@pytest.mark.xfail(strict=True, reason="E2 (pid check): after the app restarts under a new pid, "
-                   "the cached session is not dropped and re-injected")
 def test_scenario_app_restart_then_mcp_reinjects(mcp, fake_device):
     assert mcp("attach")["attached"]
     fake_device.restart_app(new_pid=5353)
@@ -958,9 +1022,6 @@ def test_scenario_app_restart_then_mcp_reinjects(mcp, fake_device):
     assert fake_device.attach_calls[-1]["socket_name"] == "viewspector_5353"
 
 
-@pytest.mark.xfail(strict=True, reason="H1: no socket timeout; a frozen app hangs the call (and a "
-                   "detach behind it) forever. The fix should honour a short deadline override; "
-                   "this test sets INSPECTOR_WIDGET_TIMEOUT=1")
 def test_scenario_hung_agent_times_out(mcp, fake_device, monkeypatch):
     monkeypatch.setenv("INSPECTOR_WIDGET_TIMEOUT", "1")
     assert mcp("attach")["attached"]
@@ -989,11 +1050,10 @@ def test_scenario_force_on_a_raw_client_subcommand_reinjects(fake_device, warm_a
     res = run_cli("dump", "--force")
     assert res.rc == 0, res
     assert set(fake_device.pushed) == {f"/data/local/tmp/{n}" for n in ARTIFACTS}
-    assert [c.get("result") for c in fake_device.attach_calls] == ["already-bound"]
+    assert [c.get("result") for c in fake_device.attach_calls] == ["started generation 2"]
+    assert not warm_agent.running
 
 
-@pytest.mark.xfail(strict=True, reason="E4: --force is silently dropped by the Session-based "
-                   "subcommands (iw.attach has no force parameter)")
 def test_scenario_force_on_an_integrated_subcommand_reinjects(fake_device, warm_agent, run_cli,
                                                               tmp_path):
     assert run_cli("screenshot", "--force", "--out", tmp_path / "s.png").rc == 0
@@ -1008,8 +1068,6 @@ def test_scenario_raw_cli_command_leaves_a_live_mcp_session_alone(mcp, fake_devi
     assert fake_device.agent().generation == 1
 
 
-@pytest.mark.xfail(strict=True, reason="E4/H5: the Session-based CLI subcommands end with "
-                   "Session.detach() == SHUTDOWN, which kills every client incl. a live MCP session")
 def test_scenario_integrated_cli_command_leaves_a_live_mcp_session_alone(mcp, fake_device,
                                                                          run_cli, tmp_path):
     assert mcp("attach")["attached"]
@@ -1040,8 +1098,6 @@ def test_scenario_dump_tree_property_parity_cli_vs_mcp(mcp, fake_device, run_cli
         assert decoded(cli_props[name]) == decoded(mcp_props[name]), name
 
 
-@pytest.mark.xfail(strict=True, reason="H3 (+E2): after a protocol glitch (a duplicated reply) "
-                   "the client never resynchronises: every later call is off by one")
 def test_scenario_duplicate_reply_does_not_desync_forever(mcp, fake_device, warm_agent):
     sent = {"dup": False}
 
@@ -1059,8 +1115,6 @@ def test_scenario_duplicate_reply_does_not_desync_forever(mcp, fake_device, warm
     assert "error" not in res, res
 
 
-@pytest.mark.xfail(strict=True, reason="H3: the agent's malformed-request ERROR uses id 0 and the "
-                   "host reports an id mismatch instead of the agent's message")
 def test_scenario_agent_error_with_id_zero_surfaces_its_message(mcp, fake_device, warm_agent):
     warm_agent.behaviour = lambda req: (
         (0, fakeagent.error_response(0, "Malformed request: boom"))
@@ -1082,7 +1136,6 @@ def test_scenario_second_window_is_addressable_by_root_id(mcp, fake_device):
     assert find(res["roots"], id=2002)["text"] == "Saved"
 
 
-@pytest.mark.xfail(strict=True, reason="E12: a failed CLI --overlay leaves OUT.png.base.png behind")
 def test_scenario_failed_cli_overlay_leaves_no_base_png(fake_device, run_cli, tmp_path, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("overlay renderer failed")
@@ -1094,8 +1147,6 @@ def test_scenario_failed_cli_overlay_leaves_no_base_png(fake_device, run_cli, tm
     assert not Path(f"{out}.base.png").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="E12: a failed MCP overlay leaves its base PNG and an empty "
-                   "output PNG in $TMPDIR")
 def test_scenario_failed_mcp_overlay_leaves_no_temp_files(mcp, fake_device, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("overlay renderer failed")
@@ -1161,6 +1212,24 @@ def _payload(result):
 
 
 @pytest.mark.parametrize("transport", ["sdk", "fallback"])
+def test_stdio_invalid_arguments_get_the_same_error_on_every_transport(tmp_path, transport):
+    if transport == "sdk":
+        pytest.importorskip("mcp")
+    results, wire, _exits = _stdio_session(tmp_path, transport == "fallback", [
+        ("screenshot", {"scale": 5}),
+        ("get_properties", {"view_id": "1003"}),
+        ("attach", {"bogus": True}),
+    ])
+    assert [r["isError"] for r in results.values()] == [True, True, True]
+    assert [_payload(r)["error"] for r in results.values()] == [
+        "invalid argument scale: 5 is greater than the maximum of 1.0",
+        "invalid argument view_id: '1003' is not of type 'integer'",
+        "unknown argument(s): bogus (allowed: force, package, serial)",
+    ]
+    assert wire == []  # rejected before anything reached the device
+
+
+@pytest.mark.parametrize("transport", ["sdk", "fallback"])
 def test_stdio_transport_end_to_end(tmp_path, transport):
     if transport == "sdk":
         pytest.importorskip("mcp")
@@ -1186,8 +1255,6 @@ def test_stdio_transport_end_to_end(tmp_path, transport):
     assert exit_record["forwards"] == [] and exit_record["running_agents"] == []
 
 
-@pytest.mark.xfail(strict=True, reason="E12: no atexit cleanup; the adb forward of every cached "
-                   "session leaks when the MCP server exits")
 def test_stdio_server_exit_removes_its_adb_forwards(tmp_path):
     pytest.importorskip("mcp")
     results, wire, exits = _stdio_session(tmp_path, False, [("attach", {})])

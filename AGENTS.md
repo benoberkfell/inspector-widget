@@ -74,7 +74,7 @@ host/                         Python host driver + entry points
 scripts/                      build.sh, run.sh, test.sh, install-a11yprobe.sh
 testapps/a11yprobe/           Compose app with deliberate a11y mistakes (lint corpus)
 skill/inspector-widget-a11y/  the a11y debugging Skill (SKILL.md, tools.md, rules.md)
-build-out/                    generated artifacts (gitignored): libviewspector.so, bootstrap.dex, payload.jar
+build-out/                    generated artifacts (gitignored): libviewspector.so, bootstrap.dex, payload.jar, BUILD_ID
 ```
 
 ---
@@ -83,8 +83,14 @@ build-out/                    generated artifacts (gitignored): libviewspector.s
 
 **Build the on-device artifacts** (one command):
 ```bash
-./scripts/build.sh        # -> build-out/{libviewspector.so, bootstrap.dex, payload.jar}
+./scripts/build.sh        # -> build-out/{libviewspector.so, bootstrap.dex, payload.jar, BUILD_ID}
 ```
+`BUILD_ID` is the sha256 of `payload.jar`; the agent reports the same hash in Hello
+(`viewspector-0.1+<sha256>`), and the host replaces a running agent whose build differs, so a
+rebuild takes effect on the next attach without restarting the app. The exception: while
+another client (an MCP server, say) is connected to that agent, it is kept and the attach warns
+instead (`--force` / `force=true` replaces it anyway), so two checkouts with different builds
+don't evict each other's agent on every call.
 Pinned for reproducibility (in `settings.gradle.kts` / `agent/build.gradle.kts`): AGP 8.7.2,
 Kotlin 2.0.21, protobuf-plugin 0.9.4, NDK `27.1.12297006`, build-tools `36.1.0`, compileSdk/targetSdk 36.
 The real requirements are looser: **any JDK 17–23** to run Gradle (`build.sh` honours an in-range
@@ -109,6 +115,23 @@ host/cli.py component-image --serial ... --node-key compose:569 --out comp.png
 Artifacts are read from `--build-out DIR`, else `$INSPECTOR_WIDGET_ARTIFACTS`, else the legacy
 `$VIEWSPECTOR_ARTIFACTS`, else the checkout's `build-out/`. A wheel install has no checkout to fall
 back on, so set the env var there (the MCP server honours it too; `--self-check` shows what it found).
+`--serial` (MCP: `serial`) defaults to `$ANDROID_SERIAL`, else the only attached device; with two
+emulators up, pass it or set `ANDROID_SERIAL`.
+
+**Session lifecycle.** Every subcommand except `detach` disconnects when it finishes and leaves the
+agent running (the next run is a warm connect, and a concurrent MCP session is untouched); `detach`
+sends SHUTDOWN, which stops the agent for every client (each one sees EOF at once), and never
+injects one first; it reports the agent stopped only once nothing listens on its socket (exit 1,
+MCP `agent_stopped: false`, otherwise). `--force` (MCP `attach(force=true)`) stops a running agent
+and injects afresh. The MCP server re-attaches a cached session that died (idle timeout, app
+restart, another client's SHUTDOWN) and retries a call once if the connection drops mid-way; a
+timeout is reported, not retried. Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`,
+default 30s, 4x for screenshots/Compose/a11y dumps; `0` disables it), so a frozen app returns an
+error, not a hang. An app in the background can be frozen by Android (the cached-apps freezer);
+attach then says so rather than queuing an injection, and asks for the app in the foreground.
+In `/proc/net/unix` only the listening entry means an agent is there: every client connection is
+listed under the same `@viewspector_<pid>` for as long as it is open (`adb.socket_exists` vs
+`adb.socket_connections`).
 
 **Run (MCP)**:
 ```bash
@@ -140,8 +163,9 @@ cd host && .venv/bin/python -m pytest tests -q -m device   # live emulator smoke
 | Accessibility | `dump_accessibility`, `a11y_lint`, `a11y_overlay` | `a11y` (+`--lint`/`--overlay`), `a11y-lint` |
 | Integrated | `inspect`, `inspect_node`, `component_image` | `inspect`, `inspect-node`, `component-image` |
 
-The integrated subcommands route through `inspector_widget.attach() -> Session` (the same
-facade the MCP uses); the older subcommands still use a raw `Client` (works; not yet unified).
+Every subcommand routes through `inspector_widget.attach() -> Session` (the same facade the MCP
+uses); the older ones then drive `session.client` directly (works; their bodies are not yet shared
+with the MCP tools).
 
 ---
 
@@ -167,7 +191,12 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
    (`fake_device.requests("dump_tree")`) and the output. Add an e2e test with every new
    subcommand or tool; the coverage guards fail otherwise. Open ledger bugs are strict xfails
    carrying the ledger id: fixing one flips it to XPASS, so remove the marker in the same change.
-   If you change the agent's wire behaviour, update the fake to match.
+   If you change the agent's wire behaviour, update the fake to match (it also models older
+   agents: `build_id=None`, `reply_to_shutdown=False`, `linger_after_stop=True`,
+   `close_clients_on_stop=False`, `hello_waits_for_other_clients=True`). Its a11y ids are the
+   A1-fixed agent's; `legacy_a11y_ids=True` reproduces what the agent on this branch sends.
+   Session-lifecycle behaviour (deadlines, poisoning, re-attach, detach, serials, the build
+   handshake) is covered in `host/tests/test_session_lifecycle.py`.
 3. **Live-verify on the emulator**, not just pytest. Launch the test app
    (`adb shell am start -n com.oberkfell.a11yprobe/.MainActivity`) and actually run the CLI /
    MCP paths you touched. Offline-green ≠ works-on-device: the fake encodes what we *believe*

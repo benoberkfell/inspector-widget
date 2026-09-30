@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import socket
 import struct
+import time
+from typing import Optional
 
 # 8-byte ASCII magic. Must match the agent's Framing.MAGIC exactly.
 MAGIC = b"VWSPCT01"
@@ -26,17 +28,39 @@ class FramingError(IOError):
     """Raised on magic mismatch, short read, or an over-large frame."""
 
 
-def _recv_exactly(sock: socket.socket, n: int) -> bytes:
-    """Read exactly ``n`` bytes from ``sock`` or raise ``FramingError`` on EOF."""
+class FrameTimeout(FramingError, TimeoutError):
+    """The deadline passed before a whole frame arrived."""
+
+
+def _recv_exactly(sock: socket.socket, n: int, what: str = "message body",
+                  deadline: Optional[float] = None) -> bytes:
+    """Read exactly ``n`` bytes from ``sock`` or raise ``FramingError`` on EOF.
+
+    ``deadline`` is a ``time.monotonic()`` instant; the whole read must finish
+    by then or :class:`FrameTimeout` is raised. ``None`` blocks per the
+    socket's own timeout setting.
+    """
     if n == 0:
         return b""
     chunks = []
     remaining = n
     while remaining > 0:
-        chunk = sock.recv(remaining)
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise FrameTimeout(f"timed out reading the {what} "
+                                   f"(got {n - remaining} of {n} bytes)")
+            sock.settimeout(left)
+        try:
+            chunk = sock.recv(remaining)
+        except socket.timeout as exc:  # TimeoutError on 3.10+
+            raise FrameTimeout(f"timed out reading the {what} "
+                               f"(got {n - remaining} of {n} bytes)") from exc
         if not chunk:
+            if what == "frame header" and remaining == n:
+                raise FramingError("the agent closed the connection (EOF) before replying")
             raise FramingError(
-                f"socket closed while reading message body "
+                f"socket closed while reading the {what} "
                 f"(needed {n} bytes, got {n - remaining})"
             )
         chunks.append(chunk)
@@ -51,20 +75,22 @@ def write_message(sock: socket.socket, payload: bytes) -> None:
     sock.sendall(header + payload)
 
 
-def read_message(sock: socket.socket) -> bytes:
+def read_message(sock: socket.socket, deadline: Optional[float] = None) -> bytes:
     """Read one framed message from ``sock`` and return its raw payload bytes.
 
     Reads the 8-byte magic (asserts it), the 4-byte big-endian length, then
-    exactly that many payload bytes. Raises ``FramingError`` on any mismatch.
+    exactly that many payload bytes. Raises ``FramingError`` on any mismatch,
+    and :class:`FrameTimeout` if ``deadline`` (a ``time.monotonic()`` instant)
+    passes first.
     """
-    magic = _recv_exactly(sock, MAGIC_SIZE)
+    magic = _recv_exactly(sock, MAGIC_SIZE, "frame header", deadline)
     if magic != MAGIC:
         raise FramingError(
             f"bad framing magic: expected {MAGIC!r}, got {magic!r}"
         )
-    (length,) = struct.unpack(">I", _recv_exactly(sock, LENGTH_SIZE))
+    (length,) = struct.unpack(">I", _recv_exactly(sock, LENGTH_SIZE, "frame length", deadline))
     if length > MAX_MESSAGE_SIZE:
         raise FramingError(
             f"framed message length {length} exceeds max {MAX_MESSAGE_SIZE}"
         )
-    return _recv_exactly(sock, length)
+    return _recv_exactly(sock, length, "message body", deadline)

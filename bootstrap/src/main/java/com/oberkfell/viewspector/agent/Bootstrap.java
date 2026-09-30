@@ -34,7 +34,7 @@ import java.lang.reflect.Method;
  *
  * <p>Its sole job is to construct a {@link DexClassLoader} for {@code payload.jar} whose
  * <strong>parent is the application classloader</strong>, then hand control to the Kotlin payload's
- * {@code Payload.start(socketName)} entry point. The app-classloader parentage is mandatory: the
+ * {@code Payload.start(socketName, payloadPath)} entry point. The app-classloader parentage is mandatory: the
  * payload must be able to resolve AndroidX / Material {@code *$InspectionCompanion} classes that only
  * exist on the application classpath (see CONTRACT.md section 2, and {@code InspectorContext.java:115-153}).
  *
@@ -51,7 +51,11 @@ public final class Bootstrap {
     private static final String PAYLOAD_CLASS_NAME =
             "com.oberkfell.viewspector.agent.payload.Payload";
 
-    /** Static entry point on {@link #PAYLOAD_CLASS_NAME}: {@code public static void start(String socketName)}. */
+    /**
+     * Static entry point on {@link #PAYLOAD_CLASS_NAME}: {@code start(String socketName, String payloadPath)}
+     * (so the payload can hash the jar it runs from for the build handshake), falling back to the
+     * original {@code start(String socketName)}.
+     */
     private static final String PAYLOAD_START_METHOD = "start";
 
     /** Name of the thread on which the payload is launched, so it never blocks the JVMTI attach thread. */
@@ -63,7 +67,7 @@ public final class Bootstrap {
 
     /**
      * Native-agent entry point. Loads the payload jar with the application classloader as its parent
-     * and invokes {@code Payload.start(socketName)} on a dedicated worker thread.
+     * and invokes {@code Payload.start(socketName, payloadPath)} on a dedicated worker thread.
      *
      * <p>This method is invoked on the JVMTI attach thread and MUST return promptly, so the actual
      * payload launch is dispatched to {@link #LAUNCH_THREAD_NAME}. All failures are caught and logged
@@ -111,8 +115,18 @@ public final class Bootstrap {
 
             final Class<?> payloadClass =
                     Class.forName(PAYLOAD_CLASS_NAME, true, payloadClassLoader);
-            final Method startMethod =
-                    payloadClass.getMethod(PAYLOAD_START_METHOD, String.class);
+            Method withPath = null;
+            try {
+                withPath = payloadClass.getMethod(PAYLOAD_START_METHOD, String.class, String.class);
+            } catch (NoSuchMethodException e) {
+                // A payload from before the build handshake.
+            }
+            final Method startMethod = withPath != null
+                    ? withPath
+                    : payloadClass.getMethod(PAYLOAD_START_METHOD, String.class);
+            final Object[] startArgs = withPath != null
+                    ? new Object[] {socketName, payloadPath}
+                    : new Object[] {socketName};
 
             // Launch on a dedicated thread. Payload.start spawns its own accept-loop thread and is
             // expected to return quickly, but we must never block the JVMTI attach thread on it.
@@ -120,7 +134,7 @@ public final class Bootstrap {
                 @Override
                 public void run() {
                     try {
-                        startMethod.invoke(null, socketName);
+                        startMethod.invoke(null, startArgs);
                         Log.i(TAG, "initialize: payload started on socket '" + socketName + "'");
                     } catch (Throwable t) {
                         Log.e(TAG, "initialize: error invoking "

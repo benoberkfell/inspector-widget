@@ -9,7 +9,7 @@
 # `proto/view_inspection.proto`).
 #
 # Two execution modes, selected at runtime:
-#   1. The real `mcp` SDK (preferred — `pip install mcp`).  We register seven
+#   1. The real `mcp` SDK (preferred — `pip install mcp`).  We register the
 #      tools via the low-level `mcp.server.Server` API and serve over stdio.
 #   2. A self-contained JSON-RPC 2.0 / MCP-over-stdio fallback used when the
 #      `mcp` package is not importable, so the server still runs with only
@@ -28,14 +28,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import contextlib
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import threading
-import traceback
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # Make the host package importable when this file is launched directly
@@ -67,7 +69,7 @@ log = logging.getLogger("inspector-widget.mcp")
 #       each: {"package": str, "pid": int|None, "running": bool}
 #       (debuggable packages only)
 #
-#   inspector_widget.attach(serial, package) -> Session
+#   inspector_widget.attach(serial, package, force_reinject=False) -> Session
 #       Injects the agent if not already attached, forwards the socket, performs
 #       the HELLO handshake.  Returns a live Session.  Cheap/idempotent if the
 #       agent is already attached for that (serial, package).
@@ -75,10 +77,15 @@ log = logging.getLogger("inspector-widget.mcp")
 #   Session attributes / methods (all synchronous, blocking):
 #       .serial: str
 #       .package: str
+#       .pid: int, .warm: bool
 #       .api_level: int
 #       .abi: str
 #       .agent_version: str
-#       .get_windows() -> dict{"root_ids": list[int], "strings": {id:str}}
+#       .info() -> dict of the above
+#       .is_alive() -> bool   (connection open + app still on the same pid)
+#       .disconnect()         (drop the connection, agent keeps running)
+#       .shutdown()           (SHUTDOWN: stop the agent for every client)
+#       .get_windows() -> GetWindowsResponse
 #       .dump_tree(root_id=0, include_properties=False,
 #                  include_resolution_stack=False, include_screenshot=False,
 #                  screenshot_scale=1.0)
@@ -87,7 +94,6 @@ log = logging.getLogger("inspector-widget.mcp")
 #           -> ViewInspection.GetPropertiesResponse  (raw proto message)
 #       .screenshot(root_id=0, scale=1.0)
 #           -> ViewInspection.ScreenshotResponse  (raw proto message)
-#       .detach()  -> sends ShutdownCommand, tears down forward, closes socket.
 #
 # The proto module is `inspector_widget.proto.view_inspection_pb2` (generated;
 # protobuf package `viewspector.proto`); we import it for enum names + screenshot
@@ -170,9 +176,11 @@ class HostFacade:
         fn = _first_attr(self.host, "list_processes", "processes", "list_packages")
         return list(fn(serial))
 
-    def attach(self, serial: str, package: str) -> Any:
-        fn = _first_attr(self.host, "attach", "connect", "inject_and_attach")
-        return fn(serial, package)
+    def attach(self, serial: str, package: str, force_reinject: bool = False) -> Any:
+        return self.host.attach(serial, package, force_reinject=force_reinject)
+
+    def connect_existing(self, serial: str, package: str) -> Any:
+        return self.host.connect_existing(serial, package)
 
 
 def _first_attr(obj: Any, *names: str) -> Callable[..., Any]:
@@ -191,28 +199,46 @@ HOST = HostFacade()
 
 # --------------------------------------------------------------------------- #
 # Session cache, keyed by (serial, package).
+#
+# A cached session is reused only while Session.is_alive() holds (the socket
+# is open and the app still runs under the same pid); otherwise it is dropped
+# and re-attached. Each key has its own lock, so a slow cold inject into one
+# app never blocks tools on another.
 # --------------------------------------------------------------------------- #
 class SessionCache:
     def __init__(self) -> None:
         self._sessions: Dict[Tuple[str, str], Any] = {}
-        self._lock = threading.Lock()
+        self._key_locks: Dict[Tuple[str, str], threading.Lock] = {}
+        self._lock = threading.Lock()  # guards the two dicts only
 
     def _key(self, serial: str, package: str) -> Tuple[str, str]:
         return (serial, package)
 
-    def get_or_attach(self, serial: str, package: str) -> Any:
-        key = self._key(serial, package)
+    def _key_lock(self, key: Tuple[str, str]) -> threading.Lock:
         with self._lock:
-            session = self._sessions.get(key)
-            if session is not None and _session_alive(session):
+            return self._key_locks.setdefault(key, threading.Lock())
+
+    def get_or_attach(self, serial: str, package: str, force: bool = False) -> Any:
+        key = self._key(serial, package)
+        with self._key_lock(key):
+            with self._lock:
+                session = self._sessions.get(key)
+            if session is not None and not force and _session_alive(session):
                 return session
-            # Stale/closed session: drop it before re-attaching.
             if session is not None:
-                _safe_detach(session)
-                self._sessions.pop(key, None)
-            session = HOST.attach(serial, package)
-            self._sessions[key] = session
+                # Dead (agent idled out, app restarted, stream broke) or forced:
+                # release it before attaching afresh.
+                self._forget(key, session)
+                _disconnect(session)
+            session = HOST.attach(serial, package, force_reinject=force)
+            with self._lock:
+                self._sessions[key] = session
             return session
+
+    def _forget(self, key: Tuple[str, str], session: Any) -> None:
+        with self._lock:
+            if self._sessions.get(key) is session:
+                del self._sessions[key]
 
     def peek(self, serial: str, package: str) -> Optional[Any]:
         with self._lock:
@@ -226,33 +252,52 @@ class SessionCache:
         with self._lock:
             return list(self._sessions.values())
 
+    def close_all(self) -> None:
+        """Disconnect every cached session (agents keep running). For exit."""
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            _disconnect(session)
+
 
 SESSIONS = SessionCache()
 
 
 def _session_alive(session: Any) -> bool:
-    alive = getattr(session, "is_alive", None)
-    if callable(alive):
-        try:
-            return bool(alive())
-        except Exception:
-            return False
-    closed = getattr(session, "closed", None)
-    if isinstance(closed, bool):
-        return not closed
-    return True
+    try:
+        return bool(session.is_alive())
+    except Exception:  # noqa: BLE001 - a probe that fails means "not usable"
+        log.debug("session liveness check failed", exc_info=True)
+        return False
 
 
-def _safe_detach(session: Any) -> None:
-    for name in ("detach", "shutdown", "close"):
-        fn = getattr(session, name, None)
-        if callable(fn):
-            try:
-                fn()
-                return
-            except Exception:  # pragma: no cover - best-effort teardown
-                log.debug("session.%s() failed", name, exc_info=True)
-                return
+def _disconnect(session: Any) -> None:
+    """Drop a session's connection and adb forward; the agent keeps running."""
+    try:
+        session.disconnect()
+    except Exception:  # pragma: no cover - best-effort teardown
+        log.debug("session.disconnect() failed", exc_info=True)
+
+
+class _NeverRaised(Exception):
+    """Stands in for a host exception class when the host package won't import."""
+
+
+def _transport_error() -> type:
+    try:
+        from inspector_widget.client import TransportError
+    except Exception:  # pragma: no cover - host package missing
+        return _NeverRaised
+    return TransportError
+
+
+def _serial(serial: Optional[str]) -> str:
+    """The serial to use: as given, else $ANDROID_SERIAL / the only attached device."""
+    if isinstance(serial, str) and serial.strip():
+        return serial
+    from inspector_widget import adb
+    return adb.resolve_serial(None)
 
 
 # --------------------------------------------------------------------------- #
@@ -512,16 +557,80 @@ def _rgba_to_png(rgba: bytearray, width: int, height: int) -> bytes:
 
 
 _TMP_PREFIX = "viewspector_"
+# PNGs go in one directory per server process (under $TMPDIR), deleted when the
+# server exits, so they don't pile up across sessions.
+_TMP_DIRS: Dict[str, str] = {}
+_TMP_LOCK = threading.Lock()
+
+
+def _tmp_dir() -> str:
+    base = tempfile.gettempdir()
+    with _TMP_LOCK:
+        path = _TMP_DIRS.get(base)
+        if path is None or not os.path.isdir(path):
+            path = tempfile.mkdtemp(prefix=f"inspector-widget-{os.getpid()}-", dir=base)
+            _TMP_DIRS[base] = path
+        return path
 
 
 def _tmp_png_path(serial: str, package: str, tag: str) -> str:
     safe_pkg = package.replace("/", "_").replace(":", "_")
     safe_serial = serial.replace("/", "_").replace(":", "_")
     fd, path = tempfile.mkstemp(
-        prefix=f"{_TMP_PREFIX}{safe_serial}_{safe_pkg}_{tag}_", suffix=".png"
+        prefix=f"{_TMP_PREFIX}{safe_serial}_{safe_pkg}_{tag}_", suffix=".png", dir=_tmp_dir()
     )
     os.close(fd)
     return path
+
+
+def _remove_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _png_output(serial: str, package: str, tag: str) -> Iterator[str]:
+    """A new PNG path for a tool result; removed again if the tool fails."""
+    path = _tmp_png_path(serial, package, tag)
+    try:
+        yield path
+    except BaseException:
+        _remove_quietly(path)
+        raise
+
+
+@contextlib.contextmanager
+def _png_scratch(serial: str, package: str, tag: str) -> Iterator[str]:
+    """A scratch PNG path (an overlay's base screenshot); always removed."""
+    path = _tmp_png_path(serial, package, tag)
+    try:
+        yield path
+    finally:
+        _remove_quietly(path)
+
+
+def _cleanup_at_exit() -> None:
+    """Disconnect cached sessions (removing their adb forwards; agents keep
+    running for the next start), remove any other forward this process still
+    holds (an attach cut short), and delete this process's PNG directory."""
+    try:
+        SESSIONS.close_all()
+    except Exception:  # noqa: BLE001 - exit cleanup is best-effort
+        pass
+    try:
+        from inspector_widget import adb
+        adb.remove_own_forwards()
+    except Exception:  # noqa: BLE001
+        pass
+    with _TMP_LOCK:
+        dirs = list(_TMP_DIRS.values())
+        _TMP_DIRS.clear()
+    for path in dirs:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -567,34 +676,62 @@ def tool_list_devices() -> Dict[str, Any]:
     return {"devices": devices, "count": len(devices)}
 
 
-def tool_list_processes(serial: str) -> Dict[str, Any]:
-    _require(serial, "serial")
+def tool_list_processes(serial: Optional[str] = None) -> Dict[str, Any]:
+    serial = _serial(serial)
     procs = [_process_to_json(p) for p in HOST.list_processes(serial)]
     procs.sort(key=lambda p: (not p["running"], p["package"] or ""))
     return {"serial": serial, "processes": procs, "count": len(procs)}
 
 
-def tool_attach(serial: str, package: str) -> Dict[str, Any]:
-    _require(serial, "serial")
+def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dict[str, Any]:
     _require(package, "package")
-    session = SESSIONS.get_or_attach(serial, package)
-    # Window count is cheap and confirms the agent is live + responsive.
-    window_count = None
+    serial = _serial(serial)
+    cached = SESSIONS.peek(serial, package)
+    session = SESSIONS.get_or_attach(serial, package, force=bool(force))
+    # get_windows confirms the agent answers real commands (not just Hello).
     try:
         windows = _session_get_windows(session)
-        window_count = len(windows.get("root_ids", []))
-    except Exception as exc:  # pragma: no cover - device-dependent
-        log.warning("get_windows after attach failed: %r", exc)
-    return {
+    except _session_lost_error() as exc:
+        # The connection died between the liveness check and now (the agent
+        # idled out or dropped us): re-attach once. A second failure is real.
+        # The failed client closed itself, so get_or_attach replaces it. A
+        # timeout is not retried: it would only wait out the deadline again.
+        log.info("get_windows after attach failed (%s); re-attaching once", exc)
+        session = SESSIONS.get_or_attach(serial, package)
+        windows = _session_get_windows(session)
+    root_ids = windows.get("root_ids", [])
+    info = session.info()
+    result = {
         "serial": serial,
         "package": package,
         "attached": True,
-        "api_level": getattr(session, "api_level", None),
-        "abi": getattr(session, "abi", None),
-        "agent_version": getattr(session, "agent_version", None),
-        "window_count": window_count,
+        "pid": info.get("pid"),
+        "warm": info.get("warm"),
+        "reused": session is cached,
+        "api_level": info.get("api_level"),
+        "abi": info.get("abi"),
+        "agent_version": info.get("agent_version"),
+        "build_id": info.get("build_id"),
+        "window_count": len(root_ids),
+        "root_ids": root_ids,
         "session": f"{serial}/{package}",
     }
+    note = getattr(session, "note", None) or _stale_build_note(info.get("build_id"))
+    if note:
+        result["note"] = note
+    return result
+
+
+def _stale_build_note(agent_build: Optional[str]) -> Optional[str]:
+    """A hint when a reused session runs another build than build-out/payload.jar."""
+    try:
+        from inspector_widget import inject
+        if inject.build_matches(agent_build, inject.local_build_id()):
+            return None
+    except Exception:  # noqa: BLE001 - informational only
+        return None
+    return ("this session's agent runs a different build than the local payload.jar "
+            "(rebuilt since it was injected?); attach with force=true to replace it")
 
 
 def tool_dump_tree(
@@ -606,8 +743,8 @@ def tool_dump_tree(
     scale: float = 1.0,
     root_id: int = 0,
 ) -> Dict[str, Any]:
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     scale = _clamp_scale(scale)
     root_id = _as_int(root_id, "root_id")
     session = SESSIONS.get_or_attach(serial, package)
@@ -631,8 +768,8 @@ def tool_dump_tree(
             for g in resp.properties
         ]
     if include_screenshot and resp.HasField("screenshot"):
-        dest = _tmp_png_path(serial, package, "tree")
-        result["screenshot"] = _save_screenshot_png(session, resp.screenshot, dest)
+        with _png_output(serial, package, "tree") as dest:
+            result["screenshot"] = _save_screenshot_png(session, resp.screenshot, dest)
     return result
 
 
@@ -642,9 +779,9 @@ def tool_get_properties(
     view_id: int,
     include_resolution_stack: bool = False,
 ) -> Dict[str, Any]:
-    _require(serial, "serial")
     _require(package, "package")
     view_id = _as_int(view_id, "view_id")
+    serial = _serial(serial)
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.get_properties(
         view_id=view_id, include_resolution_stack=bool(include_resolution_stack)
@@ -663,33 +800,52 @@ def tool_get_properties(
     }
 
 
-def tool_screenshot(serial: str, package: str, scale: float = 1.0) -> Dict[str, Any]:
-    _require(serial, "serial")
+def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> Dict[str, Any]:
     _require(package, "package")
+    serial = _serial(serial)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.screenshot(root_id=0, scale=scale)
     if not resp.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
-    dest = _tmp_png_path(serial, package, "shot")
-    meta = _save_screenshot_png(session, resp.screenshot, dest)
+    with _png_output(serial, package, "shot") as dest:
+        meta = _save_screenshot_png(session, resp.screenshot, dest)
     meta.update({"serial": serial, "package": package})
     return meta
 
 
-def tool_detach(serial: str, package: str) -> Dict[str, Any]:
-    _require(serial, "serial")
+def tool_detach(serial: Optional[str], package: str, shutdown: bool = True) -> Dict[str, Any]:
+    """shutdown=True (default): stop the agent for every client, whether or not
+    this server attached it (never injects one). shutdown=False: only drop this
+    server's cached connection and leave the agent running."""
     _require(package, "package")
-    session = SESSIONS.drop(serial, package)
+    serial = _serial(serial)
+    cached = SESSIONS.drop(serial, package)
+    if not shutdown:
+        if cached is None:
+            return {"serial": serial, "package": package, "detached": False,
+                    "note": "no cached session for this (serial, package)"}
+        _disconnect(cached)
+        return {"serial": serial, "package": package, "detached": True, "agent_stopped": False}
+    session = cached
+    if session is not None and not _session_alive(session):
+        # A dead connection, or the app restarted under a new pid: stopping
+        # through it would reach nothing. Find the agent that runs now, as the
+        # CLI's detach does.
+        _disconnect(session)
+        session = None
     if session is None:
-        return {
-            "serial": serial,
-            "package": package,
-            "detached": False,
-            "note": "no active session for this (serial, package)",
-        }
-    _safe_detach(session)
-    return {"serial": serial, "package": package, "detached": True}
+        session = HOST.connect_existing(serial, package)
+        if session is None:
+            return {"serial": serial, "package": package, "detached": cached is not None,
+                    "note": "no agent is running in this app; nothing to stop"}
+    stopped = bool(session.shutdown())
+    result = {"serial": serial, "package": package, "detached": True, "agent_stopped": stopped}
+    if not stopped:
+        result["note"] = ("the agent was asked to stop but its socket is still there; it may "
+                          "be finishing another client's request, or the app is frozen. Retry "
+                          "detach, or force-stop the app (adb shell am force-stop <package>).")
+    return result
 
 
 def tool_dump_compose(
@@ -698,8 +854,8 @@ def tool_dump_compose(
     enable_inspection: bool = False,
 ) -> Dict[str, Any]:
     """Dump the Compose layer (semantics tree + slot table) of the app's UI."""
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     from inspector_widget import strings as st
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_compose(include_semantics=include_semantics,
@@ -718,8 +874,8 @@ def tool_compose_overlay(serial: str, package: str, scale: float = 1.0,
                          labeled_only: bool = True) -> Dict[str, Any]:
     """Screenshot the app and draw every on-screen Compose element (text/role/bounds)
     as a labeled box over it. Returns the annotated PNG path + the on-screen text list."""
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     from inspector_widget import strings as st, overlay as ov, png as pngmod
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
@@ -730,16 +886,12 @@ def tool_compose_overlay(serial: str, package: str, scale: float = 1.0,
     shot = session.screenshot(root_id=0, scale=scale)
     if not shot.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
-    base = _tmp_png_path(serial, package, "compose_base")
-    pngmod.write_png(shot.screenshot, base)
     base_scale = float(shot.screenshot.scale) or scale
-    out = _tmp_png_path(serial, package, "compose_overlay")
-    summary = ov.render_compose_overlay(base, roots, out, labeled_only=labeled_only,
-                                        scale=base_scale)
-    try:
-        os.remove(base)
-    except OSError:
-        pass
+    with _png_scratch(serial, package, "compose_base") as base, \
+            _png_output(serial, package, "compose_overlay") as out:
+        pngmod.write_png(shot.screenshot, base)
+        summary = ov.render_compose_overlay(base, roots, out, labeled_only=labeled_only,
+                                            scale=base_scale)
     on_screen: List[Dict[str, Any]] = []
 
     def _collect(n: Dict[str, Any]) -> None:
@@ -835,7 +987,7 @@ def _h_list_processes(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _h_attach(args: Dict[str, Any]) -> Dict[str, Any]:
-    return tool_attach(args.get("serial"), args.get("package"))
+    return tool_attach(args.get("serial"), args.get("package"), force=args.get("force", False))
 
 
 def _h_dump_tree(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -866,10 +1018,15 @@ def _h_screenshot(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _h_detach(args: Dict[str, Any]) -> Dict[str, Any]:
-    return tool_detach(args.get("serial"), args.get("package"))
+    return tool_detach(args.get("serial"), args.get("package"),
+                       shutdown=args.get("shutdown", True))
 
 
-_SERIAL = {"type": "string", "description": "ADB device serial (from list_devices), e.g. 'emulator-5554'."}
+_SERIAL = {
+    "type": "string",
+    "description": "ADB device serial (from list_devices), e.g. 'emulator-5554'. Optional: "
+                   "defaults to $ANDROID_SERIAL, else the only attached device.",
+}
 _PACKAGE = {
     "type": "string",
     "description": "Target app package name (must be debuggable + installed), e.g. 'com.example.app'.",
@@ -905,6 +1062,11 @@ def _a11y_lint_context(session: Any, serial: str, want_image: bool, scale: float
                 ctx.screenshot_w = w
                 ctx.screenshot_h = h
                 ctx.screenshot_scale = float(shot.screenshot.scale) or scale
+        except _transport_error():
+            # A lost or timed-out session is not "no screenshot": let _run_tool
+            # report it (and retry a lost session) instead of linting half-blind
+            # on a closed connection.
+            raise
         except Exception:
             log.debug("a11y_lint screenshot decode failed; running tree-only", exc_info=True)
     return ctx, density, fscale
@@ -916,8 +1078,8 @@ def tool_dump_accessibility(
 ) -> Dict[str, Any]:
     """Dump the unified AccessibilityNodeInfo tree (Views + Compose virtual nodes)
     exactly as TalkBack/UiAutomator see it, plus the host-computed reading order."""
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     from inspector_widget import a11y as a11ymod
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_a11y(root_id=0, include_extras=bool(include_extras),
@@ -935,8 +1097,8 @@ def tool_a11y_lint(
     """Run the host-side accessibility lint (R1..R12) over the Compose semantics
     tree. Returns findings (rule, severity, node, bounds, dp, message, evidence)
     plus a summary. Contrast (the one pixel rule) samples a screenshot."""
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     from inspector_widget import strings as st, a11y_lint
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
@@ -966,8 +1128,8 @@ def tool_a11y_overlay(
     """Screenshot the app and draw every accessibility node (box + speakable label
     + TalkBack reading-order number), color-coded by lint severity. Returns the
     annotated PNG path plus the lint summary."""
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     from inspector_widget import (a11y as a11ymod, strings as st, a11y_lint,
                                   overlay as ov, png as pngmod)
     scale = _clamp_scale(scale)
@@ -983,16 +1145,12 @@ def tool_a11y_overlay(
     shot = session.screenshot(root_id=0, scale=scale)
     if not shot.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
-    base = _tmp_png_path(serial, package, "a11y_base")
-    pngmod.write_png(shot.screenshot, base)
     base_scale = float(shot.screenshot.scale) or scale
-    out = _tmp_png_path(serial, package, "a11y_overlay")
-    summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
-                                     scale=base_scale)
-    try:
-        os.remove(base)
-    except OSError:
-        pass
+    with _png_scratch(serial, package, "a11y_base") as base, \
+            _png_output(serial, package, "a11y_overlay") as out:
+        pngmod.write_png(shot.screenshot, base)
+        summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
+                                         scale=base_scale)
     return {
         "serial": serial, "package": package,
         "path": out, "overlay_path": out,
@@ -1050,7 +1208,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "schema": {
             "type": "object",
             "properties": {"serial": _SERIAL},
-            "required": ["serial"],
             "additionalProperties": False,
         },
     },
@@ -1059,14 +1216,24 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Attach the Inspector Widget agent to a running, debuggable app and open an inspection "
             "session. Injects the native agent + dex/jar and forwards the socket if not already "
-            "attached (idempotent per serial+package). The app MUST be running. Returns the "
-            "device API level, ABI, agent version, and the current number of inspectable windows. "
-            "Sessions are cached; subsequent dump_tree/get_properties/screenshot reuse them."
+            "attached (idempotent per serial+package). The app MUST be running. Returns the pid, "
+            "whether the agent was already running (warm) and whether this server's cached session "
+            "was reused, the device API level, ABI, agent version, and the inspectable windows "
+            "(window_count + root_ids for dump_tree's root_id). Sessions are cached; later tools "
+            "reuse them, and a session the agent dropped (idle timeout, app restart) is re-attached "
+            "automatically. A running agent from another build (build_id differs from the local "
+            "payload.jar) is replaced on a fresh attach; force=true replaces it regardless."
         ),
         "schema": {
             "type": "object",
-            "properties": {"serial": _SERIAL, "package": _PACKAGE},
-            "required": ["serial", "package"],
+            "properties": {
+                "serial": _SERIAL,
+                "package": _PACKAGE,
+                "force": {"type": "boolean", "default": False,
+                          "description": "Stop any running agent (for every client) and inject a "
+                                         "fresh one. Use after rebuilding the agent or if it misbehaves."},
+            },
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1114,10 +1281,10 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "root_id": {
                     "type": "integer",
                     "default": 0,
-                    "description": "Which window/root to dump (a root id from get_windows). 0 == all roots.",
+                    "description": "Which window/root to dump (one of attach's root_ids). 0 == all roots.",
                 },
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1146,7 +1313,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "description": "Include per-property source + style/layout resolution chain.",
                 },
             },
-            "required": ["serial", "package", "view_id"],
+            "required": ["package", "view_id"],
             "additionalProperties": False,
         },
     },
@@ -1156,7 +1323,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "Capture a screenshot of the app's current UI and save it as a PNG file on the host. "
             "Auto-attaches if needed. Returns the saved file path plus width/height. Use scale "
             "(0<scale<=1) to reduce size. For UI structure use dump_tree; use this when you need the "
-            "rendered pixels."
+            "rendered pixels. PNGs from every tool live in a per-server temp directory that is "
+            "deleted when the server exits; copy one elsewhere to keep it."
         ),
         "schema": {
             "type": "object",
@@ -1171,7 +1339,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "description": "Scale factor in (0, 1]; 1.0 = full resolution.",
                 },
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1199,7 +1367,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                                    "(open dialogs, text input, scroll, toggles). Off by default; the semantics "
                                    "tree needs no hot-reload. Also re-mints Compose node ids once."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1221,7 +1389,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "all_boxes": {"type": "boolean", "default": False,
                               "description": "Box every node, not just text/role-bearing ones."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1246,7 +1414,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_rendering_info": {"type": "boolean", "default": False,
                     "description": "Per-node refreshWithExtraData for layout size / text size (costly)."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1276,7 +1444,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "rules": {"type": "array", "items": {"type": "string"},
                     "description": "Optional subset of rule ids to run (e.g. 'a11y.label.missing'). Omit for all."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1300,21 +1468,28 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "Use WCAG target sizes (44dp) instead of Material (48dp)."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
     "detach": {
         "handler": _h_detach,
         "description": (
-            "Shut down the Inspector Widget agent session for an app: sends the agent a shutdown command, "
-            "tears down the forwarded socket, and drops the cached session. Call when finished "
-            "inspecting an app to free device resources. Safe to call even if not attached."
+            "Finish inspecting an app. By default (shutdown=true) sends the agent a shutdown command, "
+            "which stops it for every client, even one this server didn't attach; it never injects "
+            "an agent just to stop it. shutdown=false only drops this server's cached connection and "
+            "leaves the agent running. Safe to call even if not attached."
         ),
         "schema": {
             "type": "object",
-            "properties": {"serial": _SERIAL, "package": _PACKAGE},
-            "required": ["serial", "package"],
+            "properties": {
+                "serial": _SERIAL,
+                "package": _PACKAGE,
+                "shutdown": {"type": "boolean", "default": True,
+                             "description": "Stop the agent (true) or just drop this server's "
+                                            "connection to it (false)."},
+            },
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1370,8 +1545,8 @@ def _lint_fn():
 def tool_inspect(serial: str, package: str, include_properties: bool = False,
                  include_overlay: bool = False) -> Dict[str, Any]:
     """Whole-screen integrated tree: each node carries view/compose/a11y/image-ref + correlation."""
-    _require(serial, "serial")
     _require(package, "package")
+    serial = _serial(serial)
     from inspector_widget import correlate
     session = SESSIONS.get_or_attach(serial, package)
     merged = correlate.inspect_tree(session, include_properties=bool(include_properties))
@@ -1385,20 +1560,19 @@ def tool_inspect(serial: str, package: str, include_properties: bool = False,
         from inspector_widget import overlay as ov
         shot = session.screenshot(root_id=0, scale=1.0)
         if shot.HasField("screenshot"):
-            base = _tmp_png_path(serial, package, "integrated_base")
-            _save_screenshot_png(session, shot.screenshot, base)
-            out = _tmp_png_path(serial, package, "integrated_overlay")
             base_scale = float(shot.screenshot.scale) or 1.0
-            try:
-                summary = ov.render_integrated_overlay(base, merged, out, scale=base_scale)
-                result["overlay"] = summary
-            except (RuntimeError, AttributeError) as exc:
-                result["overlay_error"] = str(exc)
-            finally:
+            with _png_scratch(serial, package, "integrated_base") as base:
+                _save_screenshot_png(session, shot.screenshot, base)
+                out = _tmp_png_path(serial, package, "integrated_overlay")
                 try:
-                    os.remove(base)
-                except OSError:
-                    pass
+                    result["overlay"] = ov.render_integrated_overlay(
+                        base, merged, out, scale=base_scale)
+                except (RuntimeError, AttributeError) as exc:
+                    _remove_quietly(out)
+                    result["overlay_error"] = str(exc)
+                except BaseException:
+                    _remove_quietly(out)
+                    raise
     return result
 
 
@@ -1407,22 +1581,26 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
                       bounds: Optional[Dict[str, Any]] = None,
                       include_image: bool = True) -> Dict[str, Any]:
     """Full dossier for ONE element (by node_key | view_id | semantics_id | bounds)."""
-    _require(serial, "serial")
     _require(package, "package")
     from inspector_widget import correlate
     if not any(v is not None for v in (node_key, view_id, semantics_id, bounds)):
         raise ToolError("inspect_node needs one of: node_key, view_id, semantics_id, bounds")
     vid = _as_int(view_id, "view_id") if view_id is not None else None
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
+    serial = _serial(serial)
     session = SESSIONS.get_or_attach(serial, package)
-    image_path = _tmp_png_path(serial, package, "dossier") if include_image else None
-    dossier = correlate.inspect_node(
-        session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
-        include_image=bool(include_image), image_path=image_path,
-        lint_fn=_lint_fn(), density=_device_density(serial),
-    )
-    if dossier is None:
-        raise ToolError("no matching element found for the given selector")
+    with contextlib.ExitStack() as stack:
+        image_path = (stack.enter_context(_png_output(serial, package, "dossier"))
+                      if include_image else None)
+        dossier = correlate.inspect_node(
+            session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
+            include_image=bool(include_image), image_path=image_path,
+            lint_fn=_lint_fn(), density=_device_density(serial),
+        )
+        if dossier is None:
+            raise ToolError("no matching element found for the given selector")
+        if image_path and not (dossier.get("component_image") or {}).get("path"):
+            _remove_quietly(image_path)
     dossier.update({"serial": serial, "package": package})
     return dossier
 
@@ -1431,21 +1609,23 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
                          view_id: Optional[int] = None, semantics_id: Optional[int] = None,
                          bounds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Cut a per-component image for one element (SKP by graphicsLayer layerId, else BITMAP crop)."""
-    _require(serial, "serial")
     _require(package, "package")
     from inspector_widget import correlate
     if not any(v is not None for v in (node_key, view_id, semantics_id, bounds)):
         raise ToolError("component_image needs one of: node_key, view_id, semantics_id, bounds")
     vid = _as_int(view_id, "view_id") if view_id is not None else None
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
+    serial = _serial(serial)
     session = SESSIONS.get_or_attach(serial, package)
     merged = correlate.inspect_tree(session, include_properties=False)
     node = correlate.find_node(merged, node_key=node_key, view_id=vid,
                                semantics_id=sid, bounds=bounds)
     if node is None:
         raise ToolError("no matching element found for the given selector")
-    out = _tmp_png_path(serial, package, "component")
-    img = correlate.component_image(session, node, out_path=out)
+    with _png_output(serial, package, "component") as out:
+        img = correlate.component_image(session, node, out_path=out)
+        if not img.get("path"):
+            _remove_quietly(out)
     img.update({"serial": serial, "package": package, "node_key": node.get("node_key")})
     return img
 
@@ -1508,7 +1688,7 @@ TOOLS.update({
                 "include_overlay": {"type": "boolean", "default": False,
                     "description": "Also render a labelled overlay PNG (path under result.overlay.path)."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1536,7 +1716,7 @@ TOOLS.update({
                 "include_image": {"type": "boolean", "default": True,
                     "description": "Cut and save the component image (result.component_image.path)."},
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
@@ -1558,31 +1738,187 @@ TOOLS.update({
                 "semantics_id": {"type": "integer", "description": "A Compose node's semantics id."},
                 "bounds": _BOUNDS_SCHEMA,
             },
-            "required": ["serial", "package"],
+            "required": ["package"],
             "additionalProperties": False,
         },
     },
 })
 
 
+# Tools that manage the session themselves (attach re-attaches once on its own;
+# detach must never re-attach), so _run_tool doesn't retry them.
+_NO_RETRY = frozenset({"attach", "detach"})
+
+
 def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Invoke a tool handler, converting any failure into a structured error dict.
 
-    Every tool returns a plain dict — including failures ({"error": ..., "tool": ...}) —
-    so a bad argument, a missing device, an unavailable skiaparser/Pillow/grpcio, or an
-    agent ERROR never raises a raw exception (or hangs) at the transport layer.
+    Every tool returns a plain dict — including failures ({"error": ..., "tool": ...}
+    plus a "hint" when there is a next step to suggest) — so a bad argument, a
+    missing device, an unavailable skiaparser/Pillow/grpcio, or an agent ERROR
+    never raises a raw exception (or hangs) at the transport layer.
+
+    Arguments are validated against the tool's inputSchema first, the same way
+    for every transport. If the agent drops the session mid-call (idle timeout,
+    app restart), the call is retried once on a fresh attach.
     """
     entry = TOOLS.get(name)
     if entry is None:
         return {"error": f"unknown tool: {name}", "tool": name,
                 "available_tools": sorted(TOOLS.keys())}
+    if args is None:
+        args = {}
     try:
-        return entry["handler"](args or {})
+        _validate_arguments(name, entry["schema"], args)
+        try:
+            return entry["handler"](args)
+        except _session_lost_error() as exc:
+            if name in _NO_RETRY:
+                raise
+            # The client closed itself, so the retry's get_or_attach sees a dead
+            # session and re-attaches.
+            log.info("tool %s: %s; re-attaching and retrying once", name, exc)
+            return entry["handler"](args)
     except ToolError as exc:
         return {"error": str(exc), "tool": name}
     except Exception as exc:  # never leak a stack trace through the transport
-        log.exception("tool %s failed", name)
-        return {"error": f"{type(exc).__name__}: {exc}", "tool": name}
+        if _is_expected_error(exc):
+            log.warning("tool %s failed: %s", name, exc)
+        else:
+            log.exception("tool %s failed", name)
+        out = {"error": f"{type(exc).__name__}: {exc}", "tool": name}
+        hint = getattr(exc, "hint", None)
+        frozen = _frozen_note(exc, args)
+        if frozen:
+            out["error"] = f"{out['error'].rstrip('.')}. {frozen}"
+            hint = _frozen_hint()
+        if isinstance(hint, str) and hint:
+            out["hint"] = hint
+        return out
+
+
+def _frozen_note(exc: BaseException, args: Dict[str, Any]) -> Optional[str]:
+    """For a timeout: whether the app sits frozen in the background (the likely
+    cause, and not one the generic timeout hint names)."""
+    try:
+        from inspector_widget import inject
+        from inspector_widget.client import AgentTimeoutError
+    except Exception:  # pragma: no cover - host package missing
+        return None
+    package = args.get("package") if isinstance(args, dict) else None
+    if not isinstance(exc, AgentTimeoutError) or not isinstance(package, str) or not package:
+        return None
+    serial = args.get("serial")
+    return inject.frozen_note(serial if isinstance(serial, str) and serial else None, package)
+
+
+def _frozen_hint() -> str:
+    from inspector_widget import inject
+    return inject.FROZEN_HINT
+
+
+def _session_lost_error() -> type:
+    try:
+        from inspector_widget.client import SessionLostError
+    except Exception:  # pragma: no cover - host package missing
+        return _NeverRaised
+    return SessionLostError
+
+
+def _is_expected_error(exc: BaseException) -> bool:
+    """Errors with a clear message of their own (no traceback needed in the log)."""
+    try:
+        from inspector_widget.adb import AdbError, DeviceError
+        from inspector_widget.client import ClientError, TransportError
+        from inspector_widget.inject import InjectionError
+    except Exception:  # pragma: no cover - host package missing
+        return False
+    return isinstance(exc, (AdbError, DeviceError, ClientError, TransportError, InjectionError))
+
+
+# --------------------------------------------------------------------------- #
+# Argument validation against each tool's inputSchema (all transports).
+# --------------------------------------------------------------------------- #
+_VALIDATORS: Dict[str, Any] = {}
+
+
+def _validate_arguments(name: str, schema: Dict[str, Any], args: Any) -> None:
+    """Raise ToolError if ``args`` doesn't match ``schema``.
+
+    Uses jsonschema (a dependency of the mcp SDK) when importable, else a
+    minimal check of required / unknown / type / numeric bounds.
+    """
+    if not isinstance(args, dict):
+        raise ToolError(f"arguments must be a JSON object, got {type(args).__name__}")
+    try:
+        import jsonschema  # type: ignore
+    except Exception:
+        _minimal_validate(schema, args)
+        return
+    validator = _VALIDATORS.get(name)
+    if validator is None:
+        cls = jsonschema.validators.validator_for(schema)
+        validator = _VALIDATORS[name] = cls(schema)
+    errors = sorted(validator.iter_errors(args), key=lambda e: (len(e.path), list(map(str, e.path))))
+    if errors:
+        raise ToolError(_describe_schema_error(errors[0], schema))
+
+
+def _describe_schema_error(err: Any, schema: Dict[str, Any]) -> str:
+    where = ".".join(str(p) for p in err.path)
+    if err.validator == "required":
+        missing = [r for r in err.validator_value if r not in (err.instance or {})]
+        field = ".".join([where, missing[0]]) if where and missing else (missing[0] if missing else where)
+        return f"missing required argument: {field}"
+    if err.validator == "additionalProperties":
+        allowed = set((err.schema or {}).get("properties", {}))
+        extra = sorted(k for k in (err.instance or {}) if k not in allowed)
+        return (f"unknown argument(s): {', '.join(extra)}"
+                + (f" in {where}" if where else "")
+                + f" (allowed: {', '.join(sorted(allowed))})")
+    return f"invalid argument {where or '(arguments)'}: {err.message}"
+
+
+_JSON_TYPES: Dict[str, Tuple[type, ...]] = {
+    "string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,),
+    "array": (list,), "object": (dict,),
+}
+
+
+def _minimal_validate(schema: Dict[str, Any], args: Dict[str, Any], where: str = "") -> None:
+    """The jsonschema-free fallback: required, unknown, type and numeric bounds."""
+    props = schema.get("properties", {})
+    for req in schema.get("required", []):
+        if req not in args:
+            raise ToolError(f"missing required argument: {where}{req}")
+    if schema.get("additionalProperties") is False:
+        extra = sorted(k for k in args if k not in props)
+        if extra:
+            raise ToolError(f"unknown argument(s): {', '.join(extra)} "
+                            f"(allowed: {', '.join(sorted(props))})")
+    for key, value in args.items():
+        spec = props.get(key) or {}
+        typ = spec.get("type")
+        ok = True
+        if typ in _JSON_TYPES:
+            ok = isinstance(value, _JSON_TYPES[typ]) and not (
+                typ in ("integer", "number") and isinstance(value, bool))
+        if not ok:
+            raise ToolError(f"invalid argument {where}{key}: {value!r} is not of type '{typ}'")
+        if typ in ("integer", "number"):
+            if "minimum" in spec and value < spec["minimum"]:
+                raise ToolError(f"invalid argument {where}{key}: {value!r} is less than the "
+                                f"minimum of {spec['minimum']}")
+            if "maximum" in spec and value > spec["maximum"]:
+                raise ToolError(f"invalid argument {where}{key}: {value!r} is greater than the "
+                                f"maximum of {spec['maximum']}")
+        if typ == "object" and isinstance(value, dict) and spec.get("properties"):
+            _minimal_validate(spec, value, f"{where}{key}.")
+        if typ == "array" and isinstance(value, list):
+            item_type = (spec.get("items") or {}).get("type")
+            if item_type in _JSON_TYPES and not all(isinstance(v, _JSON_TYPES[item_type])
+                                                    for v in value):
+                raise ToolError(f"invalid argument {where}{key}: every item must be a {item_type}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1597,7 +1933,7 @@ def _call_tool_text(name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
     dict rather than raising, so that key is what marks a failed call.
     """
     try:
-        result = _run_tool(name, arguments or {})
+        result = _run_tool(name, {} if arguments is None else arguments)
         is_error = isinstance(result, dict) and "error" in result
         return json.dumps(result, indent=2, default=str), is_error
     except (ToolError, HostUnavailableError) as exc:
@@ -1644,7 +1980,14 @@ def _build_mcp_server() -> Any:
         async def list_tools() -> List[Any]:  # type: ignore[misc]
             return tool_list()
 
-        @server.call_tool()
+        # _run_tool validates arguments for every transport; turn the SDK's own
+        # check off (where supported) so a bad argument gets the same JSON error.
+        try:
+            call_tool_decorator = server.call_tool(validate_input=False)
+        except TypeError:
+            call_tool_decorator = server.call_tool()
+
+        @call_tool_decorator
         async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:  # type: ignore[misc]
             return await run_tool(name, arguments)
 
@@ -1666,10 +2009,12 @@ def _build_mcp_server() -> Any:
 
 def _serve_with_mcp() -> bool:
     """Try to serve using the real `mcp` SDK. Returns True if it ran."""
+    global _SDK_TRANSPORT
     server = _build_mcp_server()
     if server is None:
         return False
     from mcp.server.stdio import stdio_server
+    _SDK_TRANSPORT = True
 
     async def _main() -> None:
         async with stdio_server() as (read_stream, write_stream):
@@ -1704,10 +2049,21 @@ def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> Di
     return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
-def _fallback_handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(message, dict):
+        # Batches (arrays) and bare scalars aren't MCP requests.
+        what = "batch requests are not supported" if isinstance(message, list) \
+            else "a request must be a JSON object"
+        return _jsonrpc_error(None, -32600, f"invalid request: {what}")
     method = message.get("method")
     req_id = message.get("id")
-    params = message.get("params") or {}
+    if not isinstance(method, str):
+        return _jsonrpc_error(req_id, -32600, "invalid request: 'method' must be a string")
+    params = message.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _jsonrpc_error(req_id, -32602, "invalid params: 'params' must be an object")
 
     # Notifications (no id) get no response.
     if method == "notifications/initialized" or (method and method.startswith("notifications/")):
@@ -1739,8 +2095,10 @@ def _fallback_handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     if method == "tools/call":
         name = params.get("name")
-        arguments = params.get("arguments") or {}
-        text, is_error = _call_tool_text(name, arguments)
+        if not isinstance(name, str):
+            return _jsonrpc_error(req_id, -32602, "invalid params: 'name' must be a string")
+        arguments = params.get("arguments")
+        text, is_error = _call_tool_text(name, {} if arguments is None else arguments)
         return _jsonrpc_result(
             req_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
         )
@@ -1768,10 +2126,10 @@ def _serve_fallback() -> None:
             continue
         try:
             response = _fallback_handle(message)
-        except Exception as exc:  # pragma: no cover
-            response = _jsonrpc_error(
-                message.get("id"), -32603, f"internal error: {exc}", traceback.format_exc()
-            )
+        except Exception as exc:  # pragma: no cover - the traceback goes to stderr only
+            log.exception("internal error handling a JSON-RPC message")
+            req_id = message.get("id") if isinstance(message, dict) else None
+            response = _jsonrpc_error(req_id, -32603, f"internal error: {type(exc).__name__}: {exc}")
         if response is not None:
             stdout.write(json.dumps(response, default=str) + "\n")
             stdout.flush()
@@ -1857,6 +2215,33 @@ def _dist_version(dist: str) -> str:
         return "unknown version"
 
 
+# True while the mcp SDK's stdio transport serves (see _on_sigterm).
+_SDK_TRANSPORT = False
+
+
+def _on_sigterm(signum: int, frame: Any) -> None:
+    """SIGTERM: clean up (forwards, PNGs) and exit now, whichever transport runs.
+
+    With the fallback transport, SystemExit unwinds the main thread (closing
+    any half-made connection) and atexit cleans up. The SDK transport reads
+    stdin on a worker thread that keeps the process alive until stdin closes,
+    so SystemExit alone would leave the server running (and a later SIGKILL
+    would skip the cleanup): clean up here, then exit at once. Tool calls run
+    on worker threads there, so this handler never interrupts one holding the
+    locks the cleanup takes.
+    """
+    if not _SDK_TRANSPORT:
+        raise SystemExit(0)
+    try:
+        run_exit_hooks = getattr(atexit, "_run_exitfuncs", None)
+        if run_exit_hooks is not None:
+            run_exit_hooks()  # _cleanup_at_exit and any other exit hook
+        else:  # pragma: no cover - not CPython
+            _cleanup_at_exit()
+    finally:
+        os._exit(0)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="inspector-widget-mcp",
@@ -1888,6 +2273,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return rc
 
     _log_startup_health()
+    # Remove this server's adb forwards and PNG directory however it exits
+    # (stdin closed, an error, or SIGTERM; see _on_sigterm). Agents keep
+    # running for the next start.
+    atexit.register(_cleanup_at_exit)
+    try:
+        import signal
+
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ImportError, ValueError, OSError):  # not the main thread / unsupported
+        pass
 
     if not _serve_with_mcp():
         _serve_fallback()
@@ -1956,6 +2351,8 @@ def _artifact_report() -> List[str]:
         return [f"  artifacts: UNKNOWN (inspector_widget.inject unavailable: {exc})"]
     lines = [f"  artifacts: {st['dir']} (from {st['source']})"]
     lines += [f"    {name}: {'OK' if ok else 'MISSING'}" for name, ok in st["present"].items()]
+    if st["build_id"]:
+        lines.append(f"    build id: {st['build_id']}")
     if st["missing"]:
         lines.append(
             f"  WARNING: {len(st['missing'])} of {len(st['present'])} artifacts missing; "

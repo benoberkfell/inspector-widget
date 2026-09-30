@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Inspector Widget host CLI.
 
-Subcommands:
+Subcommands (``inspector-widget --help`` lists all of them):
   devices                      list attached devices
   packages   --serial          list debuggable (run-as-able) packages
   attach     --serial --package  inject the agent and PING it (Hello)
   dump       --serial --package  inject + dump tree (+ optional props/screenshot/json)
+  ...
+  detach     --serial --package  stop a running agent (never injects one)
 
-The ``dump`` command does the whole inject + dump + render in one shot.
+``--serial`` defaults to ``$ANDROID_SERIAL``, else the only attached device.
+Every subcommand except ``detach`` leaves the agent running when it exits, so
+the next run reconnects warm; ``--force`` stops it and injects a fresh one.
 
 Run with: ``python3 host/cli.py <subcommand> ...`` (the script adds its own
 directory to sys.path so ``inspector_widget`` resolves without installation).
@@ -25,13 +29,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import inspector_widget as iw  # noqa: E402
 from inspector_widget import adb  # noqa: E402
-from inspector_widget import inject as injectmod  # noqa: E402
+from inspector_widget import inject  # noqa: E402
 from inspector_widget import png as pngmod  # noqa: E402
+from inspector_widget.client import AgentTimeoutError  # noqa: E402
 from inspector_widget import strings as stringsmod  # noqa: E402
-from inspector_widget.client import Client  # noqa: E402
 
-DEFAULT_SERIAL = adb.DEFAULT_SERIAL
 DEFAULT_PACKAGE = "com.oberkfell.a11yprobe"
 
 
@@ -70,40 +74,52 @@ def cmd_packages(args) -> int:
     return 0
 
 
-def cmd_attach(args) -> int:
-    inj = injectmod.inject_and_connect(
-        serial=args.serial,
-        package=args.package,
-        build_out=args.build_out,
-        force_reinject=args.force,
-    )
+def _session(args):
+    """Inject or warm-connect per ``args``; use as ``with _session(args) as session``.
+
+    Leaving the block disconnects and keeps the agent running (only ``detach``
+    stops it), so a concurrent MCP session on the same app is left alone.
+    """
+    session = iw.attach(args.serial, args.package, build_out=args.build_out,
+                        force_reinject=getattr(args, "force", False))
+    if session.note:
+        print(f"warning: {session.note}", file=sys.stderr)
+    return session
+
+
+def _remove_quietly(path):
     try:
-        client = Client(inj.sock, owns_socket=False)
-        hello = client.hello()
-        warm = " (warm/reused)" if inj.warm else ""
-        print(
-            f"attached to {args.package} pid={inj.pid}{warm}: "
-            f"agent {hello.agent_version}, API {hello.api_level}, abi {hello.abi}"
-        )
-        print(f"socket=@{inj.socket_name} forwarded tcp:{inj.local_port}")
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _write_overlay(shot, out_path, render, fallback_scale):
+    """Write ``shot`` as ``OUT.png.base.png``, run ``render(base, scale)``, and
+    always remove the base file, even if rendering fails."""
+    base = out_path + ".base.png"
+    try:
+        pngmod.write_png(shot.screenshot, base)
+        return render(base, float(shot.screenshot.scale) or fallback_scale)
     finally:
-        inj.close()
+        _remove_quietly(base)
+
+
+def cmd_attach(args) -> int:
+    with _session(args) as session:
+        info = session.info()
+        warm = " (warm/reused)" if info["warm"] else ""
+        build = f" (build {info['build_id'][:12]})" if info.get("build_id") else ""
+        print(
+            f"attached to {args.package} pid={info['pid']}{warm}: "
+            f"agent {info['agent_version']}{build}, API {info['api_level']}, abi {info['abi']}"
+        )
+        print(f"socket=@{session.injection.socket_name} forwarded tcp:{session.injection.local_port}")
     return 0
-
-
 def cmd_dump(args) -> int:
-    inj = injectmod.inject_and_connect(
-        serial=args.serial,
-        package=args.package,
-        build_out=args.build_out,
-        force_reinject=args.force,
-    )
-    try:
-        client = Client(inj.sock, owns_socket=False)
-        client.hello()
-
+    with _session(args) as session:
         want_screenshot = bool(args.screenshot)
-        resp = client.dump_tree(
+        resp = session.client.dump_tree(
             root_id=args.root_id,
             properties=args.properties or args.resolution_stack,
             resolution_stack=args.resolution_stack,
@@ -130,11 +146,7 @@ def cmd_dump(args) -> int:
         if want_screenshot and resp.HasField("screenshot"):
             w, h = pngmod.write_png(resp.screenshot, args.screenshot)
             print(f"wrote screenshot {w}x{h} to {args.screenshot}", file=sys.stderr)
-    finally:
-        inj.close()
     return 0
-
-
 def _compose_text_summary(node, out, depth=0):
     a = node.get("attrs", {}) or {}
     txt = a.get("Text") or a.get("ContentDescription")
@@ -148,12 +160,8 @@ def _compose_text_summary(node, out, depth=0):
 
 def cmd_compose(args) -> int:
     from inspector_widget import overlay as ovmod
-    inj = injectmod.inject_and_connect(
-        serial=args.serial, package=args.package, build_out=args.build_out,
-        force_reinject=args.force)
-    try:
-        client = Client(inj.sock, owns_socket=False)
-        client.hello()
+    with _session(args) as session:
+        client = session.client
         comp = client.dump_compose(
             include_semantics=True,
             include_slot_table=not args.no_slot_table,
@@ -188,32 +196,23 @@ def cmd_compose(args) -> int:
                 client.dump_compose(include_semantics=True, include_slot_table=False))
             sem_roots = [w["root"] for w in sem.get("windows", []) if w.get("root")]
             shot = client.screenshot(root_id=0, scale=args.scale)
-            base = args.overlay + ".base.png"
-            pngmod.write_png(shot.screenshot, base)
-            summary = ovmod.render_compose_overlay(
-                base, sem_roots, args.overlay,
-                labeled_only=not args.all_boxes,
-                scale=(float(shot.screenshot.scale) or args.scale))
-            os.remove(base)
+            summary = _write_overlay(
+                shot, args.overlay,
+                lambda base, scale: ovmod.render_compose_overlay(
+                    base, sem_roots, args.overlay, labeled_only=not args.all_boxes, scale=scale),
+                args.scale)
             print(f"wrote compose overlay -> {args.overlay} "
                   f"({summary['boxes']} boxes, {summary['labels']} labels)", file=sys.stderr)
-    finally:
-        inj.close()
     return 0
-
 
 # --------------------------------------------------------------------------- #
 
 def cmd_a11y(args) -> int:
     from inspector_widget import a11y as a11ymod
     from inspector_widget import overlay as ovmod
-    from inspector_widget import adb, a11y_lint as lintmod
-    inj = injectmod.inject_and_connect(
-        serial=args.serial, package=args.package, build_out=args.build_out,
-        force_reinject=args.force)
-    try:
-        client = Client(inj.sock, owns_socket=False)
-        client.hello()
+    from inspector_widget import a11y_lint as lintmod
+    with _session(args) as session:
+        client = session.client
         data = a11ymod.a11y_to_dict(client.dump_a11y(
             root_id=0, include_extras=args.include_extras,
             include_rendering_info=args.include_rendering_info))
@@ -255,28 +254,18 @@ def cmd_a11y(args) -> int:
                         ctx.screenshot_scale = float(shot0.screenshot.scale) or args.scale
                 findings = [f.to_dict() for f in lintmod.lint_tree(roots, ctx)]
             shot = client.screenshot(root_id=0, scale=args.scale)
-            base = args.overlay + ".base.png"
-            pngmod.write_png(shot.screenshot, base)
-            summary = ovmod.render_a11y_overlay(
-                base, data, args.overlay, findings=findings,
-                scale=(float(shot.screenshot.scale) or args.scale))
-            os.remove(base)
+            summary = _write_overlay(
+                shot, args.overlay,
+                lambda base, scale: ovmod.render_a11y_overlay(
+                    base, data, args.overlay, findings=findings, scale=scale),
+                args.scale)
             print(f"wrote a11y overlay -> {args.overlay} "
                   f"({summary['boxes']} boxes, {summary['flagged']} flagged)", file=sys.stderr)
-    finally:
-        inj.close()
     return 0
-
-
 def cmd_a11y_lint(args) -> int:
     from inspector_widget import a11y_lint as lintmod
-    from inspector_widget import adb
-    inj = injectmod.inject_and_connect(
-        serial=args.serial, package=args.package, build_out=args.build_out,
-        force_reinject=args.force)
-    try:
-        client = Client(inj.sock, owns_socket=False)
-        client.hello()
+    with _session(args) as session:
+        client = session.client
         comp = stringsmod.dump_compose_to_dict(
             client.dump_compose(include_semantics=True, include_slot_table=False))
         roots = [w["root"] for w in comp.get("windows", []) if w.get("root")]
@@ -316,18 +305,14 @@ def cmd_a11y_lint(args) -> int:
             from inspector_widget import overlay as ovmod
             data = a11ymod.a11y_to_dict(client.dump_a11y(root_id=0, include_extras=True))
             shot2 = client.screenshot(root_id=0, scale=args.scale)
-            base = args.overlay + ".base.png"
-            pngmod.write_png(shot2.screenshot, base)
-            ovmod.render_a11y_overlay(base, data, args.overlay,
-                                      findings=[f.to_dict() for f in findings],
-                                      scale=(float(shot2.screenshot.scale) or args.scale))
-            os.remove(base)
+            _write_overlay(
+                shot2, args.overlay,
+                lambda base, scale: ovmod.render_a11y_overlay(
+                    base, data, args.overlay,
+                    findings=[f.to_dict() for f in findings], scale=scale),
+                args.scale)
             print(f"wrote a11y-lint overlay -> {args.overlay}", file=sys.stderr)
-    finally:
-        inj.close()
     return 0
-
-
 
 # --------------------------------------------------------------------------- #
 # Integrated inspector subcommands (mirror the MCP tools: inspect / inspect_node /
@@ -372,18 +357,15 @@ def _emit_json(obj, dest):
 
 def cmd_inspect(args) -> int:
     from inspector_widget import correlate, overlay as ovmod
-    import inspector_widget as iw
-    session = iw.attach(args.serial, args.package, build_out=args.build_out)
-    try:
+    with _session(args) as session:
         merged = correlate.inspect_tree(session, include_properties=args.properties)
         if args.overlay:
             shot = session.screenshot(root_id=0, scale=args.scale)
-            base = args.overlay + ".base.png"
-            pngmod.write_png(shot.screenshot, base)
-            summary = ovmod.render_integrated_overlay(
-                base, merged, args.overlay,
-                scale=(float(shot.screenshot.scale) or args.scale))
-            os.remove(base)
+            summary = _write_overlay(
+                shot, args.overlay,
+                lambda base, scale: ovmod.render_integrated_overlay(
+                    base, merged, args.overlay, scale=scale),
+                args.scale)
             print(f"wrote integrated overlay -> {args.overlay} "
                   f"({summary.get('boxes')} boxes)", file=sys.stderr)
         if args.json:
@@ -392,17 +374,11 @@ def cmd_inspect(args) -> int:
                         "sources": merged.get("sources", {})}, args.json)
         else:
             print(json.dumps(merged.get("summary", {}), indent=2))
-    finally:
-        session.detach()
     return 0
-
-
 def cmd_inspect_node(args) -> int:
     from inspector_widget import correlate, a11y_lint as lintmod
-    import inspector_widget as iw
     node_key, view_id, semantics_id, bounds = _node_selector(args)
-    session = iw.attach(args.serial, args.package, build_out=args.build_out)
-    try:
+    with _session(args) as session:
         dossier = correlate.inspect_node(
             session, node_key=node_key, view_id=view_id,
             semantics_id=semantics_id, bounds=bounds,
@@ -416,17 +392,11 @@ def cmd_inspect_node(args) -> int:
             _emit_json(dossier, args.json)
         else:
             print(json.dumps(dossier, indent=2, default=str))
-    finally:
-        session.detach()
     return 0
-
-
 def cmd_component_image(args) -> int:
     from inspector_widget import correlate
-    import inspector_widget as iw
     node_key, view_id, semantics_id, bounds = _node_selector(args)
-    session = iw.attach(args.serial, args.package, build_out=args.build_out)
-    try:
+    with _session(args) as session:
         merged = correlate.inspect_tree(session, include_properties=False)
         node = correlate.find_node(merged, node_key=node_key, view_id=view_id,
                                    semantics_id=semantics_id, bounds=bounds)
@@ -441,30 +411,18 @@ def cmd_component_image(args) -> int:
             print(f"error: {img.get('error', 'component image failed')}", file=sys.stderr)
             return 1
         print(json.dumps(img, indent=2, default=str))
-    finally:
-        session.detach()
     return 0
-
-
 def cmd_screenshot(args) -> int:
-    import inspector_widget as iw
-    session = iw.attach(args.serial, args.package, build_out=args.build_out)
-    try:
+    with _session(args) as session:
         resp = session.screenshot(root_id=0, scale=args.scale)
         if not resp.HasField("screenshot"):
             print("error: agent returned no screenshot", file=sys.stderr)
             return 1
         w, h = pngmod.write_png(resp.screenshot, args.out)
         print(f"wrote screenshot {w}x{h} to {args.out}", file=sys.stderr)
-    finally:
-        session.detach()
     return 0
-
-
 def cmd_get_properties(args) -> int:
-    import inspector_widget as iw
-    session = iw.attach(args.serial, args.package, build_out=args.build_out)
-    try:
+    with _session(args) as session:
         resp = session.get_properties(
             args.view_id, include_resolution_stack=args.resolution_stack)
         data = stringsmod.get_properties_to_dict(resp)
@@ -472,17 +430,27 @@ def cmd_get_properties(args) -> int:
             _emit_json(data, args.json)
         else:
             print(json.dumps(data, indent=2, default=str))
-    finally:
-        session.detach()
     return 0
-
-
 def cmd_detach(args) -> int:
-    import inspector_widget as iw
-    session = iw.attach(args.serial, args.package, build_out=args.build_out)
-    session.detach()
-    print(f"detached {args.package} on {args.serial}", file=sys.stderr)
-    return 0
+    """Stop the agent in ``--package`` for every client. Never injects: with no
+    agent running there is nothing to stop."""
+    session = iw.connect_existing(args.serial, args.package)
+    if session is None:
+        print(f"no agent running in {args.package} on {args.serial}; nothing to detach",
+              file=sys.stderr)
+        return 0
+    if session.shutdown():
+        print(f"detached {args.package} on {args.serial} (agent stopped)", file=sys.stderr)
+        return 0
+    print(f"error: the agent in {args.package} on {args.serial} was asked to stop but its "
+          f"socket is still there (it may be finishing another client's request, or the app "
+          f"is frozen)", file=sys.stderr)
+    print(f"hint: retry detach, or restart the app: adb -s {args.serial} shell am force-stop "
+          f"{args.package}", file=sys.stderr)
+    return 1
+def _add_serial_arg(sp):
+    sp.add_argument("--serial", default=None,
+                    help="device serial (default: $ANDROID_SERIAL, else the only attached device)")
 
 
 def _add_build_out_arg(sp):
@@ -516,18 +484,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_devices)
 
     sp = sub.add_parser("packages", help="list debuggable packages")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.set_defaults(func=cmd_packages)
 
     sp = sub.add_parser("attach", help="inject the agent and PING it")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_attach)
 
     sp = sub.add_parser("dump", help="inject + dump the view tree (one shot)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--root-id", type=int, default=0, help="0 == all roots")
     sp.add_argument("--properties", action="store_true", help="inline view properties")
@@ -552,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("compose", help="inject + dump the Compose layer (semantics + slot table)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--overlay", metavar="OUT.png",
                     help="render the Compose tree as labeled boxes over a screenshot")
@@ -571,7 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
     sp = sub.add_parser("a11y", help="dump the unified accessibility tree (Views + Compose) + TalkBack reading order")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the resolved a11y tree as JSON")
     sp.add_argument("--overlay", metavar="OUT.png",
@@ -590,7 +558,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_a11y)
 
     sp = sub.add_parser("a11y-lint", help="run the accessibility lint (R1..R12) over the Compose semantics tree")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--json", metavar="OUT.json|-", help="emit findings as JSON")
     sp.add_argument("--no-contrast", action="store_true", help="skip the contrast (image) rule")
@@ -606,7 +574,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- integrated inspector subcommands (mirror the MCP tools) ----- #
     sp = sub.add_parser("inspect",
                         help="whole-screen integrated tree (View + Compose + a11y, correlated)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--properties", action="store_true",
                     help="inline full view properties under each node's view.properties")
@@ -620,7 +588,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("inspect-node",
                         help="full dossier for ONE element (facets + component image + focused lint)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     _add_selector_args(sp)
     sp.add_argument("--no-image", action="store_true", help="skip cutting the component image")
@@ -631,7 +599,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("component-image",
                         help="cut a per-component image for one element (SKP layer cut else BITMAP crop)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     _add_selector_args(sp)
     sp.add_argument("--out", metavar="OUT.png", help="output PNG path (default: a temp file)")
@@ -641,7 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_component_image)
 
     sp = sub.add_parser("screenshot", help="capture a screenshot PNG of the app's current UI")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--out", metavar="OUT.png", required=True, help="output PNG path")
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale (<=1.0)")
@@ -650,7 +618,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_screenshot)
 
     sp = sub.add_parser("get-properties", help="fetch the full attribute set for a single view")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--view-id", type=int, required=True,
                     help="the view's uniqueDrawingId (the 'id' field from dump)")
@@ -661,10 +629,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_get_properties)
 
-    sp = sub.add_parser("detach", help="shut down the agent session for an app (sends shutdown)")
-    sp.add_argument("--serial", default=DEFAULT_SERIAL)
+    sp = sub.add_parser("detach", help="stop a running agent for every client (sends SHUTDOWN; "
+                                       "never injects)")
+    _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
-    _add_build_out_arg(sp)
+    # Accepted (and ignored) so older scripts that passed it keep working:
+    # detach never injects, so it needs no artifacts.
+    sp.add_argument("--build-out", metavar="DIR", default=None, help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_detach)
 
     return p
@@ -674,13 +645,26 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if hasattr(args, "serial"):
+            args.serial = adb.resolve_serial(args.serial)
         return args.func(args)
     except Exception as e:  # surface a clean error to the shell
         # Set INSPECTOR_WIDGET_LOG=DEBUG (or =TRACE) to get the full traceback.
-        if os.environ.get("INSPECTOR_WIDGET_LOG", "").upper() in ("DEBUG", "TRACE"):
+        level = os.environ.get("INSPECTOR_WIDGET_LOG") or os.environ.get("VIEWSPECTOR_LOG") or ""
+        if level.upper() in ("DEBUG", "TRACE"):
             import traceback
             traceback.print_exc()
-        print(f"error: {e}", file=sys.stderr)
+        hint = getattr(e, "hint", None)
+        frozen = None
+        if isinstance(e, AgentTimeoutError) and getattr(args, "package", None):
+            frozen = inject.frozen_note(getattr(args, "serial", None), args.package)
+        if frozen:
+            print(f"error: {str(e).rstrip('.')}. {frozen}", file=sys.stderr)
+            hint = inject.FROZEN_HINT
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        if hint:
+            print(f"hint: {hint}", file=sys.stderr)
         return 1
 
 
