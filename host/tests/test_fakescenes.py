@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import zlib
@@ -28,6 +27,20 @@ def walk(n):
     yield n
     for c in n.get("children") or []:
         yield from walk(c)
+
+
+def wire_fields(windows):
+    """a11y windows without what ``a11y_to_dict`` derives on the host rather than
+    reads off the wire: node keys and stop orders (a11y-core), and action names
+    (action-ids decodes the R.id-backed ids the recordings show as CUSTOM_0x0102…)."""
+    out = json.loads(json.dumps(windows))
+    for w in out:
+        for n in walk(w.get("root") or {}):
+            n.pop("node_key", None)
+            n.pop("order", None)
+            for act in n.get("actions") or ():
+                act.pop("name", None)
+    return out
 
 
 @pytest.fixture
@@ -145,7 +158,7 @@ def test_compose_and_a11y_round_trip():
     for screen in ("launcher", "viewscreen"):
         data = lf.load(screen, "a11y")
         back = a11ymod.a11y_to_dict(fs.a11y_to_pb(data))
-        assert back["windows"] == data["windows"]
+        assert wire_fields(back["windows"]) == wire_fields(data["windows"])
         assert back.get("diagnostics") == data.get("diagnostics")
 
 
@@ -163,7 +176,8 @@ def test_launcher_replay_serves_the_recorded_screen():
     kids = slots_only["windows"][0]["root"]["children"]
     assert kids and all(k["kind"] == "COMPOSABLE" for k in kids)
     a = a11ymod.a11y_to_dict(s.dump_a11y())
-    assert a["windows"] == lf.load("launcher", "a11y")["windows"]
+    assert wire_fields(a["windows"]) == wire_fields(lf.load("launcher", "a11y")["windows"])
+    assert a["windows"][0]["root"]["node_key"] == "view:1"
     no_extras = a11ymod.a11y_to_dict(s.dump_a11y(include_extras=False))
     assert not any("extras" in n for n in walk(no_extras["windows"][0]["root"]))
     tree = st.dump_tree_to_dict(s.dump_tree())
@@ -230,15 +244,26 @@ def test_behaviour_hook_shape():
     delay, resp = beh(req)
     assert delay == 0.0 and resp.id == 3 and resp.hello.agent_version == fs.AGENT_VERSION
     assert fs.replay_behaviour("wide")(req)[1].hello.api_level == 36
+    stamped = fs.replay_behaviour("wide", build_id="abc123")(req)[1].hello
+    assert stamped.agent_version == f"{fs.AGENT_VERSION}+abc123" and stamped.api_level == 36
 
 
 def test_existing_shapers_run_on_the_replays():
-    """The host shapers (strings, a11y, correlate) consume a SceneSession unchanged."""
-    s = fs.replay_scene("launcher").session()
-    merged = correlate.inspect_tree(s)
-    assert merged["summary"] == lf.load("launcher", "inspect")["summary"]
-    vs = fs.replay_scene("viewscreen").session()
-    assert correlate.inspect_tree(vs)["summary"] == lf.load("viewscreen", "inspect")["summary"]
+    """The host shapers (strings, a11y, correlate) consume a SceneSession unchanged.
+
+    The Views, Compose nodes and image refs are what the recorded inspect output
+    says. The a11y join is a11y-core's: by identity only, where the recording's
+    correlate matched by overlap. Both recordings come from a pre-ID1 agent (every
+    Compose node reads 1:11; the View screen's nodes read as virtual nodes of one
+    plain View), so their a11y nodes are listed on their own (``a11y_only``)
+    instead of guessed onto a View or Compose node."""
+    for screen, nodes, a11y, alone in (("launcher", 66, 40, 39), ("viewscreen", 73, 34, 33)):
+        got = correlate.inspect_tree(fs.replay_scene(screen).session())["summary"]
+        recorded = lf.load(screen, "inspect")["summary"]
+        for k in ("view", "compose", "with_image_ref"):
+            assert got[k] == recorded[k], (screen, k)
+        assert (got["nodes"], got["a11y"], got["a11y_only"]) == (nodes, a11y, alone), screen
+        assert got["exact"] == a11y and got["overlap"] == 0 and got["a11y_unmatched"] == 0
 
 
 def test_mcp_tools_on_the_launcher_replay_meet_the_phase0_targets(mcp):
@@ -264,16 +289,15 @@ def test_screen_pngs_keep_the_fixture_small():
     assert total < 1_500_000
 
 
-@pytest.mark.skipif(importlib.util.find_spec("fakeagent") is None,
-                    reason="the offline e2e harness (tests/fakeagent.py) is not on this branch")
-def test_wide_scene_over_the_harness_fake_adb(monkeypatch, tmp_path):  # pragma: no cover
+def test_wide_scene_over_the_harness_fake_adb(monkeypatch, tmp_path):
     import fakeagent
 
     import mcp_server
 
     monkeypatch.setattr(mcp_server, "SESSIONS", mcp_server.SessionCache())
     dev = fakeagent.default_device()
-    dev.behaviour = fs.replay_behaviour("wide")
     fakeagent.install(monkeypatch, dev, build_out=str(tmp_path / "build-out"))
+    # the replay's Hello names the build install() placed, as an injected agent does
+    dev.behaviour = fs.replay_behaviour("wide", build_id=dev.default_build_id)
     text, is_error = mcp_server._call_tool_text("dump_tree", dict(T))
     assert not is_error and abs(len(text.encode()) - 149_000) <= 0.25 * 149_000

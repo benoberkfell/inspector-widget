@@ -774,11 +774,22 @@ def replay_scene(name: str, *, slots_populated: bool = True) -> SceneData:
                      slots_populated=slots_populated)
 
 
-def replay_behaviour(name: str) -> Behaviour:
+def replay_behaviour(name: str, build_id: str | None = None) -> Behaviour:
     """The harness behaviour hook for a scene name: ``launcher``, ``viewscreen`` or
-    ``wide``."""
+    ``wide``. ``build_id`` is the build its Hello reports (``viewspector-0.1+<id>``,
+    the build handshake): pass the harness device's ``default_build_id`` so the
+    host accepts the agent as the one it injected. Without it Hello answers as an
+    agent from before the handshake, which the host refuses to use."""
     scene = wide_scene() if name == "wide" else replay_scene(name)
-    return scene.behaviour
+    if not build_id:
+        return scene.behaviour
+
+    def behaviour(req: pb.Request) -> tuple:
+        delay, resp = scene.behaviour(req)
+        if req.WhichOneof("command") == "hello" and resp.HasField("hello"):
+            resp.hello.agent_version = f"{AGENT_VERSION}+{build_id}"
+        return delay, resp
+    return behaviour
 
 
 def scene(name: str, **kw: Any) -> SceneData:
