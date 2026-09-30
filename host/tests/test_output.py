@@ -643,7 +643,8 @@ def test_tools_list_stays_within_budget():
     out.augment_schemas(tools)
     listing = {"tools": [{"name": n, "description": e["description"], "inputSchema": e["schema"]}
                          for n, e in tools.items()]}
-    assert size(listing) <= 18500
+    # ~17,200 B today: the rest is headroom for the capture tools' parameters
+    assert size(listing) <= 20000
 
 
 def test_invalid_output_params_become_error_dicts():

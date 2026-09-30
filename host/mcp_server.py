@@ -1024,12 +1024,11 @@ def _h_detach(args: Dict[str, Any]) -> Dict[str, Any]:
 
 _SERIAL = {
     "type": "string",
-    "description": "ADB device serial (from list_devices), e.g. 'emulator-5554'. Optional: "
-                   "defaults to $ANDROID_SERIAL, else the only attached device.",
+    "description": "ADB serial from list_devices; default $ANDROID_SERIAL, else the only device.",
 }
 _PACKAGE = {
     "type": "string",
-    "description": "Target app package name (must be debuggable + installed), e.g. 'com.example.app'.",
+    "description": "Debuggable app package, e.g. 'com.example.app'.",
 }
 
 # --------------------------------------------------------------------------- #
@@ -1196,17 +1195,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "list_devices": {
         "handler": _h_list_devices,
         "description": (
-            "List connected Android devices/emulators visible to adb, with each device's "
-            "serial, API level, and primary ABI. Call this first to discover targets."
+            "List adb-visible devices and emulators with serial, API level and ABI. Call first."
         ),
         "schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     "list_processes": {
         "handler": _h_list_processes,
         "description": (
-            "List debuggable application packages installed on a device. Each entry includes "
-            "the package name and, if the app is currently running, its pid. Only debuggable "
-            "apps can be inspected. Provide a serial from list_devices."
+            "List a device's debuggable packages (only those can be inspected), with the pid of "
+            "each running one."
         ),
         "schema": {
             "type": "object",
@@ -1217,15 +1214,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "attach": {
         "handler": _h_attach,
         "description": (
-            "Attach the Inspector Widget agent to a running, debuggable app and open an inspection "
-            "session. Injects the native agent + dex/jar and forwards the socket if not already "
-            "attached (idempotent per serial+package). The app MUST be running. Returns the pid, "
-            "whether the agent was already running (warm) and whether this server's cached session "
-            "was reused, the device API level, ABI, agent version, and the inspectable windows "
-            "(window_count + root_ids for dump_tree's root_id). Sessions are cached; later tools "
-            "reuse them, and a session the agent dropped (idle timeout, app restart) is re-attached "
-            "automatically. A running agent from another build (build_id differs from the local "
-            "payload.jar) is replaced on a fresh attach; force=true replaces it regardless."
+            "Inject the agent into a RUNNING debuggable app and open a session (idempotent per "
+            "serial+package; other tools auto-attach). Returns pid, warm (agent already running), "
+            "reused (cached session), API level, ABI, agent version and windows (window_count, "
+            "root_ids for dump_tree). A dropped session (idle timeout, app restart) re-attaches "
+            "automatically; an agent from another build is replaced."
         ),
         "schema": {
             "type": "object",
@@ -1234,7 +1227,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "force": {"type": "boolean", "default": False,
                           "description": "Stop any running agent (for every client) and inject a "
-                                         "fresh one. Use after rebuilding the agent or if it misbehaves."},
+                                         "fresh one."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1243,16 +1236,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_tree": {
         "handler": _h_dump_tree,
         "description": (
-            "Capture the live Android View hierarchy for an app as a JSON tree. Auto-attaches if "
-            "needed. Each node has: id (uniqueDrawingId, stable per view instance — use it for "
-            "get_properties), class_name, package_name, absolute on-screen bounds {x,y,w,h} (plus "
-            "render_quad for rotated/transformed views), the view's @id resource (resource.ref like "
-            "'@id/my_button'), best-effort text for TextViews, and IS_WEBVIEW flag. "
-            "Set include_properties=true to inline every view's attributes (larger payload); "
-            "include_resolution_stack=true to also include where each attribute value was resolved "
-            "from (style/layout chain). Set include_screenshot=true to also capture a PNG of the UI "
-            "(saved to a temp file; its path is returned under 'screenshot.path'). scale (0<scale<=1) "
-            "shrinks the screenshot."
+            "The live View hierarchy as a JSON tree (auto-attaches). Nodes carry id "
+            "(uniqueDrawingId, for get_properties), class_name, package_name, screen bounds "
+            "{x,y,w,h} (render_quad when transformed), @id resource, TextView text and IS_WEBVIEW."
         ),
         "schema": {
             "type": "object",
@@ -1262,29 +1248,29 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_properties": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Inline all view attributes for every node (use get_properties for a single view instead if you only need one).",
+                    "description": "Inline every view's attributes (large; see get_properties).",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Include the style/layout resolution chain for each property (only meaningful with include_properties).",
+                    "description": "Add where each attribute was resolved (style/layout chain).",
                 },
                 "include_screenshot": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Also capture a screenshot PNG; the saved file path is returned in result.screenshot.path.",
+                    "description": "Also save a screenshot PNG (screenshot.path).",
                 },
                 "scale": {
                     "type": "number",
                     "default": 1.0,
                     "minimum": 0.0,
                     "maximum": 1.0,
-                    "description": "Screenshot scale factor in (0, 1]. Only used when include_screenshot=true.",
+                    "description": "Screenshot scale in (0, 1].",
                 },
                 "root_id": {
                     "type": "integer",
                     "default": 0,
-                    "description": "Which window/root to dump (one of attach's root_ids). 0 == all roots.",
+                    "description": "Window root to dump (attach's root_ids); 0 = all.",
                 },
             },
             "required": ["package"],
@@ -1294,12 +1280,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "get_properties": {
         "handler": _h_get_properties,
         "description": (
-            "Fetch the full attribute set for a single view, identified by its view_id (the 'id' "
-            "field from dump_tree — a uniqueDrawingId). Returns typed properties (name, type, value), "
-            "marking layout-param attributes with is_layout, decoding colors to #AARRGGBB and "
-            "gravity/flags to ints/labels, and resolving resource references. Set "
-            "include_resolution_stack=true to also get, per property, the source file/style and the "
-            "ordered chain of styles/layouts considered."
+            "Every attribute of one view: typed name/type/value, is_layout for layout params, "
+            "colors as #AARRGGBB, gravity/flags decoded, resource references resolved."
         ),
         "schema": {
             "type": "object",
@@ -1308,12 +1290,12 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "view_id": {
                     "type": "integer",
-                    "description": "The view's uniqueDrawingId, i.e. the 'id' field of a node from dump_tree.",
+                    "description": "The view's uniqueDrawingId (its 'id' in dump_tree).",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Include per-property source + style/layout resolution chain.",
+                    "description": "Add each attribute's source and style/layout chain.",
                 },
             },
             "required": ["package", "view_id"],
@@ -1323,11 +1305,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "screenshot": {
         "handler": _h_screenshot,
         "description": (
-            "Capture a screenshot of the app's current UI and save it as a PNG file on the host. "
-            "Auto-attaches if needed. Returns the saved file path plus width/height. Use scale "
-            "(0<scale<=1) to reduce size. For UI structure use dump_tree; use this when you need the "
-            "rendered pixels. PNGs from every tool live in a per-server temp directory that is "
-            "deleted when the server exits; copy one elsewhere to keep it."
+            "Save a PNG of the app's current UI; returns path, width, height (auto-attaches). "
+            "Every tool's PNGs live in a per-server temp dir deleted on exit: copy one to keep it."
         ),
         "schema": {
             "type": "object",
@@ -1339,7 +1318,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "default": 1.0,
                     "minimum": 0.0,
                     "maximum": 1.0,
-                    "description": "Scale factor in (0, 1]; 1.0 = full resolution.",
+                    "description": "Scale in (0, 1]; 1 = full resolution.",
                 },
             },
             "required": ["package"],
@@ -1349,11 +1328,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_compose": {
         "handler": _h_dump_compose,
         "description": (
-            "Dump the Jetpack COMPOSE layer of the app's UI — the part that dump_tree cannot see "
-            "(dump_tree bottoms out at AndroidComposeView). Returns a tree of compose nodes from the "
-            "live semantics tree (every on-screen element with its Text, ContentDescription, Role, "
-            "state, and on-screen bounds) and, when available, slot-table composables with file:line. "
-            "Auto-attaches. Use this to read the actual on-screen content of a Compose app."
+            "The Jetpack Compose layer dump_tree cannot see (it stops at AndroidComposeView): the "
+            "semantics tree (text, contentDescription, role, state, bounds of every on-screen "
+            "element) and, when populated, slot-table composables with file:line. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1361,14 +1338,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "include_semantics": {"type": "boolean", "default": True,
-                    "description": "Include the semantics tree (on-screen text/role/bounds)."},
+                    "description": "Include the semantics tree."},
                 "include_slot_table": {"type": "boolean", "default": True,
-                    "description": "Also include the slot table (composable hierarchy, parameters, file:line)."},
+                    "description": "Include the slot table (composables, parameters, file:line)."},
                 "enable_inspection": {"type": "boolean", "default": False,
-                    "description": "Populate the slot table (composable names, parameters, file:line) by "
-                                   "hot-reloading. DESTRUCTIVE: resets remember{} state in every composition "
-                                   "(open dialogs, text input, scroll, toggles). Off by default; the semantics "
-                                   "tree needs no hot-reload. Also re-mints Compose node ids once."},
+                    "description": "Populate the slot table by hot-reloading. DESTRUCTIVE: "
+                                   "resets remember{} state in every composition (open dialogs, "
+                                   "text input, scroll, toggles) and re-mints Compose ids once. "
+                                   "The semantics tree does not need it."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1377,10 +1354,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "compose_overlay": {
         "handler": _h_compose_overlay,
         "description": (
-            "Screenshot the app and draw EVERY on-screen Compose element as a labeled box "
-            "(text/role + bounds) over the rendered pixels. Returns the annotated PNG path plus a "
-            "flat list of on-screen text. The single best tool to 'show what's on screen' for a "
-            "Compose app: combines the screenshot with the semantics data."
+            "Screenshot with every on-screen Compose element boxed and labelled (text/role). "
+            "Returns the PNG path and the on-screen text: the quickest look at a Compose screen."
         ),
         "schema": {
             "type": "object",
@@ -1390,7 +1365,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
                           "description": "Screenshot scale in (0, 1]."},
                 "all_boxes": {"type": "boolean", "default": False,
-                              "description": "Box every node, not just text/role-bearing ones."},
+                              "description": "Box every node, not only those with text or a role."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1399,20 +1374,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_accessibility": {
         "handler": _h_dump_accessibility,
         "description": (
-            "Dump the UNIFIED accessibility tree (AccessibilityNodeInfo) for the app — exactly "
-            "what TalkBack/UiAutomator see, covering both classic Views AND Compose virtual nodes "
-            "in one tree. Each node has its host_view_id+virtual_id key (ties back to dump_tree/"
-            "dump_compose), text/contentDescription/stateDescription/role, all a11y state flags, "
-            "on-screen bounds, decoded actions (CLICK/SCROLL_FORWARD/SET_PROGRESS/...), collection/"
-            "range info and extras. Every node has a typed node_key (view:<id> | "
-            "compose:<acvId>:<semanticsId>) usable with inspect_node, valid for this dump's "
-            "generation (it changes when Compose re-mints ids; inspect_node re-resolves older "
-            "keys). Also returns the host-computed TalkBack reading order (focus_order: "
-            "[{order, key, speak}] — what TalkBack announces at each stop, e.g. 'Delete, "
-            "button'), built from the ANI child order + traversal_before/after over the tree "
-            "TalkBack sees: Views not important for accessibility are skipped (marked ignored; "
+            "The unified accessibility tree TalkBack sees: Views and Compose virtual nodes in one "
+            "tree. Nodes carry host_view_id+virtual_id, a node_key (view:<id> | "
+            "compose:<acvId>:<semId>) for inspect_node (valid for this dump's generation), "
+            "text/contentDescription/state/role, flags, bounds, decoded actions, collection/range "
+            "info and extras. focus_order is TalkBack's reading order ([{order, key, speak}], "
+            "e.g. 'Delete, button'): Views not important for accessibility are skipped (ignored; "
             "their children read in their place) and windows under an open modal dialog are "
-            "unreachable (covered_by). reading_order_diagnostics reports cycles, dangling targets "
+            "unreachable (covered_by). reading_order_diagnostics lists cycles, dangling targets "
             "and covered windows. Auto-attaches."
         ),
         "schema": {
@@ -1421,9 +1390,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "include_extras": {"type": "boolean", "default": True,
-                    "description": "Iterate each node's extras bundle (roleDescription, compose testTag/id)."},
+                    "description": "Read each node's extras (roleDescription, Compose testTag)."},
                 "include_rendering_info": {"type": "boolean", "default": False,
-                    "description": "Per-node refreshWithExtraData for layout size / text size (costly)."},
+                    "description": "Add layout and text sizes (slow)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1432,19 +1401,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_lint": {
         "handler": _h_a11y_lint,
         "description": (
-            "Run an accessibility LINT (rules R1..R18) over the app's UNIFIED accessibility tree -- "
-            "classic Views, Compose, RecyclerView cells, AndroidView-in-Compose, all in one pass -- and "
-            "report violations: missing labels, <48dp touch targets (touch bounds, real density), low "
-            "text contrast sampled per window, redundant/duplicate labels (per-row list repeats are "
-            "fine), clickable without a role, images without descriptions, toggles without state, "
-            "empty focus stops, heading/grouping structure, non-scalable or tiny text, duplicate "
-            "clickable bounds, contentDescription on text fields, unlabeled form fields, unclear link "
-            "text and traversal-order cycles. Each finding has rule + alias (R#), severity "
-            "(error/warn/info), node_key (view:<id> or compose:<acvId>:<semId>, usable with "
-            "inspect_node), node, bounds (px and dp), window, collection position, a remediation "
-            "message and evidence (window.covered_by marks a window under an open dialog). Also "
-            "returns summary, diagnostics and the dump's generation. set include_contrast=false "
-            "to skip the one pixel rule. Auto-attaches."
+            "Lint the unified a11y tree (Views, Compose, RecyclerView cells, "
+            "AndroidView-in-Compose) with rules R1..R18: missing labels, small touch targets, "
+            "low contrast (sampled per window), redundant/duplicate labels, clickables without a "
+            "role, images without descriptions, toggles without state, empty stops, "
+            "headings/grouping, fixed or tiny text, duplicate clickable bounds, text fields with "
+            "a contentDescription, form labels, unclear links, traversal cycles. A finding has "
+            "rule, alias (R#), severity, node_key (for inspect_node), node, bounds (px, dp), "
+            "window (covered_by: under an open dialog), collection position, message and "
+            "evidence; plus summary, diagnostics, generation. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1452,18 +1417,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "include_contrast": {"type": "boolean", "default": True,
-                    "description": "Sample a screenshot to run the color-contrast rule (R3)."},
+                    "description": "Sample screenshots for the contrast rule (R3)."},
                 "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
-                    "description": "Screenshot scale in (0,1] for the contrast sample."},
+                    "description": "Screenshot scale in (0, 1]."},
                 "wcag_mode": {"type": "boolean", "default": False,
-                    "description": "Use WCAG target sizes (44dp) instead of Material (48dp)."},
+                    "description": "WCAG 44dp targets instead of Material 48dp."},
                 "rules": {"type": "array", "items": _A11Y_RULE_ITEMS,
-                    "description": "Optional subset of rules to run: canonical ids (e.g. "
-                                   "'a11y.label.missing'), aliases 'R1'..'R18', or ATF names "
-                                   "(e.g. 'TouchTargetSize'). Omit for all."},
+                    "description": "Rules to run; omit for all."},
                 "include_rendering_info": {"type": "boolean", "default": True,
-                    "description": "Request per-node ExtraRenderingInfo (View text size/unit) for the "
-                                   "text-size rules R11/R18 and text-size-aware contrast."},
+                    "description": "Read View text sizes (R11, R18, size-aware contrast)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1472,10 +1434,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_overlay": {
         "handler": _h_a11y_overlay,
         "description": (
-            "Screenshot the app and draw EVERY accessibility node as a labeled box with its "
-            "speakable label and the computed TalkBack reading-order number, color-coded by lint "
-            "severity (red=error, amber=warn, blue=info, green=clean). Returns the annotated PNG "
-            "path plus the lint summary. The single best 'show me the a11y problems on screen' tool."
+            "Screenshot with every a11y node boxed: its spoken label and TalkBack order number, "
+            "colored by lint severity (red error, amber warn, blue info, green clean). Returns the "
+            "PNG path and the lint summary."
         ),
         "schema": {
             "type": "object",
@@ -1483,11 +1444,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
-                    "description": "Screenshot scale in (0,1]."},
+                    "description": "Screenshot scale in (0, 1]."},
                 "include_contrast": {"type": "boolean", "default": True,
-                    "description": "Also run the contrast rule so contrast issues are colored in."},
+                    "description": "Run the contrast rule too."},
                 "wcag_mode": {"type": "boolean", "default": False,
-                    "description": "Use WCAG target sizes (44dp) instead of Material (48dp)."},
+                    "description": "WCAG 44dp targets instead of Material 48dp."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1496,10 +1457,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "detach": {
         "handler": _h_detach,
         "description": (
-            "Finish inspecting an app. By default (shutdown=true) sends the agent a shutdown command, "
-            "which stops it for every client, even one this server didn't attach; it never injects "
-            "an agent just to stop it. shutdown=false only drops this server's cached connection and "
-            "leaves the agent running. Safe to call even if not attached."
+            "End a session. shutdown=true (default) stops the agent for every client, even one "
+            "this server did not attach (it never injects one just to stop it); shutdown=false "
+            "only drops this server's connection. Safe when not attached."
         ),
         "schema": {
             "type": "object",
@@ -1507,8 +1467,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "shutdown": {"type": "boolean", "default": True,
-                             "description": "Stop the agent (true) or just drop this server's "
-                                            "connection to it (false)."},
+                             "description": "Stop the agent (true) or only drop this server's "
+                                            "connection (false)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1684,7 +1644,7 @@ def _h_component_image(args: Dict[str, Any]) -> Dict[str, Any]:
 
 _BOUNDS_SCHEMA = {
     "type": "object",
-    "description": "Absolute screen-px box {x,y,w,h}; resolves to the deepest covering element.",
+    "description": "Screen px {x,y,w,h}: the deepest covering element.",
     "properties": {
         "x": {"type": "integer"}, "y": {"type": "integer"},
         "w": {"type": "integer"}, "h": {"type": "integer"},
@@ -1697,16 +1657,12 @@ TOOLS.update({
     "inspect": {
         "handler": _h_inspect,
         "description": (
-            "The integrated merged tree for the whole screen: walks the View hierarchy as the "
-            "spine, grafts every ComposeView (RecyclerView cells and ones nested in AndroidView "
-            "included) under its AndroidComposeView, re-homes AndroidView content under the "
-            "Compose node hosting it, and attaches accessibility facets joined on (View id) / "
-            "(ComposeView id, semantics id), with a same-window one-to-one bounds fallback. "
-            "Keys: view:<id>, compose:<acvId>:<semanticsId>, composeview:<acvId>. Each node "
-            "carries optional view{}, compose{}, a11y{} (incl. its TalkBack order), list_item{} "
-            "(list + row), image_ref{} and a correlation_confidence (exact|overlap|none); the "
-            "summary carries counts and a generation that changes when Compose re-mints ids. "
-            "Set include_overlay=true to also render a labelled, color-coded overlay PNG."
+            "The whole screen as one merged tree: the View hierarchy with every ComposeView's "
+            "semantics grafted in (RecyclerView cells, AndroidView nesting included) and a11y "
+            "facets joined by id (a one-to-one bounds fallback within a window). Keys view:<id>, "
+            "compose:<acvId>:<semId>, composeview:<acvId>. Nodes carry view{}, compose{}, a11y{} "
+            "(with TalkBack order), list_item{}, image_ref{} and correlation_confidence "
+            "(exact|overlap|none); summary has counts and the Compose id generation."
         ),
         "schema": {
             "type": "object",
@@ -1714,9 +1670,9 @@ TOOLS.update({
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "include_properties": {"type": "boolean", "default": False,
-                    "description": "Inline full view properties under each node's view.properties."},
+                    "description": "Inline view properties (view.properties)."},
                 "include_overlay": {"type": "boolean", "default": False,
-                    "description": "Also render a labelled overlay PNG (path under result.overlay.path)."},
+                    "description": "Also render a labelled, colored overlay PNG (overlay.path)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1725,19 +1681,14 @@ TOOLS.update({
     "inspect_node": {
         "handler": _h_inspect_node,
         "description": (
-            "Full dossier for ONE element, selected by node_key ('view:<id>' | "
-            "'compose:<acvId>:<semanticsId>' | 'composeview:<acvId>'), view_id (uniqueDrawingId), "
-            "semantics_id (only when a single ComposeView has it), or bounds {x,y,w,h} (deepest "
-            "covering element). Every key dump_accessibility / a11y_lint / inspect hand out "
-            "resolves (children Compose merged into a focusable parent are a11y_only, with "
-            "a11y_parent); a Compose key from an earlier dump is re-resolved after "
-            "recomposition (resolved_from) and a rebound RecyclerView cell gets a key_note. "
-            "Returns all facets (view attributes+properties, full a11y, compose semantics attrs; "
-            "compose.source file:line only when the slot table is populated), where/context "
-            "(window > list row > ComposeView > node), its component image cut from its own "
-            "window (SKP by graphicsLayer layerId, else BITMAP crop) saved to a PNG path, and "
-            "lint: exactly the a11y_lint findings for this node (and the nodes merged into it), "
-            "with lint_summary and lint_diagnostics."
+            "Everything about ONE element, chosen by node_key (any key inspect, "
+            "dump_accessibility or a11y_lint gives), view_id, semantics_id or bounds. An older "
+            "Compose key is re-resolved (resolved_from); a rebound RecyclerView cell gets "
+            "key_note; Compose children merged into a parent are a11y_only (a11y_parent). Returns "
+            "every facet (view properties, full a11y, compose attrs; source file:line when the "
+            "slot table is populated), context (window > list row > ComposeView), a component "
+            "image PNG cut from its own window (SKP by layerId, else a crop), and its a11y_lint "
+            "findings (with those merged into it), lint_summary and lint_diagnostics."
         ),
         "schema": {
             "type": "object",
@@ -1745,18 +1696,14 @@ TOOLS.update({
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "node_key": {"type": "string",
-                    "description": "'view:<uniqueDrawingId>', 'compose:<acvId>:<semanticsId>' or "
-                                   "'composeview:<acvId>' (node_key from inspect / "
-                                   "dump_accessibility)."},
-                "view_id": {"type": "integer",
-                    "description": "A view's uniqueDrawingId (the 'id' from dump_tree/inspect)."},
+                    "description": "view:<id> | compose:<acvId>:<semId> | composeview:<acvId>."},
+                "view_id": {"type": "integer", "description": "A view's uniqueDrawingId."},
                 "semantics_id": {"type": "integer",
-                    "description": "A Compose node's semantics id (the 'id' from dump_compose); "
-                                   "ambiguous when several ComposeViews use it, so prefer "
-                                   "node_key."},
+                    "description": "A Compose semantics id; ambiguous across ComposeViews, so "
+                                   "prefer node_key."},
                 "bounds": _BOUNDS_SCHEMA,
                 "include_image": {"type": "boolean", "default": True,
-                    "description": "Cut and save the component image (result.component_image.path)."},
+                    "description": "Cut and save the component image (component_image.path)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1765,11 +1712,9 @@ TOOLS.update({
     "component_image": {
         "handler": _h_component_image,
         "description": (
-            "Cut a per-component image for one element and save it as a PNG. Uses the SKP path "
-            "(skiaparser GetViewTree by the Compose graphicsLayer render-node id) when available, "
-            "else a BITMAP crop of the element's bounds from a screenshot of the element's own "
-            "window (a dialog node is cut from the dialog). Returns the PNG path and which path "
-            "produced it (source: 'skp' | 'bitmap_crop', window: the root view id cropped)."
+            "Save one element's image as a PNG: from the SKP by its Compose graphicsLayer id when "
+            "available, else cropped from its own window's screenshot (a dialog node from the "
+            "dialog). Returns path, source (skp | bitmap_crop) and window (root view id)."
         ),
         "schema": {
             "type": "object",
@@ -1777,8 +1722,7 @@ TOOLS.update({
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "node_key": {"type": "string",
-                    "description": "'view:<id>' | 'compose:<acvId>:<semanticsId>' | "
-                                   "'composeview:<acvId>'."},
+                    "description": "view:<id> | compose:<acvId>:<semId> | composeview:<acvId>."},
                 "view_id": {"type": "integer", "description": "A view's uniqueDrawingId."},
                 "semantics_id": {"type": "integer", "description": "A Compose node's semantics id."},
                 "bounds": _BOUNDS_SCHEMA,
