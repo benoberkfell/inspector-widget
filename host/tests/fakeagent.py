@@ -1305,9 +1305,15 @@ class FakeApp:
     # after attach-agent instead of starting an agent (a message may span
     # several lines, like a Log.e with a stack trace).
     startup_error: Optional[List[Tuple[str, str, str]]] = None
+    # Lines the app logs right after attach-agent before the agent starts
+    # normally (an error the native agent recovers from, say).
+    startup_log: Optional[List[Tuple[str, str, str]]] = None
     # attach-agent is accepted but nothing runs (a main thread blocked at a
     # breakpoint): no agent, no log.
     attach_stalls: bool = False
+    # attach-agent fails to load the library for this reason (ART's "Agent
+    # attach failed" text); "" logs ActivityThread's lines without it.
+    load_failure: Optional[str] = None
 
     @property
     def data_dir(self) -> str:
@@ -1826,12 +1832,25 @@ class FakeDevice:
         # The native agent only comes up when every artifact is where it expects
         # it (the .so owner-executable, the dex/jar read-only); otherwise the
         # attach "succeeds" and the failure is only visible in logcat.
-        if not staged(so_path, injectmod.NATIVE_SO_NAME, "700"):
-            call["error"] = "artifacts not staged"
-            for _attempt in ("app class loader", "no class loader"):  # ActivityThread tries both
+        load_failure = app.load_failure
+        if load_failure is None and not staged(so_path, injectmod.NATIVE_SO_NAME, "700"):
+            load_failure = (f"Unable to dlopen {so_path}: dlopen failed: library \"{so_path}\" "
+                            f"not found")
+        if load_failure is not None:
+            call["error"] = "library not loaded"
+            # AOSP: Runtime::AttachAgent logs the reason at W under the process's
+            # own tag (its name, cut to the last 15 chars); ActivityThread then
+            # logs only the class loader and the agent argument, and tries again
+            # with no class loader (ActivityThread.attemptAttachAgent).
+            loader = (f"dalvik.system.PathClassLoader[DexPathList[[zip file \"/data/app/~~x==/"
+                      f"{package}-y==/base.apk\"],nativeLibraryDirectories=[/data/app/~~x==/"
+                      f"{package}-y==/lib/arm64, /system/lib64]]]")
+            for attempt in (loader, "null"):
+                if load_failure:
+                    self.log(app.pid, "W", package[-15:],
+                             f"Agent attach failed (result=1) : {load_failure}")
                 self.log(app.pid, "E", "ActivityThread",
-                         f"Attaching agent with {spec} failed: java.io.IOException: Unable to "
-                         f"dlopen {so_path}: dlopen failed: library \"{so_path}\" not found")
+                         f"Attaching agent with {attempt} failed: {spec}")
             return 0, "", ""
         # viewspector_agent.cpp InstallAgent logs this first.
         self.log(app.pid, "I", "ViewSpector",
@@ -1842,6 +1861,8 @@ class FakeDevice:
             self.log(app.pid, "E", "ViewSpector",
                      "Could not find class com/oberkfell/viewspector/agent/Bootstrap")
             return 0, "", ""
+        for level, tag, message in app.startup_log or ():
+            self.log(app.pid, level, tag, message)
         if app.startup_error is not None:
             # The payload fails ~10 ms later and logs why; no server binds.
             later = self.clock() + 0.01

@@ -106,7 +106,11 @@ _BUILD_ID_CACHE: Dict[Tuple[str, int, int], str] = {}
 def local_build_id(build_out: Optional[str] = None) -> Optional[str]:
     """sha256 (hex) of the payload.jar that an inject would push, or ``None``
     when there is none. The same value build.sh writes to ``BUILD_ID``."""
-    path = os.path.join(resolve_build_out(build_out), PAYLOAD_JAR_NAME)
+    return _file_digest(os.path.join(resolve_build_out(build_out), PAYLOAD_JAR_NAME))
+
+
+def _file_digest(path: str) -> Optional[str]:
+    """sha256 (hex) of ``path``, cached by (path, mtime, size); ``None`` if absent."""
     try:
         st = os.stat(path)
     except OSError:
@@ -120,6 +124,19 @@ def local_build_id(build_out: Optional[str] = None) -> Optional[str]:
                 digest.update(chunk)
         cached = _BUILD_ID_CACHE[key] = digest.hexdigest()
     return cached
+
+
+def artifacts_id(build_out: Optional[str] = None) -> Optional[str]:
+    """sha256 (hex) over all three artifacts an inject would push (the .so, the
+    bootstrap dex and payload.jar), or ``None`` when none is there. Unlike
+    :func:`local_build_id` (payload.jar only, what a running agent reports) it
+    changes when only the native agent or the bootstrap is rebuilt, so it keys
+    the failed-injection memory: a fix to either is injected again."""
+    directory = resolve_build_out(build_out)
+    parts = [_file_digest(os.path.join(directory, name)) for name in ARTIFACT_NAMES]
+    if not any(parts):
+        return None
+    return hashlib.sha256("|".join(p or "-" for p in parts).encode()).hexdigest()
 
 
 def split_agent_version(agent_version: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -227,17 +244,20 @@ class AgentStartupError(InjectionError):
     Read from logcat while waiting for the agent's socket, so it is reported
     within a poll or two of the failure rather than at the socket timeout.
 
-    ``kind`` names the failure: ``classpath_shadowing`` (the payload linked
-    against the app's own, shrunk copy of a library class), ``payload_start``
-    (``Payload.start`` threw), ``bootstrap`` (the bootstrap dex could not load
-    the payload), ``native`` (the JVMTI agent failed), ``library_load`` (the app
-    could not load libviewspector.so), ``bind`` (another server holds the
-    socket name), ``crash`` (the app died) or ``unknown`` (an agent error with
-    no socket after a grace period). ``cause`` is the root exception line
-    (e.g. ``java.lang.NoSuchMethodError: ...``) when there is one, ``log`` the
-    logcat lines it came from. ``cacheable`` failures recur on every retry into
-    the same app process with the same agent build, so :func:`inject_and_connect`
-    reports them again without re-injecting.
+    ``kind`` names the failure: ``stale_agent`` (the payload linked against the
+    app's own Kotlin or protobuf, which only a payload.jar built before those
+    were relocated does: rebuild the agent), ``classpath_shadowing`` (the
+    payload linked against the app's own, shrunk copy of an app class),
+    ``payload_start`` (``Payload.start`` threw), ``bootstrap`` (the bootstrap
+    dex could not load the payload), ``native`` (the JVMTI agent failed),
+    ``library_load`` (the app could not load libviewspector.so), ``bind``
+    (another server holds the socket name), ``crash`` (the app died) or
+    ``unknown`` (an agent error with no socket after a grace period). ``cause``
+    is the root exception line (e.g. ``java.lang.NoSuchMethodError: ...``) or
+    the runtime's reason when there is one, ``log`` the logcat lines it came
+    from. ``cacheable`` failures recur on every retry into the same app process
+    with the same artifacts (:func:`artifacts_id`), so
+    :func:`inject_and_connect` reports them again without re-injecting.
     """
 
     def __init__(self, message: str, hint: Optional[str] = None, *, kind: str = "unknown",
@@ -268,7 +288,8 @@ class AgentStartupError(InjectionError):
 # CLI run is a new process and injects again.
 _RETRY_NOTE = ("Retrying the same app process with the same agent build fails the same way: "
                "the MCP server reports it again without re-injecting until the app restarts or "
-               "build-out changes (attach with --force, MCP force=true, to inject anyway).")
+               "an artifact in build-out changes (attach with --force, MCP force=true, to inject "
+               "anyway).")
 
 
 def _restart_hint(serial: str, package: str) -> str:
@@ -594,10 +615,18 @@ _FATAL_AGENT_LINES = (
     (re.compile(r"server thread crashed"), "payload_start"),
     (re.compile(r"^initialize: "), "bootstrap"),  # every other initialize error aborts it
     (re.compile(r"^(Cannot bind @|Failed to bind LocalServerSocket)"), "bind"),
-    (re.compile(r"^(Agent options|GetEnv\(|JVMTI error|AttachCurrentThread failed|"
-                r"Pending JNI exception|Could not find|Failed to build Java string|"
-                r"Bootstrap\.initialize threw)"), "native"),
+    (re.compile(r"^(Agent options|GetEnv\(|JVMTI error \S+ during AddToBootstrapClassLoaderSearch|"
+                r"AttachCurrentThread failed|Pending JNI exception|Could not find|"
+                r"Failed to build Java string|Bootstrap\.initialize threw|"
+                r"ViewSpector cannot load at VM start)"), "native"),
 )
+# E/ViewSpector lines the native agent recovers from: it retries hidden-API
+# silencing with capabilities, or carries on without it, and a failed env
+# dispose costs nothing. Current agents log these at W; older ones at E, so
+# they are not errors here (not even unknown ones).
+_BENIGN_AGENT_LINES = re.compile(
+    r"^JVMTI error \S+ during (GetExtensionFunctions|disable_hidden_api_enforcement_policy|"
+    r"GetPotentialCapabilities|AddCapabilities|DisposeEnvironment)$")
 # Errors that name a class the payload linked against but found without the
 # member (or shape) it was compiled against.
 _LINKAGE_ERRORS = frozenset({
@@ -686,8 +715,19 @@ def _shadowed(cause: str) -> Optional[Tuple[str, str, Optional[str], Optional[st
     return exc, cls, library, apk, _DECLARED_IN.sub("", detail).strip().rstrip(".")
 
 
+def _is_linkage_error(cause: Optional[str]) -> bool:
+    """Whether ``cause`` (a root exception line) is a class-linkage failure,
+    which recurs on every retry with the same payload (unlike an
+    OutOfMemoryError or a thread that could not start)."""
+    if not cause:
+        return False
+    exc = cause.partition(": ")[0].strip()
+    return exc in _LINKAGE_ERRORS or exc == "java.lang.ClassNotFoundException"
+
+
 def _agent_error(kind: str, record: _LogRecord, serial: str, package: str, pid: int,
-                 socket_name: str) -> AgentStartupError:
+                 socket_name: str, build: Optional[Tuple[str, Optional[str]]] = None,
+                 ) -> AgentStartupError:
     app = f"'{package}' (pid {pid})"
     cause = _root_cause(record.lines)
     log = record.lines[:_MAX_LOG_LINES]
@@ -698,18 +738,37 @@ def _agent_error(kind: str, record: _LogRecord, serial: str, package: str, pid: 
         if shadow is not None:
             exc, cls, library, apk, detail = shadow
             own = "the app's own copy" + (f" (in its {apk})" if apk else "")
+            if library is not None:
+                # A current payload carries its Kotlin/protobuf relocated under
+                # com.oberkfell.viewspector.shaded and never links the app's:
+                # linking the unrelocated name means this payload.jar is old.
+                which = "this payload.jar" + (
+                    f" (build-out {build[0]}, build {_short(build[1])})" if build else "")
+                return AgentStartupError(
+                    f"the agent payload failed to start in {app}: {exc}: {_clip(detail)}. It "
+                    f"linked {cls} by its original name, so it {'resolved' if apk else 'probably resolved'} "
+                    f"to {own}: {which} predates the relocation of the payload's {library} "
+                    f"classes (a current build links only com.oberkfell.viewspector.shaded.*). "
+                    f"The agent build is stale; the app is fine as it is.",
+                    hint=("Rebuild the agent with scripts/build.sh, or point "
+                          f"{ARTIFACTS_ENV} (--build-out) at a current build-out, then retry. "
+                          + retry),
+                    kind="stale_agent", cause=cause, log=log, cacheable=True)
             return AgentStartupError(
                 f"the agent payload failed to start in {app}: {exc}: {_clip(detail)}. The "
                 f"payload's {cls} {'resolved' if apk else 'probably resolved'} to {own}, which "
-                f"lacks members the payload uses: the app's {library + ' ' if library else ''}"
-                f"classes were minified by R8/ProGuard, or are an older version.",
+                f"lacks members the payload uses: the app's classes were minified by "
+                f"R8/ProGuard, or are an older version.",
                 hint=("Inspect a build of the app without code shrinking (isMinifyEnabled = "
                       "false, e.g. its debug variant). " + retry),
                 kind="classpath_shadowing", cause=cause, log=log, cacheable=True)
+        # Only a linkage failure is sure to recur; an OutOfMemoryError or a
+        # thread that could not start may not, so those are retried.
+        linkage = _is_linkage_error(cause)
         return AgentStartupError(
             f"the agent payload failed to start in {app}: {_clip(cause or header)}.",
-            hint=f"The full stack trace is in `{LOGCAT_HINT}`. {retry}",
-            kind="payload_start", cause=cause, log=log, cacheable=True)
+            hint=f"The full stack trace is in `{LOGCAT_HINT}`." + (f" {retry}" if linkage else ""),
+            kind="payload_start", cause=cause, log=log, cacheable=linkage)
     if kind == "bootstrap":
         # A missing app class loader can mean the app is still starting up.
         transient = "ClassLoader" in record.header
@@ -745,35 +804,65 @@ def _crash_error(record: _LogRecord, serial: str, package: str, pid: int) -> Age
         kind="crash", cause=cause, log=record.lines[:_MAX_LOG_LINES])
 
 
-def _load_error(record: _LogRecord, package: str, pid: int) -> AgentStartupError:
-    reason = record.header.partition(" failed: ")[2] or record.header
+# ART says why an agent did not attach at W, under the app process's own tag
+# (Runtime::AttachAgent: "Agent attach failed (result=N) : <error>");
+# ActivityThread's E line only names the class loader and the agent argument.
+_ATTACH_FAILED = re.compile(r"Agent attach failed \(result=\w+\) : (.+)$")
+
+
+def _load_reason(entries: Optional[Sequence["adb.LogEntry"]]) -> Tuple[Optional[str], List[str]]:
+    """``(reason, lines)``: the runtime's last "Agent attach failed" reason in
+    ``entries`` (the app's W+ log since the attach), else ``(None, [])``."""
+    found = [(e, m) for e in entries or () if (m := _ATTACH_FAILED.search(e.message))]
+    if not found:
+        return None, []
+    return found[-1][1].group(1).strip(), [f"{e.level}/{e.tag}: {e.message}" for e, _ in found]
+
+
+def _load_error(record: _LogRecord, serial: str, package: str, pid: int,
+                reason: Optional[str] = None, reason_lines: Sequence[str] = ()) -> AgentStartupError:
+    """The app could not load libviewspector.so. ``reason`` is the runtime's
+    (:func:`_load_reason`); ActivityThread's own line (``record``) carries only
+    the class loader and the agent argument, never the cause."""
+    if reason:
+        said = _clip(reason)
+    else:
+        said = (f"the runtime did not log why (see `adb -s {serial} logcat --pid {pid}` for a "
+                f"line with \"Agent attach failed\")")
     return AgentStartupError(
-        f"'{package}' (pid {pid}) could not load the agent library: {_clip(reason)}",
+        f"'{package}' (pid {pid}) could not load the agent library: {said}",
         hint=(f"{NATIVE_SO_NAME} must be built for the app process's ABI and loadable from the "
               f"app's data directory. {_RETRY_NOTE}"),
-        kind="library_load", cause=reason, log=record.lines[:_MAX_LOG_LINES], cacheable=True)
+        kind="library_load", cause=reason, cacheable=True,
+        log=(list(reason_lines) + record.lines)[:_MAX_LOG_LINES])
 
 
 @dataclass
 class _Diagnosis:
     error: AgentStartupError
     fatal: bool  # False: fail only if the socket is still missing after the grace
+    record: Optional[_LogRecord] = None  # the ActivityThread line of a library_load
 
 
 def _diagnose(entries: Sequence["adb.LogEntry"], serial: str, package: str, pid: int,
-              socket_name: str) -> Optional[_Diagnosis]:
+              socket_name: str, build: Optional[Tuple[str, Optional[str]]] = None,
+              ) -> Optional[_Diagnosis]:
     """What the app's error log since the attach says about the agent's start,
-    or ``None`` if nothing yet."""
+    or ``None`` if nothing yet. ``build`` is ``(build-out dir, build id)`` for
+    the messages. A ``library_load`` diagnosis has no reason yet: the caller
+    adds it from the app's W log (:func:`_load_reason`)."""
     unknown: Optional[_Diagnosis] = None
     load_failures: List[_LogRecord] = []
     for record in _records(entries):
         if record.tag == "AndroidRuntime" and "FATAL EXCEPTION" in record.header:
             return _Diagnosis(_crash_error(record, serial, package, pid), fatal=True)
         if record.tag == _AGENT_TAG:
+            if _BENIGN_AGENT_LINES.search(record.header):
+                continue
             kind = next((k for rx, k in _FATAL_AGENT_LINES if rx.search(record.header)), None)
             if kind is not None:
-                return _Diagnosis(_agent_error(kind, record, serial, package, pid, socket_name),
-                                  fatal=True)
+                return _Diagnosis(_agent_error(kind, record, serial, package, pid, socket_name,
+                                               build), fatal=True)
             if unknown is None:
                 unknown = _Diagnosis(
                     _agent_error("unknown", record, serial, package, pid, socket_name), fatal=False)
@@ -783,42 +872,54 @@ def _diagnose(entries: Sequence["adb.LogEntry"], serial: str, package: str, pid:
     if load_failures:
         # ActivityThread tries the app's class loader, then none: the library
         # failed to load once both attempts have failed.
-        return _Diagnosis(_load_error(load_failures[-1], package, pid),
-                          fatal=len(load_failures) >= 2)
+        return _Diagnosis(_load_error(load_failures[-1], serial, package, pid),
+                          fatal=len(load_failures) >= 2, record=load_failures[-1])
     return unknown
 
 
 def _wait_for_socket(serial: str, socket_name: str,
                      max_attempts: int = 15, initial_delay: float = 0.1,
                      package: str = "", pid: Optional[int] = None,
-                     since: Optional[float] = None) -> None:
+                     since: Optional[float] = None,
+                     build: Optional[Tuple[str, Optional[str]]] = None) -> None:
     """Poll /proc/net/unix until the agent listens on its abstract socket.
 
     Exponential backoff capped at 1s (mirrors ui-inspector waitForAgentSocket).
     With ``pid``, every missed poll also reads the app's error log since
     ``since`` (the device clock at the attach, :func:`adb.device_time`) and
     raises :class:`AgentStartupError` as soon as it shows the start failed.
+    ``build`` (build-out dir, build id) goes into the messages.
     """
     delay = initial_delay
     pending: Optional[_Diagnosis] = None
     pending_at = 0.0
+
+    def fail(diagnosis: _Diagnosis) -> AgentStartupError:
+        if diagnosis.record is None or pid is None:
+            return diagnosis.error
+        # ActivityThread's line has no cause: the runtime logged it at W.
+        reason, lines = _load_reason(adb.logcat(serial, pid=pid, since=since, specs=("*:W",)))
+        if reason is None:
+            return diagnosis.error
+        return _load_error(diagnosis.record, serial, package, pid, reason, lines)
+
     for _ in range(max_attempts):
         if adb.socket_exists(serial, socket_name):
             return
         if pid is not None:
             found = _diagnose(adb.logcat(serial, pid=pid, since=since, specs=STARTUP_LOG_SPECS)
-                              or [], serial, package, pid, socket_name)
+                              or [], serial, package, pid, socket_name, build)
             if found is not None:
                 if found.fatal:
-                    raise found.error
+                    raise fail(found)
                 if pending is None:
                     pending, pending_at = found, time.monotonic()
                 elif time.monotonic() - pending_at >= UNKNOWN_ERROR_GRACE:
-                    raise found.error
+                    raise fail(found)
         time.sleep(delay)
         delay = min(delay * 2, 1.0)
     if pending is not None:
-        raise pending.error
+        raise fail(pending)
     raise _socket_timeout_error(serial, socket_name, package, pid, since)
 
 
@@ -875,10 +976,12 @@ _FAILED_LOCK = threading.Lock()
 
 
 def failed_injection(serial: str, package: str, pid: int,
-                     build_id: Optional[str]) -> Optional[AgentStartupError]:
-    """The remembered start-up failure for this app process and agent build."""
+                     artifacts: Optional[str]) -> Optional[AgentStartupError]:
+    """The remembered start-up failure for this app process and these
+    artifacts (:func:`artifacts_id`: all three, so rebuilding only the native
+    agent or the bootstrap is a new build here)."""
     with _FAILED_LOCK:
-        return _FAILED.get((serial, package, pid, build_id))
+        return _FAILED.get((serial, package, pid, artifacts))
 
 
 def forget_failed_injections() -> None:
@@ -954,7 +1057,7 @@ def inject_and_connect(
     build_dir = resolve_build_out(build_out)
     want = local_build_id(build_dir)
     socket_name = socket_name_for_pid(pid)
-    failure_key: _FailureKey = (serial, package, pid, want)
+    failure_key: _FailureKey = (serial, package, pid, artifacts_id(build_dir))
     warm = _try_warm_connect(serial, pid, package)
     if warm is not None:
         if not force_reinject and build_matches(warm.build_id, want):
@@ -977,7 +1080,7 @@ def inject_and_connect(
     if not force_reinject:
         # This process already failed to start this build: say so again rather
         # than injecting into it (and replacing any stale agent) for nothing.
-        failed = failed_injection(serial, package, pid, want)
+        failed = failed_injection(serial, package, pid, failure_key[3])
         if failed is not None:
             if warm is not None:
                 warm.close()
@@ -1011,7 +1114,8 @@ def inject_and_connect(
     adb.attach_agent(serial, package, app_so, options)
 
     try:
-        _wait_for_socket(serial, socket_name, package=package, pid=pid, since=since)
+        _wait_for_socket(serial, socket_name, package=package, pid=pid, since=since,
+                         build=(build_dir, want))
     except AgentStartupError as exc:
         if exc.cacheable:
             _remember_failure(failure_key, exc)

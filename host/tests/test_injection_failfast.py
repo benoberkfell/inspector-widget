@@ -1,10 +1,11 @@
 """Injection fails fast and says why (real-app run B4), offline.
 
-When the agent can't start (an R8-shrunk app's Kotlin shadowing the payload,
-say) it logs the cause within milliseconds of the attach. The host reads the
-app's error log while it waits for the agent's socket, so it reports that
-cause at once instead of a generic timeout 13 s later, and remembers it per
-(serial, package, pid, build) so a retry doesn't inject and fail again.
+When the agent can't start (a payload.jar from before the Kotlin relocation
+linking an R8-shrunk app's Kotlin, say) it logs the cause within milliseconds
+of the attach. The host reads the app's error log while it waits for the
+agent's socket, so it reports that cause at once instead of a generic timeout
+13 s later, and remembers it per (serial, package, pid, artifacts) so a retry
+doesn't inject and fail again.
 
 Runs the real adb / inject code against ``tests/fakeagent.py``, whose device
 keeps a logcat and a clock and can script an agent's start-up failure.
@@ -93,7 +94,8 @@ def test_process_bitness_reads_the_exe_link_as_the_app(fake_device):
 # Fail fast: the agent's start-up error, read from logcat while waiting
 # =========================================================================== #
 # What NiA's R8-shrunk (not renamed) release build logged 12 ms after attach
-# (real-app run, emulator-5554, API 37).
+# (real-app run, emulator-5554, API 37) with a payload.jar built before the
+# payload's Kotlin was relocated: only such a payload links kotlin.* by name.
 NIA_APK = ("/data/app/~~G9JleUeu_3P0lWHxM1JKRw==/com.google.samples.apps.nowinandroid.demo-"
            "78xCzPsN9ay4UIKlMPHQpQ==/base.apk!2")
 R8_SHADOWED_KOTLIN = [("E", "ViewSpector", "\n".join([
@@ -118,23 +120,29 @@ def _pushes(dev):
     return sum(1 for argv in dev.adb_log if argv[:1] == ["push"])
 
 
-def test_shadowed_kotlin_fails_fast_with_the_cause(fake_device):
+def test_a_payload_linking_unrelocated_kotlin_is_reported_stale(fake_device, tmp_path):
     fake_device.apps[PKG].startup_error = R8_SHADOWED_KOTLIN
     started = time.monotonic()
     with pytest.raises(inject.AgentStartupError) as err:
         _inject()
     assert time.monotonic() - started < 1.0  # not the 13 s socket timeout
     e = err.value
-    assert (e.kind, e.cacheable, e.cached) == ("classpath_shadowing", True, False)
+    assert (e.kind, e.cacheable, e.cached) == ("stale_agent", True, False)
     assert e.cause.startswith("java.lang.NoSuchMethodError: No static method checkNotNullParameter")
     msg = str(e)
     assert msg.startswith(f"the agent payload failed to start in '{PKG}' (pid {PID}): "
                           "java.lang.NoSuchMethodError: No static method checkNotNullParameter")
-    assert "kotlin.jvm.internal.Intrinsics resolved to the app's own copy (in its base.apk)" in msg
-    assert msg.endswith("which lacks members the payload uses: the app's Kotlin classes were "
-                        "minified by R8/ProGuard, or are an older version.")
+    build_out = str(tmp_path / "build-out")
+    assert ("It linked kotlin.jvm.internal.Intrinsics by its original name, so it resolved to "
+            "the app's own copy (in its base.apk): this payload.jar (build-out "
+            f"{build_out}, build {inject.local_build_id()[:12]}) predates the relocation of "
+            "the payload's Kotlin classes") in msg
+    assert msg.endswith("The agent build is stale; the app is fine as it is.")
+    assert "minified" not in msg and "isMinifyEnabled" not in e.hint  # not the app's fault
     assert "declaration of" not in msg  # restated, not dumped
-    assert "isMinifyEnabled = false" in e.hint and "--force" in e.hint
+    assert e.hint.startswith("Rebuild the agent with scripts/build.sh, or point "
+                             "INSPECTOR_WIDGET_ARTIFACTS (--build-out) at a current build-out")
+    assert "--force" in e.hint
     assert e.log[0].startswith("initialize: error invoking")
     assert fake_device.agent() is None and fake_device.forward_names() == []
     assert not fake_device.unexpected
@@ -143,7 +151,7 @@ def test_shadowed_kotlin_fails_fast_with_the_cause(fake_device):
 def test_a_retry_reports_the_remembered_failure_without_injecting(fake_device, mcp, run_cli):
     fake_device.apps[PKG].startup_error = R8_SHADOWED_KOTLIN
     first = mcp("attach")
-    assert "NoSuchMethodError" in first["error"] and "isMinifyEnabled" in first["hint"]
+    assert "NoSuchMethodError" in first["error"] and "scripts/build.sh" in first["hint"]
     pushes = _pushes(fake_device)
     started = time.monotonic()
     again = mcp("attach")
@@ -154,8 +162,8 @@ def test_a_retry_reports_the_remembered_failure_without_injecting(fake_device, m
     assert len(fake_device.attach_calls) == 1 and _pushes(fake_device) == pushes
     res = mcp("dump_tree")  # every tool attaches the same way
     assert "not re-injected" in res["error"] and len(fake_device.attach_calls) == 1
-    cached = inject.failed_injection(SERIAL, PKG, PID, inject.local_build_id())
-    assert cached is not None and cached.kind == "classpath_shadowing"
+    cached = inject.failed_injection(SERIAL, PKG, PID, inject.artifacts_id())
+    assert cached is not None and cached.kind == "stale_agent"
 
 
 def test_the_cli_prints_the_cause_and_the_hint(fake_device, run_cli):
@@ -163,7 +171,7 @@ def test_the_cli_prints_the_cause_and_the_hint(fake_device, run_cli):
     res = run_cli("attach", "--serial", SERIAL, "--package", PKG)
     assert res.rc == 1
     assert "java.lang.NoSuchMethodError" in res.err and "timed out" not in res.err
-    assert "\nhint: Inspect a build of the app without code shrinking" in res.err
+    assert "\nhint: Rebuild the agent with scripts/build.sh" in res.err
 
 
 def test_a_new_pid_a_new_build_or_force_injects_again(fake_device, tmp_path):
@@ -183,12 +191,24 @@ def test_a_new_pid_a_new_build_or_force_injects_again(fake_device, tmp_path):
     with pytest.raises(inject.AgentStartupError) as err:
         _inject()
     assert not err.value.cached and len(fake_device.attach_calls) == 3
+    # So is one where only the native agent (or the bootstrap) was rebuilt: the
+    # payload.jar, and so the build id an agent reports, is byte-identical.
+    payload_build = inject.local_build_id()
+    (tmp_path / "build-out" / inject.NATIVE_SO_NAME).write_bytes(b"native agent, fixed")
+    assert inject.local_build_id() == payload_build
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert not err.value.cached and len(fake_device.attach_calls) == 4
+    (tmp_path / "build-out" / inject.BOOTSTRAP_DEX_NAME).write_bytes(b"bootstrap, fixed")
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    assert not err.value.cached and len(fake_device.attach_calls) == 5
     # A restarted app is another process: injected; with a fixed app it works.
     fake_device.restart_app(PKG, new_pid=PID + 1)
     app.startup_error = None
     inj = _inject()
     try:
-        assert not inj.warm and inj.pid == PID + 1 and len(fake_device.attach_calls) == 4
+        assert not inj.warm and inj.pid == PID + 1 and len(fake_device.attach_calls) == 6
     finally:
         inj.close()
     assert inject._FAILED == {}  # the dead pid's failures were dropped, the live one never failed
@@ -202,7 +222,7 @@ def test_a_successful_forced_attach_forgets_the_failure(fake_device):
     app.startup_error = None
     inj = inject.inject_and_connect(serial=SERIAL, package=PKG, force_reinject=True)
     inj.close()
-    assert inject.failed_injection(SERIAL, PKG, PID, inject.local_build_id()) is None
+    assert inject.failed_injection(SERIAL, PKG, PID, inject.artifacts_id()) is None
     inj = _inject()  # warm, no cached error in the way
     try:
         assert inj.warm
@@ -239,22 +259,54 @@ def test_an_app_crash_during_the_start_is_reported_at_once(fake_device):
                       "java.lang.IllegalStateException: boom. The stack trace runs through the "
                       "agent (com.oberkfell.viewspector).")
     assert "logcat -b crash" in e.hint and "monkey -p" in e.hint
-    assert inject.failed_injection(SERIAL, PKG, PID, inject.local_build_id()) is None
+    assert inject.failed_injection(SERIAL, PKG, PID, inject.artifacts_id()) is None
 
 
-def test_an_agent_library_the_app_cannot_load_is_reported(fake_device):
-    spec = f"/data/user/0/{PKG}/{inject.NATIVE_SO_NAME}=..."
-    reason = ('java.io.IOException: Unable to dlopen libviewspector.so: dlopen failed: '
-              '"/data/user/0/p/libviewspector.so" is 64-bit instead of 32-bit')
-    fake_device.apps[PKG].startup_error = [
-        ("E", "ActivityThread", f"Attaching agent with {spec} failed: {reason}"),
-        ("E", "ActivityThread", f"Attaching agent with {spec} failed: {reason}"),
-    ]
+def test_an_agent_library_the_app_cannot_load_is_reported_with_the_runtimes_reason(fake_device):
+    # AOSP 36.1: ART logs the reason at W under the process's own tag; ActivityThread's
+    # E line ("Attaching agent with <class loader> failed: <agent argument>") never has it.
+    so = f"/data/user/0/{PKG}/{inject.NATIVE_SO_NAME}"
+    reason = (f'Unable to dlopen {so}: dlopen failed: "{so}" is 64-bit instead of 32-bit')
+    fake_device.apps[PKG].load_failure = reason
+    started = time.monotonic()
     with pytest.raises(inject.AgentStartupError) as err:
         _inject()
+    assert time.monotonic() - started < 1.0
     e = err.value
     assert e.kind == "library_load" and e.cacheable and e.cause == reason
     assert str(e) == f"'{PKG}' (pid {PID}) could not load the agent library: {reason}"
+    assert "bootstrap.dex" not in str(e)  # not the agent argument
+    assert e.log[0] == f"W/{PKG[-15:]}: Agent attach failed (result=1) : {reason}"
+    assert e.log[-1] == (f"Attaching agent with null failed: /data/user/0/{PKG}/"
+                         f"{inject.NATIVE_SO_NAME}=/data/user/0/{PKG}/bootstrap.dex:"
+                         f"/data/user/0/{PKG}/payload.jar:viewspector_{PID}")
+
+
+def test_an_agent_library_load_without_a_logged_reason_says_where_to_look(fake_device):
+    fake_device.apps[PKG].load_failure = ""  # only ActivityThread's lines
+    with pytest.raises(inject.AgentStartupError) as err:
+        _inject()
+    e = err.value
+    assert e.kind == "library_load" and e.cause is None
+    assert str(e) == (f"'{PKG}' (pid {PID}) could not load the agent library: the runtime did "
+                      f"not log why (see `adb -s {SERIAL} logcat --pid {PID}` for a line with "
+                      f"\"Agent attach failed\")")
+
+
+def test_a_recoverable_jvmti_error_does_not_fail_the_attach(fake_device):
+    # An older native agent logged these at E, then retried and started normally.
+    fake_device.apps[PKG].startup_log = [
+        ("E", "ViewSpector", "JVMTI error 98(JVMTI_ERROR_MUST_POSSESS_CAPABILITY) during "
+                             "disable_hidden_api_enforcement_policy"),
+        ("W", "ViewSpector", "Retrying hidden-API silencing with the potential capabilities added"),
+        ("E", "ViewSpector", "JVMTI error 116(JVMTI_ERROR_WRONG_PHASE) during DisposeEnvironment"),
+    ]
+    inj = _inject()
+    try:
+        assert not inj.warm and inj.hello is not None
+    finally:
+        inj.close()
+    assert inject._FAILED == {}
 
 
 def test_an_unrecognised_agent_error_fails_after_a_grace(fake_device, monkeypatch):
@@ -339,6 +391,15 @@ def test_diagnosis_kinds():
                        ("E", "ViewSpector", "Could not find class x/Bootstrap"))
     assert native.fatal and native.error.kind == "native"
     assert "Pending JNI exception during FindClass(Bootstrap)" in str(native.error)
+    boot_path = _diagnose(("E", "ViewSpector", "JVMTI error 100(JVMTI_ERROR_ILLEGAL_ARGUMENT) "
+                                               "during AddToBootstrapClassLoaderSearch"))
+    assert boot_path.fatal and boot_path.error.kind == "native" and boot_path.error.cacheable
+    for recoverable in ("GetExtensionFunctions", "disable_hidden_api_enforcement_policy",
+                        "GetPotentialCapabilities", "AddCapabilities", "DisposeEnvironment"):
+        line = f"JVMTI error 98(JVMTI_ERROR_MUST_POSSESS_CAPABILITY) during {recoverable}"
+        assert _diagnose(("E", "ViewSpector", line)) is None, recoverable
+    odd = _diagnose(("E", "ViewSpector", "JVMTI error 1(X) during SomethingNew"))
+    assert not odd.fatal and odd.error.kind == "unknown"  # the grace decides
     boot = _diagnose(("E", "ViewSpector", "initialize: failed to bootstrap ViewSpector payload\n"
                                           "java.lang.ClassNotFoundException: x.Payload"))
     assert boot.error.kind == "bootstrap" and boot.error.cacheable
@@ -349,31 +410,44 @@ def test_diagnosis_kinds():
     plain = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
                                            "java.lang.reflect.InvocationTargetException\n"
                                            "Caused by: java.lang.IllegalStateException: boom"))
-    assert plain.error.kind == "payload_start" and plain.error.cacheable
+    assert plain.error.kind == "payload_start" and not plain.error.cacheable
     assert str(plain.error).endswith("java.lang.IllegalStateException: boom.")
-    one_load = _diagnose(("E", "ActivityThread", "Attaching agent with /x/libviewspector.so=y "
-                                                 "failed: java.io.IOException: nope"))
+    for transient in ("java.lang.OutOfMemoryError: Failed to allocate a 16 byte allocation",
+                      "java.lang.OutOfMemoryError: pthread_create (1040KB stack) failed: Try again"):
+        oom = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
+                                             f"Caused by: {transient}"))
+        assert oom.error.kind == "payload_start" and not oom.error.cacheable, transient
+        assert "--force" not in oom.error.hint  # a retry may well work
+    linkage = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
+                                             "Caused by: java.lang.NoClassDefFoundError: "
+                                             "Failed resolution of: Lcom/example/Foo;"))
+    assert linkage.error.kind == "payload_start" and linkage.error.cacheable
+    one_load = _diagnose(("E", "ActivityThread", "Attaching agent with dalvik.system."
+                                                 "PathClassLoader[x] failed: /x/libviewspector.so=y"))
     assert not one_load.fatal  # the second attempt (no class loader) may still work
-    others_so = _diagnose(("E", "ActivityThread", "Attaching agent with /x/libother.so failed: z"))
+    assert one_load.error.kind == "library_load" and one_load.record is not None
+    others_so = _diagnose(("E", "ActivityThread", "Attaching agent with null failed: "
+                                                  "/x/libother.so=z"))
     assert others_so is None
 
 
 def test_diagnosis_prefers_a_fatal_record_over_an_unknown_one():
     found = _diagnose(("E", "ViewSpector", "something odd"), *R8_SHADOWED_KOTLIN)
-    assert found.fatal and found.error.kind == "classpath_shadowing"
+    assert found.fatal and found.error.kind == "stale_agent"
 
 
-def test_shadowing_without_the_declaring_apk_is_only_probable():
+def test_unrelocated_protobuf_without_the_declaring_apk_is_a_stale_agent_probably():
     shadow = _diagnose(("E", "ViewSpector", "initialize: error invoking x.Payload.start\n"
                                             "java.lang.reflect.InvocationTargetException\n"
                                             "Caused by: java.lang.NoClassDefFoundError: Failed "
                                             "resolution of: Lcom/google/protobuf/"
                                             "GeneratedMessageLite;"))
     e = shadow.error
-    assert e.kind == "classpath_shadowing"
-    assert ("com.google.protobuf.GeneratedMessageLite probably resolved to the app's own copy, "
-            "which lacks members the payload uses: the app's protobuf classes were minified") \
-        in str(e)
+    assert e.kind == "stale_agent" and e.cacheable
+    assert ("It linked com.google.protobuf.GeneratedMessageLite by its original name, so it "
+            "probably resolved to the app's own copy: this payload.jar predates the relocation "
+            "of the payload's protobuf classes") in str(e)
+    assert "scripts/build.sh" in e.hint
 
 
 def test_a_linkage_error_on_an_app_class_names_the_app_copy():
@@ -387,6 +461,7 @@ def test_a_linkage_error_on_an_app_class_names_the_app_copy():
     assert e.kind == "classpath_shadowing"
     assert ("androidx.compose.ui.Bar resolved to the app's own copy (in its split_compose.apk), "
             "which lacks members the payload uses: the app's classes were minified") in str(e)
+    assert "isMinifyEnabled = false" in e.hint  # an app class: the app build is what to change
 
 
 def test_a_linkage_error_in_an_unrelated_class_is_not_called_shadowing():
