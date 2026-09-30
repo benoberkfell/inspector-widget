@@ -241,3 +241,58 @@ with every consumer.
     header, deflated.
   - The strings.py tree shape round-trips exactly. The a11y windows round-trip
     exactly; `focus_order` is recomputed by a11y.py, so compare windows only.
+
+## Refs and carry-over (C5, `capture/refs.py`)
+
+- **`assign(new, prev, *, same_pid, same_generation, alloc) -> (refmap, tomb_updates)`**
+  - `new` is a key-space index (the `build_index` output). `prev` is the lineage's
+    latest published index (ref space) or None. A `prev` whose node ids are not
+    refs raises `ValueError`; two different lineages raise `OpError("bad_args")`.
+  - `alloc(n)` reserves `n` consecutive fresh ref numbers and returns the first
+    one. This is `CaptureStore.next_refs` under `refs_lock`. It is called at most
+    once per capture, and not at all when every node carries over. Fresh refs go
+    out in pre-order (ui tree with windows in z order, then the slot tree), so
+    allocation is deterministic for identical inputs.
+  - `refmap` maps every canonical key of `new` to its ref; hand it to
+    `apply_refs`. `tomb_updates` maps each old ref that found no node to
+    `[type (or kind), label cut to 40 chars with …, sel (or the ref), prev capture id]`.
+  - Side effect: `assign` writes `match`, `since` and `rebound_of` onto `new`'s
+    nodes (`refs.annotate`), so `apply_refs` carries them into the published
+    index. `since` is the capture where the ref was first assigned: the prev
+    node's `since` (or the prev capture id) when carried, else `new.meta.id`
+    (None when that is not a capture id yet).
+  - `plan(...)` is the same without the side effect and returns the whole
+    `Assignment` (`stats` counts per match kind, `rebound`, `ambiguous`).
+- **Helpers for the store and the query layer**: `identity_flags(new.meta,
+  prev.meta) -> (same_pid, same_generation)`; `merge_tomb(tomb, updates)` (cap
+  5,000; dict order is the LRU order, newest last) or `apply_to_lineage(state,
+  updates)`; `touch_tomb(tomb, ref)` on a lookup; `stale_ref_error(ref,
+  capture_id, tomb)` builds `ref_not_in_capture` with the last-seen info and the
+  old `sel` as a candidate. `LineageState` is re-exported from `model`.
+- **Decisions beyond spec 3.9**:
+  - Pass 1 treats `view:`, `sem:` and `a11y:` keys as device identity. Slot keys
+    and `a11y:path:` keys are positional, so pass 1 accepts them only when the
+    type, label and content (first three labels below) also agree.
+  - The collection guard is decided per cell. A cell is a child of a collection:
+    a View whose class is RecyclerView, ListView, GridView (and relatives), a
+    `Lazy*` display type, an `a11y.collection` facet, a Compose `CollectionInfo`
+    attr, or any node whose anchor's last segment has `[i]`. The cell's identity
+    label is its first label that no other cell of that collection has. The cell
+    keeps its refs when that identity is unchanged or absent on both sides, or
+    when it stays at the same position (`adapter_pos`, else the anchor's `[i]`,
+    else the child index) and its data did not move to another cell. Otherwise
+    every node of the cell gets a new ref, and the ones that matched by key get
+    `rebound_of`.
+  - Structure matches a sibling that is unique by `(kind, type, rid, tag,
+    label)` on both sides even when its ordinal changed. Look-alikes are split by
+    content. True twins match by ordinal only when the whole twin group is
+    unchanged; otherwise they are ambiguous, and they and their subtrees stay out
+    of the geometry pass. Collection cells match by content only.
+  - Geometry also needs equal labels (or equal content for label-less nodes),
+    skips nodes inside collection cells, and never breaks an IoU tie.
+  - The a11y uniqueId locator is read from `facets.a11y.unique_id` (or
+    `uniqueId`); C4 should store it under `unique_id`.
+- **Test helpers**: `tests/capture_scenes.py` builds key-space scenes (`V`, `C`,
+  `S`, `A`, `scene()`), re-keys them (`rekey`, `shift_udids`, `key_space`), and
+  `Chain` publishes a sequence the way the store will (plan, annotate, apply,
+  merge tombstones).
