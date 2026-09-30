@@ -151,6 +151,13 @@ object AccessibilityInspector {
         val strings: StringTable,
         val includeExtras: Boolean,
         val includeRenderingInfo: Boolean,
+        val maxDepth: Int = MAX_DEPTH,
+        val maxNodes: Int = MAX_NODES,
+        /**
+         * Skip the fields that need a walk of a whole semantics tree (is_traversal_group and
+         * layout_size of Compose nodes): the focus reader maps a node or two and must stay fast.
+         */
+        val lite: Boolean = false,
     ) {
         var count = 0
         val byA11yId = HashMap<Int, View>()
@@ -196,12 +203,14 @@ object AccessibilityInspector {
      * @param includeExtras iterate getExtras() per node.
      * @param includeRenderingInfo refreshWithExtraData + getExtraRenderingInfo per
      *   node (query mode only; costly extra round-trip).
+     * @param allRoots every current root (RootsDetector.rootViews()), for each window's z.
      */
     fun dump(
         rootViews: List<View>,
         strings: StringTable,
         includeExtras: Boolean,
         includeRenderingInfo: Boolean,
+        allRoots: List<View> = rootViews,
     ): Pair<List<ViewInspection.DumpA11yResponse.Window>, String> {
         val ctx = Ctx(rootViews, strings, includeExtras, includeRenderingInfo)
         val diag = StringBuilder("roots=${rootViews.size}; api=${Build.VERSION.SDK_INT}; ids=host-key")
@@ -285,7 +294,7 @@ object AccessibilityInspector {
                             if (Build.VERSION.SDK_INT < 34) " (api<34)" else "",
                     )
                 }
-                if (node != null) windows.add(window(root, node))
+                if (node != null) windows.add(window(root, node, WindowInfos.zOf(root, allRoots), ctx))
             } catch (t: Throwable) {
                 Log.w(TAG, "a11y dump failed for root", t)
                 diag.append("; root#${idOf(root)} error ${t.javaClass.simpleName}")
@@ -361,11 +370,40 @@ object AccessibilityInspector {
         }
     }
 
-    private fun window(root: View, node: ViewInspection.A11yNode): ViewInspection.DumpA11yResponse.Window =
+    private fun window(
+        root: View,
+        node: ViewInspection.A11yNode,
+        z: Int,
+        ctx: Ctx,
+    ): ViewInspection.DumpA11yResponse.Window =
         ViewInspection.DumpA11yResponse.Window.newBuilder()
             .setRootViewId(idOf(root))
             .setRoot(node)
+            .setInfo(WindowInfos.of(root, z, ctx.strings))
             .build()
+
+    /**
+     * [node] (and its children to [maxDepth] levels) mapped exactly like a dump node, for the
+     * focus reader (A11yFocus.kt). [node] was built locally (View.createAccessibilityNodeInfo /
+     * provider.createAccessibilityNodeInfo), so its bounds are already screen px and children
+     * resolve without a connection. [view] / [virtualId] are its identity (host-key contract).
+     * Lite: no Compose traversal priming, no is_traversal_group / layout_size. Main thread.
+     */
+    fun snapshot(
+        roots: List<View>,
+        root: View,
+        view: View?,
+        virtualId: Int,
+        node: AccessibilityNodeInfo,
+        strings: StringTable,
+        maxDepth: Int,
+        maxNodes: Int,
+    ): ViewInspection.A11yNode {
+        val ctx = Ctx(roots, strings, includeExtras = true, includeRenderingInfo = false,
+            maxDepth = maxDepth, maxNodes = maxNodes, lite = true)
+        ctx.currentRoot = root
+        return walk(node, Ident(view, virtualId), ctx, 0, local = true)
+    }
 
     // ------------------------------------------------------------ identity
 
@@ -563,7 +601,7 @@ object AccessibilityInspector {
                 .build()
         }
 
-        if (depth < MAX_DEPTH && ctx.count < MAX_NODES) {
+        if (depth < ctx.maxDepth && ctx.count < ctx.maxNodes) {
             val n = safeInt { node.childCount }
             val childIds = LongArray(n)
             var haveIds = true
@@ -575,7 +613,7 @@ object AccessibilityInspector {
                 walkLocalChildrenWithoutIds(ident, b, ctx, depth)
             } else {
                 for (i in 0 until n) {
-                    if (ctx.count >= MAX_NODES) break
+                    if (ctx.count >= ctx.maxNodes) break
                     val childId: Long? = if (haveIds) childIds[i] else null
                     val child: AccessibilityNodeInfo? =
                         if (local) {
@@ -626,7 +664,7 @@ object AccessibilityInspector {
             return
         }
         for (child in kids) {
-            if (ctx.count >= MAX_NODES) break
+            if (ctx.count >= ctx.maxNodes) break
             val ani = try {
                 child.createAccessibilityNodeInfo()
             } catch (t: Throwable) {
@@ -727,10 +765,12 @@ object AccessibilityInspector {
         // API 34+; bool{} swallows NoSuchMethodError on older runtimes.
         b.a11YDataSensitive = bool { node.isAccessibilityDataSensitive }
         b.requestInitialFocus = bool { node.hasRequestInitialAccessibilityFocus() }
-        b.isTraversalGroup = traversalGroup(node, ident, ctx)
-        composeLayoutSize(ident, ctx)?.let { (w, h) ->
-            b.layoutSizeW = w
-            b.layoutSizeH = h
+        if (!ctx.lite) {
+            b.isTraversalGroup = traversalGroup(node, ident, ctx)
+            composeLayoutSize(ident, ctx)?.let { (w, h) ->
+                b.layoutSizeW = w
+                b.layoutSizeH = h
+            }
         }
 
         // importantForAccessibility. A real View reports its mode, except that AUTO is reported

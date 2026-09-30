@@ -83,7 +83,7 @@ class Server(private val socketName: String) {
      */
     fun run() {
         // SHUTDOWN is carried out by serveConnection, after the reply is written.
-        val dispatcher = Dispatcher()
+        val dispatcher = Dispatcher(handleLock)
 
         val socket =
             try {
@@ -123,6 +123,9 @@ class Server(private val socketName: String) {
             closeQuietly(socket)
             serverSocket = null
             watchdog.interrupt()
+            // Give every window root its own AccessibilityDelegate back and wake any
+            // A11yFocus long-poll (SHUTDOWN, idle stop, or a fatal error).
+            A11yEventTap.shutdown()
             Log.i(TAG, "ViewSpector server on @$socketName stopped")
             terminated.countDown()
         }
@@ -266,14 +269,13 @@ class Server(private val socketName: String) {
             // SHUTDOWN touch no UI, so they are answered at once: a client must
             // not wait behind another client's long request (an SKP capture, a
             // big a11y dump) and conclude the app is frozen, and SHUTDOWN must
-            // not wait for work it is about to abandon.
+            // not wait for work it is about to abandon. A11Y_FOCUS long-polls
+            // first and takes the lock only for its read (Dispatcher).
             val response: ViewInspection.Response =
-                if (isShutdown ||
-                    request.commandCase == ViewInspection.Request.CommandCase.HELLO
-                ) {
-                    dispatcher.handle(request)
-                } else {
+                if (dispatcher.takesDeviceLock(request)) {
                     synchronized(handleLock) { dispatcher.handle(request) }
+                } else {
+                    dispatcher.handle(request)
                 }
 
             try {
