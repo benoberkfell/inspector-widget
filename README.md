@@ -21,7 +21,9 @@ Injects a native agent into any **debuggable** app and returns:
 - the **slot table** — the full composable hierarchy with **parameters, modifiers, and `file:line`**
   source locations. Inspector Widget enables it the way Android Studio does: set
   `isDebugInspectorInfoEnabled`, add slot-table storage, and `HotReloader` hot-reload to force a fresh
-  composition that populates it (`dump_compose --enable_inspection`, on by default). The deep tree is
+  composition that populates it. This is opt-in (MCP `enable_inspection=true`, CLI
+  `compose --enable-inspection`) because the hot reload resets `remember{}` state in every
+  composition. The deep tree is
   collapsed to named composables (structural groups hoisted) to stay readable and under protobuf's
   recursion limit.
 

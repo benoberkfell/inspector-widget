@@ -107,11 +107,10 @@ class Session:
         return self.client.get_windows()
 
     def dump_compose(self, root_view_id: int = 0, include_semantics: bool = True,
-                     include_slot_table: bool = True, enable_inspection: bool = True):
-        # enable_inspection defaults True to match the public MCP/CLI dump_compose
-        # contract (a HotReloader recomposition that populates the slot table). The
-        # correlation path (correlate._shaped_compose) deliberately passes False to
-        # avoid recomposing during an inspect; pass it explicitly to opt out.
+                     include_slot_table: bool = True, enable_inspection: bool = False):
+        # enable_inspection is opt-in everywhere (Session, CLI, MCP): populating the
+        # slot table hot-reloads every composition in the process, which resets
+        # remember{} state. See strings.ENABLE_INSPECTION_WARNING.
         return self.client.dump_compose(
             root_view_id=root_view_id, include_semantics=include_semantics,
             include_slot_table=include_slot_table, enable_inspection=enable_inspection)

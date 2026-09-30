@@ -154,10 +154,15 @@ def cmd_compose(args) -> int:
         comp = client.dump_compose(
             include_semantics=True,
             include_slot_table=not args.no_slot_table,
-            enable_inspection=not args.no_enable_inspection,
+            enable_inspection=args.enable_inspection,
         )
         data = stringsmod.dump_compose_to_dict(comp)
         print(f"compose: {data.get('diagnostics','')}", file=sys.stderr)
+        if (not args.no_slot_table and not args.enable_inspection
+                and not stringsmod.compose_slot_table_populated(data)):
+            print("compose: slot table not populated (semantics only). Re-run with "
+                  "--enable-inspection for composable names/params/file:line. WARNING: "
+                  + stringsmod.ENABLE_INSPECTION_WARNING % "--enable-inspection", file=sys.stderr)
         roots = [w["root"] for w in data.get("windows", []) if w.get("root")]
 
         if args.json:
@@ -539,8 +544,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for --overlay")
     sp.add_argument("--all-boxes", action="store_true", help="box every node, not just labeled ones")
     sp.add_argument("--no-slot-table", action="store_true", help="semantics only (skip slot table)")
-    sp.add_argument("--no-enable-inspection", action="store_true",
-                    help="don't hot-reload to populate the slot table (avoids one recomposition)")
+    sp.add_argument("--enable-inspection", action="store_true",
+                    help="hot-reload to populate the slot table (composable names, params, "
+                         "file:line). DESTRUCTIVE: resets remember{} state in every composition")
+    # Deprecated: inspection is now opt-in, so this is the default. Kept so old scripts still parse.
+    sp.add_argument("--no-enable-inspection", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--force", action="store_true", help="force re-injection")
     sp.set_defaults(func=cmd_compose)
 
