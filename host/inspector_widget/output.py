@@ -934,12 +934,23 @@ def _brief_compose_facet(c: Mapping, attr_counts: dict[str, int]) -> dict:
     return out
 
 
+#: a11y fields ``speakable`` copies (the first one set is what it holds)
+_SPEAKABLE_SOURCES = ("content_description", "text", "state_description", "hint_text")
+
+
 def _brief_a11y_facet(a: Mapping, conf: str | None, pkg: str | None,
-                      counts: dict[str, int]) -> dict:
+                      counts: dict[str, int], node_key: Any = None) -> dict:
+    """The a11y facet of an inspect node, without what the node already says: its
+    ids when the match is exact, its own ``node_key``, and ``speakable`` when it
+    only repeats one of the label fields beside it."""
     out = nz.a11y_node_brief(a, pkg, counts)
     if conf == "exact":
         for k in ("id", "host_view_id", "virtual_id"):
             out.pop(k, None)
+    if node_key is not None and out.get("node_key") == node_key:
+        del out["node_key"]
+    if "speakable" in out and out["speakable"] in [out.get(k) for k in _SPEAKABLE_SOURCES]:
+        del out["speakable"]
     return out
 
 
@@ -956,7 +967,7 @@ def _brief_inspect_node(n: Mapping, depth: int, ctx: _Ctx, pkg: str | None,
     if isinstance(n.get("compose"), Mapping):
         out["compose"] = _brief_compose_facet(n["compose"], counts)
     if isinstance(n.get("a11y"), Mapping):
-        out["a11y"] = _brief_a11y_facet(n["a11y"], conf, pkg, counts)
+        out["a11y"] = _brief_a11y_facet(n["a11y"], conf, pkg, counts, n.get("node_key"))
     if conf and conf != "exact":
         out["conf"] = conf
         iou = n.get("a11y_iou")

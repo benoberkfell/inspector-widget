@@ -508,6 +508,24 @@ def test_inspect_brief_node_shape():
     assert content["view"]["resource"] == "@android:id/content"
 
 
+def test_inspect_brief_drops_what_the_node_already_says():
+    """Over a current correlate (identity joins, a11y-core node keys), an inspect
+    node's a11y facet leaves out the node's own key and a ``speakable`` that only
+    repeats a label field beside it; every other a11y field is kept."""
+    import fakescenes as fs
+
+    from inspector_widget import correlate
+
+    data = correlate.inspect_tree(fs.replay_scene("launcher").session())
+    brief = out.slim("inspect", data, {})
+    pairs = [(b, f) for b, f in zip(walk(brief["roots"][0]), walk(data["roots"][0]))
+             if "a11y" in b]
+    assert pairs and all("node_key" not in b["a11y"] for b, _ in pairs)
+    texts = [(b, f) for b, f in pairs if f["a11y"].get("text")]
+    assert texts and all("speakable" not in b["a11y"] and b["a11y"]["text"] == f["a11y"]["text"]
+                         for b, f in texts)
+
+
 def test_inspect_properties_depth_and_root():
     data = lf.load("launcher", "inspect_props")
     brief = out.slim("inspect", data, {"include_properties": True})
