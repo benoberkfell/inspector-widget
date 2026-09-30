@@ -73,3 +73,112 @@ with every consumer.
 
   The builder's `sel` is a stand-in (`@tag` or `#rid` when unique, else the ref).
   The real `sel` is computed in C4.
+
+## Output layer (P0-1, `output.py`, `normalize.py`, `normalize_defaults.py`)
+
+- **Call order at the boundary**: `slim(tool, result, args)` then
+  `finalize(tool, brief, max_bytes=args.get("max_bytes"), spill_dir=None)`.
+  - `slim` returns the input object itself for `detail="full"`, for error dicts,
+    for the compact-only tools and for unknown tools. Otherwise it builds a new
+    dict and never mutates its input.
+  - An unknown or ambiguous `root` returns `{"error", "tool", "hint",
+    "candidates"?}` instead of raising, so callers mark it `isError` like any
+    other error dict.
+- **`finalize` extras**: it adds the keyword-only arguments `pretty=False` and
+  `now=None`. The budget is always measured on the compact encoding, so
+  `--pretty` never changes whether a result spills.
+  - `max_bytes=None` means `$INSPECTOR_WIDGET_MAX_BYTES`, else 32,000. `0` means
+    unlimited, and other values are clamped to 1,000..200,000
+    (`resolve_max_bytes`).
+  - `spill_dir=None` means `<store root>/spill`, via `model.default_store_root()`.
+    Spill files are 0600 in a 0700 directory, and files older than 1 h are purged
+    whenever something spills.
+  - If the spill write fails, the envelope carries `spill_error` and no
+    `spill_path`.
+  - The envelope copies `capture` from the result when present (S3). It is at
+    most `min(3000, max_bytes)` bytes.
+- **Preview lines** use the form `key Type #rid|@tag "label≤30" [x,y wxh] +N`.
+  - `key` is the node_key, or `view:<id>`, `compose:<id>` or
+    `a11y:<host>:<virt>`, by shape.
+  - `+N` counts the descendants hidden below the preview depth. It is shown on the
+    last previewed level only, so root lines have no `+N`.
+- **Counted omissions**: `omitted` is a dict of counters, with keys
+  - `defaults`, `duplicates`, `depth`, `properties_views`, `attr_values`,
+    `boilerplate_actions`, `empty_extras`, `focus_order`,
+    `focus_order_non_stops`;
+  - `a11y_defaults` in inspect and inspect_node, so that a11y defaults are not
+    mixed with property defaults.
+
+  dump_compose puts hoisted library composables in
+  `hidden.library_composables`. A node cut by `max_depth` carries
+  `hidden_descendants: N` instead of `children`. Per-view counts are in
+  `omitted_defaults: {view_id: n}` (dump_tree) or `view.omitted_defaults`
+  (inspect, inspect_node).
+- **`max_depth` counts levels**: 1 keeps the roots only, which is how
+  `dump_tree(max_depth=1)` lists windows. `root` takes the forms below. Accepted
+  prefixes are stripped, and a bare id that matches two nodes is ambiguous (for
+  example `82` in inspect is both `view:82` and `compose:82`).
+  - dump_tree: `82`, `view:82`, `w:82`
+  - dump_compose: `325`, `compose:325`, `sem:82:325`
+  - dump_accessibility: packed `id`, `host:virt`, `a11y:host:virt`
+  - inspect: a node_key or the bare id after its prefix
+- **Params generated from `OUTPUT_PARAMS`** (only for tools whose output is
+  shaped):
+  - `detail` for dump_tree, get_properties, dump_compose, compose_overlay,
+    dump_accessibility, a11y_lint, inspect and inspect_node.
+  - `max_bytes` for all of the above except compose_overlay and inspect_node,
+    whose outputs are small and bounded.
+  - `max_depth` and `root` for the four tree tools.
+  - `user_code_only` (dump_compose), `focus_order` (dump_accessibility),
+    `group_by` (a11y_lint) and `filter` (get_properties).
+
+  The compact-only tools get no extra params, since `tools/list` must stay at or
+  under 18,500 B. It is 18,379 B with main's TOOLS, which leaves about 120 B for
+  P0-2's doc edits.
+  - `max_bytes` defaults to the environment value both in the schema and on the
+    CLI, so the two stay equal.
+  - The CLI adds `--pretty` everywhere. `add_cli_flags` skips flags a subparser
+    already has, so calling it for dump_compose and then compose_overlay on
+    `compose` is safe.
+  - `CLI_SUBCOMMANDS` maps each MCP tool to its subcommand, and
+    `tool_args_from_cli(ns, tool)` turns parsed flags back into MCP args.
+- **Brief property values** (`normalize.prop_value`):
+  - COLOR becomes `#AARRGGBB`, and GRAVITY/INT_FLAG become their label. The legacy
+    MCP shape has lost the label and stays `0`.
+  - Resources become `@ns:type/name`, and drawable, animator and object class
+    names become simple names.
+  - FLOAT is rounded to 7 significant digits, which is float32-exact.
+  - A value with a source or resolution stack becomes `{value, source?, stack?}`.
+- **Hidden as defaults** (`nondefault_props`):
+  - Static family defaults (`normalize_defaults.STATIC_VIEW_DEFAULTS`, walking
+    `FAMILY_PARENTS`). Pivots count as default when they sit at the centre of
+    the bounds.
+  - Derived font metrics (`DERIVED_PROPS`).
+  - The per-capture class majority: at least 3 views, more than 50%, and not a
+    `MAJORITY_EXEMPT` property.
+  - The family comes from the property set first and the class name second.
+- **dump_tree brief node**: the strings.py shape, with these changes:
+  - `bounds` is `[x,y,w,h]`, plus `render` when the view is transformed.
+  - `qualified_name` is dropped when it equals package.class.
+  - The legacy `resource.ref` is dropped, and so is `view_id_name` when it
+    repeats the resource name.
+  - `layout_resource` is shown only where it differs from the parent's; children
+    inherit it.
+  - The `id` property is dropped when it repeats the node's resource, and counted
+    as `duplicates`.
+- **Library code** (`normalize.is_library_source`): a source file listed in
+  `normalize_defaults.LIBRARY_FILES`, regenerated with
+  `host/tests/gen_library_files.py`. A missing source counts as library. The
+  origin is `app` when the file is not a library file and the composable name
+  starts upper-case. dump_compose always keeps the window root and semantics nodes.
+- **Measured brief sizes on the checked-in real outputs**, in compact bytes (spec
+  2.6 target in parentheses):
+  - launcher `dump_compose`: 17,399 (24,000); with `include_slot_table=false`,
+    4,470 (6,000)
+  - launcher `inspect`: 9,896 (13,000)
+  - launcher `dump_accessibility`: 9,751 (12,500)
+  - launcher `a11y_lint`: 1,055 (1,200)
+  - launcher `dump_tree(include_properties)`: 3,481 (8,000)
+  - launcher `get_properties`: 2,154 (3,500)
+  - View screen `inspect`: 14,477 (18,000)
+  - View screen `dump_tree(include_properties)`: 16,584 (20,000)
