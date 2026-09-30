@@ -768,3 +768,118 @@ with every consumer.
   covers a, b, within, the effective include and min_move_px (not limit or
   max_bytes). A cursor used with other arguments raises `bad_args`. The
   continuation hint is `diff(a=..., b=..., [within=...,] cursor=...)`.
+
+## Analyzers (C7, `capture/analyzers.py` + `capture/rules.py`)
+
+- **What they read from a capture.** Only the section 10 `LoadedCapture` surface:
+  `meta`, `raw(name)`, `shot(root)`, `derived(name)` and `put_derived(name, bytes)`.
+  `raw()` may return `None`/`b""` or raise `KeyError`/`OSError` for a missing
+  facet. `shot()` may return the stored bytes or a `Screenshot` message.
+  `tests/loaded_fakes.FakeLoaded` is a stand-in for the store's `LoadedCapture`.
+- **`analyze(ix, loaded, lint=, density=, font_scale=)`** accepts a
+  `LoadedCapture`, a `RawCapture` (at capture time, before publish) or None
+  (render signals only).
+  - It owns every `render.*` and `a11y.*` issue and replaces them on each run, so
+    it is idempotent. Issues with other ids are kept.
+  - It sets `UNode.stop` and `Index.reading` only when the capture has an a11y
+    facet.
+  - Diagnostics use the prefixes `lint:`, `contrast:` and `reading:`. After a
+    contrast run, `contrast: sampled N windows` is also how `lint_view` and
+    `lint_summary` know contrast ran.
+  - Run it on the ref-space index (after `apply_refs`). Links in evidence
+    (`clipped_by`, `children_ids`, `node_ids`) hold node ids and are not rewritten
+    by `remap_ids`. They still resolve through `Index.get()` from either id space.
+- **What the analyzers expect from the index builder (C4).**
+  - `ids["a11y"] = "host:virtual"` on a node that carries the a11y facet.
+  - When the ID1 detector fires, register each matched a11y node's
+    `a11y:path:<root>:<0.i.j>` key as a `by_key` alias. Reading order maps
+    TalkBack stops through it, and never guesses a duplicated `(host, virtual)`
+    pair.
+  - The a11y facet's `flags` use the UNode vocabulary. `hidden` means not visible
+    to the user.
+  - `compose.attrs` keep their raw keys, so `VerticalScrollAxisRange` and
+    `HorizontalScrollAxisRange` give a scroll container's axis.
+  - Children of a collection have `[i]` in their `anchor`. `type` groups
+    same-type siblings.
+- **The lint adapter** is `_lint_windows()`. It is the only place that chooses the
+  lint input, and today that input is the Compose semantics from
+  `raw/compose_sem.pb`.
+  - Node ids are replaced by surrogates, so colliding semantics ids across
+    ComposeViews (ID3) stay distinct. Each surrogate maps back to
+    `sem:<acv>:<id>`, and the synthetic window root maps to `view:<acv>`.
+  - When improve/a11y-lint-unified lands, return the unified a11y tree there.
+    Findings that carry a typed `node_key` (`view:`, `compose:<acv>:<id>`,
+    `virtual:`) already map through `_finding_key`.
+  - A surrogate id wins over a typed key. Over Compose input, the unified lint
+    derives its keys from the ids it is given (`compose:1:<surrogate>`), and
+    those keys name no real node. The launcher mapping was checked against that
+    branch's `a11y_lint.py`: every finding maps.
+  - A finding whose node is not in the index is reported in diagnostics, never
+    dropped silently.
+- **Render issue evidence.**
+  - `render.clipped`: `{visible_px, declared_px, visible?, clipped_by, edge,
+    scroll?, est?}`. The inferred form has `est: "sibling median"`.
+    - Severity is info at a scroll edge (normal scrolling) and warn when a
+      non-scrolling parent clips the node.
+    - conf is exact for a known declared box or a scroll viewport, and inferred
+      otherwise.
+  - `render.hidden`: `{why, hides?}`.
+  - `render.offscreen`: `{rect, outside: window|screen}`.
+  - `render.zero_size`: `{w, h}`.
+  - Only nodes with content (a label, text or actions), or containers of such
+    nodes, are reported, at most one render issue per subtree. Content scrolled
+    fully out of a scroll container is not an issue.
+- **False positives at a scroll edge.** A touch-target finding on a node clipped
+  at a scroll edge gets `note: "likely false positive: clipped at scroll edge"`.
+  A contrast finding there gets a low-confidence note and conf inferred.
+- **Rule catalog (`rules.py`).**
+  - It holds R1..R12 plus R13..R18 (the unified lint's rules). `lint_view` reports
+    a rule the installed lint cannot produce under `unavailable`.
+  - It also holds the four render rules, plus the reserved `render.text_overflow`,
+    `render.covered` and `render.drawn_mismatch` (`planned`).
+  - `resolve()` accepts ids, aliases, ATF check names, short codes and family
+    prefixes (`a11y.`, `render.`), all case-insensitive. Anything else raises
+    `OpError("bad_args")`.
+  - An issue id the catalog does not know is still shown, with a generic entry.
+- **`lint_view()`.**
+  - By default it reports `a11y.*` rules. `render.*` issues appear with
+    `rules=["render."]`, and `next` points at `find(issue="render.")`.
+  - `contrast=True` and `wcag=True` results are cached as `lint.<hash8>.json`,
+    stored by canonical key.
+  - Cursors are `<capture>:l:<hash8 of args>:<offset>`. A cursor from other
+    arguments or another capture is `bad_args`.
+  - `lint_summary(ix)` returns the `lint` and `issues` one-liners for `capture()`.
+
+## Images (C9, `capture/images.py`)
+
+- **One additive `LoadedCapture` method for C2: `derived_path(name) -> str`.** It
+  returns the absolute path where derived artifact `name` lives, whether or not it
+  exists yet. Images check it to reuse a PNG without reading it back.
+  - A name under `img/` (e.g. `img/n22-p16-1a2b3c4d.png`) lives in the capture's
+    `img/` directory. Any other name (e.g. `lint.1a2b3c4d.json`) lives in
+    `derived/`.
+  - `put_derived(name, data)` writes atomically (temp, then replace) and returns
+    that same path. `derived(name)` returns the bytes or None.
+  - `tests/loaded_fakes.FakeLoaded` implements exactly this.
+- Images also read `meta`, `index()` and `shot(root)`.
+- Outputs are named by a parameter hash: `img/<ref>-p<pad>-<hash>.png` for
+  crops, `img/ov-<kind>-<hash>.png` for overlays, `img/w_<udid>.png` and
+  `img/base-*.png` for the pictures underneath, and
+  `img/pdiff-<a>-<hash>.png` (under b's capture) for pixel diffs.
+- An overlay's hash includes its labels and colours, so issues added later (for
+  example contrast) never serve a stale overlay.
+- Crops, `inline()` and the PNG codec work without Pillow.
+- `overlay()` and `pixel_diff()` raise `OpError("unsupported")` without Pillow.
+- A missing window screenshot raises `facet_unavailable`. A node with no pixels
+  (zero size, or an unlinked slot) raises `bad_args`.
+- With neither `window` nor `ref`, an overlay covers the whole screen,
+  composited from every window in z order. With `ref` it is drawn on that node's
+  crop.
+- `overlay(loaded, ix, kind, marks, *, window, ref, pad, max_side)` hands
+  `overlay.render_items` coordinates already in image pixels (`scale=1.0`), with
+  `color_idx` 1 for error, 3 for warn, 0 for info and 2 for no issue. That works
+  with both main's `render_items` and the a11y branches' version.
+- `pixel_diff(la, lb, a, b, *, refs=None, threshold=24, max_side=1024,
+  max_boxes=20)`: `refs` (for example the changed refs from `diff()`) chooses
+  which boxes are drawn. Otherwise it boxes the deepest nodes whose pixels
+  changed.
