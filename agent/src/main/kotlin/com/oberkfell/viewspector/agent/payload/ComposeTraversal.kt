@@ -10,18 +10,23 @@
  * top bar last.
  *
  * [prime] runs Compose's own setTraversalValues on each AndroidComposeView before the walk, so
- * the dumped linkage is the order TalkBack would get. It touches only the delegate's two
- * traversal maps, and [restore] clears them again afterwards when they started out empty (the
- * state of a delegate that has never had a service). When a service is on, Compose keeps the
- * maps itself and nothing is done.
+ * the dumped linkage is the order TalkBack would get. [restore] then puts the delegate back in
+ * the state Compose keeps while no service runs: it clears the two traversal maps when they
+ * started out empty, and it sets currentSemanticsNodesInvalidated back to true. Reading the
+ * delegate's currentSemanticsNodes (prime does, and so does every createAccessibilityNodeInfo of
+ * the walk) clears that flag, and Compose only recomputes the traversal maps when the flag is
+ * set; left false, a service turned on right after the dump (TalkBack) would get no Compose
+ * reading order until the next semantics or layout change. When a service is on, Compose keeps
+ * the maps and the flag itself and nothing is touched.
  *
- * Bytecode layouts (checked with javap):
- *   ui 1.7.0 / 1.8.2: private instance setTraversalValues().
- *   ui 1.12.1:        static AndroidComposeViewAccessibilityDelegateCompat_androidKt
+ * Bytecode layouts (checked with javap on ui-android 1.7.0, 1.8.2, 1.11.1 and 1.12.1):
+ *   ui <= 1.7:        private instance setTraversalValues().
+ *   ui 1.8 to 1.12:   static AndroidComposeViewAccessibilityDelegateCompat_androidKt
  *                     .setTraversalValues(IntObjectMap currentSemanticsNodes,
  *                     MutableIntIntMap idToBeforeMap, MutableIntIntMap idToAfterMap, Resources),
  *                     fed from the private getCurrentSemanticsNodes().
- *   isEnabled is `isEnabled$ui_release` (1.7) or `isEnabled$ui` (1.12).
+ *   isEnabled is `isEnabled$ui_release` (1.7, 1.8) or `isEnabled$ui` (1.11, 1.12);
+ *   currentSemanticsNodesInvalidated is a private boolean field in all of them.
  * Every step is reflective and optional: a miss leaves the dump as it was and is reported.
  */
 package com.oberkfell.viewspector.agent.payload
@@ -55,6 +60,9 @@ internal object ComposeTraversal {
         /** Maps to clear after the walk (they were empty before [prime] filled them). */
         val toClear = ArrayList<Any>()
 
+        /** Delegates without a running service, whose invalidation flag [restore] sets again. */
+        val toInvalidate = ArrayList<Any>()
+
         fun token(): String? {
             if (byService + computed + failed == 0) return null
             val parts = ArrayList<String>()
@@ -81,7 +89,11 @@ internal object ComposeTraversal {
         return result
     }
 
-    /** Clear the maps [prime] filled from empty, so the app is left as it was. */
+    /**
+     * Leave each delegate as Compose keeps it without a service: clear the maps [prime] filled
+     * from empty and mark the semantics snapshot invalidated, so the next read under a service
+     * recomputes the traversal order. Call after the walk (which also reads the snapshot).
+     */
     fun restore(result: Result) {
         for (map in result.toClear) {
             try {
@@ -91,6 +103,14 @@ internal object ComposeTraversal {
             }
         }
         result.toClear.clear()
+        for (delegate in result.toInvalidate) {
+            try {
+                invalidatedField(delegate.javaClass)?.setBoolean(delegate, true)
+            } catch (t: Throwable) {
+                logOnce("invalidate", t)
+            }
+        }
+        result.toInvalidate.clear()
     }
 
     private fun collect(view: View, out: MutableList<View>, depth: Int) {
@@ -123,6 +143,9 @@ internal object ComposeTraversal {
                 return
             }
         }
+        // From here on the dump reads the delegate's semantics snapshot without a service
+        // (even if the order below cannot be computed), which clears its invalidation flag.
+        result.toInvalidate.add(delegate)
         val before = mapField(cls, "idToBeforeMap")?.get(delegate)
         val after = mapField(cls, "idToAfterMap")?.get(delegate)
         if (before == null || after == null) {
@@ -131,13 +154,13 @@ internal object ComposeTraversal {
         }
         val wasEmpty = isEmpty(before) && isEmpty(after)
 
-        // ui 1.7 / 1.8: private instance method.
+        // ui <= 1.7: private instance method.
         val instance = cls.declaredMethods.firstOrNull { it.name == "setTraversalValues" && it.parameterCount == 0 }
         if (instance != null) {
             instance.isAccessible = true
             instance.invoke(delegate)
         } else {
-            // ui 1.9+ (checked on 1.12.1): a static helper fed the current semantics snapshot.
+            // ui 1.8 to 1.12: a static helper fed the current semantics snapshot.
             val nodes = declared(cls, "getCurrentSemanticsNodes")?.invoke(delegate)
             val kt = Class.forName(DELEGATE_KT_CLASS, false, cls.classLoader)
             val static = kt.declaredMethods.firstOrNull { it.name == "setTraversalValues" && it.parameterCount == 4 }
@@ -170,6 +193,8 @@ internal object ComposeTraversal {
         }
         return null
     }
+
+    private fun invalidatedField(cls: Class<*>): Field? = mapField(cls, "currentSemanticsNodesInvalidated")
 
     private fun mapField(cls: Class<*>, name: String): Field? = try {
         cls.getDeclaredField(name).also { it.isAccessible = true }
