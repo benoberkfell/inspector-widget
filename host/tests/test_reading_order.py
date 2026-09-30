@@ -340,3 +340,129 @@ def test_compose_order_unknown_is_reported_when_the_agent_could_not_compute_it()
     assert kinds["compose_order_unknown"]["count"] == 3
     ok = A.a11y_to_dict(pb.DumpA11yResponse(diagnostics="root#2 compose-traversal computed=12"))
     assert "reading_order_diagnostics" not in ok
+
+
+# --------------------------------------------------------------------------- what TalkBack sees
+# TalkBack does not request not-important Views; the agent's in-process connection does.
+def test_scroll_view_content_container_is_not_one_stop():
+    # ScrollView > LinearLayout (AUTO, not important) > TextViews + Button: TalkBack reads
+    # each TextView as its own top-level scroll item, not the whole screen as one stop.
+    texts = n(3, -1, cls="android.widget.LinearLayout", children=[
+        n(4, -1, cls="android.widget.TextView", text="Account", flags=VIS + ["heading"]),
+        n(5, -1, cls="android.widget.TextView", text="Signed in as ada@example.com"),
+        n(6, -1, cls="android.widget.Button", text="Sign out", flags=FOCUS),
+        n(7, -1, cls="android.widget.TextView", text="Privacy", flags=VIS + ["heading"])])
+    scroll = n(2, -1, cls="android.widget.ScrollView", flags=VIS + ["focusable", "scrollable"],
+               important_for_accessibility="YES", children=[texts])
+    assert speech([n(1, -1, children=[scroll])]) == [
+        "Account, heading", "Signed in as ada@example.com", "Sign out, button",
+        "Privacy, heading"]
+
+
+def test_not_important_and_hidden_views_are_not_stops():
+    root = n(1, -1, children=[
+        n(2, -1, cls="android.widget.TextView", text="Visible title", important_for_accessibility="YES"),
+        n(3, -1, cls="android.widget.TextView", text="Decorative duplicate",
+          important_for_accessibility="NO"),
+        n(4, -1, cls="android.widget.FrameLayout", important_for_accessibility="NO_HIDE_DESCENDANTS",
+          children=[n(5, -1, cls="android.widget.TextView", text="Hidden subtree text"),
+                    n(6, -1, cls="android.widget.Button", text="Hidden button", flags=FOCUS)])])
+    assert speech([root]) == ["Visible title"]
+
+
+def test_not_important_icon_adds_nothing_to_its_row():
+    row = n(3, -1, cls="android.widget.LinearLayout", flags=FOCUS, children=[
+        n(4, -1, cls="android.widget.ImageView"),  # decorative: AUTO, no description
+        n(5, -1, cls="android.widget.TextView", text="Wi-Fi", important_for_accessibility="YES")])
+    assert speech([n(1, -1, children=[row])]) == ["Wi-Fi"]
+    # An icon that IS important (TalkBack sees it) still adds its role, as TalkBack does.
+    row["children"][0]["important_for_accessibility"] = "YES"
+    assert speech([n(1, -1, children=[row])]) == ["image, Wi-Fi"]
+
+
+def test_recycler_view_items_stay_items_when_auto():
+    # RecyclerView marks its item Views important once a service is on, so an AUTO row
+    # is still one top-level list item (not hoisted into separate texts).
+    rows = [n(10 + i, -1, cls="android.widget.LinearLayout", children=[
+        n(20 + i, -1, cls="android.widget.TextView", text=f"Title {i}"),
+        n(30 + i, -1, cls="android.widget.TextView", text=f"Subtitle {i}")]) for i in range(2)]
+    rv = n(2, -1, cls="androidx.recyclerview.widget.RecyclerView",
+           flags=VIS + ["focusable", "scrollable"], children=rows,
+           collection_info={"row_count": 2, "column_count": 1})
+    assert speech([n(1, -1, children=[rv])]) == ["Title 0, Subtitle 0", "Title 1, Subtitle 1"]
+
+
+def test_a_view_hosted_by_a_compose_node_is_kept():
+    # Compose adds an AndroidView's holder as a child of a virtual node (it forces the
+    # holder important); its own not-important children are still hoisted.
+    holder = n(40, -1, cls="android.widget.FrameLayout", children=[
+        n(41, -1, cls="android.widget.LinearLayout", children=[
+            n(42, -1, cls="android.widget.TextView", text="From a View")])])
+    acv = n(30, -1, provider_class="androidx.compose.ui.platform.AndroidComposeView",
+            children=[n(30, 5, children=[holder])])
+    fo = a11y.reading_order([n(1, -1, children=[acv])])
+    assert [e["speak"] for e in fo["focus_order"]] == ["From a View"]
+
+
+def test_a11y_to_dict_marks_what_talkback_ignores():
+    b = mf.A11yBuilder()
+    root = b.node(2, -1, (0, 0, 1080, 2400), children=[
+        b.node(3, -1, (0, 0, 1080, 2400), cls="android.widget.LinearLayout", children=[
+            b.node(4, -1, (0, 100, 1080, 80), cls="android.widget.TextView", text="Title"),
+            b.node(5, -1, (0, 200, 100, 100), cls="android.widget.ImageView"),
+            b.node(6, -1, (0, 300, 1080, 300), cls="android.widget.FrameLayout",
+                   important_for_accessibility=4, children=[
+                b.node(7, -1, (0, 300, 1080, 80), cls="android.widget.TextView", text="gone")])])])
+    d = a11y.a11y_to_dict(b.response([root]))
+    by_key = {x["node_key"]: x for x in a11y._iter_nodes([d["windows"][0]["root"]])}
+    assert by_key["view:3"]["ignored"] == "not_important"
+    assert by_key["view:5"]["ignored"] == "not_important"
+    assert by_key["view:6"]["ignored"] == "hidden" and by_key["view:7"]["ignored"] == "hidden"
+    assert "ignored" not in by_key["view:4"] and "ignored" not in by_key["view:2"]
+    assert d["summary"]["ignored_by_talkback"] == 4
+    assert [e["speak"] for e in d["focus_order"]] == ["Title"]
+
+
+# --------------------------------------------------------------------------- modal windows
+def _two_window_response(dialog_flags: int):
+    from inspector_widget.proto import view_inspection_pb2 as pb
+    b = mf.A11yBuilder()
+    activity = b.node(2, -1, (0, 0, 1080, 2400), children=[
+        b.node(3, -1, (0, 100, 1080, 80), cls="android.widget.TextView", text="Under the dialog"),
+        b.node(4, -1, (0, 300, 400, 140), cls="android.widget.Button", text="Open dialog",
+               flags=mf.VIS + ("clickable", "focusable"))])
+    dialog = b.node(9, -1, (100, 800, 880, 600), children=[
+        b.node(10, -1, (140, 840, 800, 80), cls="android.widget.TextView", text="Dialog title",
+               flags=mf.VIS + ("heading",)),
+        b.node(11, -1, (140, 1200, 300, 140), cls="android.widget.Button", text="Close",
+               flags=mf.VIS + ("clickable", "focusable"))])
+    resp = b.response([activity, dialog])
+    resp.diagnostics = (f"roots=2; api=37; root#2 window type=1 flags=0x81810100; "
+                        f"root#9 window type=2 flags=0x{dialog_flags:x}")
+    return resp
+
+
+def test_a_modal_dialog_hides_the_activity_from_the_reading_order():
+    d = a11y.a11y_to_dict(_two_window_response(0x1820002))  # Dialog: DIM_BEHIND, no NOT_TOUCH_MODAL
+    assert [(e["speak"], e["window"]) for e in d["focus_order"]] == [
+        ("Dialog title, heading", 1), ("Close, button", 1)]
+    w0, w1 = d["windows"]
+    assert w0["covered_by"] == 9 and w1["modal"] is True and "covered_by" not in w1
+    diag = [x for x in d["reading_order_diagnostics"] if x["kind"] == "covered_windows"][0]
+    assert diag["windows"] == [2] and diag["modal_window"] == 9
+
+
+def test_a_non_modal_popup_leaves_the_activity_reachable():
+    # FLAG_NOT_TOUCH_MODAL | FLAG_NOT_FOCUSABLE: a tooltip-like popup.
+    d = a11y.a11y_to_dict(_two_window_response(0x28))
+    assert [e["speak"] for e in d["focus_order"]] == [
+        "Under the dialog", "Open dialog, button", "Dialog title, heading", "Close, button"]
+    assert all("covered_by" not in w for w in d["windows"])
+
+
+def test_generation_changes_only_when_compose_ids_change():
+    g1 = a11y.a11y_to_dict(mf.a11y_response())["generation"]
+    assert g1 == a11y.a11y_to_dict(mf.a11y_response())["generation"]
+    resp = mf.a11y_response()
+    resp.windows[0].root.children[1].children[0].children[0].children[0].virtual_id = 902
+    assert a11y.a11y_to_dict(resp)["generation"] != g1

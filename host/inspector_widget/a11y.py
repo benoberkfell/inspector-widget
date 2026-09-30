@@ -427,15 +427,22 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
 
     Output shape::
 
-        {"windows": [{"root_view_id", "root": <node>|None}, ...],
+        {"windows": [{"root_view_id", "root": <node>|None,
+                      "window_type"?, "window_flags"?, "modal"?, "covered_by"?}, ...],
          "focus_order": [{"order", "key", "id", "speak"}, ...],   # focus stops only
-         "summary": {"windows", "nodes", "focus_stops"},
+         "generation": "g...",                      # changes when Compose re-mints ids
+         "summary": {"windows", "nodes", "focus_stops", "ignored_by_talkback"?},
          "diagnostics"?: str,                       # from the agent
-         "reading_order_diagnostics"?: [...]}       # cycles / dangling linkage
+         "reading_order_diagnostics"?: [...]}       # cycles / dangling linkage / covered windows
 
     Every node carries ``id`` (integer key) and ``node_key`` (typed key); focus
     stops also carry ``order`` so the tree and ``focus_order`` cross-reference
-    without the list repeating the tree's data.
+    without the list repeating the tree's data. A real View that TalkBack never
+    sees carries ``ignored``: ``"not_important"`` (TalkBack reads its children in
+    its place) or ``"hidden"`` (importantForAccessibility=noHideDescendants on it or
+    an ancestor: its whole subtree is gone). A window under an open modal window
+    (a dialog) carries ``covered_by`` (the modal window's root_view_id); TalkBack
+    cannot reach it, so its nodes are not in ``focus_order``.
     """
     resolver = StringResolver(response.strings)
     windows: List[Dict[str, Any]] = []
@@ -444,24 +451,34 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
         windows.append({"root_view_id": w.root_view_id, "root": root})
     roots = [w["root"] for w in windows if w["root"]]
     assign_node_keys(roots)
+    mark_talkback_ignored(roots)
+    covered = apply_window_meta(windows, response.diagnostics or "")
 
-    ro = reading_order(roots)
+    root_windows = [w for w in windows if w["root"]]
+    skip = {i for i, w in enumerate(root_windows) if w.get("covered_by") is not None}
+    ro = reading_order(roots, skip=skip)
     by_id = {id(n): n for n in _iter_nodes(roots)}
     for entry, node in zip(ro["focus_order"], ro["_nodes"]):
         by_id[id(node)]["order"] = entry["order"]
 
-    out: Dict[str, Any] = {"windows": windows, "focus_order": ro["focus_order"]}
+    out: Dict[str, Any] = {"windows": windows, "focus_order": ro["focus_order"],
+                           "generation": generation(roots)}
     out["summary"] = {
         "windows": len(windows),
         "nodes": len(by_id),
         "focus_stops": len(ro["focus_order"]),
     }
+    ignored = sum(1 for n in by_id.values() if n.get("ignored"))
+    if ignored:
+        out["summary"]["ignored_by_talkback"] = ignored
     unresolved = sum(1 for n in by_id.values() if not n.get("host_view_id"))
     if unresolved:
         out["summary"]["unresolved_nodes"] = unresolved  # host_view_id 0: no node_key
     if response.diagnostics:
         out["diagnostics"] = response.diagnostics
     ro_diags = list(ro["diagnostics"])
+    if covered:
+        ro_diags.append(covered)
     unordered = _compose_order_unavailable(response.diagnostics or "")
     if unordered:
         ro_diags.append({
@@ -480,6 +497,164 @@ def _compose_order_unavailable(diagnostics: str) -> int:
     """ComposeViews whose traversal order the agent could not produce (its
     ``compose-traversal ... unavailable=N`` tokens, one per window)."""
     return sum(int(m) for m in re.findall(r"compose-traversal[^;]*?unavailable=(\d+)", diagnostics))
+
+
+# --------------------------------------------------------------------------- #
+# Windows: modal dialogs hide the windows below them from accessibility services.
+# --------------------------------------------------------------------------- #
+FLAG_NOT_FOCUSABLE = 0x00000008
+FLAG_NOT_TOUCHABLE = 0x00000010
+FLAG_NOT_TOUCH_MODAL = 0x00000020
+_WINDOW_TOKEN = re.compile(r"root#(-?\d+) window type=(-?\d+) flags=0x([0-9a-fA-F]+)")
+
+
+def _window_meta(diagnostics: str) -> Dict[int, Tuple[int, int]]:
+    """root_view_id -> (LayoutParams.type, LayoutParams.flags) from the agent's
+    ``root#<id> window type=T flags=0xF`` diagnostics tokens."""
+    return {int(m.group(1)): (int(m.group(2)), int(m.group(3), 16))
+            for m in _WINDOW_TOKEN.finditer(diagnostics or "")}
+
+
+def is_modal_window(flags: int) -> bool:
+    """A window that takes every touch in its task: neither FLAG_NOT_TOUCH_MODAL nor
+    FLAG_NOT_FOCUSABLE nor FLAG_NOT_TOUCHABLE (a Dialog, DialogFragment, Compose Dialog,
+    or a focusable PopupWindow)."""
+    return not flags & (FLAG_NOT_TOUCH_MODAL | FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE)
+
+
+def apply_window_meta(windows: List[Dict[str, Any]], diagnostics: str) -> Optional[Dict[str, Any]]:
+    """Annotate ``windows`` (z-ordered, bottom first) with their type/flags/modality and
+    mark the ones below the topmost modal window ``covered_by`` it.
+
+    The system reports no window below a modal window of the same task to accessibility
+    services (AccessibilityWindowManager: a modal window's touchable region is the whole
+    task, so everything under it counts as covered), so TalkBack cannot reach the activity
+    while a dialog is open. Returns a reading-order diagnostic when a window is covered.
+    """
+    meta = _window_meta(diagnostics)
+    top_modal = None
+    for i, w in enumerate(windows):
+        m = meta.get(int(w.get("root_view_id") or 0))
+        if m is None or not w.get("root"):
+            continue
+        w["window_type"], w["window_flags"] = m[0], "0x%x" % m[1]
+        w["modal"] = is_modal_window(m[1])
+        if w["modal"] and i > 0:
+            top_modal = i
+    if top_modal is None:
+        return None
+    by = int(windows[top_modal].get("root_view_id") or 0)
+    covered = []
+    for w in windows[:top_modal]:
+        if w.get("root"):
+            w["covered_by"] = by
+            covered.append(int(w.get("root_view_id") or 0))
+    if not covered:
+        return None
+    return {
+        "kind": "covered_windows", "windows": covered, "modal_window": by,
+        "message": (f"{len(covered)} window(s) lie under the modal window {by} (a dialog or a "
+                    "focusable popup); TalkBack cannot reach them while it is open, so their "
+                    "nodes have no reading order. The lint still checks them."),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# What TalkBack sees: not-important Views.
+#
+# TalkBack does not request FLAG_INCLUDE_NOT_IMPORTANT_VIEWS, so the platform leaves every
+# View that is not important for accessibility out of the tree it serves and lists that
+# View's children in its place (ViewGroup.addChildrenForAccessibility); a View with
+# importantForAccessibility=noHideDescendants takes its whole subtree with it. The agent's
+# in-process connection fetches not-important Views too, so the host drops them here.
+# --------------------------------------------------------------------------- #
+_NOT_IMPORTANT = {"NO", "NO_HIDE_DESCENDANTS", 2, 4}
+_HIDE_DESCENDANTS = {"NO_HIDE_DESCENDANTS", 4}
+_ITEM_PARENTS = {"RecyclerView", "WearableRecyclerView"}
+
+
+def view_is_important(n: Dict[str, Any]) -> bool:
+    """View.isImportantForAccessibility() of a real View node, from its own mode.
+
+    The agent reports AUTO only for a View that resolved to not important (AUTO that
+    resolves important is reported as YES). An older agent or a hand-built dict reports
+    the raw mode, so AUTO is resolved here with View's rules on what the node exposes:
+    actionable (clickable, long-clickable, context-clickable, focusable), a provider,
+    a live region, a pane title, a heading; TextView and setContentDescription promote
+    AUTO to YES, so text or a contentDescription counts too.
+    """
+    mode = n.get("important_for_accessibility")
+    if mode in _NOT_IMPORTANT:
+        return False
+    if mode in ("YES", 1):
+        return True
+    fl = _flags(n)
+    if {"clickable", "long_clickable", "context_clickable", "focusable", "heading"} & fl:
+        return True
+    if n.get("provider_class") or n.get("pane_title"):
+        return True
+    if n.get("live_region") not in (None, "NONE", 0):
+        return True
+    return bool(n.get("text") or n.get("content_description"))
+
+
+def talkback_exclusion(n: Dict[str, Any], raw_parent: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why TalkBack does not see node ``n`` (given its parent in the dump), else None.
+
+    ``"hidden"``: a real View with importantForAccessibility=noHideDescendants; its
+    subtree goes with it. ``"not_important"``: a real View that is not important for
+    accessibility; its children take its place. Never for virtual nodes, window roots,
+    Views a provider added as children (Compose's AndroidView holders) or a
+    RecyclerView's item Views (RecyclerView marks them important whenever a service
+    is on).
+    """
+    if raw_parent is None or int(n.get("virtual_id", HOST_VIEW_ID)) != HOST_VIEW_ID:
+        return None
+    if n.get("important_for_accessibility") in _HIDE_DESCENDANTS:
+        return "hidden"
+    if int(raw_parent.get("virtual_id", HOST_VIEW_ID)) != HOST_VIEW_ID:
+        return None
+    if _simple_class(raw_parent) in _ITEM_PARENTS:
+        return None
+    return None if view_is_important(n) else "not_important"
+
+
+def mark_talkback_ignored(roots: List[Dict[str, Any]]) -> None:
+    """Set ``ignored`` ("not_important" / "hidden") on the nodes TalkBack never sees."""
+    stack: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]] = [
+        (r, None, False) for r in reversed([r for r in roots if r])]
+    while stack:
+        n, parent, hidden = stack.pop()
+        why = "hidden" if hidden else talkback_exclusion(n, parent)
+        if why:
+            n["ignored"] = why
+        else:
+            n.pop("ignored", None)
+        for c in reversed(n.get("children") or []):
+            stack.append((c, n, why == "hidden"))
+
+
+def generation(roots: List[Dict[str, Any]]) -> str:
+    """Fingerprint of the Compose ids in an a11y dump; changes when Compose re-mints
+    semantics ids (recomposition, recycling, navigation). The same UI state gives the
+    same value in dump_accessibility, a11y_lint and inspect."""
+    import hashlib
+    per_acv: Dict[int, List[int]] = {}
+    views: List[int] = []
+    for n in _iter_nodes(roots):
+        h = int(n.get("host_view_id") or 0)
+        v = int(n.get("virtual_id", HOST_VIEW_ID))
+        if v == HOST_VIEW_ID:
+            views.append(h)
+        elif (n.get("node_key") or "").startswith("compose:") and 0 <= v < 1_000_000_000:
+            per_acv.setdefault(h, []).append(v)
+    h = hashlib.sha1()
+    if per_acv:
+        for acv in sorted(per_acv):
+            h.update(f"{acv}:{sorted(per_acv[acv])};".encode())
+    else:
+        h.update(str(sorted(views)).encode())
+    return "g" + h.hexdigest()[:10]
 
 
 # --------------------------------------------------------------------------- #
@@ -571,18 +746,46 @@ def _node_label_key(n: Dict[str, Any]) -> str:
 
 
 class _Focus:
-    """TalkBack focusability predicates over the ORIGINAL (un-reordered) tree."""
+    """TalkBack focusability predicates over the tree TalkBack sees (un-reordered).
+
+    That tree is the dump minus the Views TalkBack never gets (see
+    :func:`talkback_exclusion`): a not-important View is replaced by its children, a
+    noHideDescendants View is dropped with its subtree. ``kids``/``parent`` give it.
+    """
 
     def __init__(self, roots: List[Dict[str, Any]]):
         self.parent: Dict[int, Optional[Dict[str, Any]]] = {}
+        self._kids: Dict[int, List[Dict[str, Any]]] = {}
         for r in roots:
             self.parent[id(r)] = None
-            for n in _iter_nodes([r]):
-                for c in n.get("children") or []:
+            stack = [r]
+            while stack:
+                n = stack.pop()
+                kept: List[Dict[str, Any]] = []
+                todo = [(c, n) for c in reversed(n.get("children") or [])]
+                while todo:
+                    c, raw_parent = todo.pop()
+                    why = talkback_exclusion(c, raw_parent)
+                    if why == "hidden":
+                        continue
+                    if why == "not_important":
+                        todo.extend((g, c) for g in reversed(c.get("children") or []))
+                        continue
+                    kept.append(c)
+                self._kids[id(n)] = kept
+                for c in kept:
                     self.parent[id(c)] = n
+                stack.extend(reversed(kept))
         self._speaking: Dict[int, bool] = {}
         self._focusable: Dict[int, bool] = {}
         self._stop: Dict[int, bool] = {}
+
+    def kids(self, n: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """``n``'s children as TalkBack gets them (not-important Views hoisted through)."""
+        return self._kids.get(id(n), [])
+
+    def seen(self, n: Dict[str, Any]) -> bool:
+        return id(n) in self.parent
 
     # -- primitive predicates -------------------------------------------------
     @staticmethod
@@ -623,7 +826,7 @@ class _Focus:
         res = bool(self.has_text(n) or n.get("state_description")
                    or "checkable" in _flags(n))
         if not res:
-            for c in n.get("children") or []:
+            for c in self.kids(n):
                 if self.visible(c) and not self.focusable(c) and self.speaking(c):
                     res = True
                     break
@@ -657,7 +860,7 @@ class _Focus:
         if not self.visible(n):
             res = False
         elif self.focusable(n):
-            kids = [c for c in (n.get("children") or []) if self.visible(c)]
+            kids = [c for c in self.kids(n) if self.visible(c)]
             res = (not kids) or self.speaking(n)
         else:
             res = self.has_text(n) and not self.has_focusable_ancestor(n)
@@ -710,7 +913,12 @@ def _state_words(n: Dict[str, Any], role: Optional[str]) -> List[str]:
 
 def _describe(n: Dict[str, Any], focus: _Focus, by_key: Dict[int, Dict[str, Any]],
               depth: int = 0) -> Tuple[List[str], bool]:
-    """TalkBack-style description of ``n``: (parts, has_label)."""
+    """TalkBack-style description of ``n``: (parts, has_label).
+
+    Like TalkBack's compositor (description_for_tree_nodes), every visible,
+    non-focusable descendant TalkBack sees adds its own text, role and state; Views
+    TalkBack never sees (not important for accessibility) add nothing.
+    """
     parts: List[str] = []
     has_label = False
     cd = n.get("content_description")
@@ -733,7 +941,7 @@ def _describe(n: Dict[str, Any], focus: _Focus, by_key: Dict[int, Dict[str, Any]
                 parts.append(lab)
                 has_label = True
         if depth < 64:
-            for c in n.get("children") or []:
+            for c in focus.kids(n):
                 if not focus.visible(c) or focus.focusable(c):
                     continue
                 cparts, clab = _describe(c, focus, by_key, depth + 1)
@@ -822,8 +1030,14 @@ def _find_cycles(edges: List[Tuple[int, int]]) -> List[List[int]]:
     return out
 
 
-def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False) -> Dict[str, Any]:
+def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False,
+                  skip: Optional[set] = None) -> Dict[str, Any]:
     """Compute the TalkBack reading order over the given window roots.
+
+    ``skip`` holds indices of ``roots`` TalkBack cannot reach (windows under an open
+    modal dialog); their nodes get no order. Views TalkBack never sees (not important
+    for accessibility, or hidden by noHideDescendants) are left out and their children
+    read in their place.
 
     Returns ``{"focus_order": [...], "diagnostics": [...], "_nodes": [...]}``:
     ``focus_order`` entries are ``{"order", "key", "id", "speak"}`` (+
@@ -839,12 +1053,18 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
     diagnostics: List[Dict[str, Any]] = []
 
     # ---- 1. index the ANI tree -------------------------------------------------
+    skip = set(skip or ())
     preorder: List[Dict[str, Any]] = []
     window_of: Dict[int, int] = {}
     for wi, r in enumerate(roots):
-        for node in _iter_nodes([r]):
+        if wi in skip:
+            continue
+        stack = [r]
+        while stack:
+            node = stack.pop()
             preorder.append(node)
             window_of[id(node)] = wi
+            stack.extend(reversed(focus.kids(node)))
     by_key: Dict[int, Dict[str, Any]] = {}
     dupes: List[str] = []
     for node in preorder:
@@ -990,7 +1210,8 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
     emitted: set = set()
     active: set = set()
     stack: List[Tuple[str, Dict[str, Any]]] = [
-        ("visit", r) for r in reversed(roots) if id(r) not in moved]
+        ("visit", r) for wi, r in reversed(list(enumerate(roots)))
+        if id(r) not in moved and wi not in skip]
     while stack:
         op, node = stack.pop()
         k = id(node)
@@ -1000,7 +1221,7 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
             active.add(k)
             tasks = [("visit", u) for u in before_att.get(k, [])]
             tasks.append(("emit", node))
-            tasks += [("visit", c) for c in (node.get("children") or []) if id(c) not in moved]
+            tasks += [("visit", c) for c in focus.kids(node) if id(c) not in moved]
             tasks += [("visit", u) for u in after_att.get(k, [])]
             tasks.append(("done", node))
             stack.extend(reversed(tasks))
