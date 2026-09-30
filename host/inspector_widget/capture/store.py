@@ -58,6 +58,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -126,6 +127,10 @@ RESERVED_LABELS = frozenset({"latest", "prev"})
 #: Per-capture subdirectories the byte cap strips first (plus raw/skp_*.bin).
 HEAVY_DIRS = ("img", "out", "derived")
 DERIVED_DIRS = ("derived", "img", "out")
+
+#: What the store keeps directly under its root (and what may be tightened to 0700).
+ROOT_ENTRIES = frozenset({"store.json", "store.lock", "gc.lock", "session.json", "lineages",
+                          "captures", ".staging", ".trash", "spill"})
 
 PINNED_MARKER = ".pinned"
 STRIPPED_MARKER = ".stripped"
@@ -740,11 +745,29 @@ class CaptureStore:
             if parent and not os.path.isdir(parent):
                 os.makedirs(parent, exist_ok=True)
             _mkdir(self.root)
+        else:
+            self._tighten_root()
         for sub in ("captures", "lineages", ".staging", ".trash", "spill"):
             p = self._p(sub)
             if not os.path.isdir(p):
                 _mkdir(p)
         self._layout_ok = True
+
+    def _tighten_root(self) -> None:
+        """Make an existing root 0700 (spec 4.1) when it holds nothing but the
+        store's own layout: something else (an older host, a Phase-0 spill) may
+        have created it with the umask's mode. A directory with other content
+        (a root pointed at a shared folder) is left alone."""
+        try:
+            st = os.stat(self.root)
+            if not stat.S_IMODE(st.st_mode) & 0o077:
+                return
+            if getattr(os, "getuid", None) is not None and st.st_uid != os.getuid():
+                return
+            if set(os.listdir(self.root)) <= ROOT_ENTRIES:
+                os.chmod(self.root, 0o700)
+        except OSError:
+            pass
 
     def close(self) -> None:
         """Forget cached indexes; in memory-only mode also delete the temp root."""

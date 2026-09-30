@@ -160,10 +160,76 @@ class Budget:
 # --------------------------------------------------------------------------- #
 # Spill files and the envelope
 # --------------------------------------------------------------------------- #
-def default_spill_dir() -> str:
-    """``<store root>/spill``: the same root the capture store uses (spec 4.1)."""
+def default_spill_dir(env: Mapping[str, str] | None = None) -> str:
+    """Where spill files go when the caller names no directory.
+
+    ``<store root>/spill``, the root the capture store uses (spec 4.1), unless
+    ``$INSPECTOR_WIDGET_CAPTURE_PERSIST`` is off (memory-only mode): then nothing
+    may land in the persistent cache, and spill files go to
+    ``<system temp>/inspector-widget-<uid>/spill`` instead, a directory private to
+    this user (0700, checked to be ours and not a link; otherwise a fresh
+    per-process temp directory). Files there are purged after 1 h like any spill.
+    Callers holding a store can pass ``store.spill_dir()``, which follows the
+    store's own mode."""
     from .capture.model import default_store_root
-    return os.path.join(default_store_root(), "spill")
+    from .capture.store import env_persist
+
+    env = os.environ if env is None else env
+    if env_persist(env):
+        return os.path.join(default_store_root(env), "spill")
+    return os.path.join(_private_temp_root(), "spill")
+
+
+def _private_temp_root() -> str:
+    import stat
+    import tempfile
+
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        path = os.path.join(tempfile.gettempdir(), f"inspector-widget-{getuid()}")
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            path = ""
+        if path:
+            try:
+                st = os.lstat(path)
+                if stat.S_ISDIR(st.st_mode) and st.st_uid == getuid():
+                    if stat.S_IMODE(st.st_mode) != 0o700:
+                        os.chmod(path, 0o700)
+                    return path
+            except OSError:
+                pass
+    global _PROCESS_TEMP
+    if _PROCESS_TEMP is None or not os.path.isdir(_PROCESS_TEMP):
+        _PROCESS_TEMP = tempfile.mkdtemp(prefix="inspector-widget-")
+    return _PROCESS_TEMP
+
+
+_PROCESS_TEMP: str | None = None
+
+
+def makedirs_private(path: str) -> None:
+    """``os.makedirs`` where every directory it creates is 0700 (``makedirs``'s
+    ``mode`` applies to the leaf only, and the umask filters it). Existing
+    directories are left alone."""
+    path = os.path.abspath(path)
+    missing = []
+    cur = path
+    while not os.path.isdir(cur):
+        missing.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            continue
+        os.chmod(d, 0o700)
 
 
 def purge_spill(spill_dir: str, ttl_s: float = SPILL_TTL_S, now: float | None = None) -> int:
@@ -188,9 +254,10 @@ def purge_spill(spill_dir: str, ttl_s: float = SPILL_TTL_S, now: float | None = 
 
 
 def write_spill(tool: str, text: str, spill_dir: str, now: float | None = None) -> str:
-    """Write ``text`` to ``<spill_dir>/<tool>-<YYYYmmddTHHMMSS>-<4hex>.json`` (0600,
-    directory 0700) and return the path."""
-    os.makedirs(spill_dir, mode=0o700, exist_ok=True)
+    """Write ``text`` to ``<spill_dir>/<tool>-<YYYYmmddTHHMMSS>-<4hex>.json`` (0600;
+    every directory it creates, the store root included, is 0700) and return the
+    path."""
+    makedirs_private(spill_dir)
     stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(time.time() if now is None else now))
     safe_tool = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tool) or "tool"
     for _ in range(8):

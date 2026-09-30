@@ -199,7 +199,47 @@ def test_purge_spill_removes_files_older_than_the_ttl(tmp_path):
 
 def test_default_spill_dir_follows_the_store_root(monkeypatch, tmp_path):
     monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.delenv("INSPECTOR_WIDGET_CAPTURE_PERSIST", raising=False)
     assert out.default_spill_dir() == os.path.join(str(tmp_path), "spill")
+
+
+def test_memory_only_mode_never_spills_into_the_persistent_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(cache))
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_PERSIST", "0")
+    brief = out.slim("dump_tree", wide_tree_result(), {})
+    env = json.loads(out.finalize("dump_tree", brief, max_bytes=None))
+    path = env["spill_path"]
+    assert not cache.exists() and not path.startswith(str(cache))
+    spill = os.path.dirname(path)
+    assert stat.S_IMODE(os.stat(spill).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(os.path.dirname(spill)).st_mode) == 0o700
+    os.remove(path)
+
+
+def test_a_spill_that_creates_the_store_root_makes_it_private(monkeypatch, tmp_path):
+    root = tmp_path / "a" / "store"
+    monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(root))
+    monkeypatch.delenv("INSPECTOR_WIDGET_CAPTURE_PERSIST", raising=False)
+    brief = out.slim("dump_tree", wide_tree_result(), {})
+    assert json.loads(out.finalize("dump_tree", brief, max_bytes=None))["spill_path"]
+    for d in (tmp_path / "a", root, root / "spill"):
+        assert stat.S_IMODE(os.stat(d).st_mode) == 0o700, d
+
+
+def test_the_store_tightens_a_root_that_something_else_created(tmp_path):
+    from inspector_widget.capture.store import CaptureStore
+
+    root = tmp_path / "store"
+    (root / "spill").mkdir(parents=True)
+    os.chmod(root, 0o755)
+    CaptureStore(root=str(root), persist=True).spill_dir()
+    assert stat.S_IMODE(os.stat(root).st_mode) == 0o700
+    shared = tmp_path / "shared"
+    (shared / "notes").mkdir(parents=True)
+    os.chmod(shared, 0o755)
+    CaptureStore(root=str(shared), persist=True).spill_dir()
+    assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755  # not only ours: left alone
 
 
 def test_preview_lines_cover_every_tree_shape():

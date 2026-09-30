@@ -250,7 +250,13 @@ with every consumer.
   - `max_bytes=None` means `$INSPECTOR_WIDGET_MAX_BYTES`, else 32,000. `0` means
     unlimited, and other values are clamped to 1,000..200,000
     (`resolve_max_bytes`).
-  - `spill_dir=None` means `<store root>/spill`, via `model.default_store_root()`.
+  - `spill_dir=None` means `<store root>/spill`, via `model.default_store_root()`,
+    unless `INSPECTOR_WIDGET_CAPTURE_PERSIST=0`: then a private per-user directory
+    under the system temp dir (`<tmp>/inspector-widget-<uid>/spill`, 0700), so
+    memory-only mode never writes screen text into the persistent cache. Callers
+    that hold a `CaptureStore` can pass `store.spill_dir()`. Every directory a
+    spill creates (the store root included) is 0700, and `CaptureStore` tightens
+    an existing root that holds only its own layout.
     Spill files are 0600 in a 0700 directory, and files older than 1 h are purged
     whenever something spills.
   - If the spill write fails, the envelope carries `spill_error` and no
