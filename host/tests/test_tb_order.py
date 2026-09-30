@@ -618,3 +618,75 @@ def test_signature_ignores_ids_and_bounds():
                          b=(0, 700, 100, 50)))])
     assert a.node("view:2").signature == b.node("view:9").signature == (
         "view", "android.widget.Button", "Play", "")
+
+
+# ---------------------------------------------- calibration: the spike's own screens (p6)
+# tb17_<screen>_on.json.gz: each screen dumped by the a11y-core agent WITH TalkBack on, on the
+# emulator and in the state the walk started from; tb17_walks.json: the walk, press by press, with
+# what TalkBack said. Nodes are matched on label + bounds (lazy items re-mint ids after scrolling);
+# a node a scroll moved is matched on its key.
+TB17_WALKS = json.load(open(os.path.join(DATA, "tb17_walks.json"), encoding="utf-8"))["walks"]
+
+
+def tb17_tree(name, which="on"):
+    with gzip.open(os.path.join(DATA, f"tb17_{name}_{which}.json.gz"), "rt") as f:
+        return tb.build(json.load(f))
+
+
+def walk_node(tree, entry):
+    """The dump node a walk entry focused: same label and bounds (preferring the same key, then
+    a node TalkBack would stop on: a ComposeView cell and its row share bounds), else the same
+    key with other bounds (a scroll moved it)."""
+    rules = tb.Rules(tree)
+    same = [k for k in tree.nodes if k.rect.tuple() == _ltrb(entry["bounds"])
+            and entry["label"] in (None, k.text, k.content_description)]
+    for pick in ([k for k in same if k.key == entry["key"]],
+                 [k for k in same if rules.should_focus_node(k)], same):
+        if pick:
+            return pick[0], False
+    k = tree.node(entry["key"])
+    return (k, True) if k is not None else (None, False)
+
+
+def _ltrb(b):
+    x, y, w, h = b
+    return (x, y, x + w, y + h)
+
+
+@pytest.mark.parametrize("name", ["traversal", "S1", "S4", "D1", "D2", "launcher"])
+def test_tb17_p6_walk_order_press_for_press(name):
+    walk = TB17_WALKS[name]
+    tree = tb17_tree(name)
+    start, _ = walk_node(tree, walk[0])
+    model = tb.simulate(tree, start=start, until="steps", max_steps=len(walk) - 1).steps
+    compared = 0
+    for entry, step in zip(walk[1:], model):
+        if entry.get("edge"):
+            assert step.get("edge"), step
+            compared += 1
+            continue
+        node, moved = walk_node(tree, entry)
+        if node is None:
+            break  # scrolled in by TalkBack: not in the dump the walk started from
+        assert not step.get("edge") and step["key"] == node.key, (entry, step)
+        if moved:  # a scroll moved it: TalkBack showed it first
+            assert step.get("show_on_screen")
+        compared += 1
+    if name == "launcher":
+        # The 12 visible rows; then TalkBack scrolls the LazyColumn (SCROLL_FORWARD) where the
+        # model, which has no more rows, reports that scroll on its edge step.
+        assert compared == 12
+        assert model[12].get("edge") and model[12].get("autoscroll") == "compose:7:18"
+    else:
+        assert compared == len(walk) - 1
+
+
+def test_tb17_a_dump_without_talkback_needs_only_the_holder_correction():
+    # The spike's on/off comparison (8 screens): the only node-level difference is that
+    # AndroidView holders are not visible to TalkBack. Correcting that makes the two agree.
+    off, on = tb17_tree("S4", "off"), tb17_tree("S4", "on")
+    assert off.services == "off" and on.services == "on"
+    fixed = [k.key for k in off.nodes if "holder_invisible_with_service" in k.corrections]
+    assert len(fixed) == 6
+    assert {k.key for k in off.nodes if k.visible} == {k.key for k in on.nodes if k.visible}
+    assert tb.reading_order(off)["focus_order"] == tb.reading_order(on)["focus_order"]
