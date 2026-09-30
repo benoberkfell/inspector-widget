@@ -25,27 +25,34 @@ are written to temp PNG files and the **path** is returned (not inlined).
 - **`dump_accessibility(serial, package, include_extras=true,
   include_rendering_info=false)`** → unified `AccessibilityNodeInfo` tree (Views +
   Compose virtual nodes) with text/contentDescription/stateDescription/role,
-  state flags, bounds, decoded actions, collection/range info, plus the
-  host-computed TalkBack `focus_order` (reading order).
+  state flags, bounds, decoded actions, collection/range info, a `node_key` per
+  node, plus the host-computed TalkBack `focus_order` (`[{order, key, speak}]`:
+  each focus stop and what TalkBack announces there) and
+  `reading_order_diagnostics`.
 - **`a11y_lint(serial, package, include_contrast=true, scale=1.0,
   wcag_mode=false, rules=[...])`** → `{summary, findings:[{rule, severity, node,
   bounds, bounds_dp, message, evidence}], density, font_scale, ...}`. The DETECT
   and VERIFY engine. `rules` runs a subset; `wcag_mode` uses 44dp targets;
   `include_contrast=false` skips the pixel rule. See **rules.md**.
 - **`a11y_overlay(serial, package, scale=1.0, include_contrast=true,
-  wcag_mode=false)`** → `{path, boxes, labels, flagged, summary, ...}`. Screenshot
-  with every a11y node boxed + speakable label + reading-order number, colored by
-  severity (red=error, amber=warn, blue=info, green=clean). The SEE step.
+  wcag_mode=false)`** → `{path, boxes, labels, flagged, flagged_by_bounds,
+  summary, ...}`. Screenshot with every a11y node boxed, each focus stop numbered
+  and labelled with what TalkBack says, colored by severity (red=error,
+  amber=warn, blue=info, green=clean; a finding that maps to no a11y node is a
+  dashed box at its own bounds). The SEE step.
 
 ### Per-element dossier / image
 - **`inspect_node(serial, package, node_key|view_id|semantics_id|bounds,
   include_image=true)`** → dossier `{node_key, bounds, correlation_confidence,
-  view?, compose?, a11y?, component_image{path}, lint[]}`. `compose` carries the
+  generation, where, context, view?, compose?, a11y?, list_item?, component_image{path},
+  lint[]}`. `where` is a breadcrumb such as `view:20 RecyclerView > row 1: view:31
+  ComposeView > composeview:32 > compose:32:4 Button 'Delete'`. `compose` carries the
   **source `file:line`** + modifiers; `view` carries typed properties; `a11y` is
   the element's node; `lint` is the findings focused to this element. The LOCATE
-  step. Selectors: `node_key` = `"view:<id>"`|`"compose:<id>"`; `view_id` =
-  uniqueDrawingId; `semantics_id` = Compose id; `bounds` = `{x,y,w,h}` px
-  (deepest covering element).
+  step. Selectors: `node_key` = `"view:<id>"`|`"compose:<acvId>:<semanticsId>"`|
+  `"composeview:<acvId>"`; `view_id` = uniqueDrawingId; `semantics_id` = Compose
+  id (only when one ComposeView has it); `bounds` = `{x,y,w,h}` px (deepest
+  covering element).
 - **`component_image(serial, package, node_key|view_id|semantics_id|bounds)`** →
   `{path, source}` — a cropped PNG of one element (`source`: `skp` |
   `bitmap_crop`). Use when you only need the picture.

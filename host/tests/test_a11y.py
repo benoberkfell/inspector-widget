@@ -68,61 +68,64 @@ def test_a11y_node_to_dict_int_enum_decode(strings_builder):
 
 
 # --------------------------------------------------------------------------- #
-# Traversal order — geometry
+# Traversal order — ANI child order (the platform already sorted it)
 # --------------------------------------------------------------------------- #
 def _stop(node_id, host, virtual, x, y, w=40, h=40, speakable="t"):
-    """A focus-stop node dict (visible + screen_reader_focusable + speakable)."""
+    """A focus-stop node dict (visible + screen_reader_focusable + text)."""
     return {
         "id": node_id,
         "host_view_id": host,
         "virtual_id": virtual,
+        "text": speakable,
         "speakable": speakable,
         "bounds": {"layout": {"x": x, "y": y, "w": w, "h": h}},
         "flags": ["visible_to_user", "screen_reader_focusable"],
     }
 
 
-def test_traversal_order_geometry_top_to_bottom():
+def test_traversal_order_keeps_ani_child_order():
+    # Children arrive in ANI order a, b, c although b is geometrically first: the host
+    # must not re-sort (the framework / Compose delegate already ordered them).
     a = _stop(1, 1, 1, x=0, y=200)
     b = _stop(2, 1, 2, x=0, y=0)
     c = _stop(3, 1, 3, x=0, y=100)
     root = {
-        "id": 0, "host_view_id": 1, "virtual_id": 0,
+        "id": 0, "host_view_id": 1, "virtual_id": -1,
         "bounds": {"layout": {"x": 0, "y": 0, "w": 200, "h": 400}},
         "flags": ["visible_to_user"],
         "children": [a, b, c],
     }
     walk = a11y.compute_traversal_order([root])
     stops = [e for e in walk if e["is_focus_stop"]]
-    # b (y=0), c (y=100), a (y=200) — top-to-bottom.
-    assert [e["id"] for e in stops] == [2, 3, 1]
+    assert [e["id"] for e in stops] == [1, 2, 3]
     assert [e["order"] for e in stops] == [1, 2, 3]
 
 
-def test_traversal_order_same_row_left_to_right():
-    left = _stop(1, 1, 1, x=100, y=0)
-    right = _stop(2, 1, 2, x=0, y=5)  # overlaps vertically -> same row, but left of `left`
+def test_traversal_order_rtl_row_is_not_reversed():
+    # An RTL row: ANI order puts the right-hand node first; geometry would flip it.
+    right = _stop(1, 1, 1, x=100, y=0)
+    left = _stop(2, 1, 2, x=0, y=5)
     root = {
-        "id": 0, "host_view_id": 1, "virtual_id": 0,
+        "id": 0, "host_view_id": 1, "virtual_id": -1,
         "bounds": {"layout": {"x": 0, "y": 0, "w": 200, "h": 100}},
         "flags": ["visible_to_user"],
-        "children": [left, right],
+        "children": [right, left],
     }
     walk = a11y.compute_traversal_order([root])
     stops = [e["id"] for e in walk if e["is_focus_stop"]]
-    assert stops == [2, 1]  # right (x=0) before left (x=100)
+    assert stops == [1, 2]
 
 
 # --------------------------------------------------------------------------- #
 # Traversal order — traversal_before / traversal_after
 # --------------------------------------------------------------------------- #
 def test_traversal_before_pulls_node_earlier():
-    # Geometry order would be a, b. traversal_before on b targeting a flips it.
+    # ANI order is a, b. traversal_before on b targeting a flips it.
     a = _stop(11, 1, 11, x=0, y=0)
     b = _stop(12, 1, 12, x=0, y=100)
     b["traversal_before"] = a["id"]  # b must come before a
     root = {
-        "id": 0, "host_view_id": 1, "virtual_id": 0,
+        "id": 0, "host_view_id": 1, "virtual_id": -1,
         "bounds": {"layout": {"x": 0, "y": 0, "w": 200, "h": 400}},
         "flags": ["visible_to_user"],
         "children": [a, b],
@@ -138,7 +141,7 @@ def test_traversal_after_pushes_node_later():
     # a.traversal_after = b  => a must come AFTER b, flipping geometry order.
     a["traversal_after"] = b["id"]
     root = {
-        "id": 0, "host_view_id": 1, "virtual_id": 0,
+        "id": 0, "host_view_id": 1, "virtual_id": -1,
         "bounds": {"layout": {"x": 0, "y": 0, "w": 200, "h": 400}},
         "flags": ["visible_to_user"],
         "children": [a, b],
@@ -165,7 +168,7 @@ def test_structural_node_not_counted_as_stop():
     # A pure container (no content, not screen-reader-focusable) is in the walk
     # but is_focus_stop=False and order=None.
     container = {
-        "id": 100, "host_view_id": 1, "virtual_id": 0,
+        "id": 100, "host_view_id": 1, "virtual_id": -1,
         "bounds": {"layout": {"x": 0, "y": 0, "w": 200, "h": 200}},
         "flags": ["visible_to_user"],
         "children": [_stop(1, 1, 1, x=0, y=0)],

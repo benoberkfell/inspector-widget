@@ -997,7 +997,8 @@ def tool_a11y_overlay(
         "serial": serial, "package": package,
         "path": out, "overlay_path": out,
         "boxes": summary["boxes"], "labels": summary["labels"],
-        "flagged": summary["flagged"], "size": summary["size"],
+        "flagged": summary["flagged"], "flagged_by_bounds": summary.get("flagged_by_bounds"),
+        "size": summary["size"],
         "finding_count": len(findings),
         "summary": a11y_lint.summarize_dicts(findings) if hasattr(a11y_lint, "summarize_dicts") else None,
         "diagnostics": a11y_data.get("diagnostics"),
@@ -1233,8 +1234,12 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "in one tree. Each node has its host_view_id+virtual_id key (ties back to dump_tree/"
             "dump_compose), text/contentDescription/stateDescription/role, all a11y state flags, "
             "on-screen bounds, decoded actions (CLICK/SCROLL_FORWARD/SET_PROGRESS/...), collection/"
-            "range info and extras. Also returns the host-computed TalkBack reading order "
-            "(focus_order) honoring traversal_before/after + geometry. Auto-attaches."
+            "range info and extras. Every node has a typed node_key (view:<id> | "
+            "compose:<acvId>:<semanticsId>) usable with inspect_node. Also returns the "
+            "host-computed TalkBack reading order (focus_order: [{order, key, speak}] — what "
+            "TalkBack announces at each stop, e.g. 'Delete, button'), built from the ANI child "
+            "order + traversal_before/after, with reading_order_diagnostics for cycles and "
+            "dangling targets. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1356,7 +1361,8 @@ def _device_density(serial: str) -> int:
 def _lint_fn():
     """Return inspector_widget.a11y_lint.lint_a11y if importable, else None.
 
-    correlate.inspect_node calls this as lint_fn(compose_roots, density_dpi) and
+    correlate.inspect_node calls this as lint_fn(roots, density_dpi) — the unified
+    a11y tree, or Compose-semantics roots for a lint that only takes those — and
     expects a list[dict] of findings.
     """
     try:
@@ -1416,11 +1422,14 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
     session = SESSIONS.get_or_attach(serial, package)
     image_path = _tmp_png_path(serial, package, "dossier") if include_image else None
-    dossier = correlate.inspect_node(
-        session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
-        include_image=bool(include_image), image_path=image_path,
-        lint_fn=_lint_fn(), density=_device_density(serial),
-    )
+    try:
+        dossier = correlate.inspect_node(
+            session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
+            include_image=bool(include_image), image_path=image_path,
+            lint_fn=_lint_fn(), density=_device_density(serial),
+        )
+    except correlate.NodeKeyError as exc:
+        raise ToolError(str(exc)) from None
     if dossier is None:
         raise ToolError("no matching element found for the given selector")
     dossier.update({"serial": serial, "package": package})
@@ -1440,8 +1449,11 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
     session = SESSIONS.get_or_attach(serial, package)
     merged = correlate.inspect_tree(session, include_properties=False)
-    node = correlate.find_node(merged, node_key=node_key, view_id=vid,
-                               semantics_id=sid, bounds=bounds)
+    try:
+        node = correlate.find_node(merged, node_key=node_key, view_id=vid,
+                                   semantics_id=sid, bounds=bounds)
+    except correlate.NodeKeyError as exc:
+        raise ToolError(str(exc)) from None
     if node is None:
         raise ToolError("no matching element found for the given selector")
     out = _tmp_png_path(serial, package, "component")
@@ -1491,12 +1503,15 @@ TOOLS.update({
         "handler": _h_inspect,
         "description": (
             "The integrated merged tree for the whole screen: walks the View hierarchy as the "
-            "spine, grafts Compose subtrees under their AndroidComposeView host, and attaches "
-            "accessibility facets, correlated by uniqueDrawingId / Compose semanticsId / "
-            "a11y host_view_id+virtual_id (bounds-IoU fallback). Each node carries optional "
-            "view{}, compose{}, a11y{}, image_ref{} and a correlation_confidence "
-            "(exact|overlap|none), plus a summary of counts. Set include_overlay=true to also "
-            "render a labelled, color-coded overlay PNG."
+            "spine, grafts every ComposeView (RecyclerView cells and ones nested in AndroidView "
+            "included) under its AndroidComposeView, re-homes AndroidView content under the "
+            "Compose node hosting it, and attaches accessibility facets joined on (View id) / "
+            "(ComposeView id, semantics id), with a same-window one-to-one bounds fallback. "
+            "Keys: view:<id>, compose:<acvId>:<semanticsId>, composeview:<acvId>. Each node "
+            "carries optional view{}, compose{}, a11y{} (incl. its TalkBack order), list_item{} "
+            "(list + row), image_ref{} and a correlation_confidence (exact|overlap|none); the "
+            "summary carries counts and a generation that changes when Compose re-mints ids. "
+            "Set include_overlay=true to also render a labelled, color-coded overlay PNG."
         ),
         "schema": {
             "type": "object",
@@ -1515,11 +1530,14 @@ TOOLS.update({
     "inspect_node": {
         "handler": _h_inspect_node,
         "description": (
-            "Full dossier for ONE element, selected by node_key ('view:<id>' | 'compose:<id>'), "
-            "view_id (uniqueDrawingId), semantics_id (Compose), or bounds {x,y,w,h} (deepest "
-            "covering element). Returns all facets fully populated (view attributes+properties, "
-            "full a11y, compose attrs/source) plus its component image (SKP cut by graphicsLayer "
-            "layerId, else BITMAP crop) saved to a PNG path, plus focused a11y lint findings."
+            "Full dossier for ONE element, selected by node_key ('view:<id>' | "
+            "'compose:<acvId>:<semanticsId>' | 'composeview:<acvId>'), view_id (uniqueDrawingId), "
+            "semantics_id (only when a single ComposeView has it), or bounds {x,y,w,h} (deepest "
+            "covering element). A Compose key from an earlier dump is re-resolved after "
+            "recomposition (resolved_from). Returns all facets fully populated (view "
+            "attributes+properties, full a11y, compose attrs/source), where/context (window > "
+            "list row > ComposeView > node), its component image (SKP cut by graphicsLayer "
+            "layerId, else BITMAP crop) saved to a PNG path, and the lint findings for this node."
         ),
         "schema": {
             "type": "object",
@@ -1527,11 +1545,15 @@ TOOLS.update({
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "node_key": {"type": "string",
-                    "description": "'view:<uniqueDrawingId>' or 'compose:<semanticsId>'."},
+                    "description": "'view:<uniqueDrawingId>', 'compose:<acvId>:<semanticsId>' or "
+                                   "'composeview:<acvId>' (node_key from inspect / "
+                                   "dump_accessibility)."},
                 "view_id": {"type": "integer",
                     "description": "A view's uniqueDrawingId (the 'id' from dump_tree/inspect)."},
                 "semantics_id": {"type": "integer",
-                    "description": "A Compose node's semantics id (the 'id' from dump_compose)."},
+                    "description": "A Compose node's semantics id (the 'id' from dump_compose); "
+                                   "ambiguous when several ComposeViews use it, so prefer "
+                                   "node_key."},
                 "bounds": _BOUNDS_SCHEMA,
                 "include_image": {"type": "boolean", "default": True,
                     "description": "Cut and save the component image (result.component_image.path)."},
@@ -1553,7 +1575,9 @@ TOOLS.update({
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "node_key": {"type": "string", "description": "'view:<id>' | 'compose:<id>'."},
+                "node_key": {"type": "string",
+                    "description": "'view:<id>' | 'compose:<acvId>:<semanticsId>' | "
+                                   "'composeview:<acvId>'."},
                 "view_id": {"type": "integer", "description": "A view's uniqueDrawingId."},
                 "semantics_id": {"type": "integer", "description": "A Compose node's semantics id."},
                 "bounds": _BOUNDS_SCHEMA,

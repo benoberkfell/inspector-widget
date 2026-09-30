@@ -229,13 +229,13 @@ def cmd_a11y(args) -> int:
                     f.write(text)
                 print(f"wrote a11y JSON to {args.json}", file=sys.stderr)
         else:
-            order = [e for e in data.get("focus_order", []) if e.get("is_focus_stop")]
+            order = data.get("focus_order", [])
             if not order:
                 print("(no screen-reader focus stops found)")
             for e in order:
-                b = e.get("bounds") or {}
-                print(f"{e['order']:>3}. {e.get('speakable') or '<no label>'} "
-                      f"({b.get('x',0)},{b.get('y',0)} {b.get('w',0)}x{b.get('h',0)})")
+                print(f"{e['order']:>3}. {e.get('speak') or '<no label>'}  [{e.get('key')}]")
+            for diag in data.get("reading_order_diagnostics", []):
+                print(f"a11y: reading order: {diag.get('message')}", file=sys.stderr)
 
         if args.overlay:
             findings = None
@@ -262,7 +262,8 @@ def cmd_a11y(args) -> int:
                 scale=(float(shot.screenshot.scale) or args.scale))
             os.remove(base)
             print(f"wrote a11y overlay -> {args.overlay} "
-                  f"({summary['boxes']} boxes, {summary['flagged']} flagged)", file=sys.stderr)
+                  f"({summary['boxes']} boxes, {summary['flagged']} flagged, "
+                  f"{summary['flagged_by_bounds']} by finding bounds)", file=sys.stderr)
     finally:
         inj.close()
     return 0
@@ -403,12 +404,16 @@ def cmd_inspect_node(args) -> int:
     node_key, view_id, semantics_id, bounds = _node_selector(args)
     session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
-        dossier = correlate.inspect_node(
-            session, node_key=node_key, view_id=view_id,
-            semantics_id=semantics_id, bounds=bounds,
-            include_image=not args.no_image,
-            lint_fn=lintmod.lint_a11y,
-            density=adb.display_density(args.serial))
+        try:
+            dossier = correlate.inspect_node(
+                session, node_key=node_key, view_id=view_id,
+                semantics_id=semantics_id, bounds=bounds,
+                include_image=not args.no_image,
+                lint_fn=lintmod.lint_a11y,
+                density=adb.display_density(args.serial))
+        except correlate.NodeKeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         if dossier is None:
             print("error: no matching element found for the given selector", file=sys.stderr)
             return 1
@@ -428,8 +433,12 @@ def cmd_component_image(args) -> int:
     session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
         merged = correlate.inspect_tree(session, include_properties=False)
-        node = correlate.find_node(merged, node_key=node_key, view_id=view_id,
-                                   semantics_id=semantics_id, bounds=bounds)
+        try:
+            node = correlate.find_node(merged, node_key=node_key, view_id=view_id,
+                                       semantics_id=semantics_id, bounds=bounds)
+        except correlate.NodeKeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         if node is None:
             print("error: no matching element found for the given selector", file=sys.stderr)
             return 1
@@ -496,7 +505,8 @@ def _add_build_out_arg(sp):
 
 def _add_selector_args(sp):
     """Add the shared element-selector group used by inspect-node / component-image."""
-    sp.add_argument("--node-key", help="'view:<uniqueDrawingId>' or 'compose:<semanticsId>'")
+    sp.add_argument("--node-key", help="'view:<uniqueDrawingId>', 'compose:<acvId>:<semanticsId>' "
+                                       "or 'composeview:<acvId>' (from inspect / a11y)")
     sp.add_argument("--view-id", type=int, help="a view's uniqueDrawingId (the 'id' from dump)")
     sp.add_argument("--semantics-id", type=int, help="a Compose node's semantics id")
     sp.add_argument("--bounds", metavar="x,y,w,h",

@@ -94,8 +94,13 @@ Run two tools:
   virtual nodes in one tree. Each node carries text / contentDescription /
   stateDescription / role, all a11y state flags, on-screen bounds, decoded
   actions (CLICK, SCROLL_FORWARD, SET_PROGRESS, …), and collection/range info.
-  It also returns the host-computed **TalkBack reading order** (`focus_order`),
-  honoring `traversalBefore`/`traversalAfter` plus geometry. Read this to
+  It also returns the host-computed **TalkBack reading order** (`focus_order`:
+  `[{order, key, speak}]`, one entry per focus stop with what TalkBack
+  announces there, e.g. `"Delete, button"` or `"Unlabeled, checkbox, not
+  checked"`), built from the accessibility child order plus
+  `traversalBefore`/`traversalAfter` (`reading_order_diagnostics` reports
+  cycles and dangling targets); every node has a `node_key` you can pass to
+  `inspect_node`. Read this to
   understand what gets announced and in what order.
 - **`a11y_lint(serial, package)`** — the rule engine. Returns `findings[]`, each
   with a `rule` id, `severity` (`error` | `warn` | `info`), the `node`
