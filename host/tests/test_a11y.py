@@ -27,10 +27,11 @@ def test_action_name_standard_ids():
 
 
 def test_action_name_rid_backed_ids():
-    # android.R.id.accessibilityAction* values.
-    assert a11y.action_name(0x0102003F) == "SCROLL_UP"
-    assert a11y.action_name(0x01020041) == "SCROLL_DOWN"
-    assert a11y.action_name(0x01020055) == "SCROLL_IN_DIRECTION"
+    # android.R.id.accessibilityAction* values (from the SDK's android.jar).
+    assert a11y.action_name(0x01020036) == "SHOW_ON_SCREEN"
+    assert a11y.action_name(0x01020038) == "SCROLL_UP"
+    assert a11y.action_name(0x0102003A) == "SCROLL_DOWN"
+    assert a11y.action_name(0x0102005E) == "SCROLL_IN_DIRECTION"
 
 
 def test_action_name_custom_prefers_label():
