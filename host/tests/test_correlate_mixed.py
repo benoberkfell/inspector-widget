@@ -331,3 +331,30 @@ def test_attribution_of_a_list_item_itself():
     att = correlate.attribution(merged, correlate.find_node(merged, node_key="view:50"))
     assert att["context"]["row"] == 3 and att["context"]["list"] == "view:20"
     assert att["where"].endswith("row 3: view:50 LinearLayout")
+
+
+def test_inspect_node_prefers_the_unified_tree_for_lint(fake_session):
+    seen = []
+
+    def unified_lint(roots, density):
+        seen.append(type(roots).__name__)
+        if isinstance(roots, dict):  # the unified a11y tree: findings carry typed keys
+            assert roots["windows"][0]["root"]["node_key"] == "view:2"
+            return mf.typed_findings()
+        return []
+
+    d = correlate.inspect_node(fake_session, node_key="view:52", include_image=False,
+                               lint_fn=unified_lint)
+    assert seen == ["dict"]
+    assert [f["rule"] for f in d["lint"]] == ["a11y.image.no_description"]
+
+
+def test_inspect_node_falls_back_to_compose_roots_for_a_compose_only_lint(fake_session):
+    def compose_only_lint(roots, density):
+        if isinstance(roots, dict):
+            raise AttributeError("'str' object has no attribute 'get'")  # pre-unified lint
+        return mf.untyped_compose_findings()
+
+    d = correlate.inspect_node(fake_session, node_key="compose:42:3", include_image=False,
+                               lint_fn=compose_only_lint)
+    assert [f["node"]["node_key"] for f in d["lint"]] == ["compose:42:3"]

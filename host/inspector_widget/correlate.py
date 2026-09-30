@@ -1140,7 +1140,8 @@ def _a11y_roots(data: Any) -> List[dict]:
     return []
 
 
-def _merge_session(session: Any, props: bool) -> Tuple[MergedTree, List[dict]]:
+def _merge_session(session: Any, props: bool) -> Tuple[MergedTree, List[dict], List[dict]]:
+    """Fetch the three trees and merge them; returns (merged, compose windows, a11y roots)."""
     view_roots, prop_map = _shaped_view_tree(session, props)
     compose_windows = _shaped_compose(session)
     a11y_roots = _shaped_a11y(session)
@@ -1152,7 +1153,7 @@ def _merge_session(session: Any, props: bool) -> Tuple[MergedTree, List[dict]]:
         "a11y": bool(a11y_roots),
     }
     merged.registry = registry_for(session)
-    return merged, compose_windows
+    return merged, compose_windows, a11y_roots
 
 
 def inspect_tree(session: Any, include_properties: bool = False) -> Dict[str, Any]:
@@ -1163,7 +1164,7 @@ def inspect_tree(session: Any, include_properties: bool = False) -> Dict[str, An
     Compose keys are recorded in the session's registry so a later :func:`find_node` /
     :func:`inspect_node` can re-resolve them after recomposition.
     """
-    merged, _ = _merge_session(session, include_properties)
+    merged, _, _ = _merge_session(session, include_properties)
     merged.registry.record(merged)
     return merged
 
@@ -1294,7 +1295,7 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
                  view_id: Optional[int] = None, semantics_id: Optional[int] = None,
                  bounds: Optional[dict] = None, include_image: bool = True,
                  image_path: Optional[str] = None,
-                 lint_fn: Optional[Callable[[List[dict], int], List[dict]]] = None,  # (compose_roots, density_dpi) -> List[dict]
+                 lint_fn: Optional[Callable[[Any, int], List[dict]]] = None,  # (roots, density_dpi) -> List[dict]
                  density: float = 0.0) -> Optional[Dict[str, Any]]:
     """Full dossier for ONE element (integ.md §1.4).
 
@@ -1305,11 +1306,16 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
     ComposeView (``where`` + ``context``), cuts its component image, and attaches the lint
     findings that target it by typed key (if ``lint_fn`` provided).
 
+    ``lint_fn(roots, density_dpi) -> [finding dicts]`` is first given the unified a11y
+    tree (``{"windows": [{"root_view_id", "root"}]}``, the ``a11y.a11y_to_dict`` shape,
+    so View findings are included); a lint that only understands Compose-semantics
+    roots (it raises on that input) is called again with those.
+
     Raises :class:`NodeKeyError` for an ambiguous bare ``compose:<id>`` / ``semantics_id``
     or a stale Compose key that cannot be re-resolved.
     """
     # Build with properties so view.properties is available for the target.
-    merged, compose_windows = _merge_session(session, props=True)
+    merged, compose_windows, a11y_roots = _merge_session(session, props=True)
     registry = merged.registry
     try:
         node = find_node(merged, node_key=node_key, view_id=view_id,
@@ -1345,19 +1351,35 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
         img_dest = image_path or _tmp_png("dossier")
         dossier["component_image"] = component_image(session, node, out_path=img_dest)
 
-    # Focused lint: run over the compose-semantics tree, then keep the findings whose
-    # TYPED key is one of this node's keys (never a bare int across id spaces).
-    compose_roots = [w.get("root") for w in compose_windows if w.get("root")]
-    if lint_fn is not None and compose_roots:
-        try:
-            all_findings = lint_fn(compose_roots, density) or []
-        except Exception:
-            all_findings = []
+    # Focused lint: keep the findings whose TYPED key is one of this node's keys (never
+    # a bare int across id spaces).
+    if lint_fn is not None:
+        all_findings = _run_lint_fn(lint_fn, a11y_roots, compose_windows, density)
         tag_compose_findings(all_findings, compose_windows)
         keys = node_typed_keys(node)
         dossier["lint"] = [f for f in all_findings if _finding_matches(f, keys)]
 
     return dossier
+
+
+def _run_lint_fn(lint_fn: Callable[[Any, int], List[dict]], a11y_roots: List[dict],
+                 compose_windows: List[dict], density: float) -> List[dict]:
+    """Lint the unified a11y tree, else (a Compose-only lint) the Compose-semantics roots."""
+    if a11y_roots:
+        unified = {"windows": [{"root_view_id": _a11y_host(r), "root": r} for r in a11y_roots]}
+        try:
+            out = lint_fn(unified, density)
+            if isinstance(out, list):
+                return out
+        except Exception:
+            pass
+    compose_roots = [w.get("root") for w in compose_windows if w.get("root")]
+    if not compose_roots:
+        return []
+    try:
+        return lint_fn(compose_roots, density) or []
+    except Exception:
+        return []
 
 
 def _fetch_properties(session: Any, view_id: int) -> Optional[list]:

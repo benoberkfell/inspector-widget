@@ -1361,7 +1361,8 @@ def _device_density(serial: str) -> int:
 def _lint_fn():
     """Return inspector_widget.a11y_lint.lint_a11y if importable, else None.
 
-    correlate.inspect_node calls this as lint_fn(compose_roots, density_dpi) and
+    correlate.inspect_node calls this as lint_fn(roots, density_dpi) — the unified
+    a11y tree, or Compose-semantics roots for a lint that only takes those — and
     expects a list[dict] of findings.
     """
     try:
