@@ -29,7 +29,10 @@ scripts/build.sh
 ```
 
 `scripts/build.sh` builds `libviewspector.so`, `bootstrap.dex` and
-`payload.jar` into `build-out/`.
+`payload.jar` into `build-out/`, plus `BUILD_ID` (the sha256 of `payload.jar`).
+A running agent reports the same hash in Hello (`agent_version` is
+`viewspector-0.1+<sha256>`); when it differs from the local `payload.jar`
+(you rebuilt), the host stops the old agent and injects the new one.
 
 The Python protobuf bindings (`host/inspector_widget/proto/view_inspection_pb2.py`,
 imported via `from .proto import view_inspection_pb2`) are checked in. After
@@ -78,6 +81,7 @@ Inspector Widget MCP server — self check
     libviewspector.so: OK
     bootstrap.dex: OK
     payload.jar: OK
+    build id: 0ba5e3f7633ef8fc14c17052bda5321d21b1f1b858210bfdbd443dd05aba3b24
 ```
 
 ---
@@ -105,6 +109,14 @@ Useful flags / env:
   Defaults to the checkout's `build-out/`; **required after a wheel install**,
   where the package lives in site-packages. The CLI's `--build-out DIR` is the
   per-command equivalent.
+- `ANDROID_SERIAL=SERIAL` — the device to use when a tool gets no `serial` (the
+  CLI: no `--serial`). Without it, the only attached device is used; with
+  several, the call fails and lists them.
+- `INSPECTOR_WIDGET_TIMEOUT=SECONDS` — per-request deadline for the agent
+  (default 30; screenshots, SKP capture, Compose/a11y dumps and `dump_tree`
+  with properties or a screenshot get 4x). A call that runs out returns an
+  error with a `hint` instead of hanging on a frozen app. `0` disables it (for
+  an app paused at a breakpoint). Legacy `VIEWSPECTOR_TIMEOUT` still works.
 
 Prerequisites at runtime:
 
@@ -176,13 +188,19 @@ claude mcp list          # shows "inspector-widget"
 
 All tools return JSON. String-table ids from the wire are resolved to text, so
 trees and properties are directly readable. Screenshots are written to temp PNG
-files and the **path** is returned (the image is not inlined).
+files and the **path** is returned (the image is not inlined). The PNGs live in
+one `inspector-widget-<pid>-*` directory under `$TMPDIR`, deleted when the
+server exits; copy a file elsewhere to keep it.
+
+`serial` is optional on every tool: it defaults to `$ANDROID_SERIAL`, else the
+only attached device. Arguments are checked against each tool's `inputSchema`
+before anything touches the device, the same way on every transport.
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
 | `list_devices` | — | `{devices:[{serial, api, abi, model, state}], count}` |
-| `list_processes` | `serial` | `{serial, processes:[{package, pid, running}], count}` — debuggable packages only; running apps first |
-| `attach` | `serial`, `package` | `{attached, api_level, abi, agent_version, window_count, session}` — injects if needed (idempotent); app must be running |
+| `list_processes` | `serial?` | `{serial, processes:[{package, pid, running}], count}` — debuggable packages only; running apps first |
+| `attach` | `serial?`, `package`, `force=false` | `{attached, pid, warm, reused, api_level, abi, agent_version, build_id, window_count, root_ids, session, note?}` — injects if needed (idempotent); app must be running. `warm`: the agent was already running; `reused`: this server's cached session was reused; `note` when that session runs an older build. `force=true` stops any running agent and injects a fresh one |
 | `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0` | `{roots:[ViewNode…], root_count, properties?, screenshot?}` — auto-attaches |
 | `get_properties` | `serial`, `package`, `view_id`, `include_resolution_stack=false` | `{view_id, group:{view_id, properties:[{name,type,value,is_layout?,source?,resolution_stack?}]}}` |
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
@@ -194,7 +212,7 @@ files and the **path** is returned (the image is not inlined).
 | `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation; can render the integrated overlay |
 | `inspect_node` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, view?, compose?, a11y?, component_image{path}, lint[]}` — `compose` carries source `file:line` + modifiers, `view` typed properties, `lint` the element-focused findings |
 | `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source}` — cropped PNG of one element (`source`: `skp` \| `bitmap_crop`) |
-| `detach` | `serial`, `package` | `{detached}` — shuts down the agent session, drops the cache |
+| `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach; never injects one to stop it); `shutdown=false` only drops this server's cached connection |
 
 ### Node shape (`dump_tree`)
 
@@ -240,5 +258,25 @@ ANIMATOR, INTERPOLATOR, DIMENSION`. Decoding:
 7. `detach(serial, package)` when done.
 
 Sessions are cached per `(serial, package)`; repeated calls reuse the live
-agent. Errors are returned as `{"error": "..."}` text content with the call
-flagged as an error, so the agent can read and recover.
+agent. A cached session is checked before each use (the connection is still
+open and the app still has the same pid); a dead one (the agent idled out, the
+app restarted, another client sent SHUTDOWN) is dropped and re-attached, and a
+call whose connection drops mid-way is retried once on a fresh attach. Errors
+are returned as `{"error": "...", "hint"?: "..."}` text content with the call
+flagged as an error, so the agent can read and recover; `hint` says where to
+look next (the agent's logcat, or the timeout setting). When the server exits
+it disconnects its sessions (removing their adb forwards) and leaves the
+agents running, so the next start re-attaches warm.
+
+### Session lifecycle (CLI and Python API)
+
+`inspector_widget.attach(serial=None, package, build_out=None,
+force_reinject=False)` returns a `Session`. `session.disconnect()` (also
+`close()` and leaving a `with` block) drops the connection and keeps the agent
+running; `session.shutdown()` stops the agent for every client;
+`session.is_alive()` says whether the session is still usable;
+`session.info()` has the pid, warm/cold and the agent's Hello. Every CLI
+subcommand disconnects when it finishes, so a CLI run never disturbs an MCP
+session on the same app; only `detach` stops the agent, and it never injects
+one just to stop it. `--force` (every injecting subcommand) and MCP
+`attach(force=true)` stop a running agent and inject a fresh one.

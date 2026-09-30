@@ -9,17 +9,22 @@ View/Compose tools you may reach for, and the MCP↔CLI mapping.
 
 ## MCP tools
 
-All take `serial` + `package` (except `list_devices`). All auto-attach. Images
-are written to temp PNG files and the **path** is returned (not inlined).
+All take `package` (except `list_devices` / `list_processes`) and an optional
+`serial` (default: `$ANDROID_SERIAL`, else the only attached device). All
+auto-attach, and re-attach on their own if the agent went away. Images are
+written to temp PNG files (deleted when the MCP server exits) and the **path**
+is returned (not inlined). A failed call returns `{error, hint?}`.
 
 ### Discovery / session
 - **`list_devices()`** → `{devices:[{serial, api, abi, model, state}], count}`.
 - **`list_processes(serial)`** → `{processes:[{package, pid, running}], count}` —
   debuggable apps only, running first.
-- **`attach(serial, package)`** → `{attached, api_level, abi, agent_version,
-  window_count, session}`. Optional warm-up; idempotent.
-- **`detach(serial, package)`** → `{detached}`. Ends the session, frees the
-  device. Safe even if not attached.
+- **`attach(serial, package, force=false)`** → `{attached, pid, warm, reused,
+  api_level, abi, agent_version, build_id, window_count, root_ids, session}`.
+  Optional warm-up; idempotent. `force=true` replaces a running agent.
+- **`detach(serial, package, shutdown=true)`** → `{detached, agent_stopped}`.
+  Stops the agent for every client; `shutdown=false` only drops this server's
+  connection. Safe even if not attached.
 
 ### Accessibility (the core of this skill)
 - **`dump_accessibility(serial, package, include_extras=true,
@@ -75,8 +80,10 @@ are written to temp PNG files and the **path** is returned (not inlined).
 
 ## CLI (host/cli.py)
 
-Stateless — each call re-injects and tears down. Run from the project root
-(adds its own dir to `sys.path`). Defaults: `--serial emulator-5554`.
+Each call connects to the running agent (injecting it the first time) and
+leaves it running when it exits; only `detach` stops it. Run from the project
+root (adds its own dir to `sys.path`). `--serial` defaults to `$ANDROID_SERIAL`,
+else the only attached device.
 
 ```
 python host/cli.py devices

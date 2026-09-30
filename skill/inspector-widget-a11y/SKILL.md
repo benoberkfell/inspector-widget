@@ -76,7 +76,7 @@ to confirm it cleared.
 2. `list_processes(serial)` → choose a running, debuggable `package`. Only
    debuggable apps appear; running apps are listed first.
 3. `attach(serial, package)` → confirms the agent is live and reports
-   `api_level`, `abi`, `agent_version`, `window_count`. This is optional —
+   `pid`, `api_level`, `abi`, `agent_version`, `window_count`. This is optional —
    every dump/lint/overlay tool **auto-attaches** — but calling it once up front
    surfaces connection problems early and warms the session.
 
