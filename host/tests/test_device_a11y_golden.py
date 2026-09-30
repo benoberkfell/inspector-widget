@@ -570,6 +570,45 @@ def check_compose_password_redaction(cap: Capture) -> None:
     assert "Password" in attrs, f"good_password has no Password semantics: {sorted(attrs)}"
 
 
+WIRE_DEPTH_CAP = 80  # WireLimits.MAX_TREE_DEPTH: every tree is cut at this many levels
+
+
+def _tree_depth(n: Dict[str, Any]) -> int:
+    return 1 + max((_tree_depth(c) for c in n.get("children") or []), default=0)
+
+
+def _flagged(n: Dict[str, Any], flag: str) -> int:
+    return int(flag in (n.get("flags") or [])) + sum(_flagged(c, flag) for c in n.get("children") or [])
+
+
+def check_deep_tree(cap: Capture) -> None:
+    """Trees deeper than the wire cap (DeepTree.kt nests 100 levels) arrive parseable, cut
+    at exactly the cap, with the cut marked on the node and named in the diagnostics."""
+    roots = cap.tree.get("roots") or []
+    assert max(_tree_depth(r) for r in roots) == WIRE_DEPTH_CAP, "View tree not cut at the cap"
+    assert sum(_flagged(r, "CHILDREN_TRUNCATED") for r in roots) >= 1
+    assert "depth-truncated=" in (cap.tree.get("diagnostics") or ""), cap.tree.get("diagnostics")
+    wins = [w["root"] for w in cap.a11y.get("windows") or [] if w.get("root")]
+    assert max(_tree_depth(r) for r in wins) == WIRE_DEPTH_CAP, "a11y tree not cut at the cap"
+    assert sum(_flagged(r, "children_truncated") for r in wins) >= 1
+    assert "depth-truncated=" in (cap.a11y.get("diagnostics") or ""), cap.a11y.get("diagnostics")
+    comp = [w["root"] for w in cap.compose.get("windows") or [] if w.get("root")]
+    assert max(_tree_depth(r) for r in comp) == WIRE_DEPTH_CAP, "Compose tree not cut at the cap"
+    assert "semantics_truncated:" in (cap.compose.get("diagnostics") or ""), cap.compose.get("diagnostics")
+
+
+def _below_view_cut(cap: Capture, n: Dict[str, Any], views: Dict[int, Dict[str, Any]]) -> bool:
+    """n's View is missing because the agent cut the View tree at its depth cap: the nearest
+    a11y ancestor that is in the View tree has a CHILDREN_TRUNCATED View under it (the a11y
+    tree skips unimportant Views, so it reaches deeper Views than the cut View tree)."""
+    p = cap.parent.get(id(n))
+    while p is not None and p.get("host_view_id") not in views:
+        p = cap.parent.get(id(p))
+    if p is None:
+        return False
+    return _flagged(views[p["host_view_id"]], "CHILDREN_TRUNCATED") > 0
+
+
 def check_dialog_reading_order(cap: Capture) -> None:
     """A modal dialog hides its activity from TalkBack: every stop is in the dialog."""
     wins = [w for w in cap.a11y.get("windows") or [] if w.get("root")]
@@ -664,6 +703,7 @@ COMPOSE_GOLDENS = [
     compose_scenario("custom_toggle", "good_custom_toggle",
                      bad=(E("bad_custom_toggle", R7),), good=(E("good_custom_toggle", R1, R2, R7),)),
     compose_scenario("password_field", "good_password", checks=(check_compose_password_redaction,)),
+    compose_scenario("deep_tree", "deep_tree", checks=(check_deep_tree,)),
 ]
 
 VIEW_GOLDEN = Golden(
@@ -822,7 +862,8 @@ def test_a11y_node_keys_are_unique_and_follow_the_id_contract(captures, sid):
             problems.append(f"is_virtual disagrees with virtual_id: {describe(n)}")
         host = views.get(n.get("host_view_id"))
         if host is None:
-            problems.append(f"host_view_id is not a View in the tree: {describe(n)}")
+            if not _below_view_cut(cap, n, views):
+                problems.append(f"host_view_id is not a View in the tree: {describe(n)}")
             continue
         if virtual and not str(host.get("qualified_name") or host.get("class_name")).endswith("AndroidComposeView"):
             problems.append(f"virtual node hosted by a {host.get('class_name')}, not an AndroidComposeView: {describe(n)}")
