@@ -255,7 +255,12 @@ def test_dump_windows_carry_window_info(agent):
     assert (main["window_type"], main["window_flags"], main["z"]) == (1, "0x81810100", 0)
     assert main["frame"] == {"x": 0, "y": 0, "w": 360, "h": 640}
     assert main["insets"]["status_bars"] == {"left": 0, "top": 24, "right": 0, "bottom": 0,
-                                             "visible": True}
+                                             "visible": True,
+                                             "rects": [{"x": 0, "y": 0, "w": 360, "h": 24}]}
+    # Visible status + navigation bars, in screen px (the IME is hidden, so not listed).
+    assert main["obscured"] == [{"x": 0, "y": 0, "w": 360, "h": 24},
+                                {"x": 0, "y": 592, "w": 360, "h": 48}]
+    assert popup["frame"] == {"x": 40, "y": 560, "w": 280, "h": 64}
     assert main["modal"] is True and popup["modal"] is False and "title" not in popup
     assert "covered_by" not in main  # the popup is not modal
 
@@ -297,3 +302,18 @@ def test_session_focus_and_act(fake_device):
             s.a11y_act(node_key="compose:5")
         with pytest.raises(ValueError, match="needs node_key or host_view_id"):
             s.a11y_act()
+
+
+def test_inset_rects_follow_the_frame_edges():
+    from inspector_widget import strings
+    info = pb.WindowInfo(window_type=2)
+    info.frame.layout.x, info.frame.layout.y, info.frame.layout.w, info.frame.layout.h = (10, 20, 100, 200)
+    info.ime.bottom, info.ime.visible = 50, True
+    info.display_cutout.left, info.display_cutout.visible = 8, True
+    info.navigation_bars.right, info.navigation_bars.visible = 12, False
+    out = strings.window_info_to_dict(info, strings.StringResolver(pb.Strings()))
+    assert out["insets"]["ime"]["rects"] == [{"x": 10, "y": 170, "w": 100, "h": 50}]
+    assert out["insets"]["display_cutout"]["rects"] == [{"x": 10, "y": 20, "w": 8, "h": 200}]
+    assert out["insets"]["navigation_bars"]["rects"] == [{"x": 98, "y": 20, "w": 12, "h": 200}]
+    # Only visible bars / IME obscure the window; a display cutout is not a window.
+    assert out["obscured"] == [{"x": 10, "y": 170, "w": 100, "h": 50}]

@@ -359,6 +359,7 @@ message A11yFocusResponse {
   int64 dropped = 11;              // events after after_seq that fell out of the buffer
   bool touch_exploration = 12;     // AccessibilityManager.isTouchExplorationEnabled()
   bool services_enabled = 13;      // an accessibility service is enabled
+  int64 read_uptime_ms = 14;       // SystemClock.uptimeMillis() at the read (compare with events)
 }
 
 // An action on one node, shared by every command that acts on the UI. Values map to

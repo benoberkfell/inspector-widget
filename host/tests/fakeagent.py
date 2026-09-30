@@ -1135,6 +1135,7 @@ class FakeAgent:
         out.timed_out = wait > 0 and not seen
         out.waited_ms = waited if wait > 0 else 0
         out.read_us = 120
+        out.read_uptime_ms = int(time.monotonic() * 1000)
         out.touch_exploration = self.touch_exploration
         out.services_enabled = self.services_enabled
         out.diagnostics = "; ".join(diag)

@@ -38,6 +38,7 @@ package com.oberkfell.viewspector.agent.payload
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.accessibility.AccessibilityManager
@@ -108,6 +109,7 @@ object A11yFocus {
         val input: ViewInspection.A11yFocus?,
         val seq: Long,
         val readUs: Int,
+        val uptimeMs: Long,
         val touchExploration: Boolean,
         val servicesEnabled: Boolean,
         val diagnostics: String,
@@ -205,6 +207,9 @@ object A11yFocus {
         val added = A11yEventTap.ensureInstalled(roots)
         val diag = StringBuilder("roots=${roots.size}")
         if (added > 0) diag.append("; event-tap +$added (${A11yEventTap.installedCount()} tapped)")
+        if (A11yEventTap.foreignUnwrapped > 0) {
+            diag.append("; event-tap replaced ${A11yEventTap.foreignUnwrapped} earlier payload tap(s)")
+        }
         val depth = subtreeDepth.coerceIn(0, MAX_SUBTREE_DEPTH)
         // Lift the taps while mapping, so a focused root reports its own importance.
         val (a11y, input) = A11yEventTap.withoutTap {
@@ -215,7 +220,7 @@ object A11yFocus {
         val seq = A11yEventTap.seq()
         val (touch, services) = a11yState(roots)
         val readUs = ((System.nanoTime() - t0) / 1000L).toInt()
-        return Read(a11y, input, seq, readUs, touch, services, diag.toString())
+        return Read(a11y, input, seq, readUs, SystemClock.uptimeMillis(), touch, services, diag.toString())
     }
 
     private fun readA11y(

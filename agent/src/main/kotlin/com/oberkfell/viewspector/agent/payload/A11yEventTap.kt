@@ -107,11 +107,16 @@ object A11yEventTap {
     // --- installed taps, main thread only ----------------------------------------------
     private val taps = WeakHashMap<View, Tap>()
 
+    /** Taps left by an earlier payload that [ensureInstalled] replaced (they were not removed). */
+    var foreignUnwrapped = 0
+        private set
+
     /**
      * The forwarding delegate. [original] is the root's delegate before the tap (null = the
-     * platform default), restored on uninstall.
+     * platform default), restored on uninstall. It keeps no reference to its root (the host
+     * passed to each call is the root), so [taps] stays weak.
      */
-    private class Tap(val root: View, val original: View.AccessibilityDelegate?) :
+    private class Tap(val original: View.AccessibilityDelegate?) :
         View.AccessibilityDelegate() {
 
         override fun onRequestSendAccessibilityEvent(
@@ -125,7 +130,7 @@ object A11yEventTap {
                 super.onRequestSendAccessibilityEvent(host, child, event)
             }
             // Only what goes on to the ViewRootImpl reaches an accessibility service.
-            if (propagate) record(root, event)
+            if (propagate) record(host, event)
             return propagate
         }
 
@@ -134,13 +139,13 @@ object A11yEventTap {
             // afterwards on API 33+, where AccessibilityEvent.recycle() is a no-op; before that
             // the system may recycle it on the way out, so read what is there up front.
             val early = Build.VERSION.SDK_INT < 33
-            if (early) record(root, event)
+            if (early) record(host, event)
             if (original != null) {
                 original.sendAccessibilityEventUnchecked(host, event)
             } else {
                 super.sendAccessibilityEventUnchecked(host, event)
             }
-            if (!early) record(root, event)
+            if (!early) record(host, event)
         }
 
         override fun sendAccessibilityEvent(host: View, eventType: Int) {
@@ -201,7 +206,7 @@ object A11yEventTap {
             }
             val existing = taps[root]
             if (existing != null && current === existing) continue
-            val tap = Tap(root, unwrapForeign(current))
+            val tap = Tap(unwrapForeign(current))
             try {
                 root.accessibilityDelegate = tap
                 taps[root] = tap
@@ -226,7 +231,10 @@ object A11yEventTap {
         }
         return try {
             val f = delegate.javaClass.getDeclaredField("original").also { it.isAccessible = true }
-            f.get(delegate) as? View.AccessibilityDelegate
+            (f.get(delegate) as? View.AccessibilityDelegate).also {
+                foreignUnwrapped++
+                Log.w(TAG, "event tap: replaced a tap an earlier payload left on a window root")
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "event tap: could not unwrap an earlier payload's tap", t)
             delegate
@@ -255,12 +263,12 @@ object A11yEventTap {
      * taps back. Main thread: nothing else runs on it meanwhile, so no event is missed.
      */
     fun <T> withoutTap(block: () -> T): T {
-        val lifted = ArrayList<Tap>()
+        val lifted = ArrayList<Pair<View, Tap>>()
         for ((root, tap) in taps.entries) {
             try {
                 if (root.accessibilityDelegate === tap) {
                     root.accessibilityDelegate = tap.original
-                    lifted.add(tap)
+                    lifted.add(root to tap)
                 }
             } catch (_: Throwable) {
             }
@@ -268,9 +276,9 @@ object A11yEventTap {
         try {
             return block()
         } finally {
-            for (tap in lifted) {
+            for ((root, tap) in lifted) {
                 try {
-                    if (tap.root.accessibilityDelegate === tap.original) tap.root.accessibilityDelegate = tap
+                    if (root.accessibilityDelegate === tap.original) root.accessibilityDelegate = tap
                 } catch (_: Throwable) {
                 }
             }

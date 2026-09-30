@@ -430,7 +430,7 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
         {"windows": [{"root_view_id", "root": <node>|None,
                       "window_type"?, "window_flags"?, "modal"?, "covered_by"?,
                       "title"?, "layout_title"?, "frame"?, "z"?, "has_window_focus"?,
-                      "display_id"?, "insets"?}, ...],
+                      "display_id"?, "insets"?, "obscured"?}, ...],
          "focus_order": [{"order", "key", "id", "speak"}, ...],   # focus stops only
          "generation": "g...",                      # changes when Compose re-mints ids
          "summary": {"windows", "nodes", "focus_stops", "ignored_by_talkback"?},
@@ -1426,6 +1426,7 @@ def a11y_focus_to_dict(response: "pb.A11yFocusResponse") -> Dict[str, Any]:
          "input"?: <focus>|None,      # when include_input_focus was set
          "seq": int,                  # pass as the next after_seq
          "focus_event": bool, "timed_out": bool, "waited_ms": int, "read_us": int,
+         "read_uptime_ms": int,       # device uptime at the read (events carry uptime_ms)
          "touch_exploration": bool, "services_enabled": bool,
          "events": [<event>, ...],    # seq > after_seq, oldest first
          "dropped"?: int, "diagnostics"?: str}
@@ -1446,6 +1447,7 @@ def a11y_focus_to_dict(response: "pb.A11yFocusResponse") -> Dict[str, Any]:
         "timed_out": response.timed_out,
         "waited_ms": response.waited_ms,
         "read_us": response.read_us,
+        "read_uptime_ms": response.read_uptime_ms,
         "touch_exploration": response.touch_exploration,
         "services_enabled": response.services_enabled,
         "events": [a11y_event_to_dict(e, resolver) for e in response.events],

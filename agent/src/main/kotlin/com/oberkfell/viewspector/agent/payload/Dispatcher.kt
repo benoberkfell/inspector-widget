@@ -311,6 +311,7 @@ class Dispatcher(private val deviceLock: Any = Any()) {
             .setTimedOut(wait.timedOut)
             .setWaitedMs(wait.waitedMs)
             .setReadUs(read.readUs)
+            .setReadUptimeMs(read.uptimeMs)
             .setTouchExploration(read.touchExploration)
             .setServicesEnabled(read.servicesEnabled)
             .setDiagnostics(diag.toString())
