@@ -52,8 +52,11 @@ are written to temp PNG files and the **path** is returned (not inlined).
 
 ### Compose / View (context, not a11y-specific)
 - **`dump_compose(serial, package, include_semantics=true,
-  include_slot_table=true, enable_inspection=true)`** → Compose semantics tree +
-  slot-table composables with `file:line`. The layer `dump_tree` cannot see.
+  include_slot_table=true, enable_inspection=false)`** → Compose semantics tree;
+  slot-table composables with `file:line` only if inspection is already on or you pass
+  `enable_inspection=true`. That hot-reloads and **resets `remember{}` state** (open
+  dialogs, typed text, scroll, toggles) and re-mints Compose node ids, so do it before
+  reproducing a state-dependent bug, not after. The layer `dump_tree` cannot see.
 - **`compose_overlay(serial, package, scale=1.0, all_boxes=false)`** → screenshot
   with every on-screen Compose element boxed (text/role + bounds) + a flat
   on-screen text list.

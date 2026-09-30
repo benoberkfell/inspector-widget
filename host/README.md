@@ -20,24 +20,25 @@ responses into agent-friendly JSON (string-table ids resolved to text).
 
 ## 1. Build
 
-Everything (native `.so`, `bootstrap.dex`, `payload.jar`, and the generated
-Python protobuf module) is produced by the top-level build script:
+The device artifacts (native `.so`, `bootstrap.dex`, `payload.jar`) are
+produced by the top-level build script:
 
 ```bash
 # from the repo root
 scripts/build.sh
 ```
 
-`scripts/build.sh` is responsible for:
+`scripts/build.sh` builds `libviewspector.so`, `bootstrap.dex` and
+`payload.jar` into `build-out/`.
 
-1. Generating Python protobuf bindings into `host/inspector_widget/proto`:
-   ```bash
-   protoc --proto_path=proto --python_out=host/inspector_widget/proto proto/view_inspection.proto
-   # -> host/inspector_widget/proto/view_inspection_pb2.py
-   ```
-   the package imports it via `from .proto import view_inspection_pb2`.
-2. Building the device artifacts into `build-out/`:
-   `libviewspector.so`, `bootstrap.dex`, `payload.jar`.
+The Python protobuf bindings (`host/inspector_widget/proto/view_inspection_pb2.py`,
+imported via `from .proto import view_inspection_pb2`) are checked in. After
+changing `proto/view_inspection.proto`, regenerate them with
+`host/generate_proto.sh` (or `make -C host proto`). It requires **protoc 33.x**,
+the release the checked-in gencode and the `protobuf>=6.33.5,<7` runtime pin
+expect, and refuses any other major (protoc 34+ emits 7.x gencode that the pinned
+runtime can't import). `PROTOC="python -m grpc_tools.protoc"` with
+`grpcio-tools==1.81.0` provides protoc 33.5 without a system install.
 
 ### Python environment
 
@@ -61,15 +62,22 @@ MCP implementation — but installing `mcp` is recommended.
 python host/mcp_server.py --self-check
 ```
 
-This prints the tool surface and whether `inspector_widget`,
-`view_inspection_pb2`, and the `mcp` SDK are importable. Example:
+This prints the tool surface, whether `inspector_widget`,
+`view_inspection_pb2`, and the optional dependencies are importable, and where the
+device artifacts are looked up (a missing artifact is a warning, not a failure). Example:
 
 ```
 Inspector Widget MCP server — self check
-  tools: list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image
+  tools (15): list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image
   inspector_widget: OK
   view_inspection_pb2: OK
-  mcp SDK: present (will use real MCP transport)
+  mcp SDK: 1.30.0 OK (real MCP transport)
+  Pillow: 12.3.0 OK
+  grpcio: 1.84.0 OK
+  artifacts: /path/to/inspector-widget/build-out (from default)
+    libviewspector.so: OK
+    bootstrap.dex: OK
+    payload.jar: OK
 ```
 
 ---
@@ -87,15 +95,22 @@ host/.venv/bin/python host/mcp_server.py --self-check
 Useful flags / env:
 
 - `--self-check` — print the tool surface and dependency status (mcp SDK, Pillow, grpcio,
-  with the tools each missing one degrades), then exit. Exits 1 if the host package,
-  the proto gencode, or the installed mcp SDK is broken.
+  with the tools each missing one degrades) and where the device artifacts were
+  found, then exit. Exits 1 if the host package, the proto gencode, or the installed
+  mcp SDK is broken; missing artifacts are only a warning.
 - `--log-level DEBUG|INFO|WARNING|ERROR` (or `INSPECTOR_WIDGET_LOG=DEBUG`) — log
   verbosity (to stderr).
+- `INSPECTOR_WIDGET_ARTIFACTS=DIR` — where to read `libviewspector.so`,
+  `bootstrap.dex` and `payload.jar` (legacy `VIEWSPECTOR_ARTIFACTS` still works).
+  Defaults to the checkout's `build-out/`; **required after a wheel install**,
+  where the package lives in site-packages. The CLI's `--build-out DIR` is the
+  per-command equivalent.
 
 Prerequisites at runtime:
 
 - `adb` on `PATH` and a device/emulator connected.
-- The device artifacts present in `build-out/` (`scripts/build.sh`).
+- The device artifacts built by `scripts/build.sh`, in `build-out/` or wherever
+  `INSPECTOR_WIDGET_ARTIFACTS` points.
 - The target app **running** and **debuggable** before `attach`/`dump_tree`.
 
 ---
@@ -131,14 +146,25 @@ Equivalent explicit JSON config (e.g. for `~/.claude.json` / an MCP client's
         "<REPO>/host/.venv/bin/python",
         "<REPO>/host/mcp_server.py"
       ],
-      "env": { "INSPECTOR_WIDGET_LOG": "WARNING" }
+      "env": {
+        "INSPECTOR_WIDGET_LOG": "WARNING",
+        "INSPECTOR_WIDGET_ARTIFACTS": "<REPO>/build-out"
+      }
     }
   }
 }
 ```
 
 If you installed `protobuf`/`mcp` into your system Python instead of a venv,
-use that interpreter as `command`. Verify with:
+use that interpreter as `command`. If you installed the wheel (so the
+`inspector-widget-mcp` console script is on `PATH`), register that and tell it
+where the artifacts are, since it can't find the checkout on its own:
+
+```bash
+claude mcp add inspector-widget -e INSPECTOR_WIDGET_ARTIFACTS="$PWD/build-out" -- inspector-widget-mcp
+```
+
+Verify with:
 
 ```bash
 claude mcp list          # shows "inspector-widget"
@@ -160,7 +186,7 @@ files and the **path** is returned (the image is not inlined).
 | `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0` | `{roots:[ViewNode…], root_count, properties?, screenshot?}` — auto-attaches |
 | `get_properties` | `serial`, `package`, `view_id`, `include_resolution_stack=false` | `{view_id, group:{view_id, properties:[{name,type,value,is_layout?,source?,resolution_stack?}]}}` |
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
-| `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=true` | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
+| `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
 | `compose_overlay` | `serial`, `package`, `scale=1.0`, `all_boxes=false` | `{path, boxes, …}` — screenshot with every on-screen Compose element boxed (text/role + bounds) + a flat on-screen text list |
 | `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` |
 | `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]` | `{summary, findings:[{rule, severity, node, bounds, bounds_dp, message, evidence}], density, font_scale, …}` — the detect/verify engine; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |

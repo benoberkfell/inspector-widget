@@ -1,9 +1,12 @@
 // ============================================================================
 // app/build.gradle.kts (testapps/a11yprobe)
 // Compose + classic-View test app. Toolchain pinned to match the viewspector
-// host exactly (testapps.md §1): compileSdk 36, minSdk 29, JDK 21, debuggable,
-// Compose BOM 2024.09.00, Kotlin-2.0 compose compiler plugin.
+// host exactly (testapps.md §1): compileSdk 36, minSdk 29, Java 17 bytecode
+// (builds on any JDK 17-23), debuggable, Compose BOM 2024.09.00, Kotlin-2.0
+// compose compiler plugin.
 // ============================================================================
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -35,14 +38,17 @@ android {
         viewBinding = true
     }
 
+    // Java 17 bytecode from whichever JDK runs Gradle; no exact-JDK toolchain.
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 }
 
 kotlin {
-    jvmToolchain(21)
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
 }
 
 dependencies {

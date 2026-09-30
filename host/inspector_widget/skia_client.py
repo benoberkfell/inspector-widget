@@ -72,8 +72,9 @@ def _import_skia_grpc():
         import grpc  # noqa: F401
     except Exception as exc:  # pragma: no cover - environment-dependent
         raise SkiaClientError(
-            "grpcio is required for SKP per-component images "
-            "(pip install 'viewspector-host[images]'); falling back to BITMAP crop. "
+            "grpcio>=1.81.0 is required for SKP per-component images "
+            "(pip install 'inspector-widget[images]', or pip install 'grpcio>=1.81.0'); "
+            "falling back to BITMAP crop. "
             f"({exc})"
         ) from exc
     try:

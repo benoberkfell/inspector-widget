@@ -42,20 +42,14 @@ log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# AGP 8.7.2 needs a JDK >= 17 (the agent compiles to Java 17). Pick the newest
-# installed in [17, 25]; override by exporting JAVA_HOME before running.
-log "Selecting a JDK (>= 17)..."
-if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME:-/nonexistent}/bin/javac" ]; then
-    JAVA_HOME=""
-    for v in 25 24 23 22 21 20 19 18 17; do
-        if JAVA_HOME="$(/usr/libexec/java_home -v "$v" 2>/dev/null)"; then break; fi
-        JAVA_HOME=""
-    done
-fi
-[ -n "${JAVA_HOME:-}" ] || die "No JDK >= 17 found (AGP 8.7.2 needs 17+). Install Temurin/Corretto 17 or newer."
-export JAVA_HOME
-export PATH="$JAVA_HOME/bin:$PATH"
-ok "JAVA_HOME=$JAVA_HOME"
+# Gradle needs a JDK 17-23 (AGP 8.7.2 floor; Gradle 8.13 ceiling). The modules
+# compile to Java 17 bytecode, so any JDK in range works. An in-range JAVA_HOME
+# is honoured; otherwise one is auto-selected (see scripts/lib/select-jdk.sh).
+# shellcheck source=lib/select-jdk.sh
+. "$PROJECT_ROOT/scripts/lib/select-jdk.sh"
+log "Selecting a JDK ($JDK_MIN-$JDK_MAX)..."
+select_jdk || exit 1
+ok "JAVA_HOME=$JAVA_HOME (JDK $(jdk_major "$JAVA_HOME"))"
 
 [ -n "$BUILD_TOOLS" ] && [ -x "$D8" ] \
     || die "d8 not found under $ANDROID_HOME/build-tools — install any build-tools (e.g. sdkmanager 'build-tools;36.0.0')."

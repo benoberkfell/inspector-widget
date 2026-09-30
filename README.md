@@ -21,7 +21,9 @@ Injects a native agent into any **debuggable** app and returns:
 - the **slot table** — the full composable hierarchy with **parameters, modifiers, and `file:line`**
   source locations. Inspector Widget enables it the way Android Studio does: set
   `isDebugInspectorInfoEnabled`, add slot-table storage, and `HotReloader` hot-reload to force a fresh
-  composition that populates it (`dump_compose --enable_inspection`, on by default). The deep tree is
+  composition that populates it. This is opt-in (MCP `enable_inspection=true`, CLI
+  `compose --enable-inspection`) because the hot reload resets `remember{}` state in every
+  composition. The deep tree is
   collapsed to named composables (structural groups hoisted) to stay readable and under protobuf's
   recursion limit.
 
@@ -42,11 +44,12 @@ See `CONTRACT.md` for the fixed identifiers, framing, and build matrix.
 ```bash
 ./scripts/build.sh        # -> build-out/{libviewspector.so, bootstrap.dex, payload.jar}
 ```
-**Requires** JDK 17+ and an Android SDK. The build *pins* NDK `27.1.12297006`, build-tools `36.1.0`,
+**Requires** any JDK 17–23 (Gradle 8.13 can't run on 24+) and an Android SDK. The build *pins* NDK `27.1.12297006`, build-tools `36.1.0`,
 and platform `android-36` in `agent/build.gradle.kts` for reproducible single-host builds — relax those
 to whatever you have installed (the agent only calls API 33–34 symbols, via reflection, and compiles to
 Java 17). The Gradle wrapper auto-fetches Gradle 8.13, so you don't pick it. The only hard runtime floor
-is **`minSdk 29`** on the target device. `scripts/build.sh` selects a JDK and produces all three artifacts.
+is **`minSdk 29`** on the target device. `scripts/build.sh` uses `JAVA_HOME` if it is a JDK 17–23 (else it
+finds one, preferring 21 then 17) and produces all three artifacts.
 
 ## Use (CLI)
 ```bash

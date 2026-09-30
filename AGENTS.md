@@ -87,8 +87,9 @@ build-out/                    generated artifacts (gitignored): libviewspector.s
 ```
 Pinned for reproducibility (in `settings.gradle.kts` / `agent/build.gradle.kts`): AGP 8.7.2,
 Kotlin 2.0.21, protobuf-plugin 0.9.4, NDK `27.1.12297006`, build-tools `36.1.0`, compileSdk/targetSdk 36.
-The real requirements are looser: **JDK 17+** to run Gradle (`build.sh` selects one; code compiles to
-Java 17/11 via toolchains), the wrapper auto-fetches **Gradle 8.13**, and the only hard runtime floor is
+The real requirements are looser: **any JDK 17–23** to run Gradle (`build.sh` honours an in-range
+`JAVA_HOME`, else finds one; the code targets Java 17/11 bytecode, with no exact-JDK toolchain; Gradle
+8.13 can't run on JDK 24+), the wrapper auto-fetches **Gradle 8.13**, and the only hard runtime floor is
 **`minSdk 29`**. Relax the SDK/NDK pins to whatever you have installed. The Gradle wrapper jar is tracked
 so the build runs without a preinstalled `gradle`; **`local.properties` is not tracked** — point Gradle at
 your SDK via `local.properties` (`sdk.dir=...`) or the `ANDROID_HOME` env var.
@@ -105,6 +106,9 @@ host/cli.py inspect      --serial emulator-5554 --package com.oberkfell.a11yprob
 host/cli.py a11y-lint    --serial emulator-5554 --package com.oberkfell.a11yprobe
 host/cli.py component-image --serial ... --node-key compose:569 --out comp.png
 ```
+Artifacts are read from `--build-out DIR`, else `$INSPECTOR_WIDGET_ARTIFACTS`, else the legacy
+`$VIEWSPECTOR_ARTIFACTS`, else the checkout's `build-out/`. A wheel install has no checkout to fall
+back on, so set the env var there (the MCP server honours it too; `--self-check` shows what it found).
 
 **Run (MCP)**:
 ```bash
@@ -181,7 +185,8 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
 - One screenshot decoder of record: `inspector_widget.png._decode_to_rgba` (handles RGB_565 /
   ABGR_8888 / ARGB_8888, the last needs an R/B swap). Don't fork it; `mcp_server` delegates to it.
 - protobuf runtime must be **>= 6.33.5, < 7** (the checked-in gencode's floor). Pinning lower
-  makes the proto module unimportable on install.
+  makes the proto module unimportable on install. Regenerate the bindings only with
+  `host/generate_proto.sh` (or `make -C host proto`): it requires protoc 33.x and refuses others.
 - The wheel ships `cli.py` and `mcp_server.py` as top-level py-modules so the console scripts
   work after `pip install` (not just editable installs). See `host/PACKAGING.md`.
 

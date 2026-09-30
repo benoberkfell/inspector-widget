@@ -695,7 +695,7 @@ def tool_detach(serial: str, package: str) -> Dict[str, Any]:
 def tool_dump_compose(
     serial: str, package: str,
     include_semantics: bool = True, include_slot_table: bool = True,
-    enable_inspection: bool = True,
+    enable_inspection: bool = False,
 ) -> Dict[str, Any]:
     """Dump the Compose layer (semantics tree + slot table) of the app's UI."""
     _require(serial, "serial")
@@ -707,6 +707,10 @@ def tool_dump_compose(
                                 enable_inspection=enable_inspection)
     data = st.dump_compose_to_dict(resp)
     data.update({"serial": serial, "package": package})
+    if include_slot_table and not enable_inspection and not st.compose_slot_table_populated(data):
+        data["note"] = ("slot table not populated (semantics only). Pass enable_inspection=true for "
+                        "composable names/params/file:line. WARNING: "
+                        + st.ENABLE_INSPECTION_WARNING % "enable_inspection=true")
     return data
 
 
@@ -761,7 +765,7 @@ def _h_dump_compose(args: Dict[str, Any]) -> Dict[str, Any]:
         args.get("serial"), args.get("package"),
         include_semantics=args.get("include_semantics", True),
         include_slot_table=args.get("include_slot_table", True),
-        enable_inspection=args.get("enable_inspection", True),
+        enable_inspection=args.get("enable_inspection", False),
     )
 
 
@@ -1189,9 +1193,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "description": "Include the semantics tree (on-screen text/role/bounds)."},
                 "include_slot_table": {"type": "boolean", "default": True,
                     "description": "Also include the slot table (composable hierarchy, parameters, file:line)."},
-                "enable_inspection": {"type": "boolean", "default": True,
-                    "description": "Enable Compose inspection (hot-reload) so the slot table populates. "
-                                   "Triggers one recomposition; state is preserved. Set false to avoid it."},
+                "enable_inspection": {"type": "boolean", "default": False,
+                    "description": "Populate the slot table (composable names, parameters, file:line) by "
+                                   "hot-reloading. DESTRUCTIVE: resets remember{} state in every composition "
+                                   "(open dialogs, text input, scroll, toggles). Off by default; the semantics "
+                                   "tree needs no hot-reload. Also re-mints Compose node ids once."},
             },
             "required": ["serial", "package"],
             "additionalProperties": False,
@@ -1806,16 +1812,40 @@ def _self_check() -> int:
             print("  mcp SDK: absent (will use JSON-RPC stdio fallback)")
         else:
             print(f"  mcp SDK: {_dist_version('mcp')} OK (real MCP transport)")
-    for mod, dist, degraded in (
-        ("PIL", "Pillow", "compose_overlay, a11y_overlay, inspect overlay, component_image crop fallback"),
-        ("grpc", "grpcio", "component_image SKP rendering (falls back to a screenshot crop)"),
-    ):
-        try:
-            __import__(mod)
+    for dist, problem, degraded in _probe_optional_deps():
+        if problem is None:
             print(f"  {dist}: {_dist_version(dist)} OK")
-        except Exception:
-            print(f"  {dist}: MISSING — degrades: {degraded} (pip install {dist})")
+        else:
+            print(f"  {dist}: {problem} — degrades: {degraded}")
     return 1 if failed else 0
+
+
+def _probe_optional_deps() -> List[Tuple[str, Optional[str], str]]:
+    """``[(dist, problem_or_None, what_it_degrades)]`` for the optional deps.
+
+    grpcio is probed by loading the SKP gRPC stubs, not just ``import grpc``:
+    the stubs refuse to load on a grpcio older than the one they were generated
+    with, so a bare import would report an unusable grpcio as OK.
+    """
+    out: List[Tuple[str, Optional[str], str]] = []
+    try:
+        import PIL  # noqa: F401
+
+        pil_problem = None
+    except Exception:
+        pil_problem = "MISSING (pip install Pillow)"
+    out.append(("Pillow", pil_problem,
+                "compose_overlay, a11y_overlay, inspect overlay, component_image crop fallback"))
+    try:
+        from inspector_widget import skia_client
+
+        skia_client._import_skia_grpc()
+        grpc_problem = None
+    except Exception as exc:
+        grpc_problem = f"UNUSABLE ({exc})"
+    out.append(("grpcio", grpc_problem,
+                "component_image SKP rendering (falls back to a screenshot crop)"))
+    return out
 
 
 def _dist_version(dist: str) -> str:
@@ -1852,7 +1882,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if args.self_check:
-        return _self_check()
+        rc = _self_check()
+        # Artifact status is informational: a missing artifact warns, never fails.
+        print("\n".join(_artifact_report()))
+        return rc
 
     _log_startup_health()
 
@@ -1882,8 +1915,10 @@ def _log_startup_health() -> None:
         except Exception:
             return "absent"
 
-    pillow = _present("PIL")
-    grpcio = _present("grpc")
+    deps = {dist: ("present" if problem is None else "unusable")
+            for dist, problem, _ in _probe_optional_deps()}
+    pillow = deps["Pillow"]
+    grpcio = deps["grpcio"]
     mcp_sdk = _present("mcp")
     transport = "mcp-sdk" if mcp_sdk == "present" else "jsonrpc-fallback"
     log.info(
@@ -1891,6 +1926,43 @@ def _log_startup_health() -> None:
         "Pillow(overlays)=%s grpcio(SKP images)=%s mcp-sdk=%s | transport=%s",
         len(TOOLS), host_status, proto_status, pillow, grpcio, mcp_sdk, transport,
     )
+    try:
+        from inspector_widget import inject
+
+        st = inject.artifact_status()
+        if st["missing"]:
+            log.warning(
+                "on-device artifacts missing from %s (%s): %s. Injecting will fail; "
+                "set %s to a directory built by scripts/build.sh.",
+                st["dir"], st["source"], ", ".join(st["missing"]), inject.ARTIFACTS_ENV,
+            )
+    except Exception:  # noqa: BLE001 - health logging must never block startup
+        pass
+
+
+def _artifact_report() -> List[str]:
+    """Self-check lines: where the on-device artifacts are looked up, and which exist.
+
+    The directory comes from ``$INSPECTOR_WIDGET_ARTIFACTS``, then the legacy
+    ``$VIEWSPECTOR_ARTIFACTS``, then the checkout's ``build-out/``. A missing
+    artifact is only a warning: re-attaching to an app that already has the
+    agent loaded does not need them.
+    """
+    try:
+        from inspector_widget import inject
+
+        st = inject.artifact_status()
+    except Exception as exc:  # noqa: BLE001
+        return [f"  artifacts: UNKNOWN (inspector_widget.inject unavailable: {exc})"]
+    lines = [f"  artifacts: {st['dir']} (from {st['source']})"]
+    lines += [f"    {name}: {'OK' if ok else 'MISSING'}" for name, ok in st["present"].items()]
+    if st["missing"]:
+        lines.append(
+            f"  WARNING: {len(st['missing'])} of {len(st['present'])} artifacts missing; "
+            f"injecting an app will fail. Run scripts/build.sh and set "
+            f"{inject.ARTIFACTS_ENV}=<checkout>/build-out."
+        )
+    return lines
 
 
 if __name__ == "__main__":

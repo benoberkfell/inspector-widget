@@ -338,10 +338,12 @@ invocations.
 - **Off-screen / below-the-fold nodes are skipped** by the lint (no real bounds →
   no meaningful touch target or pixels). Scroll the content into view, then
   re-dump, to lint it.
-- **Compose `file:line` comes from the slot table.** `dump_compose` /
-  `inspect_node` enable Compose inspection (one recomposition; state preserved)
-  to populate it. If sources are missing, the app may be a minified/release-ish
-  build.
+- **Compose `file:line` comes from the slot table**, which is empty until Compose
+  inspection is enabled: `dump_compose(enable_inspection=true)` (CLI
+  `compose --enable-inspection`). That hot-reloads every composition and **resets
+  `remember{}` state** (open dialogs, typed text, scroll, toggles) and re-mints
+  Compose node ids, so enable it before reproducing a state-dependent bug, then
+  re-dump. If sources are still missing, the app may be a minified/release build.
 - **Material 48dp vs WCAG 44dp.** Default touch-target floor is Material 48dp;
   pass `wcag_mode=true` for the WCAG 2.5.8 44dp target (24dp is the hard floor).
 - **`detach` when done** to free device resources. It is safe to call even if
@@ -402,5 +404,6 @@ host/.venv/bin/python host/mcp_server.py --self-check
 The MCP server runs even without the `mcp` SDK installed (it falls back to a
 self-contained JSON-RPC-over-stdio implementation), but installing the deps from
 'host/requirements.txt' is recommended. Build artifacts must be present in
-'build-out/' (run 'scripts/build.sh') and adb must be on PATH with a device
-connected.
+'build-out/' (run 'scripts/build.sh'), or in the directory named by
+INSPECTOR_WIDGET_ARTIFACTS (needed for a wheel install; '--self-check' shows
+which directory it resolved), and adb must be on PATH with a device connected.
