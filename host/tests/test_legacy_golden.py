@@ -1,0 +1,91 @@
+"""The legacy tool outputs, pinned (work package G1).
+
+``tests/golden/legacy/<scene>/<surface>-legacy.json.gz`` holds what every legacy
+MCP tool and CLI subcommand returned, through the real entry points over the
+harness fake adb and agent, on four scenes (see ``record_goldens.py``). These
+tests run the same calls again and compare the parsed JSON (and the text of the
+human outputs) entry by entry, so any change to a shaper shows up as a readable
+path-level diff.
+
+Regenerate a golden only for a deliberate change, and say why in the commit:
+``PYTHONPATH=. .venv/bin/python tests/record_goldens.py [SCENE...]``.
+"""
+
+from __future__ import annotations
+
+import pytest
+import record_goldens as rg
+
+
+def _check(scene: str, surface: str, tmp_path, mode: str = "legacy") -> None:
+    golden = rg.load_golden(scene, surface, mode)["entries"]
+    run = rg.run_mcp if surface == "mcp" else rg.run_cli
+    actual = run(scene, str(tmp_path))
+    problems = []
+    for name in sorted(set(golden) | set(actual)):
+        if name not in actual:
+            problems.append(f"{surface} {name} [{scene}]: not run any more")
+            continue
+        if name not in golden:
+            problems.append(f"{surface} {name} [{scene}]: no golden (re-record)")
+            continue
+        lines = rg.diff(rg.comparable(golden[name]), rg.comparable(actual[name]))
+        if lines:
+            problems.append(f"{surface} {name} [{scene}] "
+                            f"(golden from {golden[name]['source_commit']}):\n    "
+                            + "\n    ".join(lines))
+    assert not problems, "legacy outputs changed:\n" + "\n".join(problems)
+
+
+@pytest.mark.parametrize("scene", rg.SCENES)
+@pytest.mark.parametrize("surface", ["mcp", "cli"])
+def test_legacy_outputs_match_the_goldens(scene, surface, tmp_path):
+    _check(scene, surface, tmp_path)
+
+
+def test_goldens_cover_every_legacy_tool_and_subcommand():
+    tools = {"list_devices", "list_processes", "attach", "detach", "dump_tree",
+             "get_properties", "screenshot", "dump_compose", "compose_overlay",
+             "dump_accessibility", "a11y_lint", "a11y_overlay", "inspect", "inspect_node",
+             "component_image"}
+    subcommands = {"devices", "packages", "attach", "dump", "compose", "a11y", "a11y-lint",
+                   "inspect", "inspect-node", "component-image", "screenshot",
+                   "get-properties", "detach"}
+    for scene in rg.SCENES:
+        mcp = rg.load_golden(scene, "mcp", "legacy")["entries"]
+        assert {e["tool"] for e in mcp.values()} == tools, scene
+        cli = rg.load_golden(scene, "cli", "legacy")["entries"]
+        assert {e["argv"][0] for e in cli.values()} == subcommands, scene
+        for name in ("dump_text", "compose_text", "a11y_text", "inspect_text"):
+            assert "stdout" in cli[name], (scene, name)
+        assert all(e["source_commit"] for e in [*mcp.values(), *cli.values()])
+
+
+def test_a_renamed_key_fails_with_a_readable_diff(monkeypatch, tmp_path):
+    """Mutating a shaper (strings.node_to_dict renaming ``class_name``) must fail
+    the comparison and name the path that changed."""
+    from inspector_widget import strings
+
+    real = strings.node_to_dict
+
+    def renamed(node, resolver):
+        out = real(node, resolver)
+        out["klass"] = out.pop("class_name")
+        return out
+
+    monkeypatch.setattr(strings, "node_to_dict", renamed)
+    with pytest.raises(AssertionError) as exc:
+        _check("default", "cli", tmp_path)
+    msg = str(exc.value)
+    assert "cli dump [default]" in msg
+    assert "$.json.roots[0].class_name: missing" in msg
+    assert "$.json.roots[0].klass: unexpected" in msg
+
+
+def test_diff_names_paths_and_values():
+    golden = {"a": [1, {"b": "x"}], "c": 1}
+    assert rg.diff(golden, {"a": [1, {"b": "y"}], "c": 1}) == [
+        '$.a[1].b: golden "x" != actual "y"']
+    assert rg.diff(golden, {"a": [1], "c": 1, "d": 2}) == [
+        "$.a: 2 items in the golden, 1 now", "$.d: unexpected 2"]
+    assert rg.diff(1, 1.0) == ["$: golden 1 != actual 1.0"]
