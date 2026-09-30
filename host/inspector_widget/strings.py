@@ -213,6 +213,40 @@ def get_windows_to_dict(response: "pb.GetWindowsResponse") -> Dict[str, Any]:
     return {"root_ids": list(response.root_ids)}
 
 
+_INSET_TYPES = ("status_bars", "navigation_bars", "ime", "display_cutout")
+
+
+def window_info_to_dict(info: "pb.WindowInfo", resolver: StringResolver) -> Dict[str, Any]:
+    """A ``WindowInfo`` as a flat dict: ``title``? (what accessibility services call the
+    window), ``layout_title``?, ``window_type``, ``window_flags`` ("0x..."), ``frame``
+    (screen px), ``z`` (0 = bottom), ``has_window_focus``, ``display_id``, and ``insets``?:
+    ``{status_bars|navigation_bars|ime|display_cutout: {left, top, right, bottom, visible}}``
+    (px within the window; only the types the agent reported, API 30+)."""
+    out: Dict[str, Any] = {}
+    title = resolver.opt(info.title)
+    if title is not None:
+        out["title"] = title
+    layout_title = resolver.opt(info.layout_title)
+    if layout_title is not None:
+        out["layout_title"] = layout_title
+    out["window_type"] = info.window_type
+    out["window_flags"] = "0x%x" % (info.wm_flags & 0xFFFFFFFF)
+    if info.HasField("frame"):
+        out["frame"] = _rect_to_dict(info.frame.layout)
+    out["z"] = info.z
+    out["has_window_focus"] = info.has_window_focus
+    out["display_id"] = info.display_id
+    insets = {}
+    for name in _INSET_TYPES:
+        if info.HasField(name):
+            i = getattr(info, name)
+            insets[name] = {"left": i.left, "top": i.top, "right": i.right, "bottom": i.bottom,
+                            "visible": i.visible}
+    if insets:
+        out["insets"] = insets
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Compose
 # --------------------------------------------------------------------------- #

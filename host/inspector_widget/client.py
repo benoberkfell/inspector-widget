@@ -20,7 +20,7 @@ import select
 import socket
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from google.protobuf.message import DecodeError
 
@@ -68,6 +68,8 @@ def request_timeout(request: "pb.Request", base: Optional[float] = None) -> Opti
     ``base`` defaults to :func:`base_timeout`. Hello is capped at
     ``HELLO_TIMEOUT``; a command that captures pixels, walks the Compose or
     accessibility tree, or inlines every property gets ``SLOW_FACTOR`` x base.
+    An ``a11y_focus`` long-poll gets its own wait (``wait_ms`` + ``quiet_ms``)
+    on top of the base, so the base stays the margin for a frozen app.
     """
     base = base_timeout() if base is None else base
     if base is None or base <= 0:
@@ -75,6 +77,9 @@ def request_timeout(request: "pb.Request", base: Optional[float] = None) -> Opti
     command = request.WhichOneof("command")
     if command == "hello":
         return min(base, HELLO_TIMEOUT)
+    if command == "a11y_focus":
+        cmd = request.a11y_focus
+        return base + (max(0, cmd.wait_ms) + max(0, cmd.quiet_ms)) / 1000.0
     slow = command in _SLOW_COMMANDS or (
         command == "dump_tree"
         and (request.dump_tree.include_screenshot or request.dump_tree.include_properties))
@@ -120,6 +125,22 @@ class AgentTimeoutError(TransportError, TimeoutError):
 
 
 _LOST = "agent session lost (idle timeout, app restart, or the agent was shut down)"
+
+
+def node_action(action: Any) -> int:
+    """A ``pb.NodeAction`` value from itself or its name, case-insensitive, with or
+    without the ``NODE_ACTION_`` prefix (``"click"``, ``"ACCESSIBILITY_FOCUS"``)."""
+    if isinstance(action, int):
+        return action
+    name = str(action).strip().upper().replace("-", "_")
+    if not name.startswith("NODE_ACTION_"):
+        name = "NODE_ACTION_" + name
+    try:
+        return pb.NodeAction.Value(name)
+    except ValueError:
+        choices = ", ".join(n[len("NODE_ACTION_"):].lower() for n in pb.NodeAction.keys()
+                            if n != "NODE_ACTION_UNSPECIFIED")
+        raise ValueError(f"unknown node action {action!r}; one of: {choices}") from None
 
 
 class Client:
@@ -380,6 +401,68 @@ class Client:
         cmd.include_extras = include_extras
         cmd.include_rendering_info = include_rendering_info
         return self.send(req).dump_a11y
+
+    def a11y_focus(
+        self,
+        after_seq: int = 0,
+        wait_ms: int = 0,
+        quiet_ms: int = 0,
+        include_input_focus: bool = False,
+        subtree_depth: int = 0,
+        max_events: int = 0,
+    ) -> "pb.A11yFocusResponse":
+        """Where accessibility focus is, plus the accessibility events recorded since ``after_seq``.
+
+        ``wait_ms`` > 0 long-polls: the agent answers once a TYPE_VIEW_ACCESSIBILITY_FOCUSED
+        event newer than ``after_seq`` was recorded and ``quiet_ms`` then passed without any
+        event, or when ``wait_ms`` runs out (``timed_out``). Pass the response's ``seq`` as the
+        next call's ``after_seq``. The deadline is the base deadline plus the wait.
+        """
+        req = pb.Request()
+        cmd = req.a11y_focus
+        cmd.after_seq = after_seq
+        cmd.wait_ms = wait_ms
+        cmd.quiet_ms = quiet_ms
+        cmd.include_input_focus = include_input_focus
+        cmd.subtree_depth = subtree_depth
+        cmd.max_events = max_events
+        return self.send(req).a11y_focus
+
+    def a11y_act(
+        self,
+        host_view_id: int,
+        virtual_id: int = -1,
+        action: Any = "accessibility_focus",
+        raw_action_id: int = 0,
+        args: Optional[Dict[str, Any]] = None,
+        subtree_depth: int = 0,
+    ) -> "pb.A11yActResponse":
+        """Perform one accessibility action on the node ``(host_view_id, virtual_id)``.
+
+        ``action`` is a ``pb.NodeAction`` value or its name, with or without the
+        ``NODE_ACTION_`` prefix (``"accessibility_focus"``, ``"click"``, ...); ``"raw"``
+        sends ``raw_action_id``. ``args`` become the action's Bundle (str / int / bool /
+        float values). A refusal (e.g. accessibility focus with TalkBack off) comes back
+        with ``performed`` False and ``error`` set, not as an exception.
+        """
+        req = pb.Request()
+        cmd = req.a11y_act
+        cmd.host_view_id = host_view_id
+        cmd.virtual_id = virtual_id
+        cmd.action = node_action(action)
+        cmd.raw_action_id = raw_action_id
+        cmd.subtree_depth = subtree_depth
+        for key, value in (args or {}).items():
+            arg = cmd.args.add(key=key)
+            if isinstance(value, bool):
+                arg.bool_value = value
+            elif isinstance(value, int):
+                arg.int_value = value
+            elif isinstance(value, float):
+                arg.float_value = value
+            else:
+                arg.string_value = str(value)
+        return self.send(req).a11y_act
 
     def capture_skp(self, root_id: int = 0) -> "pb.CaptureSkpResponse":
         req = pb.Request()

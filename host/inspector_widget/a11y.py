@@ -35,7 +35,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .proto import view_inspection_pb2 as pb
-from .strings import StringResolver, _bounds_to_dict
+from .strings import StringResolver, _bounds_to_dict, window_info_to_dict
 
 # --------------------------------------------------------------------------- #
 # AccessibilityNodeInfo action-id constants (API 36 platform values).
@@ -428,7 +428,9 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
     Output shape::
 
         {"windows": [{"root_view_id", "root": <node>|None,
-                      "window_type"?, "window_flags"?, "modal"?, "covered_by"?}, ...],
+                      "window_type"?, "window_flags"?, "modal"?, "covered_by"?,
+                      "title"?, "layout_title"?, "frame"?, "z"?, "has_window_focus"?,
+                      "display_id"?, "insets"?}, ...],
          "focus_order": [{"order", "key", "id", "speak"}, ...],   # focus stops only
          "generation": "g...",                      # changes when Compose re-mints ids
          "summary": {"windows", "nodes", "focus_stops", "ignored_by_talkback"?},
@@ -442,17 +444,24 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
     its place) or ``"hidden"`` (importantForAccessibility=noHideDescendants on it or
     an ancestor: its whole subtree is gone). A window under an open modal window
     (a dialog) carries ``covered_by`` (the modal window's root_view_id); TalkBack
-    cannot reach it, so its nodes are not in ``focus_order``.
+    cannot reach it, so its nodes are not in ``focus_order``. Agents that send a
+    ``WindowInfo`` per window add its fields (:func:`strings.window_info_to_dict`:
+    the accessibility ``title``, ``frame``, ``z``, ``insets`` ...).
     """
     resolver = StringResolver(response.strings)
     windows: List[Dict[str, Any]] = []
+    infos: Dict[int, Tuple[int, int]] = {}
     for w in response.windows:
         root = a11y_node_to_dict(w.root, resolver) if w.HasField("root") else None
-        windows.append({"root_view_id": w.root_view_id, "root": root})
+        entry: Dict[str, Any] = {"root_view_id": w.root_view_id, "root": root}
+        if w.HasField("info"):
+            entry.update(window_info_to_dict(w.info, resolver))
+            infos[int(w.root_view_id)] = (w.info.window_type, w.info.wm_flags & 0xFFFFFFFF)
+        windows.append(entry)
     roots = [w["root"] for w in windows if w["root"]]
     assign_node_keys(roots)
     mark_talkback_ignored(roots)
-    covered = apply_window_meta(windows, response.diagnostics or "")
+    covered = apply_window_meta(windows, response.diagnostics or "", infos)
 
     root_windows = [w for w in windows if w["root"]]
     skip = {i for i, w in enumerate(root_windows) if w.get("covered_by") is not None}
@@ -522,9 +531,13 @@ def is_modal_window(flags: int) -> bool:
     return not flags & (FLAG_NOT_TOUCH_MODAL | FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE)
 
 
-def apply_window_meta(windows: List[Dict[str, Any]], diagnostics: str) -> Optional[Dict[str, Any]]:
+def apply_window_meta(windows: List[Dict[str, Any]], diagnostics: str,
+                      infos: Optional[Dict[int, Tuple[int, int]]] = None) -> Optional[Dict[str, Any]]:
     """Annotate ``windows`` (z-ordered, bottom first) with their type/flags/modality and
     mark the ones below the topmost modal window ``covered_by`` it.
+
+    Type and flags come from ``infos`` (root_view_id -> (type, flags), the agent's
+    ``WindowInfo``) and otherwise from the ``root#<id> window ...`` diagnostics tokens.
 
     The system reports no window below a modal window of the same task to accessibility
     services (AccessibilityWindowManager: a modal window's touchable region is the whole
@@ -532,6 +545,7 @@ def apply_window_meta(windows: List[Dict[str, Any]], diagnostics: str) -> Option
     while a dialog is open. Returns a reading-order diagnostic when a window is covered.
     """
     meta = _window_meta(diagnostics)
+    meta.update(infos or {})
     top_modal = None
     for i, w in enumerate(windows):
         m = meta.get(int(w.get("root_view_id") or 0))
@@ -1279,3 +1293,186 @@ def compute_traversal_order(roots: List[Dict[str, Any]],
     (``is_focus_stop`` False, ``order`` None) so the full walk is inspectable.
     """
     return reading_order(roots, include_structural=include_structural)["focus_order"]
+
+
+# --------------------------------------------------------------------------- #
+# Accessibility focus and the agent's event tap (A11yFocusCommand / A11yActCommand).
+# --------------------------------------------------------------------------- #
+#: AccessibilityEvent.TYPE_* -> name (without the TYPE_ prefix).
+EVENT_TYPE_NAMES: Dict[int, str] = {
+    0x00000001: "VIEW_CLICKED",
+    0x00000002: "VIEW_LONG_CLICKED",
+    0x00000004: "VIEW_SELECTED",
+    0x00000008: "VIEW_FOCUSED",
+    0x00000010: "VIEW_TEXT_CHANGED",
+    0x00000020: "WINDOW_STATE_CHANGED",
+    0x00000040: "NOTIFICATION_STATE_CHANGED",
+    0x00000080: "VIEW_HOVER_ENTER",
+    0x00000100: "VIEW_HOVER_EXIT",
+    0x00000200: "TOUCH_EXPLORATION_GESTURE_START",
+    0x00000400: "TOUCH_EXPLORATION_GESTURE_END",
+    0x00000800: "WINDOW_CONTENT_CHANGED",
+    0x00001000: "VIEW_SCROLLED",
+    0x00002000: "VIEW_TEXT_SELECTION_CHANGED",
+    0x00004000: "ANNOUNCEMENT",
+    0x00008000: "VIEW_ACCESSIBILITY_FOCUSED",
+    0x00010000: "VIEW_ACCESSIBILITY_FOCUS_CLEARED",
+    0x00020000: "VIEW_TEXT_TRAVERSED_AT_MOVEMENT_GRANULARITY",
+    0x00040000: "GESTURE_DETECTION_START",
+    0x00080000: "GESTURE_DETECTION_END",
+    0x00100000: "TOUCH_INTERACTION_START",
+    0x00200000: "TOUCH_INTERACTION_END",
+    0x00400000: "WINDOWS_CHANGED",
+    0x00800000: "VIEW_CONTEXT_CLICKED",
+    0x01000000: "ASSIST_READING_CONTEXT",
+    0x02000000: "SPEECH_STATE_CHANGE",
+    0x04000000: "VIEW_TARGETED_BY_SCROLL",
+}
+
+#: AccessibilityEvent.CONTENT_CHANGE_TYPE_* bits -> name.
+CONTENT_CHANGE_NAMES: Dict[int, str] = {
+    0x00000001: "SUBTREE",
+    0x00000002: "TEXT",
+    0x00000004: "CONTENT_DESCRIPTION",
+    0x00000008: "PANE_TITLE",
+    0x00000010: "PANE_APPEARED",
+    0x00000020: "PANE_DISAPPEARED",
+    0x00000040: "STATE_DESCRIPTION",
+    0x00000080: "DRAG_STARTED",
+    0x00000100: "DRAG_DROPPED",
+    0x00000200: "DRAG_CANCELLED",
+    0x00000400: "CONTENT_INVALID",
+    0x00000800: "ERROR",
+    0x00001000: "ENABLED",
+    0x00002000: "CHECKED",
+    0x00004000: "EXPANDED",
+    0x00008000: "SUPPLEMENTAL_DESCRIPTION",
+}
+
+EVENT_ACCESSIBILITY_FOCUSED = 0x00008000
+
+
+def event_type_name(event_type: int) -> str:
+    return EVENT_TYPE_NAMES.get(event_type, "0x%x" % event_type)
+
+
+def _node_ref(host_view_id: int, virtual_id: int, host_class: Optional[str]) -> Dict[str, Any]:
+    """``host_view_id``/``virtual_id`` plus the integer ``id`` and the typed ``node_key``
+    (``compose:`` for a virtual node whose host View is a ComposeView, as in a dump)."""
+    out: Dict[str, Any] = {"host_view_id": host_view_id, "virtual_id": virtual_id,
+                           "id": a11y_key(host_view_id, virtual_id)}
+    compose = any(h in (host_class or "").lower() for h in _COMPOSE_HINTS)
+    out["node_key"] = _typed_key(host_view_id, virtual_id, compose=compose) if host_view_id else None
+    return out
+
+
+def a11y_event_to_dict(ev: "pb.A11yEventRecord", resolver: StringResolver) -> Dict[str, Any]:
+    """One event-tap record: ``seq``, ``uptime_ms``, ``type`` (name), ``root_view_id``, the
+    source's ``host_view_id``/``virtual_id``/``id``/``node_key``, and whichever of
+    ``content_changes`` (names), scroll fields, ``text``, ``pane_title``, ``class_name``,
+    ``action`` the event carries (zero / empty ones are left out)."""
+    out: Dict[str, Any] = {"seq": ev.seq, "uptime_ms": ev.uptime_ms,
+                           "type": event_type_name(ev.type), "root_view_id": ev.root_view_id}
+    out.update(_node_ref(ev.host_view_id, ev.virtual_id, resolver.opt(ev.host_class)))
+    if ev.content_change_types:
+        out["content_changes"] = [name for bit, name in CONTENT_CHANGE_NAMES.items()
+                                  if ev.content_change_types & bit] or [ev.content_change_types]
+    for field in ("scroll_delta_x", "scroll_delta_y", "from_index", "to_index", "item_count",
+                  "scroll_x", "scroll_y", "max_scroll_x", "max_scroll_y", "action"):
+        v = getattr(ev, field)
+        if v:
+            out[field] = v
+    for field in ("text", "pane_title", "class_name"):
+        v = resolver.opt(getattr(ev, field))
+        if v is not None:
+            out[field] = v
+    return out
+
+
+def a11y_focus_node_to_dict(focus: "pb.A11yFocus", resolver: StringResolver) -> Dict[str, Any]:
+    """One ``A11yFocus``: the node reference (``host_view_id``, ``virtual_id``, ``id``,
+    ``node_key``), ``root_view_id``, ``bounds``, ``stale``, ``source``, ``window`` (see
+    :func:`strings.window_info_to_dict`) and ``node`` (the shaped node, children to the
+    requested depth). A11yFocus nodes carry no ``is_traversal_group`` / ``layout_size``
+    (take those from a dump)."""
+    host_class = resolver.opt(focus.host_class)
+    ref = _node_ref(focus.host_view_id, focus.virtual_id, host_class)
+    node = a11y_node_to_dict(focus.node, resolver) if focus.HasField("node") else None
+    if node is not None:
+        assign_node_keys([node])
+        # The subtree lacks its host's own node, so key its virtual nodes like the focus.
+        prefix = "compose:" if str(ref["node_key"] or "").startswith("compose:") else None
+        for n in _iter_nodes([node]):
+            if prefix and str(n.get("node_key") or "").startswith("virtual:"):
+                n["node_key"] = prefix + n["node_key"][len("virtual:"):]
+    out: Dict[str, Any] = {"root_view_id": focus.root_view_id}
+    out.update(ref)
+    if host_class:
+        out["host_class"] = host_class
+    out["bounds"] = _bounds_to_dict(focus.bounds)
+    out["stale"] = focus.stale
+    if focus.source:
+        out["source"] = focus.source
+    if focus.HasField("window"):
+        out["window"] = window_info_to_dict(focus.window, resolver)
+    out["node"] = node
+    return out
+
+
+def a11y_focus_to_dict(response: "pb.A11yFocusResponse") -> Dict[str, Any]:
+    """Shape an ``A11yFocusResponse``::
+
+        {"a11y": <focus>|None,        # None = no accessibility focus in the app's windows
+         "input"?: <focus>|None,      # when include_input_focus was set
+         "seq": int,                  # pass as the next after_seq
+         "focus_event": bool, "timed_out": bool, "waited_ms": int, "read_us": int,
+         "touch_exploration": bool, "services_enabled": bool,
+         "events": [<event>, ...],    # seq > after_seq, oldest first
+         "dropped"?: int, "diagnostics"?: str}
+
+    Each ``<focus>`` is :func:`a11y_focus_node_to_dict`, each ``<event>``
+    :func:`a11y_event_to_dict`. Node keys match :func:`a11y_to_dict`'s, so a focus can be
+    looked up in a dump by ``id`` / ``node_key`` (while the dump's ids are current).
+    """
+    resolver = StringResolver(response.strings)
+    out: Dict[str, Any] = {
+        "a11y": a11y_focus_node_to_dict(response.a11y, resolver) if response.HasField("a11y") else None,
+    }
+    if response.HasField("input"):
+        out["input"] = a11y_focus_node_to_dict(response.input, resolver)
+    out.update({
+        "seq": response.seq,
+        "focus_event": response.focus_event,
+        "timed_out": response.timed_out,
+        "waited_ms": response.waited_ms,
+        "read_us": response.read_us,
+        "touch_exploration": response.touch_exploration,
+        "services_enabled": response.services_enabled,
+        "events": [a11y_event_to_dict(e, resolver) for e in response.events],
+    })
+    if response.dropped:
+        out["dropped"] = response.dropped
+    if response.diagnostics:
+        out["diagnostics"] = response.diagnostics
+    return out
+
+
+def a11y_act_to_dict(response: "pb.A11yActResponse") -> Dict[str, Any]:
+    """Shape an ``A11yActResponse``: ``performed``, ``error``?, ``action_id``,
+    ``seq_before`` (long-poll A11yFocus from here to see what the action caused), ``seq``,
+    ``after`` (the accessibility focus right after, or None) and ``diagnostics``?."""
+    resolver = StringResolver(response.strings)
+    out: Dict[str, Any] = {"performed": response.performed}
+    if response.error:
+        out["error"] = response.error
+    out.update({
+        "action_id": response.action_id,
+        "action": action_name(response.action_id) if response.action_id else None,
+        "seq_before": response.seq_before,
+        "seq": response.seq,
+        "after": (a11y_focus_node_to_dict(response.after, resolver)
+                  if response.HasField("after") else None),
+    })
+    if response.diagnostics:
+        out["diagnostics"] = response.diagnostics
+    return out
