@@ -1140,6 +1140,24 @@ def _payload(result):
 
 
 @pytest.mark.parametrize("transport", ["sdk", "fallback"])
+def test_stdio_invalid_arguments_get_the_same_error_on_every_transport(tmp_path, transport):
+    if transport == "sdk":
+        pytest.importorskip("mcp")
+    results, wire, _exits = _stdio_session(tmp_path, transport == "fallback", [
+        ("screenshot", {"scale": 5}),
+        ("get_properties", {"view_id": "1003"}),
+        ("attach", {"bogus": True}),
+    ])
+    assert [r["isError"] for r in results.values()] == [True, True, True]
+    assert [_payload(r)["error"] for r in results.values()] == [
+        "invalid argument scale: 5 is greater than the maximum of 1.0",
+        "invalid argument view_id: '1003' is not of type 'integer'",
+        "unknown argument(s): bogus (allowed: force, package, serial)",
+    ]
+    assert wire == []  # rejected before anything reached the device
+
+
+@pytest.mark.parametrize("transport", ["sdk", "fallback"])
 def test_stdio_transport_end_to_end(tmp_path, transport):
     if transport == "sdk":
         pytest.importorskip("mcp")

@@ -34,8 +34,7 @@ import os
 import sys
 import tempfile
 import threading
-import traceback
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # Make the host package importable when this file is launched directly
@@ -1801,7 +1800,7 @@ def _call_tool_text(name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
     dict rather than raising, so that key is what marks a failed call.
     """
     try:
-        result = _run_tool(name, arguments or {})
+        result = _run_tool(name, {} if arguments is None else arguments)
         is_error = isinstance(result, dict) and "error" in result
         return json.dumps(result, indent=2, default=str), is_error
     except (ToolError, HostUnavailableError) as exc:
@@ -1848,7 +1847,14 @@ def _build_mcp_server() -> Any:
         async def list_tools() -> List[Any]:  # type: ignore[misc]
             return tool_list()
 
-        @server.call_tool()
+        # _run_tool validates arguments for every transport; turn the SDK's own
+        # check off (where supported) so a bad argument gets the same JSON error.
+        try:
+            call_tool_decorator = server.call_tool(validate_input=False)
+        except TypeError:
+            call_tool_decorator = server.call_tool()
+
+        @call_tool_decorator
         async def call_tool(name: str, arguments: Dict[str, Any]) -> Any:  # type: ignore[misc]
             return await run_tool(name, arguments)
 
@@ -1908,10 +1914,21 @@ def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> Di
     return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
-def _fallback_handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(message, dict):
+        # Batches (arrays) and bare scalars aren't MCP requests.
+        what = "batch requests are not supported" if isinstance(message, list) \
+            else "a request must be a JSON object"
+        return _jsonrpc_error(None, -32600, f"invalid request: {what}")
     method = message.get("method")
     req_id = message.get("id")
-    params = message.get("params") or {}
+    if not isinstance(method, str):
+        return _jsonrpc_error(req_id, -32600, "invalid request: 'method' must be a string")
+    params = message.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _jsonrpc_error(req_id, -32602, "invalid params: 'params' must be an object")
 
     # Notifications (no id) get no response.
     if method == "notifications/initialized" or (method and method.startswith("notifications/")):
@@ -1943,8 +1960,10 @@ def _fallback_handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     if method == "tools/call":
         name = params.get("name")
-        arguments = params.get("arguments") or {}
-        text, is_error = _call_tool_text(name, arguments)
+        if not isinstance(name, str):
+            return _jsonrpc_error(req_id, -32602, "invalid params: 'name' must be a string")
+        arguments = params.get("arguments")
+        text, is_error = _call_tool_text(name, {} if arguments is None else arguments)
         return _jsonrpc_result(
             req_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
         )
@@ -1972,10 +1991,10 @@ def _serve_fallback() -> None:
             continue
         try:
             response = _fallback_handle(message)
-        except Exception as exc:  # pragma: no cover
-            response = _jsonrpc_error(
-                message.get("id"), -32603, f"internal error: {exc}", traceback.format_exc()
-            )
+        except Exception as exc:  # pragma: no cover - the traceback goes to stderr only
+            log.exception("internal error handling a JSON-RPC message")
+            req_id = message.get("id") if isinstance(message, dict) else None
+            response = _jsonrpc_error(req_id, -32603, f"internal error: {type(exc).__name__}: {exc}")
         if response is not None:
             stdout.write(json.dumps(response, default=str) + "\n")
             stdout.flush()

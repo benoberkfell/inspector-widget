@@ -418,3 +418,50 @@ def test_minimal_validator_matches_jsonschema_on_the_basics():
         with pytest.raises(mcp_server.ToolError):
             mcp_server._minimal_validate(schema, bad)
     mcp_server._minimal_validate(schema, {"package": "p", "bounds": {"x": 1, "y": 2, "w": 3, "h": 4}})
+
+
+@pytest.mark.parametrize("message,code", [
+    ([{"jsonrpc": "2.0", "id": 1, "method": "ping"}], -32600),
+    ("tools/list", -32600),
+    (7, -32600),
+    ({"jsonrpc": "2.0", "id": 1, "params": {}}, -32600),
+    ({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": "x"}, -32602),
+    ({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": 3}}, -32602),
+])
+def test_fallback_rejects_malformed_messages_without_tracebacks(message, code):
+    resp = mcp_server._fallback_handle(message)
+    assert resp["error"]["code"] == code
+    assert "data" not in resp["error"]
+
+
+def test_fallback_tools_call_with_non_object_arguments_is_a_tool_error():
+    resp = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                        "params": {"name": "attach", "arguments": [1]}})
+    assert resp["result"]["isError"] is True
+    assert "arguments must be a JSON object" in resp["result"]["content"][0]["text"]
+
+
+def _block_mcp_script(script):
+    return ("import sys, runpy\n"
+            "class _Block:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'mcp' or name.startswith('mcp.'):\n"
+            "            raise ImportError('mcp blocked for test')\n"
+            "sys.meta_path.insert(0, _Block())\n"
+            f"sys.argv = [{script!r}]\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+
+
+def test_fallback_server_survives_batches_and_scalars():
+    script = str(HOST_DIR / "mcp_server.py")
+    lines = ['[{"jsonrpc":"2.0","id":1,"method":"ping"}]', '"hello"', "42", "not json",
+             json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"})]
+    proc = subprocess.run([sys.executable, "-c", _block_mcp_script(script)],
+                          input="\n".join(lines) + "\n", capture_output=True, text=True,
+                          env=dict(os.environ, PYTHONPATH=str(HOST_DIR)), cwd=str(HOST_DIR),
+                          timeout=60)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    replies = [json.loads(l) for l in proc.stdout.splitlines() if l.startswith("{")]
+    assert [r.get("error", {}).get("code") for r in replies] == [-32600, -32600, -32600, -32700, None]
+    assert replies[-1] == {"jsonrpc": "2.0", "id": 9, "result": {}}
+    assert "Traceback" not in proc.stdout
