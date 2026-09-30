@@ -177,7 +177,8 @@ def test_session_context_manager_disconnects_and_keeps_the_agent(fake_device):
     with iw.attach(SERIAL, PKG) as session:
         assert session.info() == {
             "serial": SERIAL, "package": PKG, "pid": PID, "warm": False,
-            "agent_version": "viewspector-0.1", "api_level": 36, "abi": "arm64-v8a"}
+            "agent_version": "viewspector-0.1", "build_id": inject.local_build_id(),
+            "api_level": 36, "abi": "arm64-v8a"}
         assert session.is_alive()
         agent = fake_device.agent()
     assert session.closed and not session.is_alive()
@@ -478,3 +479,35 @@ def test_mcp_pngs_live_in_one_per_process_directory(mcp, fake_device):
     mcp_server._cleanup_at_exit()
     assert not a.parent.exists()
     assert fake_device.forward_names() == []
+
+
+# =========================================================================== #
+# H4: build handshake
+# =========================================================================== #
+def test_local_build_id_is_the_payload_sha256(fake_device, tmp_path):
+    import hashlib
+    payload = tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME
+    assert inject.local_build_id() == hashlib.sha256(payload.read_bytes()).hexdigest()
+    assert inject.artifact_status()["build_id"] == inject.local_build_id()
+    assert inject.split_agent_version("viewspector-0.1+abc") == ("viewspector-0.1", "abc")
+    assert inject.split_agent_version("viewspector-0.1") == ("viewspector-0.1", None)
+    assert inject.build_matches("unknown", "abc") and inject.build_matches(None, None)
+    assert not inject.build_matches(None, "abc") and not inject.build_matches("x", "abc")
+
+
+def test_mcp_attach_force_replaces_the_agent(mcp, fake_device):
+    first = mcp("attach")
+    assert first["build_id"] == inject.local_build_id()
+    old = fake_device.agent()
+    again = mcp("attach", force=True)
+    assert "error" not in again, again
+    assert not old.running and fake_device.agent().generation == 2
+    assert again["reused"] is False and again["warm"] is False
+
+
+def test_mcp_attach_notes_a_cached_session_on_an_old_build(mcp, fake_device, tmp_path):
+    assert "note" not in mcp("attach")
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).write_bytes(b"payload, rebuilt")
+    res = mcp("attach")
+    assert res["reused"] is True and "force=true" in res["note"]
+    assert "different build" in res["note"]

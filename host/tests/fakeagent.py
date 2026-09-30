@@ -33,10 +33,13 @@ Properties.kt, Capture.kt, ComposeInspector.kt, AccessibilityInspector.kt):
   ``int32_value``, object-ish types as the class name in ``str_value``);
 * screenshots are ``bitmap_type=2`` (ABGR_8888: in-memory bytes R,G,B,A), a
   9-byte little-endian header, deflated (Capture.kt:291-294);
-* SHUTDOWN calls ``stop()`` which closes the server socket and ALL client
-  connections (Server.stop()). Like the real Dispatcher, ``stop()`` runs
-  before the reply is written, so the reply is lost (``reply_to_shutdown``
-  flips that for tests that want the reply).
+* SHUTDOWN replies, then calls ``stop()``, which closes the server socket and
+  ALL client connections (Server.stop()). Agents built before that fix
+  stopped before writing the reply, so the requester only saw EOF;
+  ``reply_to_shutdown = False`` models them;
+* Hello reports ``viewspector-0.1+<sha256 of the payload.jar it was loaded
+  from>`` (the build handshake). ``build_id=None`` models an agent from before
+  the handshake, which reports plain ``viewspector-0.1``.
 
 Every agent takes a ``behaviour(req) -> (delay_s, action)`` hook, where action
 is a ``pb.Response`` (sent), ``None`` (no reply), ``"close"`` (drop the
@@ -47,6 +50,7 @@ connection), ``"hang"`` (never reply until the agent stops) or raw ``bytes``
 from __future__ import annotations
 
 import atexit
+import hashlib
 import itertools
 import json
 import os
@@ -542,14 +546,21 @@ class FakeAgent:
     def __init__(self, scene: Optional[Scene] = None, behaviour: Optional[Behaviour] = None,
                  socket_name: str = "", generation: int = 1,
                  on_request: Optional[Callable[["FakeAgent", int, Any], None]] = None,
-                 on_stop: Optional[Callable[["FakeAgent"], None]] = None) -> None:
+                 on_stop: Optional[Callable[["FakeAgent"], None]] = None,
+                 build_id: Optional[str] = None) -> None:
         self.scene = scene or default_scene()
         self.behaviour: Behaviour = behaviour or self.default_behaviour
         self.socket_name = socket_name
         self.generation = generation
         self.on_request = on_request
         self.on_stop = on_stop
-        self.reply_to_shutdown = False
+        self.build_id = build_id  # None: an agent from before the build handshake
+        self.reply_to_shutdown = True  # False: an agent from before the reply fix
+        # True: an agent from before the accept fix. Server.stop() closed the
+        # LocalServerSocket, but the thread blocked in accept() kept the name
+        # bound until one more connection arrived (seen live on API 37).
+        self.linger_after_stop = False
+        self.lingering = False
         self.inspection_enabled = False  # ComposeInspector.enableInspection is sticky
         self.running = True
         self.requests: List["pb.Request"] = []
@@ -634,8 +645,9 @@ class FakeAgent:
                         return
                     continue
                 if command == "shutdown" and action.status == pb.Response.OK:
-                    # Dispatcher.handleShutdown runs onShutdown() (Server.stop(),
-                    # which closes every client) before Server writes the reply.
+                    # Server.serveConnection writes the reply, then Server.stop()
+                    # closes every client. Older agents stopped first, so the
+                    # reply was lost (reply_to_shutdown = False).
                     if self.reply_to_shutdown:
                         self._send(conn, action)
                     self.stop()
@@ -703,7 +715,7 @@ class FakeAgent:
 
     def _h_hello(self, req_id, cmd):
         resp = self._ok(req_id)
-        resp.hello.agent_version = AGENT_VERSION
+        resp.hello.agent_version = AGENT_VERSION + (f"+{self.build_id}" if self.build_id else "")
         resp.hello.api_level = self.scene.api_level
         resp.hello.abi = self.scene.abi
         return resp
@@ -890,6 +902,11 @@ class FakeDevice:
         self.wire: List[WireRecord] = []
         self.adb_log: List[List[str]] = []
         self.pushed: Dict[str, str] = {}
+        self.pushed_sha: Dict[str, str] = {}  # remote path -> sha256 of what was pushed
+        # The build a pre-existing agent (start_agent) runs; install() sets it
+        # to the build-out payload.jar's hash, i.e. "injected by an earlier run
+        # of this same build".
+        self.default_build_id: Optional[str] = None
         self.staged: Dict[Tuple[str, str], Tuple[str, Optional[str]]] = {}
         self.attach_calls: List[Dict[str, str]] = []
         self.settings: Dict[str, str] = {}
@@ -904,18 +921,28 @@ class FakeDevice:
         self.apps[package] = app
         return app
 
-    def start_agent(self, package: str = DEFAULT_PACKAGE,
-                    socket_name: Optional[str] = None) -> FakeAgent:
-        """Bind an agent as if an earlier run had injected it (the warm path)."""
+    _SAME_BUILD = object()
+
+    def start_agent(self, package: str = DEFAULT_PACKAGE, socket_name: Optional[str] = None,
+                    build_id: Any = _SAME_BUILD) -> FakeAgent:
+        """Bind an agent as if an earlier run had injected it (the warm path).
+
+        ``build_id`` defaults to the local build (``default_build_id``); pass a
+        different string for a stale build, or ``None`` for an agent from before
+        the build handshake.
+        """
         app = self.apps[package]
         name = socket_name or f"viewspector_{app.pid}"
+        if build_id is FakeDevice._SAME_BUILD:
+            build_id = self.default_build_id
         with self._lock:
             existing = self.sockets.get(name)
             if existing is not None and existing.running:
                 return existing
             agent = FakeAgent(scene=self.scene_factory(), behaviour=self.behaviour,
                               socket_name=name, generation=len(self.agents) + 1,
-                              on_request=self._on_request, on_stop=self._on_stop)
+                              on_request=self._on_request, on_stop=self._on_stop,
+                              build_id=build_id)
             agent.package = package  # type: ignore[attr-defined]
             self.agents.append(agent)
             self.sockets[name] = agent
@@ -963,7 +990,10 @@ class FakeDevice:
     def _on_stop(self, agent: FakeAgent) -> None:
         with self._lock:
             if self.sockets.get(agent.socket_name) is agent:
-                del self.sockets[agent.socket_name]
+                if agent.linger_after_stop:
+                    agent.lingering = True  # still bound until a connection arrives
+                else:
+                    del self.sockets[agent.socket_name]
 
     def _log(self, record: Dict[str, Any]) -> None:
         with self._lock, open(self.log_path, "a") as f:  # type: ignore[arg-type]
@@ -1013,6 +1043,8 @@ class FakeDevice:
             if not os.path.isfile(local):
                 return 1, "", f"adb: error: cannot stat '{local}': No such file or directory"
             self.pushed[remote] = local
+            with open(local, "rb") as f:
+                self.pushed_sha[remote] = hashlib.sha256(f.read()).hexdigest()
             return 0, f"{local}: 1 file pushed, 0 skipped.\n", ""
         if verb == "forward":
             return self.forward(args[1:])
@@ -1060,7 +1092,8 @@ class FakeDevice:
 
     def _proc_net_unix(self, grep: str) -> str:
         lines = []
-        names = [n for n, a in self.sockets.items() if a.running] + list(self.foreign_sockets)
+        names = [n for n, a in self.sockets.items() if a.running or a.lingering] \
+            + list(self.foreign_sockets)
         for i, name in enumerate(["jdwp-control", "adbd", *names]):
             line = f"0000000000000000: 00000002 00000000 00010000 0001 01 {40000 + i} @{name}"
             if grep in line:  # grep is a substring match
@@ -1121,15 +1154,19 @@ class FakeDevice:
             call["error"] = "artifacts not staged"
             return 0, "", ""
         existing = self.sockets.get(socket_name)
-        if existing is not None and existing.running:
-            # Server.kt: "Address already in use" is treated as benign; the old
-            # server keeps serving and no new payload server starts (H4).
+        if existing is not None and (existing.running or existing.lingering):
+            # Server.kt can't bind a name another server holds: the new payload
+            # logs the error and exits, the old server keeps serving (H4).
             call["result"] = "already-bound"
             return 0, "", ""
+        # The payload hashes the jar it was loaded from (Payload.kt buildId).
+        payload_src = self.staged[(package, injectmod.PAYLOAD_JAR_NAME)][0]
+        build_id = self.pushed_sha.get(payload_src)
         with self._lock:
             agent = FakeAgent(scene=self.scene_factory(), behaviour=self.behaviour,
                               socket_name=socket_name, generation=len(self.agents) + 1,
-                              on_request=self._on_request, on_stop=self._on_stop)
+                              on_request=self._on_request, on_stop=self._on_stop,
+                              build_id=build_id)
             agent.package = package  # type: ignore[attr-defined]
             self.agents.append(agent)
             self.sockets[socket_name] = agent
@@ -1176,6 +1213,15 @@ class FakeDevice:
             except OSError:
                 return
             agent = self.sockets.get(name)
+            if agent is not None and agent.lingering:
+                # The old accept() returns, sees the server stopped, drops the
+                # connection and exits: only now is the name released.
+                with self._lock:
+                    if self.sockets.get(name) is agent:
+                        del self.sockets[name]
+                    agent.lingering = False
+                _close(conn)
+                continue
             if agent is None or not agent.running:
                 _close(conn)  # adb accepts, fails the device-side connect, closes
                 continue
@@ -1236,11 +1282,14 @@ class FakeAdb:
 # Installation.
 # --------------------------------------------------------------------------- #
 def make_build_out(path: str) -> str:
-    """Placeholder on-device artifacts so the cold path's existence checks pass."""
+    """Placeholder on-device artifacts so the cold path's existence checks pass
+    (only written if absent, so a test can "rebuild" by rewriting one)."""
     os.makedirs(path, exist_ok=True)
     for name in (injectmod.NATIVE_SO_NAME, injectmod.BOOTSTRAP_DEX_NAME, injectmod.PAYLOAD_JAR_NAME):
-        with open(os.path.join(path, name), "wb") as f:
-            f.write(b"fake " + name.encode())
+        target = os.path.join(path, name)
+        if not os.path.exists(target):
+            with open(target, "wb") as f:
+                f.write(b"fake " + name.encode())
     return path
 
 
@@ -1249,6 +1298,12 @@ def _patched_defaults(fn: Callable[..., Any], old: Any, new: Any) -> Optional[tu
     if not defaults or old not in defaults:
         return None
     return tuple(new if d == old else d for d in defaults)
+
+
+def build_id_of(build_out: str) -> str:
+    """sha256 of build_out/payload.jar: the build id its agent reports."""
+    with open(os.path.join(build_out, injectmod.PAYLOAD_JAR_NAME), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def install(monkeypatch, *devices: FakeDevice, build_out: str) -> FakeAdb:
@@ -1261,6 +1316,8 @@ def install(monkeypatch, *devices: FakeDevice, build_out: str) -> FakeAdb:
     fake = FakeAdb(*devices)
     monkeypatch.setattr(adbmod, "_run", fake.run)
     make_build_out(build_out)
+    for d in devices:
+        d.default_build_id = build_id_of(build_out)
     old = injectmod.DEFAULT_BUILD_OUT
     monkeypatch.setattr(injectmod, "DEFAULT_BUILD_OUT", build_out)
     new_defaults = _patched_defaults(injectmod.inject_and_connect, old, build_out)
@@ -1274,6 +1331,8 @@ def install_global(*devices: FakeDevice, build_out: str) -> FakeAdb:
     fake = FakeAdb(*devices)
     adbmod._run = fake.run  # type: ignore[assignment]
     make_build_out(build_out)
+    for d in devices:
+        d.default_build_id = build_id_of(build_out)
     old = injectmod.DEFAULT_BUILD_OUT
     injectmod.DEFAULT_BUILD_OUT = build_out
     new_defaults = _patched_defaults(injectmod.inject_and_connect, old, build_out)

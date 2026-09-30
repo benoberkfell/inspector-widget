@@ -187,11 +187,13 @@ def test_wire_bad_magic_drops_the_connection(agent):
     assert sock.recv(64) == b""
 
 
-def test_wire_shutdown_stops_the_server_and_closes_every_client(agent):
+@pytest.mark.parametrize("replies", [True, False], ids=["current", "before-reply-fix"])
+def test_wire_shutdown_stops_the_server_and_closes_every_client(agent, replies):
+    agent.reply_to_shutdown = replies
     first, second = _client(agent), _client(agent)
     second.hello()
-    # An agent built before the reply fix stops the server before the reply is
-    # written, so the requester sees EOF; Client.shutdown() counts that as done.
+    # Current agents reply, then stop. Older ones stopped before writing the
+    # reply, so the requester saw EOF; Client.shutdown() counts that as done too.
     assert first.shutdown() == pb.ShutdownResponse()
     assert first.broken  # the client closes itself after a shutdown either way
     with pytest.raises((framing.FramingError, OSError)):
@@ -289,12 +291,67 @@ def test_socket_exists_is_an_exact_name_match(fake_device):
     assert adb.socket_exists(SERIAL, f"viewspector_{PID}") is False
 
 
-@pytest.mark.xfail(strict=True, reason="H4: --force re-runs attach-agent but the new payload "
-                   "server can't bind the name, so the host keeps talking to the old agent")
 def test_force_reinject_replaces_a_running_agent(fake_device, warm_agent, run_cli):
     assert run_cli("dump", "--force").rc == 0
     assert fake_device.wire[-1].generation == 2
     assert not warm_agent.running
+    assert fake_device.commands(generation=1) == ["hello", "shutdown"]
+
+
+def test_a_rebuilt_payload_replaces_the_running_agent(fake_device, warm_agent, run_cli, tmp_path):
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).write_bytes(b"payload, rebuilt")
+    res = run_cli("dump")
+    assert res.rc == 0, res
+    assert not warm_agent.running and fake_device.commands(generation=1) == ["hello", "shutdown"]
+    new = fake_device.agent()
+    assert new.generation == 2 and new.build_id == inject.local_build_id()
+    assert fake_device.commands(generation=2) == ["hello", "dump_tree"]
+
+
+def test_an_agent_from_before_the_build_handshake_is_replaced(fake_device, run_cli):
+    legacy = fake_device.start_agent(PKG, build_id=None)
+    legacy.reply_to_shutdown = False  # it also predates the shutdown-reply fix...
+    legacy.linger_after_stop = True   # ...and the accept fix: stopping leaves the name bound
+    res = run_cli("attach")
+    assert res.rc == 0, res
+    assert not legacy.running and not legacy.lingering and "(build " in res.out
+    assert fake_device.agent().generation == 2
+    assert [c.get("result") for c in fake_device.attach_calls] == ["started generation 2"]
+
+
+def test_without_a_local_payload_any_running_agent_is_reused(fake_device, run_cli, tmp_path):
+    fake_device.start_agent(PKG, build_id=None)
+    (tmp_path / "build-out" / inject.PAYLOAD_JAR_NAME).unlink()
+    res = run_cli("attach")
+    assert res.rc == 0 and "(warm/reused)" in res.out
+    assert not fake_device.attach_calls
+
+
+def test_an_agent_that_ignores_shutdown_is_reported(fake_device, run_cli, monkeypatch, tmp_path):
+    stubborn = fake_device.start_agent(PKG, build_id="0" * 64)
+    stubborn.behaviour = lambda req: (
+        (0, fakeagent.frame(stubborn.dispatch(req)))  # replies, but never stops
+        if req.WhichOneof("command") == "shutdown" else stubborn.default_behaviour(req))
+    monkeypatch.setattr(inject, "STOP_WAIT", 0.2)
+    res = run_cli("dump")
+    assert res.rc == 1 and "did not stop after SHUTDOWN" in res.err
+    assert "am force-stop" in res.err and not fake_device.pushed
+
+
+def test_a_stale_agent_still_holding_the_socket_after_inject_is_reported(fake_device, run_cli):
+    stale = fake_device.start_agent(PKG, build_id="0" * 64)
+    hellos = {"n": 0}
+
+    def unreachable_first(req):  # the warm connect can't reach it, so it isn't stopped
+        if req.WhichOneof("command") == "hello" and not hellos["n"]:
+            hellos["n"] += 1
+            return 0, "close"
+        return stale.default_behaviour(req)
+
+    stale.behaviour = unreachable_first
+    res = run_cli("dump")
+    assert res.rc == 1 and "is not the one just injected" in res.err
+    assert [c.get("result") for c in fake_device.attach_calls] == ["already-bound"]
 
 
 # =========================================================================== #
@@ -316,8 +373,9 @@ def test_cli_packages_lists_only_debuggable_apps(fake_device, run_cli):
 def test_cli_attach_cold(fake_device, run_cli):
     res = run_cli("attach")
     assert res.rc == 0, res
-    assert (f"attached to {PKG} pid={PID}: agent viewspector-0.1, API 36, abi arm64-v8a"
-            in res.out)
+    build = fake_device.default_build_id[:12]
+    assert (f"attached to {PKG} pid={PID}: agent viewspector-0.1 (build {build}), API 36, "
+            f"abi arm64-v8a" in res.out)
     assert "warm" not in res.out and f"socket=@viewspector_{PID}" in res.out
     assert fake_device.commands() == ["hello"]  # the inject's Hello carries the metadata
     assert cold_injected(fake_device)
@@ -979,7 +1037,8 @@ def test_scenario_force_on_a_raw_client_subcommand_reinjects(fake_device, warm_a
     res = run_cli("dump", "--force")
     assert res.rc == 0, res
     assert set(fake_device.pushed) == {f"/data/local/tmp/{n}" for n in ARTIFACTS}
-    assert [c.get("result") for c in fake_device.attach_calls] == ["already-bound"]
+    assert [c.get("result") for c in fake_device.attach_calls] == ["started generation 2"]
+    assert not warm_agent.running
 
 
 def test_scenario_force_on_an_integrated_subcommand_reinjects(fake_device, warm_agent, run_cli,

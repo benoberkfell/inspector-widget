@@ -104,9 +104,10 @@ def cmd_attach(args) -> int:
     with _session(args) as session:
         info = session.info()
         warm = " (warm/reused)" if info["warm"] else ""
+        build = f" (build {info['build_id'][:12]})" if info.get("build_id") else ""
         print(
             f"attached to {args.package} pid={info['pid']}{warm}: "
-            f"agent {info['agent_version']}, API {info['api_level']}, abi {info['abi']}"
+            f"agent {info['agent_version']}{build}, API {info['api_level']}, abi {info['abi']}"
         )
         print(f"socket=@{session.injection.socket_name} forwarded tcp:{session.injection.local_port}")
     return 0

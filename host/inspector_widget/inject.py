@@ -11,6 +11,7 @@ simply connect to the existing socket and PING it with a Hello.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import time
@@ -74,7 +75,9 @@ def resolve_build_out(build_out: Optional[str] = None) -> str:
 def artifact_status(build_out: Optional[str] = None) -> Dict[str, object]:
     """Where the artifacts are looked up and which are present (no device needed).
 
-    Returns ``{"dir", "source", "present": {name: bool}, "missing": [name, ...]}``.
+    Returns ``{"dir", "source", "present": {name: bool}, "missing": [name, ...],
+    "build_id"}``; ``build_id`` is :func:`local_build_id` (``None`` without a
+    payload.jar).
     """
     directory, source = _resolve_build_out(build_out)
     present = {n: os.path.isfile(os.path.join(directory, n)) for n in ARTIFACT_NAMES}
@@ -83,7 +86,61 @@ def artifact_status(build_out: Optional[str] = None) -> Dict[str, object]:
         "source": source,
         "present": present,
         "missing": [n for n, ok in present.items() if not ok],
+        "build_id": local_build_id(directory),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Build handshake (H4). The payload hashes the payload.jar it was loaded from
+# and reports it in Hello as "<agent_version>+<sha256>"; scripts/build.sh writes
+# the same hash to build-out/BUILD_ID. A running agent whose build differs from
+# the local payload.jar is stale (e.g. after a rebuild) and gets replaced.
+# --------------------------------------------------------------------------- #
+BUILD_ID_NAME = "BUILD_ID"
+UNKNOWN_BUILD = "unknown"  # a payload that couldn't hash its own jar
+_BUILD_ID_CACHE: Dict[Tuple[str, int, int], str] = {}
+
+
+def local_build_id(build_out: Optional[str] = None) -> Optional[str]:
+    """sha256 (hex) of the payload.jar that an inject would push, or ``None``
+    when there is none. The same value build.sh writes to ``BUILD_ID``."""
+    path = os.path.join(resolve_build_out(build_out), PAYLOAD_JAR_NAME)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime_ns, st.st_size)
+    cached = _BUILD_ID_CACHE.get(key)
+    if cached is None:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                digest.update(chunk)
+        cached = _BUILD_ID_CACHE[key] = digest.hexdigest()
+    return cached
+
+
+def split_agent_version(agent_version: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """``"viewspector-0.1+<sha256>"`` -> ``("viewspector-0.1", "<sha256>")``.
+
+    Agents built before the handshake report no ``+`` part: ``(version, None)``.
+    """
+    if not agent_version:
+        return None, None
+    base, sep, build = agent_version.partition("+")
+    return base, (build or None) if sep else None
+
+
+def build_matches(agent_build: Optional[str], local_build: Optional[str]) -> bool:
+    """Whether a running agent can be reused for the local artifacts.
+
+    No local payload.jar (e.g. a wheel install that only re-attaches): any agent
+    will do. An agent from before the handshake (no build id) is stale. An agent
+    that couldn't hash its jar is given the benefit of the doubt.
+    """
+    if local_build is None or agent_build == UNKNOWN_BUILD:
+        return True
+    return agent_build == local_build
 
 
 def socket_name_for_pid(pid: int) -> str:
@@ -104,6 +161,16 @@ class Injection:
     warm: bool  # True if we connected to an already-attached agent
     hello: Any = None  # the agent's HelloResponse (agent_version / api_level / abi)
     closed: bool = False
+
+    @property
+    def agent_version(self) -> Optional[str]:
+        """The agent's version without the build id, e.g. ``viewspector-0.1``."""
+        return split_agent_version(getattr(self.hello, "agent_version", None))[0]
+
+    @property
+    def build_id(self) -> Optional[str]:
+        """sha256 of the payload.jar the agent runs; ``None`` for pre-handshake agents."""
+        return split_agent_version(getattr(self.hello, "agent_version", None))[1]
 
     def close(self) -> None:
         """Close the socket and remove the adb forward. Idempotent; the agent keeps running."""
@@ -203,9 +270,14 @@ def connect_existing(serial: Optional[str], package: str) -> Optional[Injection]
     return _try_warm_connect(serial, pid, package)
 
 
-def stop_agent(injection: Injection, wait: float = 5.0) -> bool:
+# How long to wait for a stopped agent's abstract socket to disappear.
+STOP_WAIT = 5.0
+
+
+def stop_agent(injection: Injection, wait: Optional[float] = None) -> bool:
     """Send SHUTDOWN over ``injection``, close it, and wait for the agent's
     abstract socket to disappear. Returns True once the socket is gone."""
+    wait = STOP_WAIT if wait is None else wait
     try:
         Client(injection.sock, owns_socket=False).shutdown(timeout=wait if wait > 0 else None)
     except TransportError:
@@ -216,15 +288,43 @@ def stop_agent(injection: Injection, wait: float = 5.0) -> bool:
 
 
 def _wait_for_socket_gone(serial: str, socket_name: str, wait: float) -> bool:
+    """Poll /proc/net/unix until ``socket_name`` is gone (True) or ``wait`` passes.
+
+    Agents built before the accept fix close their LocalServerSocket on stop,
+    but a thread blocked in accept() keeps the socket bound until one more
+    connection arrives. So if the name is still there, connect once to let the
+    old accept loop see it has stopped.
+    """
     end = time.monotonic() + wait
     delay = 0.05
+    kicked = False
     while True:
         if not adb.socket_exists(serial, socket_name):
             return True
+        if not kicked:
+            kicked = True
+            _kick(serial, socket_name)
+            continue
         if time.monotonic() >= end:
             return False
         time.sleep(delay)
         delay = min(delay * 2, 0.5)
+
+
+def _kick(serial: str, socket_name: str) -> None:
+    """Open and close one connection to ``socket_name`` (best-effort)."""
+    local_port = adb.free_local_port()
+    try:
+        with _connect_forward(serial, socket_name, local_port, connect_timeout=2.0) as sock:
+            sock.settimeout(2.0)
+            try:
+                sock.recv(1)  # the stopped server accepts and drops it: EOF
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        adb.remove_forward(serial, local_port)
 
 
 def _check_debuggable(serial: str, package: str) -> None:
@@ -298,12 +398,15 @@ def inject_and_connect(
 
     Sequence (CONTRACT.md section 2):
       1. check the device, resolve pid (app must be running)
-      2. warm path: if the agent socket already exists and Hello succeeds, reuse it
+      2. warm path: if the agent socket already exists and Hello succeeds, reuse
+         it when it runs the local build (:func:`build_matches`); otherwise, or
+         with ``force_reinject``, SHUTDOWN it and wait for its socket to go
       3. check the app is debuggable, then push .so + bootstrap.dex + payload.jar
          to /data/local/tmp
       4. run-as cp into the app private dir (.so 700, dex/jar 444)
       5. cmd activity attach-agent <pkg> <so>=<bootstrap>:<payload>:viewspector_<pid>
-      6. wait for the abstract socket, adb forward, connect, Hello
+      6. wait for the abstract socket, adb forward, connect, Hello, and check
+         the agent that answers runs the build just pushed
     """
     serial = adb.resolve_serial(serial)
     pid = adb.pidof(serial, package)
@@ -321,16 +424,25 @@ def inject_and_connect(
     except Exception:
         pass
 
-    if not force_reinject:
-        warm = _try_warm_connect(serial, pid, package)
-        if warm is not None:
+    build_dir = resolve_build_out(build_out)
+    want = local_build_id(build_dir)
+    socket_name = socket_name_for_pid(pid)
+    warm = _try_warm_connect(serial, pid, package)
+    if warm is not None:
+        if not force_reinject and build_matches(warm.build_id, want):
             return warm
+        # --force, or the agent runs another build (a rebuild, or an agent from
+        # before the handshake): stop it so the new payload can bind the name.
+        if not stop_agent(warm):
+            raise InjectionError(
+                f"the running agent on @{socket_name} did not stop after SHUTDOWN, so a new "
+                f"one can't bind the name; restart the app (adb shell am force-stop {package}, "
+                f"then launch it) and retry"
+            )
 
     _check_debuggable(serial, package)
-    app_so, app_boot, app_payload = _push_and_stage(
-        serial, package, resolve_build_out(build_out))
+    app_so, app_boot, app_payload = _push_and_stage(serial, package, build_dir)
 
-    socket_name = socket_name_for_pid(pid)
     # Native agent option string: bootstrapDexPath:payloadPath:socketName.
     # The native Agent_OnAttach reads everything after '=' and splits on ':'.
     options = f"{app_boot}:{app_payload}:{socket_name}"
@@ -371,4 +483,14 @@ def inject_and_connect(
     except Exception as e:
         inj.close()
         raise InjectionError(f"agent attached but Hello failed: {e}") from e
+    if not build_matches(inj.build_id, want):
+        # The payload we just pushed didn't bind the socket (another agent still
+        # holds it, e.g. one we couldn't reach to stop), so this is not our agent.
+        inj.close()
+        raise InjectionError(
+            f"the agent answering on @{socket_name} is not the one just injected (it runs "
+            f"build {inj.build_id or 'from before the build handshake'}, build-out has "
+            f"{want}). Restart the app (adb shell am force-stop {package}, then launch it) "
+            f"and retry."
+        )
     return inj

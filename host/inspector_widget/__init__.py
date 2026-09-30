@@ -100,7 +100,8 @@ class Session:
         self.pid = injection.pid
         self.warm = bool(injection.warm)
         hello = getattr(injection, "hello", None)
-        self.agent_version = hello.agent_version if hello is not None else None
+        self.agent_version = injection.agent_version
+        self.build_id = injection.build_id
         self.api_level = hello.api_level if hello is not None else None
         self.abi = hello.abi if hello is not None else None
         self.client = Client(injection.sock, owns_socket=False)
@@ -116,6 +117,7 @@ class Session:
             "pid": self.pid,
             "warm": self.warm,
             "agent_version": self.agent_version,
+            "build_id": self.build_id,
             "api_level": self.api_level,
             "abi": self.abi,
         }

@@ -694,7 +694,7 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
         windows = _session_get_windows(session)
     root_ids = windows.get("root_ids", [])
     info = session.info()
-    return {
+    result = {
         "serial": serial,
         "package": package,
         "attached": True,
@@ -704,10 +704,27 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
         "api_level": info.get("api_level"),
         "abi": info.get("abi"),
         "agent_version": info.get("agent_version"),
+        "build_id": info.get("build_id"),
         "window_count": len(root_ids),
         "root_ids": root_ids,
         "session": f"{serial}/{package}",
     }
+    note = _stale_build_note(info.get("build_id"))
+    if note:
+        result["note"] = note
+    return result
+
+
+def _stale_build_note(agent_build: Optional[str]) -> Optional[str]:
+    """A hint when a reused session runs another build than build-out/payload.jar."""
+    try:
+        from inspector_widget import inject
+        if inject.build_matches(agent_build, inject.local_build_id()):
+            return None
+    except Exception:  # noqa: BLE001 - informational only
+        return None
+    return ("this session's agent runs a different build than the local payload.jar "
+            "(rebuilt since it was injected?); attach with force=true to replace it")
 
 
 def tool_dump_tree(
@@ -1180,7 +1197,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "was reused, the device API level, ABI, agent version, and the inspectable windows "
             "(window_count + root_ids for dump_tree's root_id). Sessions are cached; later tools "
             "reuse them, and a session the agent dropped (idle timeout, app restart) is re-attached "
-            "automatically. force=true stops a running agent and injects a fresh one."
+            "automatically. A running agent from another build (build_id differs from the local "
+            "payload.jar) is replaced on a fresh attach; force=true replaces it regardless."
         ),
         "schema": {
             "type": "object",
@@ -2256,6 +2274,8 @@ def _artifact_report() -> List[str]:
         return [f"  artifacts: UNKNOWN (inspector_widget.inject unavailable: {exc})"]
     lines = [f"  artifacts: {st['dir']} (from {st['source']})"]
     lines += [f"    {name}: {'OK' if ok else 'MISSING'}" for name, ok in st["present"].items()]
+    if st["build_id"]:
+        lines.append(f"    build id: {st['build_id']}")
     if st["missing"]:
         lines.append(
             f"  WARNING: {len(st['missing'])} of {len(st['present'])} artifacts missing; "
