@@ -318,5 +318,23 @@
             android:inputType="numberPassword"
             android:minHeight="48dp" />
 
+        <!-- A "show password" field: no transformation, so its text (and the text of the
+             accessibility events it sends) is the plaintext; only the input type says secret. -->
+        <TextView
+            android:id="@+id/visiblePasswordLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:labelFor="@+id/visiblePasswordField"
+            android:text="@string/visible_password_label"
+            android:textColor="@color/text_good_contrast" />
+
+        <EditText
+            android:id="@+id/visiblePasswordField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:importantForAutofill="no"
+            android:inputType="textVisiblePassword"
+            android:minHeight="48dp" />
+
     </LinearLayout>
 </ScrollView>

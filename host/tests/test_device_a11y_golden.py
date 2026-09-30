@@ -525,8 +525,11 @@ def check_view_reading_order(cap: Capture) -> None:
 
 # The secrets A11yProbe types into its password fields (ViewScenarioActivity.kt,
 # Scenarios.kt PasswordFieldScenario); no dump may carry them in plain text.
-VIEW_PASSWORD_SECRETS = {"passwordField": "hunter2-view-secret", "pinField": "271828"}
+VIEW_PASSWORD_SECRETS = {"passwordField": "hunter2-view-secret", "pinField": "271828",
+                         "visiblePasswordField": "hunter2-visible-secret"}
 COMPOSE_PASSWORD_SECRET = "hunter2-compose-secret"
+# PasswordFieldScenario's wrapped fields (the app's own composable takes the secret).
+COMPOSE_WRAPPED_SECRETS = ("hunter2-wrapped-secret", "hunter2-wrapped-value-secret")
 
 
 def _leaked(secrets: Iterable[str], **dumps: Any) -> List[str]:
@@ -561,8 +564,8 @@ def check_view_password_redaction(cap: Capture) -> None:
 
 def check_compose_password_redaction(cap: Capture) -> None:
     """A Compose field with Password semantics: its secret appears in no dump."""
-    leaked = _leaked([COMPOSE_PASSWORD_SECRET], compose=cap.compose, tree=cap.tree,
-                     a11y=cap.a11y, lint=cap.lint)
+    leaked = _leaked([COMPOSE_PASSWORD_SECRET, *COMPOSE_WRAPPED_SECRETS], compose=cap.compose,
+                     tree=cap.tree, a11y=cap.a11y, lint=cap.lint)
     assert not leaked, f"Compose password text sent in plain text: {leaked}"
     node = _compose_node_by_tag(cap, "good_password")
     assert node is not None, "no Compose semantics node tagged good_password"

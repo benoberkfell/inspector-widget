@@ -24,6 +24,7 @@ class ViewScenarioActivity : AppCompatActivity() {
     companion object {
         const val PASSWORD_SECRET = "hunter2-view-secret"
         const val PIN_SECRET = "271828"
+        const val VISIBLE_PASSWORD_SECRET = "hunter2-visible-secret"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,6 +65,7 @@ class ViewScenarioActivity : AppCompatActivity() {
         // Known secrets for the redaction check: no dump may carry them in plain text.
         binding.passwordField.setText(PASSWORD_SECRET)
         binding.pinField.setText(PIN_SECRET)
+        binding.visiblePasswordField.setText(VISIBLE_PASSWORD_SECRET)
     }
 
     private fun applyStateDescription(

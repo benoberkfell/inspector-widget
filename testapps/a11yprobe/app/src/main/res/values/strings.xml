@@ -33,6 +33,7 @@
     <string name="view_section_password">9. Password fields</string>
     <string name="password_label">Password</string>
     <string name="pin_label">PIN</string>
+    <string name="visible_password_label">Password (shown)</string>
 
     <string name="label_good">GOOD</string>
     <string name="label_bad">BAD</string>

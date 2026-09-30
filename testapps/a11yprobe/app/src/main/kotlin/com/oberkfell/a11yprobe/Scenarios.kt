@@ -77,6 +77,8 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.traversalIndex
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -775,27 +777,52 @@ private fun Knob(on: Boolean) {
 // 21. PasswordField — a masked password field vs one that shows its secret.
 // Dump-only (no lint rule): the GOOD field carries Compose's Password semantics,
 // so the agent must never send its secret (EditableText / InputText are masked).
+// The GOOD side also has two password fields wrapped the way apps write them
+// (Thunderbird's PasswordInput(password = ...) / TextFieldOutlinedPassword(
+// value = ...)): the secret is hoisted and handed to the app's own composable
+// as a String, which builds the transformation inside. With the slot table
+// (enable_inspection) the wrapper's parameter must be masked too.
 // BAD shows and speaks the secret; there is no Password semantics to redact by.
 // ---------------------------------------------------------------------------
 const val COMPOSE_PASSWORD_SECRET = "hunter2-compose-secret"
+const val COMPOSE_WRAPPED_SECRET = "hunter2-wrapped-secret"
+const val COMPOSE_WRAPPED_VALUE_SECRET = "hunter2-wrapped-value-secret"
 
 @Composable
 fun PasswordFieldScenario() {
     var g by remember { mutableStateOf(COMPOSE_PASSWORD_SECRET) }
+    var w by remember { mutableStateOf(COMPOSE_WRAPPED_SECRET) }
+    var v by remember { mutableStateOf(COMPOSE_WRAPPED_VALUE_SECRET) }
     var b by remember { mutableStateOf("shown-on-screen") }
     Section(
         "Password field",
         good = {
-            OutlinedTextField(
-                value = g,
-                onValueChange = { g = it },
-                label = { Text("Password") },
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("good_password")
-            )
+            Column {
+                OutlinedTextField(
+                    value = g,
+                    onValueChange = { g = it },
+                    label = { Text("Password") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("good_password")
+                )
+                PasswordWrapper(
+                    password = w,
+                    onPasswordChange = { w = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("good_wrapped_password")
+                )
+                PasswordValueWrapper(
+                    password = v,
+                    onPasswordChange = { v = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("good_wrapped_value_password")
+                )
+            }
         },
         bad = {
             OutlinedTextField(
@@ -808,5 +835,36 @@ fun PasswordFieldScenario() {
                     .testTag("bad_password")
             )
         },
+    )
+}
+
+/**
+ * An app's own password composable: it takes the secret as a String and builds the
+ * transformation inside, so its own call carries no PasswordVisualTransformation. The
+ * field below receives the same String, which is how the agent knows it is secret.
+ */
+@Composable
+fun PasswordWrapper(password: String, onPasswordChange: (String) -> Unit, modifier: Modifier = Modifier) {
+    OutlinedTextField(
+        value = password,
+        onValueChange = onPasswordChange,
+        label = { Text("Wrapped password") },
+        visualTransformation = PasswordVisualTransformation(),
+        modifier = modifier,
+    )
+}
+
+/**
+ * The same, but the field gets a TextFieldValue, so no String below matches the
+ * wrapper's parameter: only its name (password) and the field below say it is secret.
+ */
+@Composable
+fun PasswordValueWrapper(password: String, onPasswordChange: (String) -> Unit, modifier: Modifier = Modifier) {
+    OutlinedTextField(
+        value = TextFieldValue(password, TextRange(password.length)),
+        onValueChange = { onPasswordChange(it.text) },
+        label = { Text("Wrapped password (value)") },
+        visualTransformation = PasswordVisualTransformation(),
+        modifier = modifier,
     )
 }

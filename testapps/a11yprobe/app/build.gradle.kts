@@ -49,6 +49,12 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
+        // Lambdas as classes, not invokedynamic (the Kotlin 2.0 default), so the slot table
+        // shows A11yProbe's own composables with their parameters: ui-tooling-data 1.7 reads
+        // a call's parameters from the captured fields of its restart lambda by name, and
+        // an indy lambda has none. The redaction check (host/tests/test_device_redaction.py)
+        // needs PasswordWrapper's parameters to be there to see them masked.
+        freeCompilerArgs.add("-Xlambdas=class")
     }
 }
 
