@@ -278,3 +278,22 @@ def test_empty_compose_plumbing_takes_no_outline_line(tmp_path):
         full = run(r.ctx, "outline", root="#message_list", depth=4, detail="all",
                    max_lines=400)
         assert any("AndroidViewsHandler" in ln for ln in full["lines"])
+
+
+def test_the_screen_composite_shows_the_window_under_a_dialogs_transparent_edge(tmp_path):
+    """Live on Now in Android's Settings dialog: the dialog window is transparent
+    outside its card, and the composited screen showed black there instead of
+    the For you screen under it."""
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    with Replay("nia_settings", str(tmp_path)) as r:
+        r.capture()
+        doc = run(r.ctx, "image", overlay="none", max_side=4096)
+        img = Image.open(doc["path"]).convert("RGBA")
+        f = img.width / 1280
+        x, y = int(40 * f), int(1500 * f)  # left of the card, inside the dialog window
+        assert img.getpixel((x, y))[:3] != (0, 0, 0)
+        main = cr.load("nia_settings")
+        shot = pb.Screenshot.FromString(main.shots[main.window_ids()[0]])
+        assert shot.width == 1280  # the main window's full-screen screenshot

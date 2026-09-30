@@ -499,7 +499,11 @@ def _base(loaded: Any, ix: Index, wins: Sequence[_Win], max_side: int
             tw, th = max(1, int(w.rect[2] * s)), max(1, int(w.rect[3] * s))
             if (tw, th) != (pw, ph):
                 img = img.resize((tw, th), Image.BILINEAR)
-            canvas.paste(img, (int(w.rect[0] * s), int(w.rect[1] * s)))
+            # over, not paste: a dialog window is transparent outside its card, and
+            # the window under it shows there (a paste made it black)
+            layer = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+            layer.paste(img, (int(w.rect[0] * s), int(w.rect[1] * s)))
+            canvas = Image.alpha_composite(canvas, layer)
         if (ow, oh) != (cw, ch):
             canvas = canvas.resize((ow, oh), Image.BILINEAR)
         buf = io.BytesIO()
