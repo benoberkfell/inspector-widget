@@ -143,3 +143,18 @@ def test_self_check_reports_incompatible_sdk(monkeypatch, capsys):
     )
     assert mcp_server._self_check() == 1
     assert "INCOMPATIBLE" in capsys.readouterr().out
+
+
+def test_self_check_flags_grpcio_that_cannot_load_the_stubs(monkeypatch, capsys):
+    """grpcio can import yet be too old for the generated SKP stubs; the self-check
+    must say so instead of printing OK."""
+    from inspector_widget import skia_client
+
+    def refuse():
+        raise skia_client.SkiaClientError("skia gRPC stubs unavailable: needs grpcio>=1.81.0")
+
+    monkeypatch.setattr(skia_client, "_import_skia_grpc", refuse)
+    mcp_server._self_check()
+    out = capsys.readouterr().out
+    grpc_line = next(line for line in out.splitlines() if "grpcio" in line)
+    assert "UNUSABLE" in grpc_line and "1.81.0" in grpc_line
