@@ -1,12 +1,13 @@
 """Lifecycle polish, offline: no retry during exit cleanup or after a detach,
 retries only for calls that are safe to repeat, the session note on every
-session tool (CLI parity).
+session tool (CLI parity), argument normalization.
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
@@ -320,3 +321,52 @@ def test_cli_and_mcp_print_the_same_note(mcp, fake_device, run_cli):
         assert res.rc == 0 and f"warning: {note}\n" in res.err
     finally:
         other.disconnect()
+
+
+# =========================================================================== #
+# 4. Argument normalization and validation (both validators)
+# =========================================================================== #
+@pytest.fixture(params=["jsonschema", "minimal"])
+def validator(request, monkeypatch):
+    if request.param == "minimal":
+        monkeypatch.setitem(sys.modules, "jsonschema", None)
+    return request.param
+
+
+def test_a_whole_number_float_is_an_integer(mcp, fake_device, validator):
+    res = mcp("get_properties", view_id=1003.0)
+    assert "error" not in res and res["view_id"] == 1003
+    assert fake_device.requests("get_properties")[-1].view_id == 1003
+    res = mcp("inspect_node", bounds={"x": 20.0, "y": 90.0, "w": 4.0, "h": 4.0},
+              include_image=False)
+    assert res["node_key"] == "view:1004", res
+    res = mcp("get_properties", view_id=1003.5)
+    assert res["error"] == "invalid argument view_id: 1003.5 is not of type 'integer'"
+
+
+def test_a_null_optional_argument_means_the_default(mcp, fake_device, validator):
+    res = mcp("dump_tree", include_properties=None, root_id=None, scale=None, serial=None)
+    assert "error" not in res and res["serial"] == SERIAL, res
+    req = fake_device.requests("dump_tree")[-1]
+    assert (req.root_id, req.include_properties) == (0, False)
+    assert "error" in mcp("dump_tree", package=None)  # a required one is still required
+
+
+def test_scale_zero_is_out_of_range(mcp, fake_device, validator):
+    res = mcp("a11y_overlay", scale=0)
+    assert res["error"] == "invalid argument scale: 0 is less than or equal to the minimum of 0"
+    assert fake_device.wire == []
+
+
+def test_every_scale_schema_excludes_zero():
+    scales = [entry["schema"]["properties"]["scale"] for entry in mcp_server.TOOLS.values()
+              if "scale" in entry["schema"]["properties"]]
+    assert scales and all(s.get("exclusiveMinimum") == 0 and "minimum" not in s for s in scales)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "x"])
+def test_cli_scale_takes_the_mcp_range(run_cli, fake_device, value, capsys):
+    with pytest.raises(SystemExit):
+        run_cli("screenshot", "--out", "x.png", "--scale", value)
+    assert "--scale" in capsys.readouterr().err
+    assert fake_device.wire == []

@@ -194,7 +194,9 @@ server exits; copy a file elsewhere to keep it.
 
 `serial` is optional on every tool: it defaults to `$ANDROID_SERIAL`, else the
 only attached device. Arguments are checked against each tool's `inputSchema`
-before anything touches the device, the same way on every transport.
+before anything touches the device, the same way on every transport; an
+explicit `null` for an optional argument means its default, and a whole-number
+float (`12.0`) passes for an integer. `scale` is in (0, 1].
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|

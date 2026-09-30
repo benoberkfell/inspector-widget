@@ -482,6 +482,17 @@ def cmd_detach(args) -> int:
     return 1
 
 
+def _scale(text):
+    """argparse type for ``--scale``: a number in (0, 1], as the MCP tools take it."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError(f"must be in (0, 1], got {text}")
+    return value
+
+
 def _add_serial_arg(sp):
     sp.add_argument("--serial", default=None,
                     help="device serial (default: $ANDROID_SERIAL, else the only attached device)")
@@ -545,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OUT.png",
         help="capture a BITMAP screenshot and write it to this PNG path",
     )
-    sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale (<=1.0)")
+    sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale in (0, 1]")
     sp.add_argument(
         "--json",
         metavar="OUT.json|-",
@@ -561,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--overlay", metavar="OUT.png",
                     help="render the Compose tree as labeled boxes over a screenshot")
     sp.add_argument("--json", metavar="OUT.json|-", help="emit resolved compose tree as JSON")
-    sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for --overlay")
+    sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale for --overlay")
     sp.add_argument("--all-boxes", action="store_true", help="box every node, not just labeled ones")
     sp.add_argument("--no-slot-table", action="store_true", help="semantics only (skip slot table)")
     sp.add_argument("--enable-inspection", action="store_true",
@@ -582,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--lint", action="store_true",
                     help="also run the a11y lint (adds a 'lint' key to --json, colors --overlay "
                          "by severity); implies --rendering-info")
-    sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for --overlay")
+    sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale for --overlay")
     sp.add_argument("--no-contrast", action="store_true", help="skip the contrast (image) lint rule")
     sp.add_argument("--wcag", action="store_true", help="use WCAG target sizes (44dp) for the lint")
     sp.add_argument("--rendering-info", action="store_true", dest="include_rendering_info",
@@ -601,7 +612,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", metavar="OUT.json|-", help="emit findings as JSON")
     sp.add_argument("--no-contrast", action="store_true", help="skip the contrast (image) rule")
     sp.add_argument("--wcag", action="store_true", help="use WCAG target sizes (44dp) instead of Material (48dp)")
-    sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for the contrast sample")
+    sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale for the contrast sample")
     sp.add_argument("--rule", action="append", dest="rules", metavar="RULE_ID",
                     help="only run this rule (repeatable): an id like a11y.label.missing, an "
                          "alias R1..R18, or an ATF name like TouchTargetSize; omit to run all")
@@ -622,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="inline full view properties under each node's view.properties")
     sp.add_argument("--overlay", metavar="OUT.png",
                     help="render a labelled, color-coded integrated overlay PNG")
-    sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for --overlay")
+    sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale for --overlay")
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the merged tree as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
@@ -654,7 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--out", metavar="OUT.png", required=True, help="output PNG path")
-    sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale (<=1.0)")
+    sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale in (0, 1]")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_screenshot)

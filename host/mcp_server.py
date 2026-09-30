@@ -1403,7 +1403,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "scale": {
                     "type": "number",
                     "default": 1.0,
-                    "minimum": 0.0,
+                    "exclusiveMinimum": 0,
                     "maximum": 1.0,
                     "description": "Screenshot scale factor in (0, 1]. Only used when include_screenshot=true.",
                 },
@@ -1463,7 +1463,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "scale": {
                     "type": "number",
                     "default": 1.0,
-                    "minimum": 0.0,
+                    "exclusiveMinimum": 0,
                     "maximum": 1.0,
                     "description": "Scale factor in (0, 1]; 1.0 = full resolution.",
                 },
@@ -1513,7 +1513,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
+                "scale": {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0,
                           "description": "Screenshot scale in (0, 1]."},
                 "all_boxes": {"type": "boolean", "default": False,
                               "description": "Box every node, not just text/role-bearing ones."},
@@ -1579,7 +1579,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "include_contrast": {"type": "boolean", "default": True,
                     "description": "Sample a screenshot to run the color-contrast rule (R3)."},
-                "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
+                "scale": {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0,
                     "description": "Screenshot scale in (0,1] for the contrast sample."},
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "Use WCAG target sizes (44dp) instead of Material (48dp)."},
@@ -1608,7 +1608,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
+                "scale": {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0,
                     "description": "Screenshot scale in (0,1]."},
                 "include_contrast": {"type": "boolean", "default": True,
                     "description": "Also run the contrast rule so contrast issues are colored in."},
@@ -1991,6 +1991,7 @@ def _run_tool_call(name: str, entry: Dict[str, Any], args: Any,
                    call: _CallState) -> Dict[str, Any]:
     """_run_tool's body, with ``call`` as this thread's call state."""
     try:
+        args = _normalize_arguments(entry["schema"], args)
         _validate_arguments(name, entry["schema"], args)
         try:
             return entry["handler"](args)
@@ -2074,6 +2075,37 @@ def _is_expected_error(exc: BaseException) -> bool:
 _VALIDATORS: Dict[str, Any] = {}
 
 
+def _normalize_arguments(schema: Dict[str, Any], args: Any) -> Any:
+    """``args`` with an explicit null for an optional argument dropped (null
+    means "use the default", as omitting it does) and a whole-number float for
+    an integer one made an int (12.0 -> 12; JSON has a single number type and
+    some clients send every number as a float). Nested objects too. Anything
+    else is left for validation to report."""
+    if not isinstance(args, dict):
+        return args
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or ())
+    out: Dict[str, Any] = {}
+    for key, value in args.items():
+        spec = props.get(key)
+        if spec is None:
+            out[key] = value  # unknown: validation names it
+            continue
+        if value is None and key not in required:
+            continue
+        typ = spec.get("type")
+        if typ == "integer" and _whole_float(value):
+            value = int(value)
+        elif typ == "object" and isinstance(value, dict) and spec.get("properties"):
+            value = _normalize_arguments(spec, value)
+        out[key] = value
+    return out
+
+
+def _whole_float(value: Any) -> bool:
+    return isinstance(value, float) and value.is_integer()
+
+
 def _validate_arguments(name: str, schema: Dict[str, Any], args: Any) -> None:
     """Raise ToolError if ``args`` doesn't match ``schema``.
 
@@ -2117,6 +2149,19 @@ _JSON_TYPES: Dict[str, Tuple[type, ...]] = {
 }
 
 
+def _check_bounds(spec: Dict[str, Any], value: Any, name: str) -> None:
+    """The numeric bounds of ``spec``, with jsonschema's wording."""
+    checks = (
+        ("minimum", lambda v, b: v < b, "less than the minimum"),
+        ("exclusiveMinimum", lambda v, b: v <= b, "less than or equal to the minimum"),
+        ("maximum", lambda v, b: v > b, "greater than the maximum"),
+        ("exclusiveMaximum", lambda v, b: v >= b, "greater than or equal to the maximum"),
+    )
+    for keyword, fails, words in checks:
+        if keyword in spec and fails(value, spec[keyword]):
+            raise ToolError(f"invalid argument {name}: {value!r} is {words} of {spec[keyword]!r}")
+
+
 def _minimal_validate(schema: Dict[str, Any], args: Dict[str, Any], where: str = "") -> None:
     """The jsonschema-free fallback: required, unknown, type and numeric bounds."""
     props = schema.get("properties", {})
@@ -2133,17 +2178,13 @@ def _minimal_validate(schema: Dict[str, Any], args: Dict[str, Any], where: str =
         typ = spec.get("type")
         ok = True
         if typ in _JSON_TYPES:
-            ok = isinstance(value, _JSON_TYPES[typ]) and not (
-                typ in ("integer", "number") and isinstance(value, bool))
+            # As jsonschema: a bool is no number, and 12.0 is an integer.
+            ok = (isinstance(value, _JSON_TYPES[typ]) or (typ == "integer" and _whole_float(value))
+                  ) and not (typ in ("integer", "number") and isinstance(value, bool))
         if not ok:
             raise ToolError(f"invalid argument {where}{key}: {value!r} is not of type '{typ}'")
         if typ in ("integer", "number"):
-            if "minimum" in spec and value < spec["minimum"]:
-                raise ToolError(f"invalid argument {where}{key}: {value!r} is less than the "
-                                f"minimum of {spec['minimum']}")
-            if "maximum" in spec and value > spec["maximum"]:
-                raise ToolError(f"invalid argument {where}{key}: {value!r} is greater than the "
-                                f"maximum of {spec['maximum']}")
+            _check_bounds(spec, value, f"{where}{key}")
         if typ == "object" and isinstance(value, dict) and spec.get("properties"):
             _minimal_validate(spec, value, f"{where}{key}.")
         if typ == "array" and isinstance(value, list):

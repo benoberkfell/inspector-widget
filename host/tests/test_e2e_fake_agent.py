@@ -778,16 +778,20 @@ def test_mcp_screenshot(mcp, fake_device):
         assert png_pixel(res["path"], 20, 50) == OK_BUTTON_RGB
 
 
-@pytest.mark.parametrize("scale,wire", [(0, 1.0), (0.25, 0.25), (1, 1.0)])
-def test_mcp_screenshot_scale_is_clamped(mcp, fake_device, scale, wire):
-    assert "error" not in mcp("screenshot", scale=scale)
+@pytest.mark.parametrize("scale,wire", [(0.25, 0.25), (1, 1.0), (None, 1.0)])
+def test_mcp_screenshot_scale_reaches_the_wire(mcp, fake_device, scale, wire):
+    assert "error" not in mcp("screenshot", scale=scale)  # null: the default
     assert fake_device.requests("screenshot")[-1].scale == wire
 
 
-def test_mcp_scale_out_of_schema_range_is_rejected_before_touching_the_device(mcp, fake_device):
-    res = mcp("screenshot", scale=5)
-    assert res == {"error": "invalid argument scale: 5 is greater than the maximum of 1.0",
-                   "tool": "screenshot"}
+@pytest.mark.parametrize("scale,error", [
+    (5, "invalid argument scale: 5 is greater than the maximum of 1.0"),
+    (0, "invalid argument scale: 0 is less than or equal to the minimum of 0"),
+])
+def test_mcp_scale_out_of_schema_range_is_rejected_before_touching_the_device(mcp, fake_device,
+                                                                              scale, error):
+    res = mcp("screenshot", scale=scale)
+    assert res == {"error": error, "tool": "screenshot"}
     assert fake_device.adb_log == [] and fake_device.wire == []
 
 
