@@ -195,6 +195,11 @@ _SIG_SOURCES = (
     "inspector_widget/inject.py",
     "inspector_widget/client.py",
     "inspector_widget/correlate.py",
+    "inspector_widget/talkback/device.py",
+    "inspector_widget/talkback/inject.py",
+    "inspector_widget/talkback/walk.py",
+    "inspector_widget/talkback/diff.py",
+    "inspector_widget/talkback/scenarios.py",
 )
 
 _NAMED_RECEIVERS = {
@@ -250,16 +255,22 @@ def _instance_attrs(cls) -> Set[str]:
     if dataclasses.is_dataclass(cls):
         names |= {f.name for f in dataclasses.fields(cls)}
     names |= set(getattr(cls, "__annotations__", {}))
-    try:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(cls)))
-    except (OSError, TypeError, SyntaxError):
-        tree = None
-    for node in ast.walk(tree) if tree else ():
-        targets = node.targets if isinstance(node, ast.Assign) else (
-            [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
-        for t in targets:
-            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self":
-                names.add(t.attr)
+    # self.<attr> assignments in the class and in the base classes it inherits from
+    for klass in getattr(cls, "__mro__", (cls,)):
+        if (getattr(klass, "__module__", "") or "").split(".")[0] != "inspector_widget" \
+                and klass is not cls:
+            continue
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(klass)))
+        except (OSError, TypeError, SyntaxError):
+            tree = None
+        for node in ast.walk(tree) if tree else ():
+            targets = node.targets if isinstance(node, ast.Assign) else (
+                [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+            for t in targets:
+                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
+                        and t.value.id == "self":
+                    names.add(t.attr)
     _ATTRS_CACHE[cls] = names
     return names
 
@@ -310,7 +321,10 @@ class _SignatureScan(ast.NodeVisitor):
                 if node.level:
                     if not self.package:
                         continue
-                    base = self.package + ("." + node.module if node.module else "")
+                    # `from .. import x` in a subpackage is relative to its parent.
+                    parts = self.package.split(".")
+                    parts = parts[:len(parts) - (node.level - 1)]
+                    base = ".".join(parts) + ("." + node.module if node.module else "")
                 else:
                     base = node.module or ""
                 if base.split(".")[0] != "inspector_widget":
@@ -584,6 +598,12 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("skia_client", "per_component_images"),
         ("overlay", "render_a11y_overlay"),
         ("a11y_lint", "run_lint"),          # cli / mcp_server -> the unified lint
+        ("device", "action"),               # talkback tool / subcommand
+        ("walk", "run_walk"),               # tb_walk
+        ("scenarios", "run_scenario"),      # tb_scenario
+        ("Session", "dump_a11y"),           # the walk's focus reader
+        ("adb", "shell"),                   # talkback/device.py
+        ("diff", "analyze"),
     }
     assert expected <= seen, f"scan no longer checks: {sorted(expected - seen)}"
     probes = {(o, a) for s in signature_scans.values() for o, a, _ok, _l in s.probes}
