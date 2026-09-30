@@ -170,6 +170,9 @@ def node_to_dict(node: "pb.ViewNode", resolver: StringResolver) -> Dict[str, Any
     if node.flags & pb.ViewNode.TEXT_REDACTED:
         # A password field: "text" is one U+2022 per character, not the content.
         flags.append("TEXT_REDACTED")
+    if node.flags & pb.ViewNode.CHILDREN_TRUNCATED:
+        # At the agent's depth cap: this node has children that were not sent.
+        flags.append("CHILDREN_TRUNCATED")
     if flags:
         out["flags"] = flags
 
@@ -204,6 +207,9 @@ def dump_tree_to_dict(response: "pb.DumpTreeResponse") -> Dict[str, Any]:
             "scale": s.scale,
             "compressed_bytes": len(s.data),
         }
+    if response.diagnostics:
+        # What the agent cut or skipped (depth cap, failed properties).
+        out["diagnostics"] = response.diagnostics
     return out
 
 

@@ -191,6 +191,12 @@ class Dispatcher(private val deviceLock: Any = Any()) {
                 val firstRoot: View? = selectRootViews(rootId).firstOrNull()
                 DumpTreeWork(roots, views, firstRoot)
             }
+        if (treeBuilder.truncatedNodes > 0) {
+            diag.add(
+                "depth-truncated=${treeBuilder.truncatedNodes} (children below " +
+                    "${WireLimits.MAX_TREE_DEPTH} levels not sent)",
+            )
+        }
 
         // Properties are read in batches, one main-thread hop each (see PROPERTY_BATCH). A
         // View detached between hops still reads its last state.

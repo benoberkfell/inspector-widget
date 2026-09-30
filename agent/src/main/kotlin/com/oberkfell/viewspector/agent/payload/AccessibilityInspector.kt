@@ -71,8 +71,10 @@ object AccessibilityInspector {
 
     private const val TAG = "ViewSpector"
 
-    // Loop / fan-out guards.
-    private const val MAX_DEPTH = 250
+    // Loop / fan-out guards. walk() depth is 0-based, so MAX_DEPTH = cap - 1 sends at most
+    // WireLimits.MAX_TREE_DEPTH levels (deeper, the host can't parse the response at all);
+    // a node at the cap with children is flagged children_truncated.
+    private const val MAX_DEPTH = WireLimits.MAX_TREE_DEPTH - 1
     private const val MAX_NODES = 5000
     private const val VIEW_MAX_DEPTH = 400
 
@@ -183,6 +185,7 @@ object AccessibilityInspector {
         var nullChildren = 0
         var unenumerable = 0
         var reflectFailures = 0
+        var depthTruncated = 0
         val loggedFailures = HashSet<String>()
         val composeIndex = HashMap<View, ComposeInspector.SemanticsIndex?>()
 
@@ -310,6 +313,13 @@ object AccessibilityInspector {
         if (ctx.nullChildren > 0) diag.append("; null-children=${ctx.nullChildren}")
         if (ctx.unenumerable > 0) diag.append("; provider-children-unreachable=${ctx.unenumerable}")
         if (ctx.reflectFailures > 0) diag.append("; reflect-failures=${ctx.reflectFailures}")
+        if (ctx.depthTruncated > 0) {
+            diag.append(
+                "; depth-truncated=${ctx.depthTruncated} (children below " +
+                    "${WireLimits.MAX_TREE_DEPTH} levels not sent)",
+            )
+        }
+        if (ctx.count >= ctx.maxNodes) diag.append("; node-cap=${ctx.maxNodes} reached (later nodes not sent)")
         return windows to diag.toString()
     }
 
@@ -634,6 +644,11 @@ object AccessibilityInspector {
                     b.addChildren(walk(child, identify(child, childId, ctx), ctx, depth + 1, local))
                 }
             }
+        }
+        if (depth >= ctx.maxDepth && safeInt { node.childCount } > 0) {
+            // The depth cap (the wire cap for a dump): this node's children were not walked.
+            b.childrenTruncated = true
+            ctx.depthTruncated++
         }
         return b.build()
     }

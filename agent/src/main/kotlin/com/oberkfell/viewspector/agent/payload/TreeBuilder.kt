@@ -51,6 +51,13 @@ class TreeBuilder(val strings: StringTable) {
     fun viewFor(id: Long): View? = viewsById[id]
 
     /**
+     * Nodes of the last [buildRoots] at the depth cap ([WireLimits.MAX_TREE_DEPTH]) whose
+     * children were not sent (each is flagged CHILDREN_TRUNCATED).
+     */
+    var truncatedNodes: Int = 0
+        private set
+
+    /**
      * Build view-node trees for the requested root.
      *
      * @param rootId a window root's uniqueDrawingId, or 0 to build every root.
@@ -61,6 +68,7 @@ class TreeBuilder(val strings: StringTable) {
     fun buildRoots(rootId: Long): List<ViewInspection.ViewNode> {
         visitedViews.clear()
         viewsById.clear()
+        truncatedNodes = 0
 
         val roots = RootsDetector.rootViews()
         val selected =
@@ -72,7 +80,7 @@ class TreeBuilder(val strings: StringTable) {
 
         return selected.mapNotNull { root ->
             try {
-                buildNode(root)
+                buildNode(root, 1)
             } catch (t: Throwable) {
                 Log.w(TAG, "Failed to build node tree for root", t)
                 null
@@ -80,8 +88,13 @@ class TreeBuilder(val strings: StringTable) {
         }
     }
 
-    /** Recursively convert [view] (and any children) into a ViewNode. */
-    private fun buildNode(view: View): ViewInspection.ViewNode {
+    /**
+     * Recursively convert [view] (and any children) into a ViewNode. [depth] is 1 for a
+     * window root; a node at [WireLimits.MAX_TREE_DEPTH] keeps its fields but not its
+     * children (flagged CHILDREN_TRUNCATED): a deeper tree would make the whole response
+     * unparseable by the host's protobuf runtime.
+     */
+    private fun buildNode(view: View, depth: Int): ViewInspection.ViewNode {
         visitedViews.add(view)
         val id = ViewReflect.uniqueDrawingId(view)
         if (id != 0L) {
@@ -142,6 +155,11 @@ class TreeBuilder(val strings: StringTable) {
                     Log.w(TAG, "ViewGroup.getChildCount() failed", t)
                     0
                 }
+            if (childCount > 0 && depth >= WireLimits.MAX_TREE_DEPTH) {
+                builder.flags = builder.flags or ViewInspection.ViewNode.Flag.CHILDREN_TRUNCATED_VALUE
+                truncatedNodes++
+                return builder.build()
+            }
             for (i in 0 until childCount) {
                 val child =
                     try {
@@ -150,7 +168,7 @@ class TreeBuilder(val strings: StringTable) {
                         Log.w(TAG, "ViewGroup.getChildAt($i) failed", t)
                         null
                     } ?: continue
-                builder.addChildren(buildNode(child))
+                builder.addChildren(buildNode(child, depth + 1))
             }
         }
 

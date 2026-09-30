@@ -58,6 +58,12 @@ object ComposeInspector {
     private const val ANDROID_COMPOSE_VIEW = "androidx.compose.ui.platform.AndroidComposeView"
     private const val MAX_DEPTH = 400
 
+    // Semantics nodes sit under the synthetic AndroidComposeView root, so depth 0..cap-2
+    // keeps a window within WireLimits.MAX_TREE_DEPTH levels (deeper, the host can't parse
+    // the response at all). Nodes cut here are counted into the diagnostics.
+    private const val SEMANTICS_MAX_DEPTH = WireLimits.MAX_TREE_DEPTH - 2
+    private var semanticsCut = 0
+
     /**
      * Build a Compose window per AndroidComposeView found under [rootViews]. Call on the main thread.
      * Returns the windows plus a human diagnostics string describing what was reachable.
@@ -68,6 +74,7 @@ object ComposeInspector {
         includeSemantics: Boolean,
         includeSlotTable: Boolean,
     ): Pair<List<ViewInspection.DumpComposeResponse.Window>, String> {
+        semanticsCut = 0
         val composeViews = ArrayList<View>()
         val nested = intArrayOf(0)
         for (root in rootViews) collectComposeViews(root, composeViews, nested, false, 0)
@@ -147,6 +154,12 @@ object ComposeInspector {
         }
         if (noNodes.isNotEmpty()) {
             diag.append("; view#${noNodes.joinToString(",view#")} produced no compose nodes")
+        }
+        if (semanticsCut > 0) {
+            diag.append(
+                "; semantics-depth-truncated=$semanticsCut (nodes below " +
+                    "${WireLimits.MAX_TREE_DEPTH} levels not sent)",
+            )
         }
         return windows to diag.toString()
     }
@@ -355,7 +368,7 @@ object ComposeInspector {
         depth: Int,
         off: IntArray,
     ): ViewInspection.ComposeNode? {
-        if (depth > MAX_DEPTH) return null
+        if (depth > SEMANTICS_MAX_DEPTH) { semanticsCut++; return null }
         val b = ViewInspection.ComposeNode.newBuilder()
         b.kind = ViewInspection.ComposeNode.Kind.SEMANTICS
         (invoke(node, "getId") as? Int)?.let { b.id = it.toLong() }

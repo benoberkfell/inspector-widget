@@ -113,6 +113,8 @@ _BOOL_FLAGS = (
     "content_invalid", "showing_hint_text", "text_entry_key", "text_selectable",
     "field_required", "can_open_popup", "a11y_data_sensitive",
     "request_initial_focus", "is_virtual", "is_traversal_group",
+    # Agent-side markers: children cut at the wire depth cap.
+    "children_truncated",
 )
 
 # String-table-id text fields -> output key.
