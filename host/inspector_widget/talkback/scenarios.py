@@ -111,15 +111,12 @@ def timeline(drv: Driver, t0: float, wait_s: float, stop_when_quiet: bool,
 
 
 def _ensure_proven(drv: Driver, cur: Snapshot) -> Snapshot:
-    """Prove the keymap without moving: next, then prev back to where we were."""
+    """Prove the keymap without moving: next, then back to where we were (the
+    proof may have wrapped past an edge)."""
     assert drv.inj is not None
     if drv.inj.proven:
         return cur
-    w = drv.prove(cur.key)
-    if cur.key is None or w.snap.key == cur.key:
-        return w.snap
-    t, _ = drv.press("prev")
-    return drv.wait(w.snap.key, t).snap
+    return drv.return_to(cur.key, drv.prove(cur.key).snap)
 
 
 def _do_action(drv: Driver, cur: Snapshot, action: str) -> Tuple[str, Snapshot]:
@@ -191,7 +188,9 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
                  step_timeout_ms=step_timeout_ms, settle_ms=settle_ms, what="tb_scenario")
     out: Dict[str, Any] = {"kind": kind, "serial": session.serial, "package": session.package}
     with drv:
-        cur = drv.reader.snapshot()
+        # TalkBack that just started puts its own initial focus on the window ~550ms
+        # later; let it, or it lands after (and over) the target we focus.
+        cur = drv.settle_initial()
         legacy = bool(cur.index.legacy)
         if target:
             cur = _seek_start(drv, cur, target, "next", 60)

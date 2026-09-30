@@ -159,7 +159,8 @@ def first_lap(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _lap_complete(walk: Dict[str, Any]) -> bool:
-    return walk.get("ended") in ("wrap", "edge") or any(s.get("edge") for s in walk["steps"])
+    """A full lap: the walk wrapped (past an edge and back onto a stop it had read)."""
+    return walk.get("ended") == "wrap" or any(s.get("via") == "wrap" for s in walk["steps"])
 
 
 def _dp(px: float, density: int) -> float:
@@ -223,14 +224,27 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
     return vs, findings
 
 
-def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows: set) -> List[str]:
-    """Predicted stops never visited, where the walk covered them: all of P after a
-    full lap, else only those between the first and last predicted stops reached."""
-    pwin = {p["key"]: p.get("window") for p in walk.get("predicted") or []}
+def _coverage(walk: Dict[str, Any], P: List[str], visited: set) -> Tuple[int, int, str]:
+    """The part of P the walk went over: all of it after a full lap; from where it
+    started to the end it reached (an edge); else between the stops it reached."""
     idx = [i for i, k in enumerate(P) if k in visited]
     if not idx:
-        return []
-    lo, hi = (0, len(P) - 1) if _lap_complete(walk) else (min(idx), max(idx))
+        return 0, -1, ""
+    if _lap_complete(walk):
+        return 0, len(P) - 1, "in a full lap"
+    first = next((_pk(s) for s in _moves(walk["steps"]) if _pk(s) in P), None)
+    start = P.index(first) if first is not None else min(idx)
+    if any(s.get("edge") for s in walk["steps"]):
+        if walk.get("direction", "next") == "next":
+            return start, len(P) - 1, "from the start to the edge"
+        return 0, start, "from the start back to the edge"
+    return min(idx), max(idx), "between the stops it did reach"
+
+
+def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows: set) -> List[str]:
+    """Predicted stops never visited, where the walk went over them (:func:`_coverage`)."""
+    pwin = {p["key"]: p.get("window") for p in walk.get("predicted") or []}
+    lo, hi, _scope = _coverage(walk, P, visited)
     return [k for k in P[lo:hi + 1] if k not in visited and pwin.get(k) not in covered_windows]
 
 
@@ -244,7 +258,7 @@ def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
     names = ", ".join(f"{pref[k]['ref']} {_q(pref[k]['label'])}" for k in miss[:3])
     more = f" (+{len(miss) - 3} more)" if len(miss) > 3 else ""
-    scope = "in a full lap" if _lap_complete(walk) else "between the stops it did reach"
+    scope = _coverage(walk, P, visited)[2]
     return [_finding("tb.skipped", "warn",
                      f"TalkBack never reached {len(miss)} predicted stop(s) {scope}: {names}{more}",
                      refs=[pref[k]["ref"] for k in miss], keys=miss)]
@@ -302,16 +316,25 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
             if a and b and a != b and (_contains(a, b) or _contains(b, a)):
                 outer, inner = (prev, s) if _contains(a, b) else (s, prev)
                 # The inner stop's own words (its label; role and state words aside)
-                # against everything the outer stop says.
+                # against what the outer stop says (its label joins its children's
+                # texts, which TalkBack does not speak when they are stops of their own).
                 ti = _tokens(inner.get("label") or inner.get("speak")) - _ROLE_STATE_WORDS
-                to = _tokens(f"{outer.get('speak') or ''} {outer.get('label') or ''}")
+                to = _tokens(outer.get("speak") or outer.get("label"))
                 overlap = len(ti & to) / len(ti) if ti else 0.0
+                both = "clickable" in (outer.get("flags") or []) and \
+                    "clickable" in (inner.get("flags") or [])
                 if overlap >= DOUBLE_STOP_OVERLAP:
                     out.append(_finding(
                         "tb.double_stop", "warn",
                         f"steps {prev['i']}-{s['i']}: {_name(outer)} and {_name(inner)} inside it are "
                         f"both stops, and {int(overlap * 100)}% of the inner one's words are already "
                         f"spoken at the outer one", [prev, s]))
+                elif both:
+                    out.append(_finding(
+                        "tb.double_stop", "warn",
+                        f"steps {prev['i']}-{s['i']}: {_name(outer)} and {_name(inner)} inside it are "
+                        f"both clickable stops: one item takes two swipes, and activating the outer "
+                        f"one may not do what the inner control does", [prev, s]))
         prev = s
     return out[:5]
 

@@ -277,3 +277,30 @@ def test_role_only_logcat_speech_is_unlabelled():
     s = step(1, "view:5", (39, 236, 117, 117), "Like this photo", speak="Like this photo. Button",
              utt="logcat")
     assert diff._ghost_reasons(s, 390) == []
+
+
+def test_double_stop_from_speech_not_from_the_containers_child_texts():
+    row = step(0, "compose:14:3", (0, 300, 1280, 190), "Item 0 (compose) | Done",
+               speak="Item 0 (compose)", via="start", flags=["focusable"])
+    box = step(1, "compose:14:5", (900, 330, 120, 120), "Done", speak="checked. Done. Check box",
+               cls="CheckBox", flags=["clickable", "focusable"])
+    assert "tb.double_stop" not in codes(diff.analyze(record([row, box], ended="max_steps")))
+    row["flags"] = ["clickable", "focusable"]  # a clickable card around its own Checkbox (C1)
+    res = diff.analyze(record([row, box], ended="max_steps"))
+    f = next(f for f in res["findings"] if f["code"] == "tb.double_stop")
+    assert "both clickable stops" in f["msg"] and f["refs"] == ["compose:14:3", "compose:14:5"]
+
+
+def test_a_walk_from_the_middle_to_the_edge_covers_only_that_part():
+    items = _column(6)
+    steps = [step(0, items[3][0], items[3][1], items[3][2], via="start"),
+             step(1, items[4][0], items[4][1], items[4][2]),
+             step(2, items[5][0], items[5][1], items[5][2]), edge(3, items[5][0])]
+    res = diff.analyze(record(steps, [pstop(*it) for it in items], ended="edge"))
+    assert "tb.skipped" not in codes(res) and "unvisited" not in res["vs_model"]
+    # prev from the middle to the top edge: the stops after the start are not covered
+    back = [step(0, items[2][0], items[2][1], items[2][2], via="start"),
+            step(1, items[1][0], items[1][1], items[1][2]), edge(2, items[1][0])]
+    res = diff.analyze(record(back, [pstop(*it) for it in items], ended="edge", direction="prev"))
+    skipped = next(f for f in res["findings"] if f["code"] == "tb.skipped")
+    assert skipped["refs"] == [items[0][0]] and "back to the edge" in skipped["msg"]

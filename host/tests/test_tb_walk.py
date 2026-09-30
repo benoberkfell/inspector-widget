@@ -881,3 +881,31 @@ def test_focus_after_reports_the_models_initial_focus(probe, monkeypatch):
     res = scenario(probe, "focus_after", target="Item 2", action="activate")
     assert res["verdict"] == "initial_ok"
     assert res["model"]["initial"] == "view:2010" and res["model"]["title"] == "Share"
+
+
+def test_scenario_target_is_focused_after_talkbacks_own_initial_focus(probe, monkeypatch):
+    """TalkBack's initial focus comes ~550ms after it starts: a target focused
+    before that would be overwritten, so the scenario waits for it first."""
+    import threading
+    monkeypatch.setattr(tbwalk, "INITIAL_FOCUS_S", 1.0)
+    tb = probe.talkback
+    real_sync = tb.sync
+
+    def late_initial_focus():
+        was = tb.was_running
+        real_sync()
+        if tb.running and not was:
+            threading.Timer(0.3, tb.set_focus, args=[TB_TITLE]).start()
+
+    monkeypatch.setattr(tb, "sync", late_initial_focus)
+    res = scenario(probe, "survive", target="Item 3", mutate="broadcast:-a x")
+    assert res["target"]["ref"] == "view:1023" and res["verdict"] == "kept"
+
+
+def test_proving_the_keymap_on_the_last_stop_comes_back_to_it(probe, monkeypatch):
+    """Live D1: the target is the last stop, so the proof's "next" hits the edge and
+    wraps; focus must come back to the target before it is activated."""
+    monkeypatch.setattr(tbscenarios, "WINDOW_QUIET_S", 0.1)
+    res = scenario(probe, "focus_after", target="Item 5", action="activate")
+    assert probe.talkback.clicks == [tb_item(5)]
+    assert res["target"]["ref"] == "view:1025"

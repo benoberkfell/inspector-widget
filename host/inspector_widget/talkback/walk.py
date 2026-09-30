@@ -946,6 +946,27 @@ class Driver:
                         hint="Check TalkBack is running (talkback status) and that the app has "
                              "focusable content.")
 
+    def return_to(self, key: Optional[str], snap: Snapshot) -> Snapshot:
+        """Put focus back on ``key`` after the keymap proof moved it. The proof's
+        "next" may have hit an edge and wrapped, so one "prev" is not enough: use
+        A11yAct when the agent has it, else up to two "prev" presses."""
+        if key is None or snap.key == key:
+            return snap
+        if isinstance(self.reader, A11yFocusReader):
+            from .. import a11y
+            d = a11y.a11y_act_to_dict(self.session.a11y_act(node_key=key, action="accessibility_focus"))
+            if d.get("performed"):
+                back = self.reader.wait_change(snap.key, self.timeout_s, self.quiet_s).snap
+                if back.key == key:
+                    return back
+        for _ in range(2):
+            t, _ = self.press("prev")
+            self.seek_presses += 1
+            snap = self.wait(snap.key, t).snap
+            if snap.key == key:
+                break
+        return snap
+
     def try_other_keymap(self) -> bool:
         """Switch an unproven keyboard to the classic (Alt) keymap once."""
         keys = self.inj
@@ -1173,21 +1194,14 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
     if start not in ("current", "first"):
         acted = _act_focus(drv, cur, start)
         if acted is not None:
-            if direction == "prev":  # prove the keymap, then step back onto the target
-                w = drv.prove(acted.key)
-                t, _ = drv.press("prev")
-                drv.seek_presses += 1
-                return drv.wait(w.snap.key, t).snap
+            if direction == "prev":  # prove the keymap, then back onto the target
+                return drv.return_to(acted.key, drv.prove(acted.key).snap)
             return acted
     before = cur
     w = drv.prove(cur.key)
     snap = w.snap
     if start == "current":
-        if before.key is not None and snap.key != before.key:
-            t, _ = drv.press("prev")  # back to where the user was
-            snap = drv.wait(snap.key, t).snap
-            drv.seek_presses += 1
-        return snap
+        return drv.return_to(before.key, snap)  # back to where the user was
     if start == "first":
         t, _ = drv.press("first")
         w2 = drv.wait(snap.key, t)
