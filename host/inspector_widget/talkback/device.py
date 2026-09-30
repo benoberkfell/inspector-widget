@@ -421,7 +421,13 @@ def dismiss_talkback_activities(serial: str, top_before: Optional[str] = None) -
     permission flags unchanged) is on top. The dialog can come a second or two
     after touch exploration is on, so this watches for DISMISS_WINDOW_S and
     stops early once one was dismissed and the top has stayed put. An injected
-    BACK reaches the activity (it is not a TalkBack key)."""
+    BACK reaches the activity (it is not a TalkBack key).
+
+    BACK goes only to an activity that is on top on two reads DISMISS_POLL_S
+    apart: the dialog sits on TalkBack's PermissionRequestActivity, which
+    finishes by itself once the dialog is gone, and a BACK sent as it leaves
+    lands on the app below and closes it (seen on API 37: the app came back
+    recreated, without the screen it had been started on)."""
     dismissed: List[str] = []
     deadline = time.monotonic() + DISMISS_WINDOW_S
     calm = 0
@@ -429,6 +435,9 @@ def dismiss_talkback_activities(serial: str, top_before: Optional[str] = None) -
         top = top_activity(serial)
         if top and top != top_before and top.startswith(
                 tuple(p + "/" for p in _DISMISSABLE_PACKAGES)):
+            time.sleep(DISMISS_POLL_S)
+            if top_activity(serial) != top:
+                continue  # it left by itself
             adb.shell(serial, "input keyevent KEYCODE_BACK")
             dismissed.append(top)
             calm = 0
