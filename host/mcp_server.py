@@ -2120,7 +2120,8 @@ def _render_result(name: str, result: Any, args: Any) -> Tuple[str, bool]:
     if not isinstance(args, dict):
         args = {}
     brief = output.slim(name, result, args)
-    text = output.finalize(name, brief, max_bytes=args.get("max_bytes"))
+    text = output.finalize(name, brief, max_bytes=args.get("max_bytes"),
+                           detail=args.get("detail"))
     return text, isinstance(brief, dict) and "error" in brief
 
 

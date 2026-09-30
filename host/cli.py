@@ -417,7 +417,8 @@ def _emit_result(args, tool, legacy, result=None, dest=None, what="JSON"):
         doc = output.slim(tool, legacy if result is None else result, targs)
     pretty = bool(getattr(args, "pretty", False))
     if dest == "-":
-        print(output.finalize(tool, doc, max_bytes=targs.get("max_bytes"), pretty=pretty))
+        print(output.finalize(tool, doc, max_bytes=targs.get("max_bytes"), pretty=pretty,
+                              detail=targs.get("detail")))
     else:
         with open(dest, "w", encoding="utf-8") as f:
             f.write(output.dumps(doc, pretty=pretty))

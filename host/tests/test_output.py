@@ -150,6 +150,11 @@ def test_finalize_spills_oversize_results_to_an_envelope(tmp_path):
     assert env["preview"][0] == "view:1001 LinearLayout #view_1 [1,3 300x60]"
     assert env["preview"][1] == "  view:1002 LinearLayout #view_2 [2,6 300x60] +42"
     assert "max_depth=2" in env["hint"] and "root=" in env["hint"]
+    # the call was brief already: the hint does not suggest it (live, it did)
+    assert "brief" not in env["hint"]
+    full = json.loads(out.finalize("dump_tree", brief, max_bytes=None, detail="full",
+                                   spill_dir=str(tmp_path / "spill")))
+    assert 'use detail="brief"' in full["hint"]
     # the spill file holds the complete brief result, private to the user
     with open(env["spill_path"], encoding="utf-8") as f:
         assert json.load(f) == json.loads(full_text)
@@ -245,13 +250,23 @@ def test_the_store_tightens_a_root_that_something_else_created(tmp_path):
 def test_preview_lines_cover_every_tree_shape():
     a11y = lf.load("launcher", "a11y")
     lines = out.preview_lines(a11y)
-    assert lines[0].startswith("a11y:1:-1 FrameLayout [0,0 1280x2856]")
+    assert lines[0].startswith("a11y:1:-1 FrameLayout > ")
+    assert lines[0].endswith(" [0,0 1280x2856]")
     comp = lf.load("launcher", "compose_sem")
-    assert out.preview_lines(comp)[:2] == ["compose:82 AndroidComposeView [0,0 1280x2856]",
-                                           "  compose:150 Node [0,0 1280x2856] +16"]
+    assert out.preview_lines(comp)[:2] == [
+        "compose:82 AndroidComposeView > compose:150 Node > compose:310 Node [0,0 1280x2856]",
+        "  compose:325 launcher_list @launcher_list [0,348 1280x2436] +12"]
     ins = lf.load("launcher", "inspect")
-    assert out.preview_lines(ins)[:2] == ["view:1 DecorView [0,0 1280x2856]",
-                                          "  view:78 LinearLayout [0,0 1280x2856] +23"]
+    # a single-child chain is one line (the ViewStub beside #content is a zero-size
+    # leaf, left out), so the two levels shown reach the ComposeView
+    assert out.preview_lines(ins)[:2] == [
+        "view:1 DecorView [0,0 1280x2856]",
+        "  view:78 LinearLayout > view:80 FrameLayout #content > view:81 ComposeView > "
+        "view:82 AndroidComposeView [0,0 1280x2856] +19"]
+    screen = out.preview_lines(lf.load("viewscreen", "inspect"))
+    assert screen[0].startswith("view:34 DecorView > view:35 LinearLayout > ")
+    assert screen[0].endswith("> view:1 ScrollView > view:2 LinearLayout [0,0 1280x2856]")
+    assert screen[1] == '  view:3 MaterialTextView "1. ImageButton contentDescrip…" [48,48 757x101]'
     many = out.preview_lines(out.slim("dump_tree", wide_tree_result(props=False), {}),
                              max_lines=5, depth=3)
     assert len(many) == 5 and many[-1].strip().startswith("…") and "more lines" in many[-1]
@@ -732,3 +747,26 @@ def test_dump_accessibility_root_takes_a_node_key():
             "node_key"] == "view:6", spec
     assert out.slim("dump_accessibility", data, {"root": "compose:6:2"})["windows"][0][
         "root"]["node_key"] == "compose:6:2"
+
+
+def test_brief_keeps_the_clipped_mark_of_clamped_bounds():
+    """strings._bounds_to_dict clamps a negative size and says clipped; the brief
+    [x,y,w,h] must not lose that (host/README "brief keeps it")."""
+    view = {"roots": [{"id": 1, "class_name": "FrameLayout",
+                       "bounds": {"layout": {"x": 0, "y": 0, "w": 100, "h": 100}},
+                       "children": [{"id": 2, "class_name": "View",
+                                     "bounds": {"layout": {"x": 10, "y": 90, "w": 0, "h": 0},
+                                                "clipped": True}}]}]}
+    brief = out.slim("dump_tree", view, {})
+    kid = brief["roots"][0]["children"][0]
+    assert kid["bounds"] == [10, 90, 0, 0] and kid["clipped"] is True
+    assert "clipped" not in brief["roots"][0]
+
+
+def test_the_preview_names_the_rid_of_a_brief_inspect_node():
+    """The brief inspect view facet carries its resource as "@pkg:id/name"; the
+    envelope preview must still say #name (live on S1 it said nothing)."""
+    ins = {"roots": [{"node_key": "view:11", "bounds": [0, 309, 1280, 2475],
+                      "view": {"id": 11, "class_name": "RecyclerView",
+                               "resource": "@com.oberkfell.a11yprobe:id/interop_list"}}]}
+    assert out.preview_lines(ins) == ["view:11 RecyclerView #interop_list [0,309 1280x2475]"]
