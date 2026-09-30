@@ -703,7 +703,7 @@ object AccessibilityInspector {
         fun s(cs: CharSequence?): Int = strings.intern(cs?.toString())
 
         // --- text & description ------------------------------------------------
-        b.text = s(safe { node.text })
+        b.text = s(safe { a11yText(node) })
         b.contentDescription = s(safe { node.contentDescription })
         b.hintText = s(safe { node.hintText })
         b.stateDescription = s(safe { node.stateDescription })
@@ -1044,6 +1044,20 @@ object AccessibilityInspector {
         }
 
     // ------------------------------------------------------------ guard helpers
+
+    /**
+     * The node's text, masked (Redaction.kt) for a password field: the node says so
+     * (isPassword) or its input type is a password variation (a visible-password field is
+     * not isPassword, yet its text is the plaintext). A node showing its hint keeps it.
+     */
+    private fun a11yText(node: AccessibilityNodeInfo): CharSequence? {
+        val text = node.text
+        if (text.isNullOrEmpty()) return text
+        val secret = bool { node.isPassword } ||
+            Redaction.isPasswordInputType(safeInt { node.inputType })
+        if (!secret || bool { node.isShowingHintText }) return text
+        return Redaction.mask(text)
+    }
 
     private inline fun <T> safe(block: () -> T): T? = try {
         block()

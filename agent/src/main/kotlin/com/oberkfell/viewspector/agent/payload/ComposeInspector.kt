@@ -365,6 +365,7 @@ object ComposeInspector {
 
         // attrs: iterate the SemanticsConfiguration
         val attrs = readSemanticsConfig(node)
+        Redaction.redactComposeAttrs(attrs) // a Password node's field content (Redaction.kt)
         for ((k, v) in attrs) {
             b.addAttrs(
                 ViewInspection.ComposeNode.Attr.newBuilder()

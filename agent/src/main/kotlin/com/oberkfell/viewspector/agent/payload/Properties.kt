@@ -132,6 +132,8 @@ class Properties(val strings: StringTable) {
             props = viewProps,
             isLayout = false,
             includeResolutionStack = includeResolutionStack,
+            // A password field's "text" property is its plaintext (Redaction.kt).
+            redactText = Redaction.isPasswordView(view),
         )
         for (companion in viewData.companions) {
             try {
@@ -158,6 +160,7 @@ class Properties(val strings: StringTable) {
                 props = layoutProps,
                 isLayout = true,
                 includeResolutionStack = false, // source/stack are VIEW-only (SimplePropertyReader.kt:159)
+                redactText = false,
             )
             for (companion in layoutData.companions) {
                 try {
@@ -363,6 +366,8 @@ class Properties(val strings: StringTable) {
         private val props: List<PropAccumulator>,
         private val isLayout: Boolean,
         private val includeResolutionStack: Boolean,
+        // Mask the "text" attribute (a password field's content).
+        private val redactText: Boolean,
     ) : PropertyReader {
 
         // Cache the source map once per reader (SimplePropertyReader.kt:45). Guarded: the API is
@@ -413,7 +418,9 @@ class Properties(val strings: StringTable) {
                     // Any CharSequence, not only String: an EditText's text is an Editable,
                     // most TextViews' a Spanned. Stringified here, on the main thread.
                     props[id].type = ViewInspection.Property.Type.STRING
-                    readAny(id, o.toString())
+                    val meta = props[id].meta
+                    val isText = meta.attributeId == android.R.attr.text || meta.name == "text"
+                    readAny(id, if (redactText && isText) Redaction.mask(o) else o.toString())
                 }
                 is ColorStateList -> {
                     props[id].type = ViewInspection.Property.Type.COLOR

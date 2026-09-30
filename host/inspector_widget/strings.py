@@ -167,6 +167,9 @@ def node_to_dict(node: "pb.ViewNode", resolver: StringResolver) -> Dict[str, Any
     flags: List[str] = []
     if node.flags & pb.ViewNode.IS_WEBVIEW:
         flags.append("IS_WEBVIEW")
+    if node.flags & pb.ViewNode.TEXT_REDACTED:
+        # A password field: "text" is one U+2022 per character, not the content.
+        flags.append("TEXT_REDACTED")
     if flags:
         out["flags"] = flags
 

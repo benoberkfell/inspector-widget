@@ -124,8 +124,14 @@ class TreeBuilder(val strings: StringTable) {
         }
 
         // text_value — best-effort for TextViews (ViewExtensions.kt:136,
-        // framework/ViewExtensions.kt:37-40 getTextValue).
-        textValueOrNull(view)?.let { text -> builder.textValue = strings.intern(text) }
+        // framework/ViewExtensions.kt:37-40 getTextValue). A password field's text is
+        // masked (Redaction.kt) and flagged TEXT_REDACTED.
+        textValueOrNull(view)?.let { (text, redacted) ->
+            builder.textValue = strings.intern(text)
+            if (redacted) {
+                builder.flags = builder.flags or ViewInspection.ViewNode.Flag.TEXT_REDACTED_VALUE
+            }
+        }
 
         // children (ViewExtensions.kt:137-139).
         if (view is ViewGroup) {
@@ -301,16 +307,25 @@ class TreeBuilder(val strings: StringTable) {
 
     /**
      * Best-effort text for text-bearing views (framework/ViewExtensions.kt:37-40):
-     * TextView.text.toString(), or null otherwise. Guarded because subclasses can
-     * throw from getText().
+     * TextView.text.toString() paired with false, or null for other views. Guarded
+     * because subclasses can throw from getText(). getText() of a password field is
+     * the plaintext (the dots are only a TransformationMethod), so for one
+     * ([Redaction.isPasswordView]) the text is masked and paired with true.
      */
-    private fun textValueOrNull(view: View): String? {
+    private fun textValueOrNull(view: View): Pair<String, Boolean>? {
         if (view !is TextView) return null
-        return try {
-            view.text?.toString()
-        } catch (t: Throwable) {
-            Log.w(TAG, "TextView.getText() failed", t)
-            null
+        val text: CharSequence =
+            try {
+                view.text
+            } catch (t: Throwable) {
+                Log.w(TAG, "TextView.getText() failed", t)
+                null
+            } ?: return null
+        if (text.isEmpty()) return "" to false
+        return if (Redaction.isPasswordView(view)) {
+            Redaction.mask(text) to true
+        } else {
+            text.toString() to false
         }
     }
 }
