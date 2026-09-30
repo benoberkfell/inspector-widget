@@ -74,6 +74,7 @@ def cmd_attach(args) -> int:
     inj = injectmod.inject_and_connect(
         serial=args.serial,
         package=args.package,
+        build_out=args.build_out,
         force_reinject=args.force,
     )
     try:
@@ -94,6 +95,7 @@ def cmd_dump(args) -> int:
     inj = injectmod.inject_and_connect(
         serial=args.serial,
         package=args.package,
+        build_out=args.build_out,
         force_reinject=args.force,
     )
     try:
@@ -147,7 +149,8 @@ def _compose_text_summary(node, out, depth=0):
 def cmd_compose(args) -> int:
     from inspector_widget import overlay as ovmod
     inj = injectmod.inject_and_connect(
-        serial=args.serial, package=args.package, force_reinject=args.force)
+        serial=args.serial, package=args.package, build_out=args.build_out,
+        force_reinject=args.force)
     try:
         client = Client(inj.sock, owns_socket=False)
         client.hello()
@@ -206,7 +209,8 @@ def cmd_a11y(args) -> int:
     from inspector_widget import overlay as ovmod
     from inspector_widget import adb, a11y_lint as lintmod
     inj = injectmod.inject_and_connect(
-        serial=args.serial, package=args.package, force_reinject=args.force)
+        serial=args.serial, package=args.package, build_out=args.build_out,
+        force_reinject=args.force)
     try:
         client = Client(inj.sock, owns_socket=False)
         client.hello()
@@ -268,7 +272,8 @@ def cmd_a11y_lint(args) -> int:
     from inspector_widget import a11y_lint as lintmod
     from inspector_widget import adb
     inj = injectmod.inject_and_connect(
-        serial=args.serial, package=args.package, force_reinject=args.force)
+        serial=args.serial, package=args.package, build_out=args.build_out,
+        force_reinject=args.force)
     try:
         client = Client(inj.sock, owns_socket=False)
         client.hello()
@@ -368,7 +373,7 @@ def _emit_json(obj, dest):
 def cmd_inspect(args) -> int:
     from inspector_widget import correlate, overlay as ovmod
     import inspector_widget as iw
-    session = iw.attach(args.serial, args.package)
+    session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
         merged = correlate.inspect_tree(session, include_properties=args.properties)
         if args.overlay:
@@ -396,7 +401,7 @@ def cmd_inspect_node(args) -> int:
     from inspector_widget import correlate, a11y_lint as lintmod
     import inspector_widget as iw
     node_key, view_id, semantics_id, bounds = _node_selector(args)
-    session = iw.attach(args.serial, args.package)
+    session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
         dossier = correlate.inspect_node(
             session, node_key=node_key, view_id=view_id,
@@ -420,7 +425,7 @@ def cmd_component_image(args) -> int:
     from inspector_widget import correlate
     import inspector_widget as iw
     node_key, view_id, semantics_id, bounds = _node_selector(args)
-    session = iw.attach(args.serial, args.package)
+    session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
         merged = correlate.inspect_tree(session, include_properties=False)
         node = correlate.find_node(merged, node_key=node_key, view_id=view_id,
@@ -443,7 +448,7 @@ def cmd_component_image(args) -> int:
 
 def cmd_screenshot(args) -> int:
     import inspector_widget as iw
-    session = iw.attach(args.serial, args.package)
+    session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
         resp = session.screenshot(root_id=0, scale=args.scale)
         if not resp.HasField("screenshot"):
@@ -458,7 +463,7 @@ def cmd_screenshot(args) -> int:
 
 def cmd_get_properties(args) -> int:
     import inspector_widget as iw
-    session = iw.attach(args.serial, args.package)
+    session = iw.attach(args.serial, args.package, build_out=args.build_out)
     try:
         resp = session.get_properties(
             args.view_id, include_resolution_stack=args.resolution_stack)
@@ -474,10 +479,19 @@ def cmd_get_properties(args) -> int:
 
 def cmd_detach(args) -> int:
     import inspector_widget as iw
-    session = iw.attach(args.serial, args.package)
+    session = iw.attach(args.serial, args.package, build_out=args.build_out)
     session.detach()
     print(f"detached {args.package} on {args.serial}", file=sys.stderr)
     return 0
+
+
+def _add_build_out_arg(sp):
+    """Add --build-out to a subcommand that may inject the agent."""
+    sp.add_argument(
+        "--build-out", metavar="DIR", default=None,
+        help="directory holding libviewspector.so, bootstrap.dex and payload.jar "
+             "(default: $INSPECTOR_WIDGET_ARTIFACTS, else $VIEWSPECTOR_ARTIFACTS, "
+             "else the checkout's build-out/)")
 
 
 def _add_selector_args(sp):
@@ -509,6 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--serial", default=DEFAULT_SERIAL)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_attach)
 
     sp = sub.add_parser("dump", help="inject + dump the view tree (one shot)")
@@ -533,6 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit resolved tree as JSON ('-' for stdout)",
     )
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("compose", help="inject + dump the Compose layer (semantics + slot table)")
@@ -550,6 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Deprecated: inspection is now opt-in, so this is the default. Kept so old scripts still parse.
     sp.add_argument("--no-enable-inspection", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_compose)
 
 
@@ -569,6 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-extras", action="store_false", dest="include_extras",
                     help="skip iterating each node's extras bundle (roleDescription, compose testTag/id)")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_a11y)
 
     sp = sub.add_parser("a11y-lint", help="run the accessibility lint (R1..R12) over the Compose semantics tree")
@@ -582,6 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only run this rule id (repeatable); omit to run all")
     sp.add_argument("--overlay", metavar="OUT.png", help="also render a severity-colored overlay")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_a11y_lint)
 
     # ----- integrated inspector subcommands (mirror the MCP tools) ----- #
@@ -596,6 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for --overlay")
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the merged tree as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_inspect)
 
     sp = sub.add_parser("inspect-node",
@@ -606,6 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-image", action="store_true", help="skip cutting the component image")
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the dossier as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_inspect_node)
 
     sp = sub.add_parser("component-image",
@@ -616,6 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", metavar="OUT.png", help="output PNG path (default: a temp file)")
     sp.add_argument("--scale", type=float, default=1.0, help="component image scale")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_component_image)
 
     sp = sub.add_parser("screenshot", help="capture a screenshot PNG of the app's current UI")
@@ -624,6 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", metavar="OUT.png", required=True, help="output PNG path")
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale (<=1.0)")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_screenshot)
 
     sp = sub.add_parser("get-properties", help="fetch the full attribute set for a single view")
@@ -635,11 +658,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="include per-property source + style/layout resolution chain")
     sp.add_argument("--json", metavar="OUT.json|-", help="emit the properties as JSON")
     sp.add_argument("--force", action="store_true", help="force re-injection")
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_get_properties)
 
     sp = sub.add_parser("detach", help="shut down the agent session for an app (sends shutdown)")
     sp.add_argument("--serial", default=DEFAULT_SERIAL)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
+    _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_detach)
 
     return p

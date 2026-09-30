@@ -21,7 +21,8 @@ cd "$PROJECT_ROOT"
 SERIAL="${1:-emulator-5554}"
 PACKAGE="${2:-com.oberkfell.a11yprobe}"
 
-OUT_DIR="$PROJECT_ROOT/build-out"
+# Same lookup order as the host (inspector_widget.inject.resolve_build_out).
+OUT_DIR="${INSPECTOR_WIDGET_ARTIFACTS:-${VIEWSPECTOR_ARTIFACTS:-$PROJECT_ROOT/build-out}}"
 HOST_DIR="$PROJECT_ROOT/host"
 
 ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
@@ -81,7 +82,7 @@ ok "App $PACKAGE is running (pid $PID)."
 # test does not depend on a specific argparse CLI shape.
 log "Attaching agent and dumping the View tree via inspector_widget..."
 
-VIEWSPECTOR_ARTIFACTS="$OUT_DIR" \
+INSPECTOR_WIDGET_ARTIFACTS="$OUT_DIR" \
 "$PYTHON" - "$SERIAL" "$PACKAGE" "$HOST_DIR" <<'PYEOF'
 import os, sys, json
 

@@ -404,5 +404,6 @@ host/.venv/bin/python host/mcp_server.py --self-check
 The MCP server runs even without the `mcp` SDK installed (it falls back to a
 self-contained JSON-RPC-over-stdio implementation), but installing the deps from
 'host/requirements.txt' is recommended. Build artifacts must be present in
-'build-out/' (run 'scripts/build.sh') and adb must be on PATH with a device
-connected.
+'build-out/' (run 'scripts/build.sh'), or in the directory named by
+INSPECTOR_WIDGET_ARTIFACTS (needed for a wheel install; '--self-check' shows
+which directory it resolved), and adb must be on PATH with a device connected.

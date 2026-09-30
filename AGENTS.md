@@ -106,6 +106,9 @@ host/cli.py inspect      --serial emulator-5554 --package com.oberkfell.a11yprob
 host/cli.py a11y-lint    --serial emulator-5554 --package com.oberkfell.a11yprobe
 host/cli.py component-image --serial ... --node-key compose:569 --out comp.png
 ```
+Artifacts are read from `--build-out DIR`, else `$INSPECTOR_WIDGET_ARTIFACTS`, else the legacy
+`$VIEWSPECTOR_ARTIFACTS`, else the checkout's `build-out/`. A wheel install has no checkout to fall
+back on, so set the env var there (the MCP server honours it too; `--self-check` shows what it found).
 
 **Run (MCP)**:
 ```bash

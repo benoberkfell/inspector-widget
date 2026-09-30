@@ -61,15 +61,22 @@ MCP implementation — but installing `mcp` is recommended.
 python host/mcp_server.py --self-check
 ```
 
-This prints the tool surface and whether `inspector_widget`,
-`view_inspection_pb2`, and the `mcp` SDK are importable. Example:
+This prints the tool surface, whether `inspector_widget`,
+`view_inspection_pb2`, and the optional dependencies are importable, and where the
+device artifacts are looked up (a missing artifact is a warning, not a failure). Example:
 
 ```
 Inspector Widget MCP server — self check
-  tools: list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image
+  tools (15): list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image
   inspector_widget: OK
   view_inspection_pb2: OK
-  mcp SDK: present (will use real MCP transport)
+  mcp SDK: 1.30.0 OK (real MCP transport)
+  Pillow: 12.3.0 OK
+  grpcio: 1.84.0 OK
+  artifacts: /path/to/inspector-widget/build-out (from default)
+    libviewspector.so: OK
+    bootstrap.dex: OK
+    payload.jar: OK
 ```
 
 ---
@@ -87,15 +94,22 @@ host/.venv/bin/python host/mcp_server.py --self-check
 Useful flags / env:
 
 - `--self-check` — print the tool surface and dependency status (mcp SDK, Pillow, grpcio,
-  with the tools each missing one degrades), then exit. Exits 1 if the host package,
-  the proto gencode, or the installed mcp SDK is broken.
+  with the tools each missing one degrades) and where the device artifacts were
+  found, then exit. Exits 1 if the host package, the proto gencode, or the installed
+  mcp SDK is broken; missing artifacts are only a warning.
 - `--log-level DEBUG|INFO|WARNING|ERROR` (or `INSPECTOR_WIDGET_LOG=DEBUG`) — log
   verbosity (to stderr).
+- `INSPECTOR_WIDGET_ARTIFACTS=DIR` — where to read `libviewspector.so`,
+  `bootstrap.dex` and `payload.jar` (legacy `VIEWSPECTOR_ARTIFACTS` still works).
+  Defaults to the checkout's `build-out/`; **required after a wheel install**,
+  where the package lives in site-packages. The CLI's `--build-out DIR` is the
+  per-command equivalent.
 
 Prerequisites at runtime:
 
 - `adb` on `PATH` and a device/emulator connected.
-- The device artifacts present in `build-out/` (`scripts/build.sh`).
+- The device artifacts built by `scripts/build.sh`, in `build-out/` or wherever
+  `INSPECTOR_WIDGET_ARTIFACTS` points.
 - The target app **running** and **debuggable** before `attach`/`dump_tree`.
 
 ---
@@ -131,14 +145,25 @@ Equivalent explicit JSON config (e.g. for `~/.claude.json` / an MCP client's
         "<REPO>/host/.venv/bin/python",
         "<REPO>/host/mcp_server.py"
       ],
-      "env": { "INSPECTOR_WIDGET_LOG": "WARNING" }
+      "env": {
+        "INSPECTOR_WIDGET_LOG": "WARNING",
+        "INSPECTOR_WIDGET_ARTIFACTS": "<REPO>/build-out"
+      }
     }
   }
 }
 ```
 
 If you installed `protobuf`/`mcp` into your system Python instead of a venv,
-use that interpreter as `command`. Verify with:
+use that interpreter as `command`. If you installed the wheel (so the
+`inspector-widget-mcp` console script is on `PATH`), register that and tell it
+where the artifacts are, since it can't find the checkout on its own:
+
+```bash
+claude mcp add inspector-widget -e INSPECTOR_WIDGET_ARTIFACTS="$PWD/build-out" -- inspector-widget-mcp
+```
+
+Verify with:
 
 ```bash
 claude mcp list          # shows "inspector-widget"

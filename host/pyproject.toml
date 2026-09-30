@@ -84,7 +84,8 @@ py-modules = ["cli", "mcp_server"]
 # NOTE — runtime artifacts are NOT python package data:
 #   build-out/libviewspector.so, build-out/bootstrap.dex, build-out/payload.jar
 # are produced by the Gradle/native build (scripts/build.sh) and located at
-# runtime via the repo path (inspector_widget.inject._REPO_ROOT -> build-out/).
+# runtime by inspector_widget.inject.resolve_build_out: --build-out, then
+# $INSPECTOR_WIDGET_ARTIFACTS, then $VIEWSPECTOR_ARTIFACTS, then the repo's build-out/.
 # They are large binary build outputs that live OUTSIDE the python package and
 # are deliberately excluded from the wheel. See host/PACKAGING.md.
 

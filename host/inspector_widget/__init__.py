@@ -137,8 +137,13 @@ class Session:
     close = detach
 
 
-def attach(serial: str, package: str) -> "Session":
-    """Inject (or warm-reconnect) the agent into ``package`` and return a Session."""
+def attach(serial: str, package: str, build_out=None) -> "Session":
+    """Inject (or warm-reconnect) the agent into ``package`` and return a Session.
+
+    ``build_out`` is the artifacts directory; ``None`` resolves it from
+    ``$INSPECTOR_WIDGET_ARTIFACTS`` / ``$VIEWSPECTOR_ARTIFACTS`` / the repo's
+    ``build-out/`` (see :func:`inspector_widget.inject.resolve_build_out`).
+    """
     from . import inject
-    injection = inject.inject_and_connect(serial=serial, package=package)
+    injection = inject.inject_and_connect(serial=serial, package=package, build_out=build_out)
     return Session(injection)

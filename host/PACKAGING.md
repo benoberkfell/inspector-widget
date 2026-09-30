@@ -106,9 +106,15 @@ and are deliberately excluded from the wheel:
     build-out/payload.jar
 
 They are produced by the native/Gradle build (`scripts/build.sh`) and located at
-runtime via the **repo path**, not via `importlib.resources`:
-`inspector_widget.inject` computes the repo root as three directories up from
-`inject.py` and reads `build-out/` from there
-(`inject._REPO_ROOT` → `inject.DEFAULT_BUILD_OUT`). Keep this checkout intact (so
-`host/` and `build-out/` stay siblings under the repo root) and run
-`scripts/build.sh` once to produce the artifacts before injecting into a device.
+runtime by `inspector_widget.inject.resolve_build_out`, first match wins:
+
+1. the CLI's `--build-out DIR` flag (on every subcommand that injects);
+2. `$INSPECTOR_WIDGET_ARTIFACTS`;
+3. `$VIEWSPECTOR_ARTIFACTS` (legacy name);
+4. `inject.DEFAULT_BUILD_OUT`: the repo's `build-out/`, three directories up from
+   `inject.py`. This only works for an editable install from the checkout.
+
+After a **wheel** install `inject.py` lives in site-packages, so the default points
+nowhere useful: set `INSPECTOR_WIDGET_ARTIFACTS=<checkout>/build-out` (the MCP
+server reads it too) or pass `--build-out`. `inspector-widget-mcp --self-check`
+prints the directory it resolved and whether each artifact is there.
