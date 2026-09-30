@@ -316,9 +316,9 @@ def _kick(serial: str, socket_name: str) -> None:
     local_port = adb.free_local_port()
     try:
         with _connect_forward(serial, socket_name, local_port, connect_timeout=2.0) as sock:
-            sock.settimeout(2.0)
+            sock.settimeout(0.5)
             try:
-                sock.recv(1)  # the stopped server accepts and drops it: EOF
+                sock.recv(1)  # the stopped server accepts and drops it: EOF at once
             except OSError:
                 pass
     except OSError:
