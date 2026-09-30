@@ -5,6 +5,9 @@
 // reflects: getContentDescription, getStateDescription, isHeading,
 // getRoleDescription, bounds. GOOD/BAD pairs map onto the same lint rules the
 // Compose path covers, confirming the host's View path detects the same defects.
+// The BAD views are deliberate defects; see activity_view_scenarios.xml.
+//
+//   adb shell am start -n com.oberkfell.a11yprobe/.ViewScenarioActivity
 // ============================================================================
 package com.oberkfell.a11yprobe
 
@@ -35,7 +38,7 @@ class ViewScenarioActivity : AppCompatActivity() {
         ViewCompat.setAccessibilityHeading(binding.goodHeading, true)
 
         // GOOD: custom clickable view gets a Button roleDescription + clickable.
-        // (badCustomClickable: clickable, no role, no contentDescription.)
+        // (badCustomClickable: clickable, no role.)
         ViewCompat.setAccessibilityDelegate(
             binding.goodCustomClickable,
             object : AccessibilityDelegateCompat() {
