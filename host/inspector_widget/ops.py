@@ -1066,7 +1066,7 @@ def _export(ctx: OpContext, lc: LoadedCapture, what: str, fmt: str) -> dict[str,
     from .capture.model import index_to_jsonl
 
     ix = lc.index()
-    parts = list(EXPORT_WHAT[:-1]) if what == "all" else [what]
+    parts = _export_parts(what, fmt)
     written: list[tuple[str, int, int]] = []  # (path, rows, bytes)
 
     def put(name: str, data: bytes, rows: int) -> None:
@@ -1104,6 +1104,10 @@ def _export(ctx: OpContext, lc: LoadedCapture, what: str, fmt: str) -> dict[str,
             for rel, data in sorted(lc.raw_capture().files().items()):
                 put(rel, data, 1)
             put("meta.json", lc.meta.to_json(), 1)
+        elif part.startswith("raw:"):  # one facet's protobuf reply, as the agent sent it
+            data = lc.raw(part[4:])
+            if data:
+                put(f"raw/{part[4:]}.pb", data, 1)
     if not written:
         raise OpError("facet_unavailable", f"capture {lc.id} has no {what} to export",
                       hint=f"captures(action=\"show\",id=\"{lc.id}\") lists its facets")
@@ -1111,16 +1115,44 @@ def _export(ctx: OpContext, lc: LoadedCapture, what: str, fmt: str) -> dict[str,
     rows = sum(r for _p, r, _b in written)
     first = written[0][0]
     path = os.path.dirname(first) if len(written) > 1 else first
-    if len(written) > 1 and what in ("raw", "all"):
+    raw = any(p == "raw" or p.startswith("raw:") for p in parts)
+    if len(written) > 1 and (raw or what == "all"):
         path = os.path.join(lc.path, "out")
     out: dict[str, Any] = {"capture": lc.id, "path": path.rstrip(os.sep), "rows": rows,
                            "bytes": total}
     if len(written) > 1:
         out["files"] = len(written)
-    out["hint"] = ("Read with jq or a JSON reader; deleted with the capture."
-                   if what != "raw" else "raw/*.pb are the agent's protobuf replies "
-                                         "(proto/view_inspection.proto).")
+    out["hint"] = ("raw/*.pb are the agent's protobuf replies (proto/view_inspection.proto)."
+                   if raw else "Read with jq or a JSON reader; deleted with the capture.")
     return out
+
+
+#: format="raw" for one facet: the pb that holds it (props travel in views.pb).
+_RAW_PART = {"views": "raw:views", "props": "raw:views", "compose": "raw:compose_sem",
+             "slots": "raw:slots", "a11y": "raw:a11y"}
+_LEGACY_PARTS = ("views", "compose", "slots", "a11y")
+
+
+def _export_parts(what: str, fmt: str) -> list[str]:
+    """What ``_export`` writes: ``format`` picks the form (spec 5.4). ``raw`` copies
+    the agent's protobuf replies (the whole capture for nodes/all/raw, else the
+    facet's pb); ``legacy`` regenerates the old dump_tree/dump_compose/
+    dump_accessibility JSON; ``jsonl``/``json`` are the index and the facets."""
+    if fmt == "raw":
+        if what in ("nodes", "all", "raw"):
+            return ["raw"]
+        if what in _RAW_PART:
+            return [_RAW_PART[what]]
+        raise _bad(f"what={what!r} has no raw form",
+                   hint='captures(action="export", what="raw") copies every protobuf reply.')
+    if fmt == "legacy":
+        if what in ("nodes", "all"):
+            return list(_LEGACY_PARTS)
+        if what in _LEGACY_PARTS:
+            return [what]
+        raise _bad(f"what={what!r} has no legacy form (views, compose, slots, a11y do)",
+                   hint='format="json" exports props and lint; what="raw" the protobufs.')
+    return list(EXPORT_WHAT[:-1]) if what == "all" else [what]
 
 
 def _legacy_facet(lc: LoadedCapture, part: str) -> Any:

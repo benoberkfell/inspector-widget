@@ -384,3 +384,27 @@ def test_a_small_budget_cuts_the_summary_explicitly(tmp_path):
                 if doc.get(key):
                     assert doc[key][-1].startswith("…"), (budget, key, doc[key])
         ctx.sessions.close_all()
+
+
+def test_export_format_picks_the_form(tmp_path):
+    """format="raw" copies the protobufs and format="legacy" regenerates the old
+    dump JSON whatever ``what`` says (live: export --format raw wrote nodes.jsonl)."""
+    with ch.harness("viewscreen", str(tmp_path)):
+        ctx = ch.ops_context()
+        cid = capture(ctx)["capture"]
+        raw = ok(run(ctx, "captures", action="export", id=cid, format="raw"))
+        assert raw["path"].endswith("out") and raw["files"] >= 3
+        assert os.path.isfile(os.path.join(raw["path"], "raw", "views.pb"))
+        assert os.path.isfile(os.path.join(raw["path"], "meta.json"))
+        assert "protobuf" in raw["hint"]
+        one = ok(run(ctx, "captures", action="export", id=cid, what="a11y", format="raw"))
+        assert one["path"].endswith(os.path.join("raw", "a11y.pb")) and "files" not in one
+        legacy = ok(run(ctx, "captures", action="export", id=cid, format="legacy"))
+        assert legacy["files"] >= 2 and os.path.isfile(os.path.join(legacy["path"], "a11y.json"))
+        with open(os.path.join(legacy["path"], "views.json"), encoding="utf-8") as f:
+            assert json.load(f)["roots"]
+        bad = run(ctx, "captures", action="export", id=cid, what="lint", format="raw")
+        assert bad["error"]["code"] == "bad_args"
+        bad = run(ctx, "captures", action="export", id=cid, what="props", format="legacy")
+        assert bad["error"]["code"] == "bad_args"
+        ctx.sessions.close_all()
