@@ -43,7 +43,7 @@ Rationale for 3 layers (do not collapse): the payload MUST run in a classloader 
 
 ## 3. Fixed identifiers
 - Kotlin/Java packages: payload = `com.oberkfell.viewspector.agent.payload`; bootstrap = `com.oberkfell.viewspector.agent` (class `Bootstrap`); proto java = `com.oberkfell.viewspector.proto` (outer class `ViewInspection`).
-- Native lib: `libviewspector.so` (target abi `arm64-v8a`). JVMTI entry symbols: `Agent_OnAttach` (and `Agent_OnLoad`).
+- Native lib: `libviewspector.so` (target abi `arm64-v8a`). JVMTI entry symbols: `Agent_OnAttach` (and `Agent_OnLoad`, which only logs and returns `JNI_ERR`: loading at VM start is unsupported). The native agent requests no JVMTI capabilities (it adds the potential set only to retry hidden-API silencing should that fail without them), appends `bootstrap.dex` to the boot class path only if `Bootstrap` is not already loadable from an earlier attach, and disposes its JVMTI env before calling `Bootstrap.initialize`.
 - Artifacts the host pushes: `libviewspector.so`, `bootstrap.dex`, `payload.jar` (payload as a dex-in-jar loadable by DexClassLoader).
 - Abstract socket name: `viewspector_<pid>` (LocalServerSocket name, i.e. `@viewspector_<pid>` abstract namespace).
 - Python host package: `inspector_widget` (module files under `host/inspector_widget/`; the user-facing name, see AGENTS.md §1). CLI entry `host/cli.py`, MCP entry `host/mcp_server.py`.
