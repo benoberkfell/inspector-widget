@@ -502,6 +502,36 @@ def check_label_for(cap: Capture) -> None:
         f"goodEmailLabel.label_for should be goodEditText's key {fld.get('id')}: {label.get('label_for')}")
 
 
+VIEW_SECTION_TITLES = [
+    "1. ImageButton contentDescription", "2. Touch target size", "3. Text contrast",
+    "4. ImageView label", "5. Custom clickable role", "6. EditText label (labelFor)",
+    "7. Switch stateDescription", "8. Heading semantics",
+]
+
+
+def check_view_reading_order(cap: Capture) -> None:
+    """The classic-View screen is ScrollView > LinearLayout (not important for a11y) >
+    TextViews: TalkBack reads each text as its own stop, never the whole screen as one."""
+    speak = [str(e.get("speak") or "") for e in cap.a11y.get("focus_order") or []]
+    glued = [x for x in speak if sum(t in x for t in VIEW_SECTION_TITLES) > 1]
+    assert not glued, f"several section titles read as one stop: {glued[:2]}"
+    titles = [x for x in speak if x in VIEW_SECTION_TITLES]
+    assert titles == VIEW_SECTION_TITLES, f"section titles as stops: {titles}\n  order: {speak}"
+    assert "Account, heading" in speak, speak
+    deco = _node(cap, "goodDecorativeImage")  # importantForAccessibility="no"
+    assert deco.get("ignored") and not _is_stop(cap, deco), describe(deco)
+    assert "4. ImageView label" in speak, "the decorative image must add nothing to its section"
+
+
+def check_dialog_reading_order(cap: Capture) -> None:
+    """A modal dialog hides its activity from TalkBack: every stop is in the dialog."""
+    wins = [w for w in cap.a11y.get("windows") or [] if w.get("root")]
+    dialog = next(i for i, w in enumerate(wins) if w.get("modal") and i > 0)
+    assert wins[0].get("covered_by") == wins[dialog]["root_view_id"], wins[0].get("covered_by")
+    order = cap.a11y.get("focus_order") or []
+    assert order and {e.get("window") for e in order} == {dialog}, order
+
+
 def _compose_node_by_tag(cap: Capture, tag: str) -> Optional[Dict[str, Any]]:
     stack = [w["root"] for w in cap.compose.get("windows") or [] if w.get("root")]
     while stack:
@@ -595,7 +625,7 @@ VIEW_GOLDEN = Golden(
     good=(E("goodImageButton", R1, R6), E("goodTouchTarget", R1, R2), E("goodContrast", R3),
           E("goodImage", R1, R6), E("goodCustomClickable", R1, R2, R5),
           E("goodEditText", R1, FORM_LABEL)),
-    checks=(check_label_for,),
+    checks=(check_label_for, check_view_reading_order),
 )
 
 # --- interop: mirrors InteropFragment.kt / InteropCells.kt ------------------ #
@@ -652,11 +682,11 @@ INTEROP_GOLDENS = [
            bad=(E("dialog_compose_unlabeled", R1), E("dialog_view_unlabeled", R1, R6)),
            good=(E("dialog_compose_labeled", *GOOD_BASE), E("dialog_view_labeled", *GOOD_BASE),
                  E("dialog_close", *GOOD_BASE)),
-           checks=(check_dialog(require_offset=True),)),
+           checks=(check_dialog(require_offset=True), check_dialog_reading_order)),
     Golden("D2", INTEROP, "D2", "dialog_compose_unlabeled", min_windows=2, compose_views=(2, 2),
            bad=(E("dialog_compose_unlabeled", R1),),
            good=(E("dialog_compose_labeled", *GOOD_BASE), E("dialog_close", *GOOD_BASE)),
-           checks=(check_dialog(require_offset=False),)),
+           checks=(check_dialog(require_offset=False), check_dialog_reading_order)),
 ]
 
 GOLDENS: List[Golden] = COMPOSE_GOLDENS + [VIEW_GOLDEN] + INTEROP_GOLDENS
