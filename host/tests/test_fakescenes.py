@@ -76,7 +76,7 @@ def test_wide_scene_shape():
         "CLICK", "SELECT", "CLEAR_SELECTION", "ACCESSIBILITY_FOCUS", "CLEAR_ACCESSIBILITY_FOCUS"]
     assert list(s.get_windows().root_ids) == [1001]
     w, h, _ = png._decode_to_rgba(s.screenshot().screenshot)
-    assert (w, h) == (8, 8)
+    assert (w, h) == (300, 60)  # the root window's own size
 
 
 @pytest.mark.parametrize("tool,args,e6_bytes", [

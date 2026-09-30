@@ -720,9 +720,14 @@ def wide_scene(fan: int = 6, depth: int = 3) -> SceneData:
     cw.root.kind = pb.ComposeNode.SEMANTICS
     cst.fill(comp.strings)
 
-    pixel = bytes([10, 20, 30, 255])
+    def shot(scale: float) -> pb.Screenshot:
+        # one flat colour over the whole root window (300x60 at (1, 3)), so every
+        # node the window shows has pixels under it
+        w, h = max(1, int(300 * scale)), max(1, int(60 * scale))
+        return rgba_to_screenshot(w, h, bytes([10, 20, 30, 255]) * (w * h), scale)
+
     return SceneData("wide", views=views, a11y=a11y, compose_sem=comp, api_level=36,
-                     screens={1001: lambda scale: rgba_to_screenshot(8, 8, pixel * 64, scale)})
+                     screens={1001: shot})
 
 
 def _strip_mcp_keys(d: Mapping[str, Any]) -> dict:
