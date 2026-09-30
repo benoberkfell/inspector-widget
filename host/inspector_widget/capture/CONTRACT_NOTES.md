@@ -154,6 +154,72 @@ with every consumer.
   capture is dropped or evicted, because no later capture was matched against
   it. Refs are still never reused: the counter is global.
 
+## Fetch (C3, `capture/fetch.py`)
+
+- **`fetch(session, opts=None, *, compose_generation=0, clock=time.monotonic,
+  sleep, wall_clock=time.time, device=None, retries=2, retry_delay_s=0.15,
+  skp_max_version=109) -> RawCapture`.** `meta.id` is `""` until the store
+  publishes the capture.
+  - `session` only needs the `CaptureSession` protocol, which is the public
+    Session method surface. `pid`, `api_level`, `abi`, `agent_version`,
+    `build_id` and `capture_skp` are read with getattr, so main's Session and
+    session-lifecycle's Session both work.
+  - fetch never calls adb. S1 passes `device={dpi, font_scale}`; fetch derives
+    `screen` and `orientation` from the window roots when they are missing.
+  - `compose_generation` is the lineage's current generation (0 for a new
+    pid). The meta records it plus one when `enable_inspection` was sent. It
+    also bumps when the enable request itself errors, since the hot reload may
+    have happened anyway.
+- **`meta.facets` keys**: `windows`, `views`, `props`, `shots`, `compose`,
+  `slots`, `a11y`, `skp`, `fingerprint`.
+  - `props` rides on DumpTree.
+  - `fingerprint` times the re-check.
+  - Facets that were not requested are `off` with a reason (`screenshot=false`,
+    `slots=off`, `skp=false`, `props=false`).
+- **Registry.** `FACETS` maps each name to a `Facet(name, request, policy,
+  stored, run, position(opts), required, off_reason)`, and `plan(opts)` gives
+  the request order. `windows` and `views` are the required facets.
+- **Slots.** `enable` sends `DumpCompose(slots only, enable_inspection)` first
+  and stores that reply. Retries read without enabling. `if_available` never
+  enables.
+  - Unpopulated slots: `unavailable` with `SLOTS_NOT_POPULATED`.
+  - No ComposeView: `NO_COMPOSE`.
+  - `SLOTS_ENABLE_WARNING` is for the capture response (S1). fetch does not add
+    it to diagnostics.
+- **Screenshots.** The first root is `DumpTree.roots[0]`, whose screenshot the
+  agent embeds. It is split into `shots[firstRoot]`, and `views.pb` is stored
+  without it. Every other root gets `Screenshot(root_id)`, and the first root
+  does too if the embedded shot is missing. Each `shots[root]` is a serialized
+  `Screenshot` message, still deflated.
+- **a11y.** `a11y_rendering=True` sets `include_rendering_info` on the single
+  DumpA11y. Its reply goes to `raw/a11y.pb`, and `RawCapture.a11y_render` stays
+  None (reserved).
+- **SKP.** An SKP is not stored when `supported=false` or when its version is
+  above `SKP_MAX_VERSION` (109). Either case is `unsupported` with a reason.
+- **Errors.**
+  - `OSError` (transport, deadline) always propagates.
+  - A failing required facet raises `OpError("agent_error")`.
+  - An optional facet records `error` and the capture goes on.
+  - A DumpTree that fails with properties is retried without them, giving
+    `props: error`.
+- **Consistency.**
+  - `fingerprint_of(views, compose)` is a blake2b-128 hex over the tuples of
+    spec 3.2. Strings are resolved per message, so a dump with properties and
+    one without give the same value.
+  - `fingerprint_raw(raw)` computes it for a stored capture, and
+    `fingerprint_now(session)` for the live UI.
+  - `meta.fingerprint` is the fingerprint of the stored data, even when the
+    capture is unsettled.
+  - A retry re-fetches every facet. After 3 attempts the capture is
+    `unsettled`, with a diagnostic.
+- **`settle(session, settle_ms) -> bool`** (section 10 said `None`) polls every
+  100 ms and stops at two equal fingerprints. Its budget is `settle_ms`, capped
+  at 3,000 ms. fetch runs it first and adds a diagnostic when the UI never
+  settled.
+- **`unchanged_since(session, meta)`** implements `if_changed_since`. It returns
+  `{capture, unchanged: true, age_s}` when the lineage, the pid and the
+  fingerprint all match, else None. It writes nothing.
+
 ## Output layer (P0-1, `output.py`, `normalize.py`, `normalize_defaults.py`)
 
 - **Call order at the boundary**: `slim(tool, result, args)` then
