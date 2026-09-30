@@ -197,6 +197,126 @@ with every consumer.
   - View screen `inspect`: 14,477 (18,000)
   - View screen `dump_tree(include_properties)`: 16,584 (20,000)
 
+## Query engine and line grammar (C6, `capture/query.py`, `capture/lines.py`)
+
+- **Signatures.** Section 10 exactly, plus keyword-only extras:
+  - `resolve_selector(ix, sel, *, tomb=None)`: `tomb` is the lineage's tombstone
+    map (`LineageState.tomb`), used for `ref_not_in_capture` last-seen info.
+  - `outline(ix, **p)`, `find(ix, **p)` and `node(ix, loaded, refs, **p)` also
+    accept `capture`, `serial`, `package`, `loaded`, `props_fn` and `tomb`. Any
+    other unknown argument is `bad_args`. `find` takes `in` (or `in_` from
+    Python). `node` also takes `image_fn(node)` and `issue_fmt(issue)` hooks.
+  - `render_line(ix, n, fields=None, depth=0, hidden=0, tail="", **kw)`:
+    `fields` is a `lines.Fields` or a `fields` argument. `tail` is raw text,
+    appended as is.
+  - `select(ix, sel) -> list[UNode]` returns every match without raising. C4
+    uses it to check that a generated `sel` is unique and parses.
+- **Props accessor.** `node` (and `+props:` projections) read property values
+  through `props_fn(view_udid)` if given, else `loaded.props(view_udid)`. The
+  result is `{name: value}` (normalized), a list of strings.py/legacy property
+  dicts (normalized with `normalize.props_to_map`), or None. **C2/C4: expose
+  `LoadedCapture.props(udid)`.** Results are cached per call. `nondefault` also
+  reads the same-class views, because `normalize.nondefault_props` needs the
+  class majority.
+- **Facet statuses read.** `meta.facet_status("slots")` and
+  `meta.facet_status("a11y")`. `outline(view="slots")` on a capture that has
+  Compose nodes but no slot groups is `facet_unavailable` (hint:
+  `capture(slots="enable")`). With no Compose at all it is an empty outline.
+- **Line grammar v1.** `lines.LINE_RE` is the regex, `format_line(row)` renders a
+  row and `parse_line(line)` reads it back. `row_matches_line(row, line)`
+  checks that a json row and its line carry the same fields.
+  - A rid or tag that is not a plain `[A-Za-z0-9_.:/$-]+` token is JSON-quoted
+    (`@"my tag"`). The selector grammar accepts the same form.
+  - `Type` is `UNode.type` with anything outside `[A-Za-z0-9_$]` removed and
+    the first letter upper-cased. Flags print in `model.FLAGS` order.
+  - A line's label is `UNode.label`. For slot nodes it falls back to `text` (or
+    the `text` param). It is cut at 48 characters with `…`.
+  - `!code` is `short_code(rule)`: `a11y.<group>.<x>` gives `group`,
+    `render.<x>` gives `x`, and anything else has dots turned into `_`. Codes
+    are distinct and sorted.
+  - Tail values are one token: numbers compact, lists comma-joined, dicts as
+    `k:v,…`. Anything with spaces or quotes is JSON-quoted. Values are capped at
+    120 characters.
+  - The row keys `mark` (a diff prefix `~ + - >`), `order` (the reading prefix
+    `N. `) and `depth` (the indent) are rendered by `format_line`. C8 should
+    build diff lines with `node_row(..., mark="~")`.
+- **Chains.** A chain follows single visible children that have identical
+  bounds and the same kind. It never enters a window root, holds at most
+  `CHAIN_MAX` (8) members, and ends at a member with issues. If no member is shown, the chain collapses and its
+  children are hoisted. Otherwise it is one line whose bounds, issues, `+N`
+  and tail belong to the **last** member (the row's top-level `ref`), with
+  `row["chain"]` listing every segment.
+- **Outline disclosure.**
+  - `depth` counts display levels (0 = the roots only).
+  - In semantic detail a node is shown when it is a window, has a
+    label/rid/tag, is actionable (click, longclick, edit, checkable, scroll),
+    is a stop, has issues, is a leaf, or has 2 or more shown direct children.
+  - Zero-size nodes and ViewStubs are hidden with their subtree.
+  - Each tree node is exactly one of: on a line, collapsed (hoisted through),
+    hidden, or counted in one line's `+N`. The response's
+    `hidden:{zero_size, collapsed, library}` counts the middle two, and a
+    test checks this partition.
+  - `max_children` caps only collections: nodes that scroll, have an a11y
+    `collection`, or are a RecyclerView/ListView/GridView/pager/`Lazy*`. Other
+    parents list every child and rely on paging. (With a global cap, the View
+    screen's 22-child form would be cut.)
+  - A slot `root` without an explicit `view` selects `view="slots"`.
+  - `view="compose"` always prints each ComposeView's semantics root.
+    `view="slots"` hoists library groups (`hidden.library`) and has no chains.
+    `view="views"` implies `detail="all"`.
+- **find.**
+  - `in="slots"` means slot nodes only, and `in="all"` means everything. `src`
+    implies `all` unless `in` is given.
+  - `src` without a `:` globs the file name; with a `:` it globs `File.kt:line`.
+  - `type`, `role` and `text` are case-insensitive. `rid`, `tag` and `src` are
+    case-sensitive globs.
+  - `within` is the selected subtree including the node itself.
+  - `window` takes a window selector or a z index.
+  - `sort="area"` puts the smallest nodes first. `sort="reading"` puts stops
+    first, in order.
+  - A single hit gets `path`: the landmark ancestors from the root.
+  - Breadcrumbs are the 2 nearest ancestors with a rid, tag, label or a11y
+    collection.
+- **node.**
+  - Facets: `core issues a11y layout compose text props children ancestors`,
+    or `all`. `core` is always included. For slot nodes, `compose` renders
+    the `slot` facet.
+  - `props` defaults to `none`, and `facets` containing `props` implies
+    `nondefault`. `key` and `nondefault` drop the `id` property when it repeats
+    the rid.
+  - Parts are packed in priority order across the batch, with room reserved
+    for short `omitted` entries. The long form
+    `"<facet>(detail): node(...)"` is used when it fits.
+  - Batch errors are reported per item as `{sel, error}`. A single-node error
+    raises.
+- **Selectors (extensions to 6.1).**
+  - Atoms can also be refs or keys, so `n10 > @x` works and a generated
+    `<parent sel> > Type"label"` always parses.
+  - `#"…"` and `@"…"` quote unusual ids.
+  - A label ending in `…` matches as a prefix, so labels copied from a cut
+    line still resolve.
+  - Atoms match ui nodes first and fall back to slot nodes when no ui node
+    matches.
+  - `bad_selector` errors start with `column N:` (1-based) and set
+    `OpError.column`. The column is the first character that breaks the
+    grammar: for a bad separator, the character right after the atom.
+- **Cursors.**
+  - Letters: `o` outline, `f` find, plus `l` lint and `d` diff for C7/C8 (see
+    `TOOL_LETTERS`, `make_cursor`, `parse_cursor`, `args_hash`).
+  - The hash covers the normalized arguments, with root/within/window
+    resolved to ids. It excludes `cursor`, `max_lines`/`limit`, `max_bytes`
+    and `format`, so page size and format can change between pages.
+  - `cursor_capture(cursor)` lets the ops layer resolve the capture a cursor
+    belongs to.
+- **Budgets.**
+  - Defaults: outline 6,000, find 3,000, node 3,000 (6,000 for a batch). `0`
+    means the 32,000 ceiling, and other values are clamped to 300..32,000.
+  - `query.pack()` uses `output.Budget` and reserves the page footer's exact
+    cost before each entry. When nothing fits it emits a minimal `ref` line,
+    so every page advances. C7 and C8 can reuse `pack` and `assemble`.
+- **`next`** (`call()`, `next_hints()`): at most 3 hints and at most 200 B. A
+  cursor hint repeats the caller's non-default arguments.
+
 ## Offline scenes (F1, `tests/fakescenes.py`)
 
 - **No harness dependency.** improve/offline-e2e-harness (`tests/fakeagent.py`)
