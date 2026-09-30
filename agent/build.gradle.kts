@@ -1,5 +1,6 @@
 import com.google.protobuf.gradle.id
 import com.google.protobuf.gradle.proto
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.io.File
 import java.util.Properties
 
@@ -99,6 +100,9 @@ android {
         }
     }
 
+    // Java 17 bytecode, compiled by whichever JDK runs Gradle (17-23). No
+    // toolchain is requested on purpose: jvmToolchain(N) demands an *exact* JDK N
+    // be installed, which broke builds on machines with only a newer JDK.
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -129,7 +133,11 @@ android {
 }
 
 kotlin {
-    jvmToolchain(17)
+    // Match the Java target above (Kotlin would otherwise default jvmTarget to
+    // the running JDK and fail the JVM-target consistency check).
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
 }
 
 protobuf {
