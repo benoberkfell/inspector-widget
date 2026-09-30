@@ -1714,6 +1714,10 @@ def rule_link_purpose(n: _Node, run: _Run) -> List[Finding]:
     if _norm(label) not in _VAGUE:
         return []
     is_link = role == "Link" or "link" in n.simple_class.lower() or "URLSpan" in n.class_name
+    if not is_link and n.collection_ctx is not None:
+        # A per-row action ("More info" on every list row) takes its purpose from the
+        # row it sits in (WCAG 2.4.4, "in context"), the way R12 accepts per-row repeats.
+        return []
     sev = "warn" if is_link else "info"
     return [run.finding(
         "a11y.link.purpose_unclear", sev, n,

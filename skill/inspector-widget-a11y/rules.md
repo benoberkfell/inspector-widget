@@ -201,7 +201,9 @@ description), else its `labeledBy` target. A descendant that takes its own focus
 ### R15 `a11y.link.purpose_unclear` — link/action text does not describe its purpose  (ATF LinkPurposeUnclear)
 - **Flags:** link spans (from the compat span extras) or link-role nodes whose
   text is vague ("click here", "here", "more", "read more", "learn more", "link").
-  → `warn`. An actionable non-link with such a label. → `info`.
+  → `warn`. An actionable non-link with such a label. → `info`, except inside a
+  list row, where the row gives a per-row action ("More info") its purpose in
+  context.
 - **Fix:** name the destination ("Read the pricing FAQ"), or give it a
   descriptive contentDescription. Plain `ClickableSpan`s inside a TextView are
   only visible when the agent exports span extras.

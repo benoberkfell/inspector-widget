@@ -1036,3 +1036,17 @@ def test_r2_compose_small_layout_behind_widened_touch_bounds_warns():
     v = view(30, "android.widget.ImageButton", flags=CLICK, cd="Info", b=(20, 1200, 117, 117),
              layout_size={"w": 59, "h": 59})
     assert of(lint(screen(decor(1, v)), density=390), "a11y.touch_target.small") == []
+
+
+def test_r15_per_row_action_in_a_list_takes_its_purpose_from_the_row():
+    def row(i):
+        more = view(100 + i, "android.widget.ImageButton", flags=CLICK, cd="More info",
+                    b=(900, 300 + i * 200, 160, 160))
+        title = view(200 + i, "android.widget.TextView", text=f"Item {i}", b=(40, 300 + i * 200, 600, 60))
+        return view(300 + i, "android.widget.LinearLayout", b=(0, 300 + i * 200, 1080, 180),
+                    kids=[title, more], collection_item_info={"row_index": i})
+    rv = view(20, "androidx.recyclerview.widget.RecyclerView", flags=("scrollable",),
+              b=(0, 260, 1080, 1814), kids=[row(0), row(1)], collection_info={"row_count": 2})
+    alone = view(30, "android.widget.Button", flags=CLICK, text="More info", b=(40, 2100, 400, 160))
+    f = of(lint(screen(decor(1, rv, alone))), "a11y.link.purpose_unclear")
+    assert [(x.node_key, x.severity) for x in f] == [("view:30", "info")]
