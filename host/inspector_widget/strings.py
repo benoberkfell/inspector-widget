@@ -237,9 +237,10 @@ def compose_node_to_dict(node: "pb.ComposeNode", resolver: StringResolver) -> Di
     return out
 
 
-#: Why ``enable_inspection`` is opt-in. Shared by the CLI and MCP so both warn identically.
+#: Why ``enable_inspection`` is opt-in. Shared by the CLI and MCP so both warn identically;
+#: ``%s`` is the surface's spelling of the flag (``--enable-inspection`` / ``enable_inspection=true``).
 ENABLE_INSPECTION_WARNING = (
-    "enable_inspection hot-reloads every composition in the app process, which resets plain remember{} state (open dialogs, text input, scroll position, toggles). Only use it when you need slot-table detail "
+    "%s hot-reloads every composition in the app process, which resets plain remember{} state (open dialogs, text input, scroll position, toggles). Only use it when you need slot-table detail "
     "(composable names, parameters, file:line), and capture any state you care about first."
 )
 
