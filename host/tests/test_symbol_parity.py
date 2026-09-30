@@ -4,8 +4,9 @@ host submodule must actually exist on that imported module.
 This is the highest-leverage regression guard for the whole bug class that this
 test pass targets: it statically scans ``cli.py`` and ``mcp_server.py`` for every
 ``<module>.<attr>`` access on the inspector_widget submodules they import
-(adb / a11y / a11y_lint / overlay / png / correlate / strings / inject / client)
-and asserts the referenced attribute is a real member of the imported module.
+(adb / a11y / a11y_lint / overlay / png / correlate / strings / inject / client /
+results) and asserts the referenced attribute is a real member of the imported
+module.
 
 It would have caught, in one shot:
   * ``adb.display_density`` / ``adb.font_scale`` missing from adb.py
@@ -42,7 +43,7 @@ _HOST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # signature scan at the bottom of this file covers the rest of the package.
 _POLICED_SUBMODULES = {
     "adb", "a11y", "a11y_lint", "overlay", "png", "correlate", "strings",
-    "inject", "client",
+    "inject", "client", "results",
 }
 
 _SCRIPTS = ("cli.py", "mcp_server.py")
@@ -155,7 +156,9 @@ def test_scan_actually_finds_contract_symbols() -> None:
         ("adb", "font_scale"),
         ("a11y_lint", "run_lint"),
         ("overlay", "render_integrated_overlay"),
-        ("png", "_decode_to_rgba"),
+        ("png", "write_png"),
+        ("results", "dump_tree"),
+        ("results", "a11y_lint"),
     }
     not_seen = expected - found
     assert not not_seen, (
@@ -195,6 +198,7 @@ _SIG_SOURCES = (
     "inspector_widget/inject.py",
     "inspector_widget/client.py",
     "inspector_widget/correlate.py",
+    "inspector_widget/results.py",
     "inspector_widget/talkback/device.py",
     "inspector_widget/talkback/inject.py",
     "inspector_widget/talkback/walk.py",
@@ -604,10 +608,15 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("Session", "dump_a11y"),           # the walk's focus reader
         ("adb", "shell"),                   # talkback/device.py
         ("diff", "analyze"),
+        ("results", "dump_tree"),           # mcp_server -> the shared result shapes
+        ("results", "get_properties"),
+        ("results", "with_target"),
+        ("strings", "dump_tree_to_dict"),   # mcp_server's dump_tree (E3: no second decoder)
+        ("strings", "get_properties_to_dict"),
     }
     assert expected <= seen, f"scan no longer checks: {sorted(expected - seen)}"
     probes = {(o, a) for s in signature_scans.values() for o, a, _ok, _l in s.probes}
-    assert ("Session", "capture_skp") in probes and ("a11y_lint", "lint_a11y") in probes
+    assert ("Session", "capture_skp") in probes
 
 
 def test_signature_scan_catches_seeded_bugs() -> None:

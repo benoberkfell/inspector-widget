@@ -18,9 +18,10 @@
 #      `notifications/initialized`) to drive the same tool surface.
 #
 # The host driver is the single source of truth for adb/injection/transport.
-# This module owns only: tool schemas, argument validation, per-(serial,package)
-# session caching, screenshot temp-file materialisation, and JSON shaping of the
-# protobuf responses (string-table ids resolved to text) for the agent.
+# This module owns only: the 18 tool schemas (15 inspection tools + 3 TalkBack
+# tools), argument validation, per-(serial,package) session caching, and
+# screenshot temp-file materialisation. Protobuf responses are shaped by the
+# package (strings, a11y, correlate, results), the same code the CLI uses.
 #
 # See host/README.md for build + run + `claude mcp add` instructions.
 
@@ -55,9 +56,8 @@ log = logging.getLogger("inspector-widget.mcp")
 # Host-driver facade.
 #
 # We depend on the public surface of `inspector_widget` (built as a sibling
-# module).  The facade below isolates the exact import shape in ONE place and
-# adapts a couple of reasonable naming variants so the MCP layer stays stable
-# even if the host module exposes its entry points slightly differently.
+# module). The facade below isolates the import in ONE place, so a broken host
+# package is one clear error (and --self-check can probe it).
 #
 # Required `inspector_widget` public API (documented in host/README.md):
 #
@@ -96,8 +96,8 @@ log = logging.getLogger("inspector-widget.mcp")
 #           -> ViewInspection.ScreenshotResponse  (raw proto message)
 #
 # The proto module is `inspector_widget.proto.view_inspection_pb2` (generated;
-# protobuf package `viewspector.proto`); we import it for enum names + screenshot
-# decoding helpers. The self-check probes it; the tools reach it via the package.
+# protobuf package `viewspector.proto`). The self-check probes it; the tools reach
+# it through the package.
 # --------------------------------------------------------------------------- #
 
 
@@ -119,28 +119,18 @@ def _import_host() -> Any:
 
 
 def _import_proto() -> Any:
-    """Import the generated protobuf module used to read response fields.
-
-    The bindings live in the host package's ``proto`` subpackage
-    (``inspector_widget/proto/view_inspection_pb2.py``) — the same module the
-    rest of the package imports via ``from .proto import view_inspection_pb2``.
-    The bare names are kept only as fallbacks for a flat protoc layout.
-    """
-    for name in (
-        "inspector_widget.proto.view_inspection_pb2",
-        "view_inspection_pb2",
-        "inspector_widget.view_inspection_pb2",
-    ):
-        try:
-            # fromlist non-empty -> __import__ returns the leaf submodule itself.
-            return __import__(name, fromlist=["Request"])
-        except Exception:
-            continue
-    raise HostUnavailableError(
-        "Could not import the generated protobuf module "
-        "'inspector_widget.proto.view_inspection_pb2'. "
-        "Run scripts/build.sh to generate it."
-    )
+    """Import the generated protobuf bindings (``inspector_widget/proto/
+    view_inspection_pb2.py``, the module the package itself uses); for
+    ``--self-check`` and the startup health line."""
+    try:
+        from inspector_widget.proto import view_inspection_pb2
+    except Exception as exc:
+        raise HostUnavailableError(
+            "Could not import the generated protobuf module "
+            "'inspector_widget.proto.view_inspection_pb2'. "
+            f"Run scripts/build.sh to generate it. Underlying error: {exc!r}"
+        ) from exc
+    return view_inspection_pb2
 
 
 class HostFacade:
@@ -169,29 +159,16 @@ class HostFacade:
 
     # -- adb-level queries -------------------------------------------------- #
     def list_devices(self) -> List[Dict[str, Any]]:
-        fn = _first_attr(self.host, "list_devices", "devices")
-        return list(fn())
+        return list(self.host.list_devices())
 
     def list_processes(self, serial: str) -> List[Dict[str, Any]]:
-        fn = _first_attr(self.host, "list_processes", "processes", "list_packages")
-        return list(fn(serial))
+        return list(self.host.list_processes(serial))
 
     def attach(self, serial: str, package: str, force_reinject: bool = False) -> Any:
         return self.host.attach(serial, package, force_reinject=force_reinject)
 
     def connect_existing(self, serial: str, package: str) -> Any:
         return self.host.connect_existing(serial, package)
-
-
-def _first_attr(obj: Any, *names: str) -> Callable[..., Any]:
-    for name in names:
-        fn = getattr(obj, name, None)
-        if callable(fn):
-            return fn
-    raise HostUnavailableError(
-        f"inspector_widget is missing any of {names!r}; the host driver API does "
-        "not match the version this MCP server expects."
-    )
 
 
 HOST = HostFacade()
@@ -382,259 +359,22 @@ def _serial(serial: Optional[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Proto -> JSON shaping.  String-table ids are resolved to text here so the
-# agent sees readable trees/properties rather than raw integer indices.
+# Screenshots: written as PNG by inspector_widget.png (the one decoder of record,
+# AGENTS.md section 6) into this server's temp directory.
 # --------------------------------------------------------------------------- #
-def _strings_to_map(strings_msg: Any) -> Dict[int, str]:
-    """ViewInspection.Strings -> {id: str}.  id 0 is implicitly "" (absent)."""
-    table: Dict[int, str] = {0: ""}
-    if strings_msg is None:
-        return table
-    for entry in getattr(strings_msg, "entries", []):
-        table[entry.id] = entry.str
-    return table
+def _save_screenshot_png(screenshot_msg: Any, dest_path: str) -> Dict[str, Any]:
+    """Write a Screenshot proto to ``dest_path`` as PNG; returns
+    ``{path, width, height, bytes, scale}``."""
+    from inspector_widget import png as pngmod
 
-
-def _s(table: Dict[int, str], sid: int) -> Optional[str]:
-    """Resolve a string-table id to text; id 0 -> None (absent)."""
-    if not sid:
-        return None
-    return table.get(sid)
-
-
-_PROPERTY_TYPE_NAMES = {
-    0: "STRING", 1: "BOOLEAN", 2: "BYTE", 3: "CHAR", 4: "DOUBLE", 5: "FLOAT",
-    6: "INT16", 7: "INT32", 8: "INT64", 9: "OBJECT", 10: "COLOR", 11: "GRAVITY",
-    12: "INT_ENUM", 13: "INT_FLAG", 14: "RESOURCE", 15: "DRAWABLE", 16: "ANIM",
-    17: "ANIMATOR", 18: "INTERPOLATOR", 19: "DIMENSION",
-}
-
-# Types whose payload travels in str_value (a string-table id).
-_STR_VALUE_TYPES = {0, 9, 12, 15, 16, 17, 18}  # STRING, OBJECT, INT_ENUM, DRAWABLE, ANIM, ANIMATOR, INTERPOLATOR
-# Types whose payload travels in int32_value.
-_INT32_VALUE_TYPES = {2, 3, 6, 7, 10, 11, 13}  # BYTE, CHAR, INT16, INT32, COLOR, GRAVITY, INT_FLAG
-
-
-def _resource_to_json(table: Dict[int, str], res: Any) -> Optional[Dict[str, Any]]:
-    if res is None:
-        return None
-    type_name = _s(table, res.type)
-    name = _s(table, res.name)
-    namespace = _s(table, res.namespace)
-    if type_name is None and name is None and namespace is None:
-        return None
-    out: Dict[str, Any] = {}
-    if namespace is not None:
-        out["namespace"] = namespace
-    if type_name is not None:
-        out["type"] = type_name
-    if name is not None:
-        out["name"] = name
-    # Convenience @type/name string, e.g. "@id/my_button".
-    if type_name is not None and name is not None:
-        out["ref"] = f"@{type_name}/{name}"
-    return out
-
-
-def _bounds_to_json(bounds: Any) -> Optional[Dict[str, Any]]:
-    if bounds is None:
-        return None
-    # Bounds.layout is a sub-message; in proto3 reading it always yields a value
-    # (a default all-zero Rect if unset), which we surface as-is.
-    layout = bounds.layout
-    out: Dict[str, Any] = {
-        "x": layout.x, "y": layout.y, "w": layout.w, "h": layout.h,
-    }
-    if bounds.HasField("render"):
-        q = bounds.render
-        out["render_quad"] = [
-            [q.x0, q.y0], [q.x1, q.y1], [q.x2, q.y2], [q.x3, q.y3],
-        ]
-    return out
-
-
-def _node_to_json(table: Dict[int, str], node: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "id": node.id,
-        "class_name": _s(table, node.class_name),
-        "package_name": _s(table, node.package_name),
-    }
-    bounds = _bounds_to_json(node.bounds if node.HasField("bounds") else None)
-    if bounds is not None:
-        out["bounds"] = bounds
-    resource = _resource_to_json(table, node.resource if node.HasField("resource") else None)
-    if resource is not None:
-        out["resource"] = resource
-    layout_resource = _resource_to_json(
-        table, node.layout_resource if node.HasField("layout_resource") else None
-    )
-    if layout_resource is not None:
-        out["layout_resource"] = layout_resource
-    view_id_name = _s(table, node.view_id_name)
-    if view_id_name:
-        out["view_id_name"] = view_id_name
-    text = _s(table, node.text_value)
-    if text:
-        out["text"] = text
-    if node.flags:
-        flag_names = []
-        # Flag.IS_WEBVIEW == 1 (bitmask) per proto.
-        if node.flags & 1:
-            flag_names.append("IS_WEBVIEW")
-        out["flags"] = flag_names
-    children = [_node_to_json(table, c) for c in node.children]
-    if children:
-        out["children"] = children
-    return out
-
-
-def _property_to_json(table: Dict[int, str], prop: Any, include_stack: bool) -> Dict[str, Any]:
-    ptype = int(prop.type)
-    out: Dict[str, Any] = {
-        "name": _s(table, prop.name),
-        "type": _PROPERTY_TYPE_NAMES.get(ptype, str(ptype)),
-    }
-    if prop.is_layout:
-        out["is_layout"] = True
-
-    # Pull the single populated value slot per type.
-    if ptype == 1:  # BOOLEAN
-        out["value"] = bool(prop.int32_value)
-    elif ptype in (10,):  # COLOR -> #AARRGGBB
-        out["value"] = _color_hex(prop.int32_value)
-    elif ptype in _INT32_VALUE_TYPES:
-        out["value"] = prop.int32_value
-    elif ptype == 8:  # INT64
-        out["value"] = prop.int64_value
-    elif ptype == 4:  # DOUBLE
-        out["value"] = prop.double_value
-    elif ptype in (5, 19):  # FLOAT, DIMENSION
-        out["value"] = prop.float_value
-    elif ptype in _STR_VALUE_TYPES:
-        out["value"] = _s(table, prop.str_value)
-    elif ptype == 14:  # RESOURCE
-        out["value"] = _resource_to_json(
-            table, prop.resource_value if prop.HasField("resource_value") else None
-        )
-    else:
-        # Unknown / future type: surface whatever non-empty slot we can.
-        if prop.str_value:
-            out["value"] = _s(table, prop.str_value)
-        elif prop.int64_value:
-            out["value"] = prop.int64_value
-        elif prop.int32_value:
-            out["value"] = prop.int32_value
-
-    source = _s(table, prop.source)
-    if source:
-        out["source"] = source
-    if include_stack and prop.resolution_stack:
-        stack = [_s(table, sid) for sid in prop.resolution_stack]
-        out["resolution_stack"] = [s for s in stack if s]
-    return out
-
-
-def _color_hex(argb: int) -> str:
-    # int32 may be negative (sign bit set); mask to 32 bits.
-    v = argb & 0xFFFFFFFF
-    return "#{:08X}".format(v)
-
-
-def _property_group_to_json(
-    table: Dict[int, str], group: Any, include_stack: bool
-) -> Dict[str, Any]:
-    return {
-        "view_id": group.view_id,
-        "properties": [
-            _property_to_json(table, p, include_stack) for p in group.properties
-        ],
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Screenshot decoding: the wire `Screenshot.data` is a Deflate(BEST_SPEED)
-# buffer of [9-byte header | raw pixels].  The host driver is expected to expose
-# a decoder that yields a PNG; if it does not, we decode here using stdlib
-# (zlib) + a tiny BMP/PNG writer fallback.  We prefer the driver's decoder.
-# --------------------------------------------------------------------------- #
-def _save_screenshot_png(session: Any, screenshot_msg: Any, dest_path: str) -> Dict[str, Any]:
-    """Materialise a Screenshot proto to a PNG file at dest_path.
-
-    Returns metadata {path, width, height, bytes}.
-    """
-    # 1. Prefer a host-driver decoder that returns PNG bytes (it already owns the
-    #    Deflate + header + pixel-config decoding to stay byte-exact with the agent).
-    png_bytes: Optional[bytes] = None
-    decoder = None
-    for name in ("screenshot_to_png", "decode_screenshot_png", "to_png"):
-        fn = getattr(session, name, None) or getattr(HOST.host, name, None)
-        if callable(fn):
-            decoder = fn
-            break
-    if decoder is not None:
-        try:
-            png_bytes = decoder(screenshot_msg)
-        except Exception:  # pragma: no cover - fall back to our own decoder
-            log.debug("host screenshot decoder failed; using stdlib decoder", exc_info=True)
-            png_bytes = None
-    if png_bytes is None:
-        # 2. Self-contained stdlib decode (zlib + minimal PNG writer).
-        png_bytes = _decode_screenshot_to_png(screenshot_msg)
-
-    with open(dest_path, "wb") as fh:
-        fh.write(png_bytes)
+    pngmod.write_png(screenshot_msg, dest_path)
     return {
         "path": dest_path,
         "width": int(screenshot_msg.width),
         "height": int(screenshot_msg.height),
-        "bytes": len(png_bytes),
+        "bytes": os.path.getsize(dest_path),
         "scale": float(screenshot_msg.scale) if screenshot_msg.scale else 1.0,
     }
-
-
-def _decode_screenshot_to_png(screenshot_msg: Any) -> bytes:
-    """Decode the Inspector Widget BITMAP wire format -> PNG bytes.
-
-    Decoding is delegated to ``inspector_widget.png._decode_to_rgba`` (the single
-    source of truth for the Deflate + 9-byte header + pixel-config handling, incl.
-    the ARGB_8888/type-3 R/B swap), then encoded to PNG with our stdlib encoder.
-    """
-    from inspector_widget import png as pngmod  # type: ignore
-
-    width, height, rgba = pngmod._decode_to_rgba(screenshot_msg)
-    return _rgba_to_png(rgba, width, height)
-
-
-def _rgba_to_png(rgba: bytearray, width: int, height: int) -> bytes:
-    """Minimal RGBA8888 -> PNG encoder (stdlib zlib, no Pillow)."""
-    import struct
-    import zlib
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    # IHDR: width, height, bit depth 8, colour type 6 (RGBA), no interlace.
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-
-    stride = width * 4
-    raw = bytearray()
-    for y in range(height):
-        raw.append(0)  # filter type 0 (None) per scanline
-        start = y * stride
-        raw += rgba[start : start + stride]
-    idat = zlib.compress(bytes(raw), 9)
-
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", idat)
-        + chunk(b"IEND", b"")
-    )
 
 
 _TMP_PREFIX = "viewspector_"
@@ -730,36 +470,23 @@ def _cleanup_at_exit() -> None:
 # the MCP layer (real or fallback) runs them in a worker thread because the host
 # driver does blocking adb + socket I/O.
 # --------------------------------------------------------------------------- #
-def _device_to_json(d: Any) -> Dict[str, Any]:
-    if isinstance(d, dict):
-        return {
-            "serial": d.get("serial"),
-            "api": d.get("api"),
-            "abi": d.get("abi"),
-            "model": d.get("model"),
-            "state": d.get("state", "device"),
-        }
+def _device_to_json(d: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``inspector_widget.list_devices()`` entry, as list_devices reports it."""
     return {
-        "serial": getattr(d, "serial", None),
-        "api": getattr(d, "api", None),
-        "abi": getattr(d, "abi", None),
-        "model": getattr(d, "model", None),
-        "state": getattr(d, "state", "device"),
+        "serial": d.get("serial"),
+        "api": d.get("api"),
+        "abi": d.get("abi"),
+        "model": d.get("model"),
+        "state": d.get("state", "device"),
     }
 
 
-def _process_to_json(p: Any) -> Dict[str, Any]:
-    if isinstance(p, dict):
-        return {
-            "package": p.get("package"),
-            "pid": p.get("pid"),
-            "running": bool(p.get("pid")) if p.get("running") is None else bool(p.get("running")),
-        }
-    pid = getattr(p, "pid", None)
+def _process_to_json(p: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``inspector_widget.list_processes()`` entry."""
     return {
-        "package": getattr(p, "package", None),
-        "pid": pid,
-        "running": bool(getattr(p, "running", pid is not None)),
+        "package": p.get("package"),
+        "pid": p.get("pid"),
+        "running": bool(p.get("pid")) if p.get("running") is None else bool(p.get("running")),
     }
 
 
@@ -866,6 +593,7 @@ def tool_dump_tree(
     serial = _serial(serial)
     scale = _clamp_scale(scale)
     root_id = _as_int(root_id, "root_id")
+    from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_tree(
         root_id=root_id,
@@ -874,21 +602,11 @@ def tool_dump_tree(
         include_screenshot=bool(include_screenshot),
         screenshot_scale=scale,
     )
-    table = _strings_to_map(resp.strings if resp.HasField("strings") else None)
-    result: Dict[str, Any] = {
-        "serial": serial,
-        "package": package,
-        "roots": [_node_to_json(table, r) for r in resp.roots],
-        "root_count": len(resp.roots),
-    }
-    if include_properties:
-        result["properties"] = [
-            _property_group_to_json(table, g, include_resolution_stack)
-            for g in resp.properties
-        ]
+    result = results.dump_tree(st.dump_tree_to_dict(resp), serial, package,
+                               include_properties=bool(include_properties))
     if include_screenshot and resp.HasField("screenshot"):
         with _png_output(serial, package, "tree") as dest:
-            result["screenshot"] = _save_screenshot_png(session, resp.screenshot, dest)
+            result["screenshot"] = _save_screenshot_png(resp.screenshot, dest)
     return result
 
 
@@ -901,22 +619,14 @@ def tool_get_properties(
     _require(package, "package")
     view_id = _as_int(view_id, "view_id")
     serial = _serial(serial)
+    from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.get_properties(
         view_id=view_id, include_resolution_stack=bool(include_resolution_stack)
     )
-    table = _strings_to_map(resp.strings if resp.HasField("strings") else None)
-    group = resp.group if resp.HasField("group") else None
-    return {
-        "serial": serial,
-        "package": package,
-        "view_id": view_id,
-        "group": (
-            _property_group_to_json(table, group, include_resolution_stack)
-            if group is not None
-            else None
-        ),
-    }
+    if not resp.HasField("group"):
+        return {"serial": serial, "package": package, "view_id": view_id, "group": None}
+    return results.get_properties(st.get_properties_to_dict(resp), serial, package)
 
 
 def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> Dict[str, Any]:
@@ -928,7 +638,7 @@ def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> 
     if not resp.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
     with _png_output(serial, package, "shot") as dest:
-        meta = _save_screenshot_png(session, resp.screenshot, dest)
+        meta = _save_screenshot_png(resp.screenshot, dest)
     meta.update({"serial": serial, "package": package})
     return meta
 
@@ -984,17 +694,15 @@ def tool_dump_compose(
     """Dump the Compose layer (semantics tree + slot table) of the app's UI."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import strings as st
+    from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_compose(include_semantics=include_semantics,
                                 include_slot_table=include_slot_table,
                                 enable_inspection=enable_inspection)
-    data = st.dump_compose_to_dict(resp)
-    data.update({"serial": serial, "package": package})
+    data = results.with_target(st.dump_compose_to_dict(resp), serial, package)
     if include_slot_table and not enable_inspection and not st.compose_slot_table_populated(data):
-        data["note"] = ("slot table not populated (semantics only). Pass enable_inspection=true for "
-                        "composable names/params/file:line. WARNING: "
-                        + st.ENABLE_INSPECTION_WARNING % "enable_inspection=true")
+        data["note"] = results.slot_table_note("enable_inspection=true",
+                                               st.ENABLE_INSPECTION_WARNING)
     return data
 
 
@@ -1058,14 +766,9 @@ def _h_compose_overlay(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _session_get_windows(session: Any) -> Dict[str, Any]:
-    """Normalise session.get_windows() to {root_ids, strings} regardless of
-    whether the host returns a proto message or a plain dict."""
-    raw = session.get_windows()
-    if isinstance(raw, dict):
-        return {"root_ids": list(raw.get("root_ids", [])), "strings": raw.get("strings", {})}
-    # Proto GetWindowsResponse
-    table = _strings_to_map(raw.strings if raw.HasField("strings") else None)
-    return {"root_ids": list(raw.root_ids), "strings": table}
+    """``{root_ids}`` of the app's windows (a GetWindowsResponse)."""
+    from inspector_widget import strings as st
+    return st.get_windows_to_dict(session.get_windows())
 
 
 # --------------------------------------------------------------------------- #
@@ -1202,14 +905,13 @@ def tool_dump_accessibility(
     exactly as TalkBack/UiAutomator see it, plus the host-computed reading order."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import a11y as a11ymod, correlate
+    from inspector_widget import a11y as a11ymod, correlate, results
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_a11y(root_id=0, include_extras=bool(include_extras),
                              include_rendering_info=bool(include_rendering_info))
     data = a11ymod.a11y_to_dict(resp)
     correlate.record_a11y(session, data)  # its Compose keys re-resolve in inspect_node
-    data.update({"serial": serial, "package": package})
-    return data
+    return results.with_target(data, serial, package)
 
 
 def tool_a11y_lint(
@@ -1223,7 +925,7 @@ def tool_a11y_lint(
     typed node keys plus a summary and diagnostics. Contrast samples each window."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import a11y_lint, correlate
+    from inspector_widget import a11y_lint, correlate, results
     enabled = _a11y_lint_rules(rules)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
@@ -1233,10 +935,7 @@ def tool_a11y_lint(
         include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
         rules=enabled, include_rendering_info=bool(include_rendering_info))
     correlate.record_a11y(session, report.a11y_data, (report.compose_data or {}).get("windows"))
-    out = report.to_dict()
-    out.update({"serial": serial, "package": package,
-                "contrast_sampled": bool(out["stats"].get("contrast_windows"))})
-    return out
+    return results.a11y_lint(report.to_dict(), serial, package)
 
 
 def tool_a11y_overlay(
@@ -1370,7 +1069,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "The live View hierarchy as a JSON tree (auto-attaches). Nodes carry id "
             "(uniqueDrawingId, for get_properties), class_name, package_name, screen bounds "
-            "{x,y,w,h} (render_quad when transformed), @id resource, TextView text and IS_WEBVIEW."
+            "{layout:{x,y,w,h}, render?}, resource, TextView text and IS_WEBVIEW."
         ),
         "schema": {
             "type": "object",
@@ -1413,7 +1112,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "handler": _h_get_properties,
         "description": (
             "Every attribute of one view: typed name/type/value, is_layout for layout params, "
-            "colors as #AARRGGBB, gravity/flags decoded, resource references resolved."
+            "gravity/flags as their names, dimensions in px, resource references resolved."
         ),
         "schema": {
             "type": "object",
@@ -1616,60 +1315,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 #   component_image  — cut a per-component image (SKP by layerId else BITMAP crop)
 # Defined here (before _run_tool) and registered via TOOLS.update(...).
 # --------------------------------------------------------------------------- #
-def _device_density(serial: str) -> int:
-    """Best-effort device density as raw DPI (e.g. 420) for dp-based a11y lint.
-
-    Returned as DPI (NOT a px/dp ratio): it is forwarded to inspect_node's
-    density=, which feeds the lint as a DPI int (matching LintContext.density).
-    Default 420 on any failure.
-    """
-    try:
-        from inspector_widget import adb  # type: ignore
-        out = adb.shell(serial, "wm density").strip()
-        # "Physical density: 420" (and maybe an Override line); prefer override.
-        dpi = None
-        for line in out.splitlines():
-            if ":" in line:
-                try:
-                    dpi = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-        if dpi:
-            return dpi
-    except Exception:
-        pass
-    return 420
-
-
-def _lint_fn():
-    """Return inspector_widget.a11y_lint.lint_a11y if importable, else None.
-
-    correlate.inspect_node calls this as lint_fn(roots, density_dpi) — the unified
-    a11y tree, or Compose-semantics roots for a lint that only takes those — and
-    expects a list[dict] of findings.
-    """
-    try:
-        from inspector_widget import a11y_lint  # type: ignore
-        fn = getattr(a11y_lint, "lint_a11y", None)
-        return fn if callable(fn) else None
-    except Exception:
-        return None
-
-
 def tool_inspect(serial: str, package: str, include_properties: bool = False,
                  include_overlay: bool = False) -> Dict[str, Any]:
     """Whole-screen integrated tree: each node carries view/compose/a11y/image-ref + correlation."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import correlate
+    from inspector_widget import correlate, results
     session = SESSIONS.get_or_attach(serial, package)
     merged = correlate.inspect_tree(session, include_properties=bool(include_properties))
-    result: Dict[str, Any] = {
-        "serial": serial, "package": package,
-        "roots": merged.get("roots", []),
-        "summary": merged.get("summary", {}),
-        "sources": merged.get("sources", {}),
-    }
+    result = results.inspect(merged, serial, package)
     if include_overlay:
         from inspector_widget import overlay as ov
         with _png_scratch(serial, package, "integrated_base") as base:
@@ -1709,7 +1363,7 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
             dossier = correlate.inspect_node(
                 session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
                 include_image=bool(include_image), image_path=image_path,
-                lint=True, density=density or _device_density(serial), font_scale=fscale,
+                lint=True, density=density, font_scale=fscale,
             )
         except correlate.NodeKeyError as exc:
             raise ToolError(str(exc)) from None
@@ -1717,8 +1371,8 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
             raise ToolError("no matching element found for the given selector")
         if image_path and not (dossier.get("component_image") or {}).get("path"):
             _remove_quietly(image_path)
-    dossier.update({"serial": serial, "package": package})
-    return dossier
+    from inspector_widget import results
+    return results.with_target(dossier, serial, package)
 
 
 def tool_component_image(serial: str, package: str, node_key: Optional[str] = None,
@@ -1745,8 +1399,8 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
         img = correlate.component_image(session, node, out_path=out, merged=merged)
         if not img.get("path"):
             _remove_quietly(out)
-    img.update({"serial": serial, "package": package, "node_key": node.get("node_key")})
-    return img
+    from inspector_widget import results
+    return results.with_target(img, serial, package, node_key=node.get("node_key"))
 
 
 def _h_inspect(args: Dict[str, Any]) -> Dict[str, Any]:

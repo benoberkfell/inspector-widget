@@ -718,9 +718,10 @@ def test_mcp_session_is_cached_and_reused(mcp, fake_device):
 def test_mcp_dump_tree(mcp, fake_device):
     res = mcp("dump_tree")
     assert res["root_count"] == 2 and "properties" not in res and "screenshot" not in res
-    title = find(res["roots"], id=1003)
-    assert title["resource"]["ref"] == "@id/title" and title["text"] == "Hello world"
-    assert title["bounds"] == {"x": 16, "y": 24, "w": 328, "h": 40}
+    title = find(res["roots"], id=1003)  # the strings.py node shape (E3)
+    assert title["resource"] == {"namespace": PKG, "type": "id", "name": "title"}
+    assert title["text"] == "Hello world"
+    assert title["bounds"] == {"layout": {"x": 16, "y": 24, "w": 328, "h": 40}}
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_screenshot) == (0, False, False)
 
@@ -732,7 +733,7 @@ def test_mcp_dump_tree_with_properties_and_screenshot(mcp, fake_device):
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_screenshot) == (1001, True, True)
     assert req.screenshot_scale == 0.5
-    assert [g["view_id"] for g in res["properties"]] == list(range(1001, 1007))
+    assert sorted(res["properties"]) == list(range(1001, 1007))
     shot = res["screenshot"]
     assert (shot["width"], shot["height"], shot["scale"]) == (180, 320, 0.5)
     assert fake_device.tmpdir in Path(shot["path"]).parents and png_size(shot["path"]) == (180, 320)
@@ -742,23 +743,21 @@ def test_mcp_get_properties(mcp, fake_device):
     res = mcp("get_properties", view_id=1003)
     req = fake_device.requests("get_properties")[-1]
     assert (req.view_id, req.include_resolution_stack) == (1003, False)
-    props = props_by_name(res["group"]["properties"])
+    props = props_by_name(res["group"]["properties"])  # strings.py shape: COLOR is the int
     assert props["text"]["value"] == "Hello world"
-    assert props["textColor"]["value"] == "#FF202124"
+    assert props["textColor"]["value"] == -14671580  # 0xFF202124
     assert props["textSize"]["value"] == 42.0
     assert props["enabled"]["value"] is True
     assert props["visibility"]["value"] == "visible"
-    assert props["id"]["value"]["ref"] == "@id/title"
+    assert props["id"]["value"] == {"namespace": PKG, "type": "id", "name": "title"}
     assert props["layout_gravity"]["is_layout"] is True
 
 
-@pytest.mark.xfail(strict=True, reason="E3: the MCP property decoder reads GRAVITY/INT_FLAG as "
-                   "int32 and DIMENSION as float (the agent sends str_value / int32_value)")
 def test_mcp_get_properties_decodes_gravity_flags_and_dimensions(mcp, fake_device):
+    """E3: the MCP decodes properties with inspector_widget.strings, as the CLI does."""
     props = props_by_name(mcp("get_properties", view_id=1003)["group"]["properties"])
-    assert "center_vertical|start" in (props["gravity"].get("value"), props["gravity"].get("label"))
-    assert "text|textCapSentences" in (props["inputType"].get("value"),
-                                       props["inputType"].get("label"))
+    assert props["gravity"]["value"] == "center_vertical|start"
+    assert props["inputType"]["value"] == "text|textCapSentences"
     assert props["paddingStart"]["value"] == 42
     assert props["layout_marginTop"]["value"] == 16
 
@@ -1082,8 +1081,6 @@ def test_scenario_integrated_cli_command_leaves_a_live_mcp_session_alone(mcp, fa
     assert "error" not in res, res
 
 
-@pytest.mark.xfail(strict=True, reason="E3: CLI and MCP decode the same properties differently "
-                   "(GRAVITY/INT_FLAG/DIMENSION)")
 def test_scenario_property_decoding_parity_cli_vs_mcp(mcp, fake_device, run_cli):
     cli_props = props_by_name(run_cli("get-properties", "--view-id", "1003", "--json", "-")
                               .json()["properties"])
@@ -1093,13 +1090,10 @@ def test_scenario_property_decoding_parity_cli_vs_mcp(mcp, fake_device, run_cli)
         assert decoded(cli_props[name]) == decoded(mcp_props[name]), name
 
 
-@pytest.mark.xfail(strict=True, reason="E3: dump --properties (CLI) and dump_tree "
-                   "include_properties (MCP) disagree on GRAVITY/DIMENSION values")
 def test_scenario_dump_tree_property_parity_cli_vs_mcp(mcp, fake_device, run_cli):
     cli_props = props_by_name(run_cli("dump", "--properties", "--json", "-")
                               .json()["properties"]["1003"])
-    groups = mcp("dump_tree", include_properties=True)["properties"]
-    mcp_props = props_by_name(next(g for g in groups if g["view_id"] == 1003)["properties"])
+    mcp_props = props_by_name(mcp("dump_tree", include_properties=True)["properties"][1003])
     for name in ("gravity", "paddingStart", "layout_marginTop"):
         assert decoded(cli_props[name]) == decoded(mcp_props[name]), name
 

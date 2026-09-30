@@ -79,7 +79,15 @@ _E3_FLAGS = ("E3: GRAVITY/INT_FLAG properties carry the agent's flag string as t
 #: Legacy entries re-recorded after G1, and why: the only allowed deltas. Each
 #: carries its reason in the golden entry (``delta``).
 LEGACY_DELTAS: dict[tuple[str, str], str] = {
+    ("mcp", "dump_tree"): "E3: the strings.py node shape (bounds {layout, render?}, "
+                          "qualified_name, resource without ref) replaces the MCP's own decoder",
+    ("mcp", "dump_tree_props"): "E3: strings.py node and property shapes; properties keyed by "
+                                "view id",
+    ("mcp", "get_properties"): "E3: the strings.py property shape (is_layout always, COLOR as "
+                               "its int, DIMENSION px, GRAVITY/INT_FLAG as their flag string)",
     ("mcp", "inspect_node"): _E3_FLAGS,
+    ("mcp", "screenshot"): "the PNG is written by inspector_widget.png, as the CLI writes it "
+                           "(Pillow when present): the same pixels, another file size",
     ("cli", "dump_props"): _E3_FLAGS,
     ("cli", "get_properties"): _E3_FLAGS,
     ("cli", "inspect_node"): _E3_FLAGS,

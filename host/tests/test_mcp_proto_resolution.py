@@ -1,9 +1,9 @@
-"""Guard mcp_server's lazy proto + lint resolution.
+"""Guard mcp_server's proto probe.
 
-These two helpers are pure indirection layers that have silently broken before:
-``_import_proto`` must resolve to the package's generated bindings (not a stale
-flat-layout fallback), and ``_lint_fn`` must hand back the real callable lint
-adapter (it used to return None when the lint moved modules).
+``_import_proto`` backs ``--self-check`` and the startup health line; it must
+resolve to the package's generated bindings (there is no flat-layout fallback
+any more). The tools themselves never import the proto module: they go through
+``inspector_widget.strings`` and friends.
 """
 
 from __future__ import annotations
@@ -22,13 +22,10 @@ def test_import_proto_exposes_core_messages():
         assert hasattr(proto, symbol), f"proto missing {symbol}"
 
 
-def test_lint_fn_is_callable():
-    fn = mcp_server._lint_fn()
-    assert fn is not None, "_lint_fn() returned None (lint adapter not importable)"
-    assert callable(fn)
-
-
-def test_lint_fn_is_the_a11y_lint_adapter():
-    from inspector_widget import a11y_lint
-
-    assert mcp_server._lint_fn() is a11y_lint.lint_a11y
+def test_the_parallel_decoder_and_compat_shims_are_gone():
+    """E3 and the ledger's dead code: one decoder (strings), one PNG writer (png)."""
+    for name in ("_node_to_json", "_property_to_json", "_property_group_to_json",
+                 "_resource_to_json", "_bounds_to_json", "_color_hex", "_strings_to_map",
+                 "_decode_screenshot_to_png", "_rgba_to_png", "_first_attr", "_lint_fn",
+                 "_device_density"):
+        assert not hasattr(mcp_server, name), name

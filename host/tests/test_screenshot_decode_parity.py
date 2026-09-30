@@ -1,14 +1,14 @@
 """Screenshot-decode parity: mcp_server and png must agree, with no R/B swap bug.
 
-``mcp_server._decode_screenshot_to_png`` used to carry its own pixel-unpacking
-copy (the removed ``_pixels_to_rgba``) that mishandled ARGB_8888 (type 3),
-swapping red and blue. The contract makes it delegate to
-``inspector_widget.png._decode_to_rgba`` (single source of truth). This test
-builds a synthetic ARGB_8888 buffer (in-memory byte order B,G,R,A) and asserts:
+mcp_server used to carry its own pixel-unpacking copy (the removed
+``_pixels_to_rgba``) that mishandled ARGB_8888 (type 3), swapping red and blue,
+and later its own PNG encoder. It now writes every screenshot with
+``inspector_widget.png.write_png`` (single source of truth). This test builds a
+synthetic ARGB_8888 buffer (in-memory byte order B,G,R,A) and asserts:
 
   * ``png._decode_to_rgba`` un-swaps to R,G,B,A, and
-  * the PNG emitted by ``mcp_server._decode_screenshot_to_png`` decodes back to
-    the exact same RGBA pixels (so the two paths agree; R and B are NOT swapped).
+  * the PNG ``mcp_server._save_screenshot_png`` writes decodes back to the exact
+    same RGBA pixels (so the two paths agree; R and B are NOT swapped).
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def test_png_decode_unswaps_argb():
     assert rgba == expected, "png._decode_to_rgba did not un-swap ARGB B/R"
 
 
-def test_mcp_and_png_agree_on_rgba():
+def test_mcp_and_png_agree_on_rgba(tmp_path):
     pytest.importorskip("PIL", reason="need Pillow to decode the emitted PNG")
     from PIL import Image
 
@@ -70,15 +70,19 @@ def test_mcp_and_png_agree_on_rgba():
     # Reference RGBA from the single source of truth.
     w, h, ref_rgba = png._decode_to_rgba(s)
 
-    # mcp_server path -> PNG bytes -> decode back to RGBA via PIL.
-    png_bytes = mcp_server._decode_screenshot_to_png(s)
+    # mcp_server path -> PNG file -> decode back to RGBA via PIL.
+    path = str(tmp_path / "shot.png")
+    meta = mcp_server._save_screenshot_png(s, path)
+    assert meta == {"path": path, "width": 2, "height": 2,
+                    "bytes": len(open(path, "rb").read()), "scale": 1.0}
+    png_bytes = open(path, "rb").read()
     assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
     img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     assert img.size == (w, h)
     mcp_rgba = img.tobytes()
 
     assert mcp_rgba == ref_rgba, (
-        "mcp_server._decode_screenshot_to_png and png._decode_to_rgba disagree "
+        "mcp_server._save_screenshot_png and png._decode_to_rgba disagree "
         "(R/B swap regression?)"
     )
 
