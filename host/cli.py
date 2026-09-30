@@ -250,12 +250,10 @@ def cmd_a11y(args) -> int:
 
         if args.overlay:
             findings = data["lint"]["findings"] if report is not None else None
-            shot = client.screenshot(root_id=0, scale=args.scale)
             base = args.overlay + ".base.png"
-            pngmod.write_png(shot.screenshot, base)
+            base_scale = ovmod.write_screen_png(client, data, base, scale=args.scale)
             summary = ovmod.render_a11y_overlay(
-                base, data, args.overlay, findings=findings,
-                scale=(float(shot.screenshot.scale) or args.scale))
+                base, data, args.overlay, findings=findings, scale=base_scale)
             os.remove(base)
             print(f"wrote a11y overlay -> {args.overlay} "
                   f"({summary['boxes']} boxes, {summary['flagged']} flagged, "
@@ -297,12 +295,10 @@ def cmd_a11y_lint(args) -> int:
             print(lintmod.format_text(report))
         if args.overlay:
             from inspector_widget import overlay as ovmod
-            shot2 = client.screenshot(root_id=0, scale=args.scale)
             base = args.overlay + ".base.png"
-            pngmod.write_png(shot2.screenshot, base)
+            base_scale = ovmod.write_screen_png(client, report.a11y_data, base, scale=args.scale)
             ov = ovmod.render_a11y_overlay(base, report.a11y_data, args.overlay,
-                                           findings=out["findings"],
-                                           scale=(float(shot2.screenshot.scale) or args.scale))
+                                           findings=out["findings"], scale=base_scale)
             os.remove(base)
             s = out["summary"]
             print(f"wrote a11y-lint overlay -> {args.overlay} ({ov['boxes']} boxes, "

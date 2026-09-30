@@ -148,3 +148,56 @@ def test_focus_stops_are_labelled_with_their_announcement(base, tmp_path):
                                         data["focus_order"])
     labels = [i["label"] for i in items if i["label"]]
     assert labels == mf.EXPECTED_SPEECH  # one label per stop, in tree order
+
+
+# --------------------------------------------------------------------------- #
+# Multi-window base image: a dialog is drawn over its activity.
+# --------------------------------------------------------------------------- #
+def _shot(w, h, rgba, scale=0.5):
+    import struct
+    import zlib
+
+    from inspector_widget.proto import view_inspection_pb2 as pb
+    raw = struct.pack("<ii", w, h) + bytes([2]) + bytes(rgba) * (w * h)  # 2 = ABGR_8888 (RGBA bytes)
+    return pb.ScreenshotResponse(screenshot=pb.Screenshot(
+        width=w, height=h, bitmap_type=2, data=zlib.compress(raw), scale=scale))
+
+
+class _Shots:
+    def __init__(self, by_root):
+        self.by_root = by_root
+        self.calls = []
+
+    def screenshot(self, root_id=0, scale=1.0):
+        self.calls.append(root_id)
+        return self.by_root.get(root_id) or self.by_root[0]
+
+
+def _win(root_view_id, x, y, w, h):
+    return {"root_view_id": root_view_id,
+            "root": {"host_view_id": root_view_id, "virtual_id": -1,
+                     "bounds": {"layout": {"x": x, "y": y, "w": w, "h": h}}}}
+
+
+def test_screen_png_composites_a_dialog_window_at_its_origin(tmp_path):
+    # Activity 200x200 at 0,0 (white); dialog 80x60 at 100,120 (red); both captured at
+    # scale 0.5, so the dialog lands at 50,60 on the 100x100 canvas.
+    act = _shot(100, 100, (255, 255, 255, 255))
+    dlg = _shot(40, 30, (200, 0, 0, 255))
+    conn = _Shots({2: act, 20: dlg, 0: act})
+    data = {"windows": [_win(2, 0, 0, 200, 200), _win(20, 100, 120, 80, 60)]}
+    out = tmp_path / "screen.png"
+    scale = overlay.write_screen_png(conn, data, str(out), scale=0.5)
+    assert scale == 0.5 and conn.calls == [2, 20]
+    img = Image.open(out).convert("RGB")
+    assert img.size == (100, 100)
+    assert img.getpixel((50 + 5, 60 + 5)) == (200, 0, 0)     # inside the dialog (100,120)*0.5
+    assert img.getpixel((10, 10)) == (255, 255, 255)          # activity elsewhere
+    assert img.getpixel((49, 59)) == (255, 255, 255)          # just outside its origin
+
+
+def test_screen_png_single_window_uses_one_screenshot(tmp_path):
+    conn = _Shots({0: _shot(10, 10, (1, 2, 3, 255), scale=1.0)})
+    out = tmp_path / "one.png"
+    assert overlay.write_screen_png(conn, {"windows": [_win(2, 0, 0, 10, 10)]}, str(out)) == 1.0
+    assert conn.calls == [0]

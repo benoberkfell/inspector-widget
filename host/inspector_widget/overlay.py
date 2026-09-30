@@ -457,6 +457,55 @@ def _map_finding(f: Dict[str, Any], by_pair: Dict[Tuple[int, int], Dict[str, Any
     return None
 
 
+def write_screen_png(conn: Any, a11y_dict: Dict[str, Any], out_png: str,
+                     scale: float = 1.0) -> float:
+    """Screenshot every a11y window and composite them into ``out_png``; return its scale.
+
+    ``conn.screenshot(root_id=...)`` captures one window root, so an overlay drawn on the
+    first window alone shows an empty area where a dialog or popup is. The windows of
+    ``a11y_dict`` (``a11y.a11y_to_dict``; z-ordered, bottom first) are alpha-composited
+    at their on-screen origins (their root bounds), onto a canvas the size of the
+    bottom window. Falls back to ``screenshot(root_id=0)`` when a window cannot be
+    captured or Pillow is missing. The window dim behind a dialog is not reproduced.
+    Raises RuntimeError when not even the first window can be captured.
+    """
+    from . import png as pngmod
+
+    def fallback() -> float:
+        shot = conn.screenshot(root_id=0, scale=scale)
+        if not shot.HasField("screenshot") or not shot.screenshot.width:
+            raise RuntimeError("the agent returned no screenshot")
+        pngmod.write_png(shot.screenshot, out_png)
+        return float(shot.screenshot.scale) or scale
+
+    wins = [w for w in (a11y_dict.get("windows") or []) if w.get("root")]
+    if len(wins) < 2 or not _HAVE_PIL:
+        return fallback()
+    canvas = None
+    base_xy = (0, 0)
+    got_scale = scale
+    for w in wins:
+        try:
+            shot = conn.screenshot(root_id=int(w.get("root_view_id") or 0), scale=scale)
+            if not shot.HasField("screenshot") or not shot.screenshot.width:
+                return fallback()
+            iw, ih, rgba = pngmod._decode_to_rgba(shot.screenshot)
+        except Exception:
+            return fallback()
+        img = Image.frombytes("RGBA", (iw, ih), bytes(rgba))
+        b = (w["root"].get("bounds") or {}).get("layout") or {}
+        x, y = int(b.get("x", 0) or 0), int(b.get("y", 0) or 0)
+        if canvas is None:
+            canvas, base_xy = img, (x, y)
+            got_scale = float(shot.screenshot.scale) or scale
+            continue
+        s = float(shot.screenshot.scale) or scale
+        canvas.alpha_composite(img, (int(round((x - base_xy[0]) * s)),
+                                     int(round((y - base_xy[1]) * s))))
+    canvas.save(out_png)
+    return got_scale
+
+
 def render_a11y_overlay(base_png: str, a11y_dict: Dict[str, Any], out_png: str,
                         findings: Optional[List[Dict[str, Any]]] = None,
                         max_labels: int = 160, scale: float = 1.0) -> Dict[str, Any]:

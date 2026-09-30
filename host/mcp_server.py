@@ -958,8 +958,7 @@ def tool_a11y_overlay(
     annotated PNG path plus the lint summary."""
     _require(serial, "serial")
     _require(package, "package")
-    from inspector_widget import (a11y as a11ymod, a11y_lint,
-                                  overlay as ov, png as pngmod)
+    from inspector_widget import a11y as a11ymod, a11y_lint, overlay as ov
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
     # One a11y dump feeds both the boxes/reading order and the lint.
@@ -972,12 +971,11 @@ def tool_a11y_overlay(
         a11y_data=a11y_data)
     lint_out = report.to_dict()
     findings = lint_out["findings"]
-    shot = session.screenshot(root_id=0, scale=scale)
-    if not shot.HasField("screenshot"):
-        raise ToolError("agent returned no screenshot")
     base = _tmp_png_path(serial, package, "a11y_base")
-    pngmod.write_png(shot.screenshot, base)
-    base_scale = float(shot.screenshot.scale) or scale
+    try:
+        base_scale = ov.write_screen_png(session, a11y_data, base, scale=scale)
+    except RuntimeError as exc:
+        raise ToolError(str(exc)) from None
     out = _tmp_png_path(serial, package, "a11y_overlay")
     summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
                                      scale=base_scale)
