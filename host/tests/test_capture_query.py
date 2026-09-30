@@ -8,9 +8,11 @@ from the real recorded fixtures (tests/fixtures/live/viewscreen).
 
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import random
+import re
 import time
 from typing import Any
 
@@ -299,10 +301,10 @@ def test_long_chains_are_capped():
     head = " > ".join(f"n{i} FrameLayout" for i in range(1, q.CHAIN_MAX + 1))
     assert out["lines"] == [head + " [0,0 1280x2856]", '  n602 TextView "deep" [10,10 100x50]']
     assert out["hidden"] == {"collapsed": 601 - q.CHAIN_MAX}
-    assert q.find(ix, text="deep")["path"] == "n1 > n602"
+    assert q.find(ix, text="deep")["path"] == "n1 / n602"
     with pytest.raises(OpError) as e:
         q.resolve_selector(ix, "n999")
-    assert e.value.message == "n999 is not in capture c7h2kq"
+    assert e.value.message.startswith("n999 is not in capture c7h2kq")
 
 
 # =========================================================================== #
@@ -502,7 +504,8 @@ def test_truncation_is_explicit(wide):
     out = q.outline(wide, max_bytes=1500)
     tr = out["truncated"]
     assert tr["why"] == "max_bytes" and tr["omitted"] == 259 - out["shown"]
-    assert out["next"][0] == f'outline(cursor="{tr["cursor"]}")'
+    # the cursor hint repeats the page size, so page 2 is the size of page 1
+    assert out["next"][0] == f'outline(max_bytes=1500,cursor="{tr["cursor"]}")'
     assert nbytes(out["next"]) <= 200 and len(out["next"]) <= 3
     f = q.find(wide, flags=["click"], limit=5)
     assert f["truncated"]["why"] == "limit" and f["shown"] == 5 and f["total"] == 259
@@ -659,7 +662,7 @@ def test_find_sorts(launcher):
 def test_find_count_only_limit_and_path(launcher):
     assert q.find(launcher, flags=["click"], count_only=True) == {"capture": "c7h2kq", "total": 12}
     one = q.find(launcher, tag="launch_toggle_state")
-    assert one["path"] == "n1 > n4 > n10 > n15"
+    assert one["path"] == "n1 / n4 / n10 / n15"  # skips levels: not a selector
     assert one["next"] == ['node("n15")', 'image(ref="n15")']
     assert one["lines"][0].endswith(" in n10 @launcher_list < n4 FrameLayout #content")
 
@@ -698,6 +701,9 @@ def test_json_rows_equal_line_fields(launcher, wide, viewscreen):
         (wide, q.outline, {"depth": 99}),
         (vs, q.outline, {"fields": "+props:text,visibility,+hint,+state", "props_fn": props.get}),
         (vs, q.find, {"has": ["label"], "fields": "+text,+role"}),
+        # a projection named like a field is namespaced, so no key repeats
+        (vs, q.outline, {"fields": "+props:hint,text,+hint,+text", "props_fn": props.get}),
+        (launcher, q.find, {"in_": "all", "fields": "+text,+params:text"}),
     ]
     for ix, fn, kw in cases:
         lines = fn(ix, **kw, max_bytes=32000)
@@ -706,6 +712,28 @@ def test_json_rows_equal_line_fields(launcher, wide, viewscreen):
         for line, row in zip(lines["lines"], rows["rows"], strict=True):
             assert L.row_matches_line(row, line), (line, row)
             assert L.format_line(row) == line
+            keys = re.findall(r" ([A-Za-z_][\w.:-]*)=", line.split(" in ")[0])
+            assert len(keys) == len(set(keys)), line
+
+
+def test_projections_named_like_fields_are_namespaced(launcher, viewscreen):
+    vs, props = viewscreen
+    hint = q.find(vs, has=["label"], fields="+hint,+props:hint", props_fn=props.get,
+                  text="example.com")["lines"][0]
+    assert " hint=" in hint and " props.hint=" in hint
+    text = q.find(launcher, in_="all", fields="+text,+params:text", text="Section heading",
+                  kind="slot")["lines"][0]
+    assert " params.text=" in text
+    assert L.proj_key("props", "textSize") == "textSize"  # the spec's bare form stays
+
+
+def test_find_issue_by_group_or_by_rule(launcher):
+    ix = copy.deepcopy(launcher)
+    n = ix.nodes["n12"]
+    n.issues.append(Issue("a11y.label.redundant", "warn"))
+    assert "!label_redundant" in q.find(ix, issue="label_redundant")["lines"][0]
+    assert q.find(ix, issue="label")["total"] == q.find(ix, issue="a11y.label.")["total"] >= 1
+    assert q.find(ix, issue="label_missing")["total"] == 0
 
 
 # =========================================================================== #
@@ -779,8 +807,11 @@ def test_node_without_slot_table():
     b.compose(acv, "n3", sem_id=5, b=(0, 0, 100, 100), label="Hi", flags=["click"])
     ix = b.build()
     d = q.node(ix, None, ["n3"])
-    assert d["compose"]["slots"] == q.SLOTS_NOT_CAPTURED
-    assert 'capture(slots="enable")' in d["next"]
+    assert d["compose"]["slots"] == q.SLOTS_NOT_CAPTURED  # the warning, with its cost
+    # the recompose is destructive: it is never offered as a follow-up call
+    assert not any(h.startswith("capture(") for h in d.get("next", []))
+    bare = q.node(ix, None, ["n3"], facets="core,a11y,issues")
+    assert not any(h.startswith("capture(") for h in bare.get("next", []))
 
 
 def test_missing_facets_are_reported(launcher):
@@ -992,6 +1023,37 @@ def test_selector_ref_not_in_capture_with_tombstone(launcher):
         q.resolve_selector(launcher, "n999", tomb=tomb)
     assert "c8m2pa" in e.value.message and 'Switch "Notifications"' in e.value.message
     assert e.value.candidates == ["#badSwitch"]
+
+
+def test_ref_errors_say_why_the_ref_is_missing(launcher):
+    # newer than every ref of this capture: it may come from a later capture
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, "n99999", tomb={})
+    assert "newer than every ref" in e.value.message and 'capture="latest"' in e.value.hint
+    # older than the capture's refs, and the lineage has no record: another app or a typo
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, "n100", tomb={})
+    assert "no record" in e.value.message and "another app" in e.value.hint
+    assert "capture again" not in e.value.hint
+
+
+def test_a_direct_child_path_that_should_be_a_descendant_says_so(launcher):
+    # @launch_heading is a grandchild of #content's subtree, not a direct child
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, '#content > "Section heading, MissingHeading"')
+    err = e.value
+    assert err.code == "not_found" and "direct child" in err.message
+    assert 'find(within="#content",text="Section heading, MissingHeading")' in err.hint
+    assert err.candidates and err.candidates[0].startswith("n22 ")
+
+
+def test_a_sel_pasted_with_its_outer_quotes_is_recognized(launcher):
+    sel = '@launcher_list > "Section heading, MissingHeading"'
+    assert q.resolve_selector(launcher, sel).id == "n22"
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, json.dumps(sel))
+    assert e.value.code == "not_found" and e.value.candidates == [sel]
+    assert sel in e.value.hint
 
 
 def test_legacy_compose_key_ambiguous_across_compose_views():

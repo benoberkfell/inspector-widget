@@ -347,7 +347,9 @@ def crop(loaded: Any, n: UNode | str, *, pad: int = DEFAULT_PAD,
     x1 = min(W, math.ceil((r[0] + r[2] + pad - ox) * s))
     y1 = min(H, math.ceil((r[1] + r[3] + pad - oy) * s))
     if x1 <= x0 or y1 <= y0:
-        raise OpError("bad_args", f"{_ref(node)} lies outside its window's screenshot")
+        raise OpError("bad_args", f"{_ref(node)} lies outside its window's screenshot",
+                      hint=f"Scroll it into view and capture again, or image(window="
+                           f"\"{_ref(win.node)}\") for the whole window.")
     cw, ch = x1 - x0, y1 - y0
     ow, oh = _fit(cw, ch, max_side)
     name = f"img/{_fname(_ref(node))}-p{pad}-{_hash({'k': node.key, 'pad': pad, 'm': max_side})}.png"

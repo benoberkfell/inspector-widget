@@ -81,6 +81,10 @@ ZERO_SIZE = "render.zero_size"
 LIKELY_FP = "likely false positive: clipped at scroll edge"
 #: bytes kept free for the truncation notice and the next hints
 FOOTER_RESERVE = 280
+#: lint() defaults (spec 5.9, 7).
+LINT_MAX_BYTES = 4000
+LINT_LIMIT = 30
+PER_RULE = 3
 #: bump when the cached lint shape changes (derived/lint.<hash>.json)
 LINT_CACHE_VERSION = 1
 
@@ -1156,11 +1160,19 @@ def _effective(ix: Index, src: _Src, *, contrast: bool, wcag: bool, density: int
 
 def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "info",
               within: str | None = None, contrast: bool = False, wcag: bool = False,
-              group: str = "rule", per_rule: int = 3, limit: int = 30,
-              cursor: str | None = None, max_bytes: int = 4000) -> dict[str, Any]:
+              group: str = "rule", per_rule: int = PER_RULE, limit: int = LINT_LIMIT,
+              cursor: str | None = None, max_bytes: int | None = None) -> dict[str, Any]:
     """The ``lint`` tool over one capture (spec 5.9). Default rules are every
     ``a11y.*`` rule; ``render.*`` issues are reported when asked for
-    (``rules=["render."]``) and pointed to otherwise."""
+    (``rules=["render."]``) and pointed to otherwise.
+
+    ``max_bytes`` works as in every query tool (``query.resolve_max_bytes``):
+    None is the 4,000 default, 0 the 32,000 ceiling, anything else is clamped to
+    500..32,000. A page always shows at least one finding (in its smallest form
+    when nothing else fits), so following ``truncated.cursor`` always advances;
+    the cursor's ``next`` hint repeats every non-default argument."""
+    from .query import cursor_call, next_hints, resolve_max_bytes  # C6
+
     if severity not in R.SEVERITIES:
         raise OpError("bad_args", f"severity must be one of {', '.join(R.SEVERITIES)}")
     if group not in GROUPS:
@@ -1168,10 +1180,10 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     try:
         per_rule = max(1, min(20, int(per_rule)))
         limit = max(1, min(200, int(limit)))
-        max_bytes = int(max_bytes)
     except (TypeError, ValueError) as e:
-        raise OpError("bad_args", f"per_rule, limit and max_bytes are integers ({e})") from None
-    max_bytes = 0 if max_bytes <= 0 else max(500, min(32000, max_bytes))
+        raise OpError("bad_args", f"per_rule and limit are integers ({e})") from None
+    max_bytes_arg = max_bytes
+    max_bytes = resolve_max_bytes(max_bytes, LINT_MAX_BYTES)
     selected = R.resolve(rules)
     explicit = selected is not None
     if selected is None:
@@ -1181,9 +1193,10 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     src = _Src(loaded)
     density = _density(ix, src)
     cid = ix.meta.id if ix.meta else ""
+    # the page size (limit, max_bytes) is not part of the cursor: it may change
     norm = {"rules": sorted(selected_set) if explicit else None, "severity": severity,
             "within": within, "contrast": bool(contrast), "wcag": bool(wcag), "group": group,
-            "per_rule": per_rule, "limit": limit}
+            "per_rule": per_rule}
     h = _cursor_hash(norm)
     offset = _parse_cursor(cursor, cid, h) if cursor else 0
 
@@ -1229,7 +1242,20 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if shown_end < total:
         out["truncated"] = {"omitted": total - shown_end, "why": truncated_why,
                             "cursor": _make_cursor(cid, h, shown_end)}
-        nxt.append(f'lint(cursor="{out["truncated"]["cursor"]}")')
+        args: dict[str, Any] = {}
+        if explicit:
+            args["rules"] = rules
+        for k, v, default in (("severity", severity, "info"), ("within", within, None),
+                              ("contrast", bool(contrast), False), ("wcag", bool(wcag), False),
+                              ("group", group, "rule"), ("per_rule", per_rule, PER_RULE)):
+            if v != default:
+                args[k] = v
+        page: dict[str, Any] = {}
+        if limit != LINT_LIMIT:
+            page["limit"] = limit
+        if max_bytes_arg is not None and max_bytes != LINT_MAX_BYTES:
+            page["max_bytes"] = max_bytes_arg
+        nxt.append(cursor_call("lint", args, page, out["truncated"]["cursor"]))
     if kept:
         nxt.append('image(overlay="lint")')
         focus = _focus_node(ix, kept)
@@ -1238,8 +1264,27 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if not explicit and any(i.id.startswith("render.") for n in ix.nodes.values()
                             for i in n.issues):
         nxt.append('find(issue="render.")')
+    nxt = next_hints(nxt)
     if nxt:
-        out["next"] = nxt[:3]
+        out["next"] = nxt
+    return _fit_lint(out, max_bytes)
+
+
+def _fit_lint(out: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """Shed optional parts when a forced single-finding page runs over the budget:
+    the non-cursor hints, then the bookkeeping counts."""
+    if json_cost(out) <= max_bytes:
+        return out
+    if out.get("next"):
+        keep = [x for x in out["next"] if x.startswith("lint(") and "cursor=" in x]
+        if keep:
+            out["next"] = keep
+        else:
+            out.pop("next")
+    for key in ("unavailable", "unmapped", "contrast"):
+        if json_cost(out) <= max_bytes:
+            break
+        out.pop(key, None)
     return out
 
 
@@ -1270,13 +1315,27 @@ def _render_groups(ix: Index, kept: list[tuple[str, Issue]], group: str, per_rul
             break
         if not budget.add(json_cost(item) + 1):
             why = "max_bytes"
-            if not page and isinstance(item, dict):
-                small = dict(item, nodes=item["nodes"][:1])
-                if budget.add(json_cost(small) + 1):
-                    page.append(small)
+            if not page:
+                # a page always advances: the smallest form of this finding, even
+                # when the footer reserve says it does not fit (_fit_lint trims)
+                page.append(_minimal_item(item, budget))
             break
         page.append(item)
     return page, total, why
+
+
+def _minimal_item(item: Any, budget: Budget) -> Any:
+    """``item`` with its first example node only, else without msg/fix and with a
+    short example; a finding line is cut."""
+    if isinstance(item, dict):
+        small = dict(item, nodes=item["nodes"][:1])
+        if budget.add(json_cost(small) + 1):
+            return small
+        first = str(item["nodes"][0]) if item.get("nodes") else ""
+        return {"rule": item["rule"], "sev": item["sev"], "n": item["n"],
+                "nodes": [first if len(first) <= 60 else first[:59] + "…"]}
+    s = str(item)
+    return s if len(s) <= 100 else s[:99] + "…"
 
 
 def _line(ix: Index, nid: str, iss: Issue) -> str:

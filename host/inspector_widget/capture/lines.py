@@ -6,7 +6,7 @@ candidates, node dossier sub-lists) is made of lines in this grammar::
     line  := [prefix] indent seg (" > " seg)* [" [x,y wxh]"] (" !"issue)* [" +"N] [tail]
     seg   := ref [" "Type] [" #"rid] [" @"tag] [" \\""label"\\""] (" "flag)*
     tail  := (" "key"="value)* [" in " crumb (" < " crumb)*]
-    crumb := ref [" "Type] [" "(#rid | @tag | "label")]
+    crumb := ref [" "Type] [" "(#rid | @tag)] [" \\""label"\\""]
 
 * ``indent`` is two spaces per depth. ``prefix`` is ``<stop>. `` in the reading
   view and ``~ ``/``+ ``/``- ``/``> `` in diffs.
@@ -23,7 +23,13 @@ candidates, node dossier sub-lists) is made of lines in this grammar::
   is a run of single-child nodes with identical bounds; its bounds, issues, ``+N``
   and tail belong to its last member (a chain ends at a member with issues).
 * The tail holds projections (``src=MainActivity.kt:151``, ``textSize=14sp``) and,
-  in ``find``, the breadcrumb (`` in n10 @launcher_list < n5 ComposeView``).
+  in ``find``, the breadcrumb (`` in n10 @launcher_list < n5 ComposeView``). A
+  ``+props:``/``+params:`` name that is also a field name (``text``, ``hint``,
+  ``state`` ...) renders namespaced (``params.text=``, ``props.hint=``), so a
+  line never carries one key twice.
+* A crumb names its node by tag, else rid, else label; when that tag or rid is
+  shared by other nodes of the capture (list cells) the label follows it
+  (``n749 Card @card "Item 3"``), so the crumb still says which one.
 
 Rows and lines are the same data: :func:`node_row` builds a row (the
 ``format="json"`` form), :func:`format_line` renders exactly that row, and
@@ -63,6 +69,14 @@ _TAIL_SET = frozenset(TAIL_FIELDS)
 #: Row keys that are not tail fields (everything else in a row renders as key=value).
 _ROW_STRUCT = frozenset(SEG_FIELDS) | {"chain", "bounds", "issues", "hidden", "in", "depth",
                                       "order", "mark", "props", "params"}
+#: Names a +props:/+params: projection cannot use bare in a line.
+_RESERVED_KEYS = _TAIL_SET | _ROW_STRUCT
+
+
+def proj_key(group: str, name: str) -> str:
+    """How a projected property or parameter is keyed in a line: bare, or
+    ``group.name`` when the name is also a field (``params.text``)."""
+    return f"{group}.{name}" if name in _RESERVED_KEYS else name
 
 PropsFn = Callable[[UNode], "Mapping[str, Any] | None"]
 
@@ -140,8 +154,14 @@ def fmt_value(v: Any) -> str | None:
 
 
 def short_code(rule_id: str) -> str:
-    """A rule id's short code for ``!issue``: ``a11y.<group>.<x>`` -> ``group``,
-    ``render.<x>`` -> ``x``, anything else with dots turned into underscores."""
+    """A rule id's short code for ``!issue``: the catalog's code (``rules.short``:
+    ``a11y.<group>.<x>`` -> ``group``, or ``group_x`` when the group has several
+    rules; ``render.<x>`` -> ``x``); for a rule the catalog does not know, the
+    group, and anything else with dots turned into underscores."""
+    from . import rules as R  # the catalog (pure; imports only model)
+
+    if R.is_known(rule_id):
+        return R.short(rule_id)
     parts = str(rule_id).split(".")
     if parts[0] == "a11y" and len(parts) >= 3:
         code = parts[1]
@@ -488,6 +508,12 @@ def node_row(ix: Index, n: UNode, fields: Fields | Any = None, *, chain: Sequenc
     return row
 
 
+def seg_text(s: Mapping[str, Any]) -> str:
+    """A segment row (:func:`seg_row`) as text: ``ref [Type] [#rid] [@tag]
+    ["label"] (flag)*``."""
+    return _seg_text(s)
+
+
 def _seg_text(s: Mapping[str, Any]) -> str:
     out = [str(s["ref"])]
     if s.get("type"):
@@ -529,7 +555,7 @@ def format_line(row: Mapping[str, Any]) -> str:
         for k, v in (row.get(group) or {}).items():
             fv = fmt_value(v)
             if fv is not None:
-                out.append(f" {k}={fv}")
+                out.append(f" {proj_key(group, k)}={fv}")
     if row.get("in"):
         out.append(" in " + " < ".join(row["in"]))
     return "".join(out)
@@ -546,21 +572,44 @@ def render_line(ix: Index, n: UNode, fields: Fields | Any = None, depth: int = 0
 # --------------------------------------------------------------------------- #
 # Brief references (breadcrumbs, parents, candidates)
 # --------------------------------------------------------------------------- #
-def crumb(n: UNode, label_max: int = CRUMB_LABEL_MAX) -> str:
-    """``ref [Type] [@tag | #rid | "label"]``: a short reference to a node."""
+def crumb(n: UNode, label_max: int = CRUMB_LABEL_MAX, ix: Index | None = None) -> str:
+    """``ref [Type] [@tag | #rid] ["label"]``: a short reference to a node, by tag,
+    else rid, else label. With ``ix``, a tag or rid that other nodes of the capture
+    share (every cell of a list) is followed by the label, which tells them apart."""
     out = [n.id]
     t = display_type(n)
     if t:
         out.append(t)
+    lab = display_label(n)
     if n.tag:
         out.append("@" + ident(n.tag))
+        shared = ix is not None and _ident_counts(ix)[0].get(n.tag, 0) > 1
     elif n.rid:
         out.append("#" + ident(n.rid))
+        shared = ix is not None and _ident_counts(ix)[1].get(n.rid, 0) > 1
     else:
-        lab = display_label(n)
-        if lab:
-            out.append(jstr(cut(lab, label_max)))
+        shared = True
+    if shared and lab:
+        out.append(jstr(cut(lab, label_max)))
     return " ".join(out)
+
+
+def _ident_counts(ix: Index) -> tuple[dict[str, int], dict[str, int]]:
+    """How many ui nodes carry each testTag and each rid (cached on the index)."""
+    cached = ix.__dict__.get("_iw_ident_counts")
+    if cached is not None and cached[0] == len(ix.nodes):
+        return cached[1], cached[2]
+    tags: dict[str, int] = {}
+    rids: dict[str, int] = {}
+    for m in ix.nodes.values():
+        if m.kind == "slot":
+            continue
+        if m.tag:
+            tags[m.tag] = tags.get(m.tag, 0) + 1
+        if m.rid:
+            rids[m.rid] = rids.get(m.rid, 0) + 1
+    ix.__dict__["_iw_ident_counts"] = (len(ix.nodes), tags, rids)
+    return tags, rids
 
 
 def is_landmark(n: UNode) -> bool:
@@ -582,7 +631,7 @@ def breadcrumbs(ix: Index, n: UNode, k: int = 2) -> list[str]:
         if a is None:
             break
         if is_landmark(a):
-            out.append(crumb(a))
+            out.append(crumb(a, ix=ix))
         p = a.parent
     return out
 
@@ -596,7 +645,7 @@ _TYPE = r"[A-Z][A-Za-z0-9_$]*"
 _ID = rf"(?:[A-Za-z0-9_.:/$-]+|{_JSTR})"
 _FLAG = "(?:" + "|".join(sorted(FLAGS, key=len, reverse=True)) + ")"
 _SEG = rf"{_REF}(?: {_TYPE})?(?: #{_ID})?(?: @{_ID})?(?: {_JSTR})?(?: {_FLAG})*"
-_CRUMB = rf"{_REF}(?: {_TYPE})?(?: (?:#{_ID}|@{_ID}|{_JSTR}))?"
+_CRUMB = rf"{_REF}(?: {_TYPE})?(?: (?:#{_ID}|@{_ID}))?(?: {_JSTR})?"
 _TOKEN = rf" [A-Za-z_][\w.:-]*=(?:{_JSTR}|[^\s\"\\]+)"
 #: The whole-line grammar (v1). Every line the query engine renders matches it.
 LINE_RE = re.compile(
@@ -756,7 +805,7 @@ def row_matches_line(row: Mapping[str, Any], line: str) -> bool:
         for k, v in (row.get(group) or {}).items():
             fv = fmt_value(v)
             if fv is not None:
-                want_tail[k] = fv
+                want_tail[proj_key(group, k)] = fv
     return want_tail == p.get("tail", {})
 
 
@@ -791,9 +840,11 @@ __all__ = [
     "parse_fields",
     "parse_line",
     "plain_value",
+    "proj_key",
     "render_line",
     "row_matches_line",
     "seg_row",
+    "seg_text",
     "short_code",
     "slot_params",
     "to_dp",

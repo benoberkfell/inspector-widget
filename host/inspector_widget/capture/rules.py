@@ -10,8 +10,11 @@ A rule has:
 * ``id``: ``a11y.<group>.<x>`` (accessibility lint) or ``render.<x>`` (render
   signals).
 * ``short``: the code used after ``!`` in outline lines: the group for
-  ``a11y.<group>.<x>``, and ``x`` for ``render.<x>``. Short codes are not unique
-  (``a11y.label.missing`` and ``a11y.label.redundant`` are both ``label``).
+  ``a11y.<group>.<x>`` when the group has one rule (``role``, ``touch_target``),
+  ``group_x`` when it has several (``label_missing`` and ``label_redundant``,
+  ``text_fixed_scaling`` and ``text_too_small``: one code never names opposite
+  rules), and ``x`` for ``render.<x>``. The bare group still selects every rule
+  of the group in ``resolve()`` and ``find(issue=...)``.
 * ``sev``: the default (worst) severity. A single issue may be milder; the issue's
   own ``sev`` wins.
 * ``msg`` and ``fix``: one line each.
@@ -77,9 +80,30 @@ def short_code(rule_id: str) -> str:
     return parts[-1]
 
 
+def group(rule_id: str) -> str:
+    """The group a rule id belongs to (``a11y.label.missing`` -> ``label``; a
+    render rule is its own group)."""
+    return short_code(rule_id)
+
+
 def _r(rule_id: str, sev: str, msg: str, fix: str | None = None, alias: str | None = None,
        atf: str | None = None, planned: bool = False) -> Rule:
     return Rule(rule_id, short_code(rule_id), sev, msg, fix, alias, atf, planned)
+
+
+def _unique_shorts(rules: tuple[Rule, ...]) -> tuple[Rule, ...]:
+    """Give each rule of a multi-rule a11y group the short code ``group_x``."""
+    per_group: dict[str, int] = {}
+    for r in rules:
+        per_group[r.short] = per_group.get(r.short, 0) + 1
+    out = []
+    for r in rules:
+        parts = r.id.split(".")
+        if per_group[r.short] > 1 and parts[0] == "a11y" and len(parts) >= 3:
+            r = Rule(r.id, f"{parts[1]}_{'_'.join(parts[2:])}", r.sev, r.msg, r.fix, r.alias,
+                     r.atf, r.planned)
+        out.append(r)
+    return tuple(out)
 
 
 _CATALOG: tuple[Rule, ...] = (
@@ -141,6 +165,8 @@ _CATALOG: tuple[Rule, ...] = (
        planned=True),
 )
 
+_CATALOG = _unique_shorts(_CATALOG)
+
 #: rule id -> Rule
 RULES: dict[str, Rule] = {r.id: r for r in _CATALOG}
 #: "R5" -> rule id (keys upper case; lookups are case-insensitive)
@@ -160,6 +186,8 @@ for _rule in _CATALOG:
 _BY_SHORT: dict[str, list[str]] = {}
 for _rule in _CATALOG:
     _BY_SHORT.setdefault(_rule.short, []).append(_rule.id)
+    if _rule.short != group(_rule.id):  # the bare group selects all of its rules
+        _BY_SHORT.setdefault(group(_rule.id), []).append(_rule.id)
 
 
 def get(rule_id: str, sev: str | None = None, msg: str | None = None) -> Rule:
@@ -173,8 +201,14 @@ def get(rule_id: str, sev: str | None = None, msg: str | None = None) -> Rule:
 
 
 def short(rule_id: str) -> str:
+    """The ``!issue`` code of a rule (unique per catalog rule)."""
     rule = RULES.get(rule_id)
     return rule.short if rule else short_code(rule_id)
+
+
+def matches_code(rule_id: str, code: str) -> bool:
+    """Whether a user's short code names ``rule_id``: its own code or its group."""
+    return code in (short(rule_id), group(rule_id))
 
 
 def is_known(rule_id: str) -> bool:
@@ -238,5 +272,6 @@ def at_least(sev: str, minimum: str) -> bool:
 
 __all__ = [
     "ALIASES", "ATF_NAMES", "FAMILIES", "RULES", "SEVERITIES", "SEV_RANK", "Rule",
-    "at_least", "get", "is_known", "resolve", "short", "short_code", "worst",
+    "at_least", "get", "group", "is_known", "matches_code", "resolve", "short", "short_code",
+    "worst",
 ]

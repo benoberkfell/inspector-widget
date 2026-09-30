@@ -44,8 +44,21 @@ from typing import Any
 from .. import normalize as nz
 from ..output import Budget, dumps, utf8_len
 from . import lines as L
+from . import rules as R
 from .lines import Fields, crumb, fmt_value, node_row, parse_fields, render_line
-from .model import FLAG_SET, FLAGS, KINDS, Index, Issue, OpError, Tree, UNode, is_key, is_ref
+from .model import (
+    FLAG_SET,
+    FLAGS,
+    KINDS,
+    Index,
+    Issue,
+    OpError,
+    Tree,
+    UNode,
+    is_key,
+    is_ref,
+    ref_num,
+)
 
 # --------------------------------------------------------------------------- #
 # Limits and vocabularies (spec 5.5-5.7, 6.5, 7)
@@ -53,7 +66,7 @@ from .model import FLAG_SET, FLAGS, KINDS, Index, Issue, OpError, Tree, UNode, i
 TOOL_LETTERS = {"outline": "o", "find": "f", "lint": "l", "diff": "d"}
 DEFAULT_MAX_BYTES = {"outline": 6000, "find": 3000, "node": 3000, "node_batch": 6000}
 MAX_BYTES_CEILING = 32000
-MIN_MAX_BYTES = 300
+MIN_MAX_BYTES = 500
 FIND_LIMIT = 20
 FIND_LIMIT_MAX = 200
 OUTLINE_DEPTH = 3
@@ -220,8 +233,9 @@ def _numbers(name: str, v: Any, n: int) -> list[float] | None:
 
 
 def resolve_max_bytes(v: Any, default: int) -> int:
-    """A query tool's max_bytes: None -> the tool default; 0 or less -> the
-    32,000 ceiling; otherwise clamped to 300..32,000 (spec 6.5)."""
+    """``max_bytes`` for every capture query tool (outline, find, node, lint and
+    diff alike): None -> the tool default; 0 or less -> the 32,000 ceiling;
+    otherwise clamped to 500..32,000 (spec 6.5)."""
     if v is None or v == "":
         return default
     if isinstance(v, bool):
@@ -335,6 +349,21 @@ def call(tool: str, *positional: Any, **kw: Any) -> str:
             continue
         parts.append(f"{k}={json.dumps(v, ensure_ascii=False, separators=(',', ':'))}")
     return f"{tool}({','.join(parts)})"
+
+
+def cursor_call(tool: str, args: Mapping[str, Any], page: Mapping[str, Any],
+                cursor: str) -> str:
+    """The follow-up call for a cursor: ``tool(**args, **page, cursor=...)``.
+
+    ``args`` are the caller's non-default arguments that the cursor hash covers
+    (the call fails without them); ``page`` the non-default page-shape arguments
+    (max_lines, limit, max_bytes, format) that keep page 2 the size and shape of
+    page 1. The page arguments are dropped when the call would not fit a ``next``
+    list (200 B), the others never are."""
+    full = call(tool, **args, **page, cursor=cursor)
+    if not page or utf8_len(dumps([full])) <= NEXT_MAX_BYTES:
+        return full
+    return call(tool, **args, cursor=cursor)
 
 
 def next_hints(candidates: Iterable[str | None]) -> list[str]:
@@ -543,6 +572,7 @@ def type_names(n: UNode) -> list[str]:
             out.append(s)
 
     add(n.type)
+    add(L.display_type(n))  # the Type lines show (upper-cased, safe for the grammar)
     v = n.facets.get("view")
     if v:
         for k in ("class", "qualified"):
@@ -710,19 +740,7 @@ def resolve_selector(ix: Index, sel: Any, *, tomb: Mapping[str, Sequence] | None
         n = ix.get(ref)
         if n is not None:
             return n
-        info = (tomb or {}).get(ref)
-        msg = f"{ref} is not in {cid}"
-        cands = None
-        if info:
-            typ, label, last_sel, last_cap = (list(info) + [None] * 4)[:4]
-            desc = " ".join(x for x in (typ, L.jstr(label) if label else None) if x)
-            msg += f"; last seen in {last_cap} as {desc or 'a node'}"
-            if last_sel:
-                msg += f" (sel {last_sel})"
-                cands = [last_sel]
-        raise OpError("ref_not_in_capture", msg,
-                      hint="Refs are never reused; capture again, or select by its sel.",
-                      candidates=cands)
+        raise _ref_error(ix, ref, cid, tomb)
     matches = select(ix, s)
     if len(matches) == 1:
         return matches[0]
@@ -733,6 +751,22 @@ def resolve_selector(ix: Index, sel: Any, *, tomb: Mapping[str, Sequence] | None
         if s.kind == "key":
             raise OpError("not_found", f"no node with key {s.atoms[0].value} in {cid}",
                           hint="Keys: view:<udid>, sem:<acv>:<id>, a11y:<host>:<virt>, w:<udid>.")
+        deeper = _deeper(ix, s)
+        if deeper:
+            head = " > ".join(a.text() for a in s.atoms[:-1])
+            last = s.atoms[-1]
+            raise OpError("not_found",
+                          f"nothing matches {s.text} in {cid}: ' > ' means a direct child, "
+                          f"and {last.text()} is deeper under {head}",
+                          hint=f"Use {call('find', within=head, **_atom_filters(last))}, or "
+                               "one of the candidates' sel.",
+                          candidates=[render_line(ix, n, _AMBIG_FIELDS) for n in deeper[:5]])
+        quoted = _quoted_sel(ix, s)
+        if quoted is not None:
+            raise OpError("not_found",
+                          f"nothing matches {s.text} in {cid}: it is one quoted label",
+                          hint=f"Pass the sel without its outer quotes: {quoted}",
+                          candidates=[quoted])
         last = s.atoms[-1]
         cands = _nearest(ix, last)
         raise OpError("not_found", f"nothing matches {s.text} in {cid}",
@@ -745,6 +779,89 @@ def resolve_selector(ix: Index, sel: Any, *, tomb: Mapping[str, Sequence] | None
                   + (f" ({more} not listed)" if more > 0 else ""),
                   hint="Use one candidate's ref or sel, or add a parent: #list > \"Item\".",
                   candidates=top)
+
+
+def _ref_error(ix: Index, ref: str, cid: str, tomb: Mapping[str, Sequence] | None) -> OpError:
+    """``ref_not_in_capture`` that says why: gone (the lineage's tombstone), newer
+    than this capture, or unknown to this app's lineage (another app, a typo)."""
+    info = (tomb or {}).get(ref)
+    msg = f"{ref} is not in {cid}"
+    if info:
+        typ, label, last_sel, last_cap = (list(info) + [None] * 4)[:4]
+        desc = " ".join(x for x in (typ, L.jstr(label) if label else None) if x)
+        msg += f"; last seen in {last_cap} as {desc or 'a node'}"
+        cands = None
+        if last_sel:
+            msg += f" (sel {last_sel})"
+            cands = [last_sel]
+        return OpError("ref_not_in_capture", msg,
+                       hint="It left the screen (refs are never reused): select it by its "
+                            "sel in a newer capture, or bring it back and capture again.",
+                       candidates=cands)
+    newest = max((ref_num(r) for r in ix.nodes if is_ref(r)), default=0)
+    if ref_num(ref) > newest:
+        return OpError("ref_not_in_capture",
+                       f"{msg}; it is newer than every ref of this capture",
+                       hint='It may come from a newer capture of this app: pass '
+                            'capture="latest" (or that capture\'s id). Refs are never reused.')
+    if tomb is not None:
+        return OpError("ref_not_in_capture",
+                       f"{msg}, and this app's lineage has no record of it",
+                       hint="It is a ref of another app (refs belong to one serial and "
+                            "package) or a typo: select by text or sel, e.g. find(text=...).")
+    return OpError("ref_not_in_capture", msg,
+                   hint='Refs are never reused: capture="latest" if it came from a newer '
+                        "capture, else select by text or sel (another app's ref, or a typo).")
+
+
+def _deeper(ix: Index, s: Selector) -> list[UNode]:
+    """For a path that matched nothing: nodes its last atom matches deeper (not as a
+    direct child) under what the rest of the path matches."""
+    if s.kind != "path" or len(s.atoms) < 2:
+        return []
+    heads = select(ix, Selector("path", s.text, s.atoms[:-1]))
+    last = s.atoms[-1]
+    out: list[UNode] = []
+    seen: set[str] = set()
+    for h in heads:
+        for nid in _subtree_ids(ix, h) - {h.id}:
+            n = ix.nodes.get(nid)
+            if n is not None and nid not in seen and _ui(n) and _atom_match(ix, n, last):
+                seen.add(nid)
+                out.append(n)
+    order = {nid: i for i, nid in enumerate(ix.nodes)}
+    return sorted(out, key=lambda n: order.get(n.id, 0))
+
+
+def _atom_filters(atom: Atom) -> dict[str, Any]:
+    """find() filters that match what ``atom`` matches (roughly: text is a substring)."""
+    out: dict[str, Any] = {}
+    if atom.kind == "rid":
+        out["rid"] = atom.value
+    elif atom.kind == "tag":
+        out["tag"] = atom.value
+    elif atom.kind == "type":
+        out["type"] = atom.value
+    if atom.label is not None:
+        out["text"] = atom.label
+    return out
+
+
+def _quoted_sel(ix: Index, s: Selector) -> str | None:
+    """A sel pasted with its outer JSON quotes parses as one label atom; return the
+    unquoted sel when that is what it is and it matches something."""
+    if s.kind != "path" or len(s.atoms) != 1 or s.atoms[0].kind != "label":
+        return None
+    inner = s.atoms[0].label
+    if not inner or s.atoms[0].prefix or s.atoms[0].ci:
+        return None
+    try:
+        t = parse_selector(inner)
+    except OpError:
+        return None
+    if t.kind == "path" and len(t.atoms) == 1 and t.atoms[0].kind == "label":
+        return None
+    return inner if select(ix, t) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -1158,6 +1275,18 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
     user_args = {k: params[k] for k in ("view", "root", "depth", "detail", "origin",
                                         "max_children", "fields")
                  if params.get(k) is not None}
+    # page shape: not in the cursor hash, but page 2 should look like page 1
+    page_args = {k: params[k] for k in ("max_lines", "max_bytes", "format")
+                 if params.get(k) not in (None, "")}
+
+    # nodes hidden by semantic collapse or zero size: detail="all" shows them
+    reveal = None
+    if hidden_counts.keys() & {"zero_size", "collapsed"} and detail == "semantic" \
+            and view != "reading":
+        reveal = call("outline", **{**{k: v for k, v in user_args.items()
+                                       if k not in ("detail", "view")},
+                                    **({"view": view} if view != "ui" else {}),
+                                    "detail": "all"})
 
     # prefix facts over the page range, so each footer() is O(1)
     span = items[offset:min(total, offset + max_lines)]
@@ -1175,7 +1304,8 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
         if more:
             why = "max_lines" if shown >= max_lines else "max_bytes"
             f["truncated"] = _truncated("outline", ix, h, offset, shown, total, why)
-            hints.append(call("outline", **user_args, cursor=f["truncated"]["cursor"]))
+            hints.append(cursor_call("outline", user_args, page_args,
+                                     f["truncated"]["cursor"]))
         first_cut = first_cut_at[shown]
         if first_cut is not None:
             ref = ix.nodes[first_cut.anchor].id
@@ -1189,6 +1319,8 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
             hints.append(call("find", issue="render."))
         if a11y_upto[shown]:
             hints.append(call("lint"))
+        if reveal is not None:
+            hints.append(reveal)
         nx = next_hints(hints)
         if nx:
             f["next"] = nx
@@ -1272,7 +1404,8 @@ def _issue_pred(q: str) -> Callable[[UNode], bool]:
         return lambda n: any(i.sev == q for i in n.issues)
 
     def pred(n: UNode) -> bool:
-        return any(i.id == q or i.id.startswith(q) or L.short_code(i.id) == q for i in n.issues)
+        return any(i.id == q or i.id.startswith(q) or L.short_code(i.id) == q
+                   or R.group(i.id) == q for i in n.issues)
     return pred
 
 
@@ -1430,12 +1563,23 @@ def _find_predicates(ix: Index, params: Mapping[str, Any], props_on: bool
     return preds, norm
 
 
+PATH_JOINER = " / "
+
+
 def _path(ix: Index, n: UNode) -> str:
+    """The hit's landmark ancestors, window first: ``n1 / n6 / n10 / n15``. It
+    skips levels, so it is joined with `` / `` (not a selector: `` > `` means a
+    direct child there)."""
     chain = [n]
     for a in ix.ancestors(n.id):
         if a.is_window or L.is_landmark(a) or ACTIONABLE.intersection(a.flags) or a.parent is None:
             chain.append(a)
-    return " > ".join(x.id for x in reversed(chain))
+    return PATH_JOINER.join(x.id for x in reversed(chain))
+
+
+def _slots_missing(ix: Index) -> bool:
+    """The screen has Compose but the capture has no slot table (not populated)."""
+    return not ix.tree("slots").roots and any(n.kind == "compose" for n in ix.nodes.values())
 
 
 def find(ix: Index, **params: Any) -> dict[str, Any]:
@@ -1469,6 +1613,21 @@ def find(ix: Index, **params: Any) -> dict[str, Any]:
         raise OpError("facet_unavailable", "+props: needs the capture's properties",
                       hint="The ops layer passes loaded=; call node(ref, props=...) instead.")
     props_on = bool(ix.meta is None or ix.meta.options.props)
+    notes: list[str] = []
+    if _slots_missing(ix):
+        need = [what for what, on in (
+            ("src", bool(params.get("src"))), ('in="slots"', domain == "slots"),
+            ("has=slots", "slots" in _str_list("has", params.get("has"))))
+            if on]
+        if need:
+            raise OpError("facet_unavailable",
+                          f"{need[0]} needs the slot table, which this capture does not have "
+                          "(not populated)",
+                          hint='capture(slots="enable") recomposes once and resets remember{} '
+                               "state; then find again.")
+        if domain == "all" or fields.params:
+            notes.append('slot table not captured: no slot nodes or params '
+                         '(capture(slots="enable") recomposes and resets remember{} state)')
     preds, norm = _find_predicates(ix, params, props_on)
     norm.update({"in": domain, "sort": sort, "fields": fields.spec()})
     h = args_hash(norm)
@@ -1510,7 +1669,11 @@ def find(ix: Index, **params: Any) -> dict[str, Any]:
         base["offset"] = offset
     if total == 1:
         base["path"] = _path(ix, hits[0])
-    user_args = {k: params[k] for k in _FIND_FILTERS + ("sort", "fields", "limit")
+    if notes:
+        base["notes"] = notes
+    user_args = {k: params[k] for k in _FIND_FILTERS + ("sort", "fields")
+                 if params.get(k) not in (None, "", [])}
+    page_args = {k: params[k] for k in ("limit", "max_bytes", "format")
                  if params.get(k) not in (None, "", [])}
 
     def footer(shown: int, more: bool) -> dict[str, Any]:
@@ -1521,11 +1684,11 @@ def find(ix: Index, **params: Any) -> dict[str, Any]:
         if more:
             why = "limit" if shown >= limit else "max_bytes"
             f["truncated"] = _truncated("find", ix, h, offset, shown, total, why)
-            hints.append(call("find", **user_args, cursor=f["truncated"]["cursor"]))
+            hints.append(cursor_call("find", user_args, page_args, f["truncated"]["cursor"]))
         if total == 1:
             n = hits[0]
             hints.append(call("node", n.id))
-            if n.issues or (n.visible is not None and n.visible < 1):
+            if _wants_image(ix, n):
                 hints.append(call("image", ref=n.id))
         nx = next_hints(hints)
         if nx:
@@ -1577,11 +1740,51 @@ def _sorted_issues(n: UNode) -> list[Issue]:
     return sorted(n.issues, key=lambda i: (SEVERITY_ORDER.get(i.sev, 3), i.id))
 
 
-def _tap_xy(n: UNode) -> list[int] | None:
+_NOT_DRAWN = {"render.offscreen": "offscreen", "render.zero_size": "zero size"}
+
+
+def visible_rect(ix: Index, n: UNode) -> tuple[list[int] | None, str | None]:
+    """``(rect, None)``: the part of ``n`` that is on screen, its visible bounds
+    clipped to its window and the screen; or ``(None, why)`` for a node nobody can
+    see or tap (hidden, offscreen, zero size, outside its window)."""
+    if "hidden" in n.flags:
+        return None, "hidden"
+    for i in n.issues:
+        if i.id in _NOT_DRAWN:
+            return None, _NOT_DRAWN[i.id]
     b = n.b
     if not b or b[2] <= 0 or b[3] <= 0:
-        return None
-    return [int(b[0] + b[2] // 2), int(b[1] + b[3] // 2)]
+        return None, "zero size"
+    x0, y0, x1, y1 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+    w = ix.nodes.get(n.window) if n.window else None
+    clips = []
+    if w is not None and w.id != n.id and w.b and w.b[2] > 0 and w.b[3] > 0:
+        clips.append(w.b)
+    screen = (ix.meta.device or {}).get("screen") if ix.meta is not None else None
+    if screen and len(screen) >= 2 and screen[0] and screen[1]:
+        clips.append([0, 0, screen[0], screen[1]])
+    for c in clips:
+        x0, y0 = max(x0, c[0]), max(y0, c[1])
+        x1, y1 = min(x1, c[0] + c[2]), min(y1, c[1] + c[3])
+    if x1 <= x0 or y1 <= y0:
+        return None, "outside its window"
+    return [int(x0), int(y0), int(x1 - x0), int(y1 - y0)], None
+
+
+def _tap_xy(ix: Index, n: UNode) -> tuple[list[int] | None, str | None]:
+    """The centre of the visible part (spec 5.7), or None and why not."""
+    r, why = visible_rect(ix, n)
+    if r is None:
+        return None, why
+    return [int(r[0] + r[2] // 2), int(r[1] + r[3] // 2)], None
+
+
+def _wants_image(ix: Index, n: UNode) -> bool:
+    """image(ref) is worth suggesting: something to look at (an issue, or only
+    part visible) and pixels to cut (it is on screen)."""
+    if not (n.issues or (n.visible is not None and n.visible < 1)):
+        return False
+    return n.kind != "slot" and visible_rect(ix, n)[0] is not None
 
 
 def _clipped_by(ix: Index, n: UNode) -> str | None:
@@ -1864,9 +2067,14 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
     dp = L.to_dp(n.b, L.capture_dpi(ix))
     if dp:
         extra.append(("dp", dp))
-    tap = _tap_xy(n)
-    if tap and n.kind != "slot":
-        extra.append(("tap_xy", tap))
+    if n.kind != "slot":
+        tap, why = _tap_xy(ix, n)
+        if tap:
+            extra.append(("tap_xy", tap))
+        else:
+            extra.append(("tap", f"not tappable: {why}"
+                          + (" (scroll it into view, then capture again)"
+                             if why in ("offscreen", "outside its window") else "")))
     if n.stop is not None and not (n.facets.get("a11y") and "a11y" in facets):
         extra.append(("stop", n.stop))
     if n.src:
@@ -1892,7 +2100,7 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
         if v and not (k == "since" and v == _cid(ix)):  # new in this capture: match says so
             extra.append((k, v))
     parent = ix.nodes.get(n.parent) if n.parent else None
-    extra.append(("parent", crumb(parent) if parent is not None else None))
+    extra.append(("parent", crumb(parent, ix=ix) if parent is not None else None))
     if not children:
         extra.append(("children", len(n.children)))
     core_parts = [_Part(idx, "core", k, v) for k, v in core]
@@ -1946,12 +2154,14 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
 
 def _shrink(part: _Part, room: int) -> Any:
     """The largest prefix of a list/dict-valued part (props values, children,
-    issues, slots) that costs at most ``room`` bytes, or None."""
+    issues, slots) that costs at most ``room`` bytes, or None. A props prefix
+    says how many values it holds (``n``), of how many (``of``) and how many
+    more there are (``more``)."""
     key, v = part.key, part.value
     if key == "props" and isinstance(v, dict) and isinstance(v.get("values"), dict):
         items = list(v["values"].items())
         for k in range(len(items) - 1, 0, -1):
-            cand = {**v, "values": dict(items[:k]), "more": len(items) - k}
+            cand = {**v, "n": k, "values": dict(items[:k]), "more": len(items) - k}
             if _kv_cost(key, cand) <= room:
                 return cand
         return None
@@ -1961,6 +2171,14 @@ def _shrink(part: _Part, room: int) -> Any:
             if _kv_cost(key, cand) <= room:
                 return cand
     return None
+
+
+def _shrunk_detail(part: _Part, shown: Any) -> str:
+    """The omitted entry of a props facet shown in part: ``props(all,+52 more)``
+    (a cut list already ends with its own ``+N more`` item)."""
+    if isinstance(shown, dict) and "more" in shown:
+        return f"({shown.get('mode')},+{shown['more']} more)"
+    return part.detail
 
 
 def _call_for(ref: str, part: _Part, props_mode: Any, need: int) -> str:
@@ -2059,16 +2277,20 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
         opts.append(o)
 
     omitted: list[list[tuple[_Part, int]]] = [[] for _ in resolved]
+    shrunk: dict[int, str] = {}  # id(part) -> its omitted detail when a prefix is shown
 
-    def envelope(long_omitted: bool = True, with_next: bool = True) -> dict[str, Any]:
+    def envelope(long_omitted: bool | str = True, with_next: bool = True) -> dict[str, Any]:
         outs = []
         for i, d in enumerate(docs):
             doc = dict(d)
             if omitted[i]:
                 ref = doc.get("ref", "")
                 entries = []
-                for part, need in omitted[i]:
-                    head = f"{part.facet}{part.detail}"
+                if long_omitted == "count":
+                    entries = [f"{len(omitted[i])} facet{'s' if len(omitted[i]) > 1 else ''}: "
+                               "raise max_bytes"]
+                for part, need in omitted[i] if long_omitted != "count" else ():
+                    head = f"{part.facet}{shrunk.get(id(part), part.detail)}"
                     entries.append(f"{head}: {_call_for(ref, part, props_mode, need)}"
                                    if long_omitted else head)
                 doc["omitted"] = entries
@@ -2113,16 +2335,23 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
         smaller = _shrink(p, room) if room > 40 else None
         if smaller is not None:
             docs[i][p.key] = smaller
+            shrunk[id(p)] = _shrunk_detail(p, smaller)
         omitted[i].append((p, used + 200))
     for i, p in pending:  # refill: an omitted part may fit now that the set is final
         entry = next((e for e in omitted[i] if e[0] is p), None)
-        if entry is None or p.key in docs[i]:
+        if entry is None:
             continue
+        before = docs[i].get(p.key)
         omitted[i].remove(entry)
         docs[i][p.key] = p.value
         if size(long_omitted=False) > max_bytes:
-            del docs[i][p.key]
+            if before is None:
+                del docs[i][p.key]
+            else:
+                docs[i][p.key] = before
             omitted[i].append(entry)
+        else:
+            shrunk.pop(id(p), None)
     long_form, with_next = True, True
     if size(long_omitted=True) > max_bytes:
         long_form = False
@@ -2130,6 +2359,7 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
         for p in reversed(opts[i]):
             if p.key in docs[i] and size(long_omitted=long_form) > max_bytes:
                 del docs[i][p.key]
+                shrunk.pop(id(p), None)
                 if not any(q is p for q, _ in omitted[i]):
                     omitted[i].append((p, max_bytes + _kv_cost(p.key, p.value) + 200))
     if size(long_omitted=long_form, with_next=with_next) > max_bytes:
@@ -2143,7 +2373,14 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
         for i in range(len(docs)):
             if isinstance(docs[i].get("label"), str):
                 docs[i]["label"] = L.cut(docs[i]["label"])
-            omitted[i] = []
+        long_form = "count"  # still say what was left out, without the calls
+    need = size(long_omitted=long_form, with_next=with_next)
+    if need > max_bytes:
+        # never drop the "something is missing" markers to squeeze under the budget:
+        # the core of these nodes does not fit, so say what would
+        raise _bad(f"node: the core fields of {len(sels)} node{'s' if batch else ''} take "
+                   f"{need} bytes, over max_bytes={max_bytes}",
+                   hint=f"Pass max_bytes={min(MAX_BYTES_CEILING, need + 50)} or fewer refs.")
     return envelope(long_omitted=long_form, with_next=with_next)
 
 
@@ -2153,11 +2390,10 @@ def _node_next(ix: Index, resolved: Sequence[tuple[str, UNode | None, OpError | 
     for i, (_s, n, _e) in enumerate(resolved):
         if n is None:
             continue
-        if n.issues or (n.visible is not None and n.visible < 1):
+        if _wants_image(ix, n):
             hints.append(call("image", ref=n.id))
-        if n.kind == "compose" and not (n.facets.get("compose") or {}).get("slots") \
-                and not _has_slots(ix):
-            hints.append(call("capture", slots="enable"))
+        # (capture(slots="enable") is destructive: never a next hint; the compose
+        # facet says how to get the slot table and what it costs)
         if omitted[i]:
             part, need = omitted[i][0]
             hints.append(_call_for(n.id, part, props_mode, need))
@@ -2187,6 +2423,7 @@ __all__ = [
     "assemble",
     "at_point",
     "call",
+    "cursor_call",
     "cursor_capture",
     "find",
     "is_collection",
@@ -2203,4 +2440,5 @@ __all__ = [
     "resolve_selector",
     "select",
     "type_names",
+    "visible_rect",
 ]

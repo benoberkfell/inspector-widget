@@ -89,6 +89,18 @@ def test_short_codes():
     assert R.short("a11y.brand.new_rule") == "brand"  # unknown ids still get one
 
 
+def test_one_short_code_never_names_two_rules():
+    codes = [r.short for r in R.RULES.values()]
+    assert len(codes) == len(set(codes))
+    assert R.short("a11y.label.missing") == "label_missing"
+    assert R.short("a11y.label.redundant") == "label_redundant"
+    assert R.short("a11y.text.fixed_scaling") == "text_fixed_scaling"
+    assert R.short("a11y.text.too_small") == "text_too_small"
+    # the bare group still selects the whole group
+    assert R.resolve("label") == ["a11y.label.missing", "a11y.label.redundant"]
+    assert R.resolve("label_redundant") == ["a11y.label.redundant"]
+
+
 def test_resolve_accepts_ids_aliases_shorts_families_and_atf_names():
     assert R.resolve(["R5"]) == [ROLE]
     assert R.resolve("r5") == [ROLE]

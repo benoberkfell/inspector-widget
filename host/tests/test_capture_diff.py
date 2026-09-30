@@ -165,8 +165,7 @@ def test_min_move_px_and_include_filter():
     with pytest.raises(m.OpError) as e:
         d.diff(a, b, include=["text", "colour"])
     assert e.value.code == "bad_args"
-    for bad in ({"limit": 0}, {"limit": 201}, {"min_move_px": -1}, {"max_bytes": 100},
-                {"max_bytes": "x"}):
+    for bad in ({"limit": 0}, {"limit": 201}, {"min_move_px": -1}, {"max_bytes": "x"}):
         with pytest.raises(m.OpError):
             d.diff(a, b, **bad)
 
@@ -468,7 +467,8 @@ def test_budgets_are_respected_at_random_max_bytes():
     assert default["truncated"] == {"omitted": 176, "why": "max_lines",
                                     "cursor": default["truncated"]["cursor"]}
     assert d.diff(a, b, max_bytes=2000)["truncated"]["why"] == "max_bytes"
-    assert d._max_bytes(10**6) == d.HARD_MAX_BYTES and d._max_bytes(0) == 0
+    assert d._max_bytes(10**6) == d.HARD_MAX_BYTES and d._max_bytes(0) == d.HARD_MAX_BYTES
+    assert d._max_bytes(100) == d.MIN_MAX_BYTES  # clamped, as in every query tool
 
 
 def test_cursor_is_bound_to_its_arguments():
@@ -518,9 +518,28 @@ def test_outline_preview_and_lines_follow_the_grammar():
     n.issues.append(m.Issue("a11y.role.missing_on_clickable"))
     n.issues.append(m.Issue("render.clipped"))
     assert d.node_line(n, 1, 3) == ('  n63 Switch #badSwitch "Notifications" click focus '
-                                    "checkable checked [0,1610 1280x144] !role !clipped +3")
+                                    "checkable checked [0,1610 1280x144] !clipped !role +3")
     assert d.issue_short("a11y.touch_target.small") == "touch_target"
+    assert d.issue_short("a11y.label.redundant") == "label_redundant"
     assert d.issue_short("render.text_overflow") == "text_overflow"
+
+
+def test_diff_segments_follow_the_line_grammar_and_the_selector_grammar():
+    """A diff line names a node exactly as an outline line does: display type,
+    and a tag or rid that is not a plain token quoted, so it pastes as a selector."""
+    from inspector_widget.capture import lines as L
+    from inspector_widget.capture import query as q
+
+    b = view_screen("c9q4tz", checked=True, created_at=1.0)
+    n = b.nodes["n63"]
+    n.type, n.tag, n.rid = "current", "Save button", None
+    assert d.seg(n) == L.seg_text(L.seg_row(n, L.Fields(line=("ref", "type", "rid", "tag",
+                                                              "label"))))
+    assert d.seg(n) == 'n63 Current @"Save button" "Notifications"'
+    assert L.is_line(d.node_line(n))
+    assert q.resolve_selector(b, '@"Save button"').id == "n63"
+    # the display type is a Type atom that matches
+    assert q.resolve_selector(b, 'Current"Notifications"').id == "n63"
 
 
 def test_diff_of_5000_nodes_is_fast():

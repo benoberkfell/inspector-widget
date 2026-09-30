@@ -964,10 +964,10 @@ class CaptureStore:
         lineage's latest (unless the latest has a newer ``created_at``: a capture
         that started first but published last goes into ``history`` by time, its
         ``prev`` is the next older capture, and its tombstones are dropped because
-        they name refs the newer latest holds), applies ``meta.label`` (moving the label from another
-        capture of the lineage), merges ``tomb`` updates (refs present in
-        ``refmap`` leave the tomb) and sets the default session. ``meta.pinned``
-        pins it (bad_args when 20 are pinned already).
+        they name refs the newer latest holds), applies ``meta.label`` (moving the
+        label from another capture of the lineage), merges ``tomb`` updates (refs
+        present in ``refmap`` leave the tomb) and sets the default session.
+        ``meta.pinned`` pins it (bad_args when 20 are pinned already).
         """
         meta = raw.meta
         if meta is None:

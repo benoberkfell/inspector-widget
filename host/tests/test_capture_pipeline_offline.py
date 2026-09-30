@@ -36,6 +36,7 @@ from typing import Any
 import capture_scenes as cs
 import fakescenes as fs
 import pytest
+from capture_hints import run_hint
 from loaded_fakes import screen_of
 
 from inspector_widget.capture import analyzers, diff, fetch, images, index, lines, query, refs
@@ -841,3 +842,177 @@ if __name__ == "__main__":  # PYTHONPATH=. python tests/test_capture_pipeline_of
     with tempfile.TemporaryDirectory(prefix="iw-measure-") as _root:
         for _scene, _sizes in measure(_root).items():
             print(_scene, json.dumps(_sizes))
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up calls work verbatim; what the agent is offered is always possible
+# --------------------------------------------------------------------------- #
+def _take_scene(pipe: Pipeline, scene: fs.SceneData, serial: str, pid: int,
+                device: dict) -> Captured:
+    loaded = pipe.capture(scene.session(serial=serial, package=PACKAGE, pid=pid), device=device)
+    return Captured(pipe, scene, loaded, serial, pid, device)
+
+
+def _sweep_calls(c: Captured) -> list[Callable[[], dict]]:
+    p, lc, ix = c.pipe, c.loaded, c.ix
+    some = [n.id for n in ui(ix) if n.issues][:4] + [n.id for n in ui(ix) if n.label][:4]
+    calls: list[Callable[[], dict]] = [
+        lambda: p.outline(lc), lambda: p.outline(lc, max_lines=5),
+        lambda: p.outline(lc, max_lines=4, max_bytes=900, format="json"),
+        lambda: p.outline(lc, view="reading", max_lines=3),
+        lambda: p.find(lc, flags=["click"], limit=2),
+        lambda: p.find(lc, flags=["click"], limit=3, format="json", max_bytes=800),
+        lambda: p.lint(lc), lambda: p.lint(lc, limit=1), lambda: p.lint(lc, group="node", limit=2),
+        lambda: p.lint(lc, group="none", per_rule=1, limit=2, max_bytes=600),
+        lambda: p.lint(lc, severity="warn", limit=1),
+        lambda: p.lint(lc, rules=["R5", "R2"], group="none", limit=1),
+    ]
+    for ref in some:
+        calls.append(lambda ref=ref: p.node(lc, ref))
+        calls.append(lambda ref=ref: p.node(lc, ref, facets="core,a11y,issues"))
+    for n in ui(ix):
+        if n.rid and sum(1 for m in ui(ix) if m.rid == n.rid) == 1:
+            calls.append(lambda rid=n.rid: p.find(lc, rid=rid))
+            if len(calls) > 60:
+                break
+    return calls
+
+
+@pytest.mark.parametrize("scene", list(SCENES))
+def test_every_next_hint_runs_verbatim(pipe: Pipeline, scene: str) -> None:
+    """Every hint the tools emit (cursor pages, image(ref), node(...), lint(), ...)
+    runs exactly as written and never offers the destructive capture(slots=...)."""
+    c = take(pipe, scene)
+    hints: list[str] = []
+    for fn in _sweep_calls(c):
+        hints.extend(fn().get("next") or [])
+    assert hints
+    ran = 0
+    for h in dict.fromkeys(hints):
+        assert not h.startswith("capture("), h
+        run_hint(pipe, c.loaded, h)  # raises OpError when a hint is wrong
+        ran += 1
+    assert ran >= 5
+
+
+def test_diff_cursor_hints_repeat_the_callers_arguments(pipe: Pipeline) -> None:
+    c = take(pipe, "viewscreen", label="before")
+    tap_switch(c.scene)
+    tap_switch(c.scene, "goodSwitch")
+    after = c.recapture()
+    for kw in ({"limit": 1}, {"limit": 1, "include": ["text", "state", "props"]},
+               {"limit": 1, "min_move_px": 10}, {"limit": 1, "image": True},
+               {"limit": 1, "max_bytes": 900}):
+        first = pipe.diff(c.loaded, after, **kw)
+        assert first.get("truncated"), kw
+        hint = next(h for h in first["next"] if h.startswith("diff("))
+        page2 = run_hint(pipe, after, hint)
+        assert page2["lines"] and page2["lines"][0] not in first["lines"]
+
+
+def test_lint_pages_always_advance(world: dict[str, Captured]) -> None:
+    for name in ("launcher", "mixed"):
+        c = world[name]
+        full = c.pipe.lint(c.loaded, group="none", limit=200, max_bytes=0)["lines"]
+        for mb in (500, 550, 600, 650, 700):
+            for group in ("rule", "node", "none"):
+                out = c.pipe.lint(c.loaded, group=group, max_bytes=mb)
+                seen, offsets = 0, []
+                while True:
+                    assert nbytes(out) <= mb, (name, mb, group, nbytes(out))
+                    items = out.get("rules") or out.get("lines") or []
+                    assert items, (name, mb, group)  # a page is never empty
+                    seen += len(items)
+                    tr = out.get("truncated")
+                    if not tr:
+                        break
+                    off = int(tr["cursor"].rsplit(":", 1)[1])
+                    assert not offsets or off > offsets[-1]
+                    offsets.append(off)
+                    hint = next(h for h in out["next"] if h.startswith("lint("))
+                    out = run_hint(c.pipe, c.loaded, hint)
+                if group == "none":
+                    assert seen == len(full)
+
+
+def test_offscreen_and_hidden_nodes_are_not_offered_for_image_or_tap(
+        world: dict[str, Captured]) -> None:
+    wide = world["wide"]
+    off = next(n for n in ui(wide.ix)
+               if any(i.id == "render.offscreen" for i in n.issues) and n.rid)
+    node = wide.pipe.node(wide.loaded, off.id)
+    assert "tap_xy" not in node and node["tap"].startswith("not tappable: offscreen")
+    assert not any(h.startswith("image(") for h in node.get("next", []))
+    found = wide.pipe.find(wide.loaded, rid=off.rid)
+    assert found["total"] == 1 and not any(h.startswith("image(") for h in found["next"])
+    with pytest.raises(OpError) as e:
+        wide.pipe.image(wide.loaded, off.id)
+    assert e.value.hint and "image(window=" in e.value.hint
+
+    launcher = world["launcher"]
+    bar = launcher.pipe.node(launcher.loaded, "#statusBarBackground")
+    assert "hidden" in (bar.get("flags") or []) and "tap_xy" not in bar
+    assert bar["tap"] == "not tappable: hidden"
+    # a visible node still gets the centre of its visible part
+    heading = launcher.pipe.node(launcher.loaded, "@launch_heading")
+    assert heading["tap_xy"] == [640, 2770]
+
+
+def test_capture_without_the_slot_table(pipe: Pipeline) -> None:
+    _make, serial, pid, device = SCENES["launcher"]
+    c = _take_scene(pipe, fs.replay_scene("launcher", slots_populated=False), serial, pid,
+                    device)
+    lc = c.loaded
+    assert not c.ix.tree("slots").roots
+    # the recompose is destructive: offered as a warning in the facet, never as a call
+    node = pipe.node(lc, "@launch_checkbox_state", facets="core,a11y,issues")
+    assert not any(h.startswith("capture(") for h in node.get("next", []))
+    full = pipe.node(lc, "@launch_checkbox_state")
+    assert "resets remember{} state" in full["compose"]["slots"]
+    # filters that can only match slot data say so instead of returning total 0
+    for kw in ({"src": "MainActivity.kt"}, {"in_": "slots"}, {"has": ["slots"]}):
+        with pytest.raises(OpError) as e:
+            pipe.find(lc, **kw)
+        assert e.value.code == "facet_unavailable" and 'capture(slots="enable")' in e.value.hint
+    audit = pipe.find(lc, type="Text", fields="+params:maxLines,overflow")
+    assert any("slot table not captured" in n for n in audit["notes"])
+
+
+def test_breadcrumbs_tell_list_cells_apart(world: dict[str, Captured]) -> None:
+    c = world["mixed"]
+    hits = c.pipe.find(c.loaded, text="Delete", flags=["click"], within="#feed")
+    compose = [ln for ln in hits["lines"] if "@card" in ln]
+    assert len(compose) == 3
+    labels = [re.search(r'@card ("[^"]*")', ln).group(1) for ln in compose]
+    assert len(set(labels)) == 3  # the shared tag is followed by each cell's label
+    assert all(lines.is_line(ln) for ln in hits["lines"])
+
+
+def test_outline_says_how_to_reveal_what_it_hid(world: dict[str, Captured]) -> None:
+    c = world["launcher"]
+    out = c.pipe.outline(c.loaded)
+    assert out["hidden"].get("collapsed") or out["hidden"].get("zero_size")
+    assert 'outline(detail="all")' in out["next"]
+
+
+def test_a_partly_shown_props_facet_says_how_much_is_missing(world: dict[str, Captured]
+                                                             ) -> None:
+    c = world["viewscreen"]
+    node = c.pipe.node(c.loaded, "#badSwitch", props="all")
+    props = node["props"]
+    assert props["n"] == len(props["values"]) and props["more"] == props["of"] - props["n"]
+    entry = next(e for e in node["omitted"] if e.startswith("props"))
+    assert entry.startswith(f"props(all,+{props['more']} more)")
+
+
+def test_a_node_batch_never_silently_drops_what_it_left_out(world: dict[str, Captured]
+                                                            ) -> None:
+    c = world["launcher"]
+    batch = [n.id for n in ui(c.ix) if n.label][:10]
+    with pytest.raises(OpError) as e:
+        c.pipe.node(c.loaded, batch, max_bytes=1000)
+    assert e.value.code == "bad_args" and "max_bytes=" in e.value.hint
+    need = int(re.search(r"max_bytes=(\d+)", e.value.hint).group(1))
+    out = c.pipe.node(c.loaded, batch, max_bytes=need)
+    assert nbytes(out) <= need
+    assert all(d.get("omitted") for d in out["nodes"])  # each says facets were left out

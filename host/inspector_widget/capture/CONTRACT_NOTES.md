@@ -395,9 +395,13 @@ with every consumer.
     the first letter upper-cased. Flags print in `model.FLAGS` order.
   - A line's label is `UNode.label`. For slot nodes it falls back to `text` (or
     the `text` param). It is cut at 48 characters with `…`.
-  - `!code` is `short_code(rule)`: `a11y.<group>.<x>` gives `group`,
-    `render.<x>` gives `x`, and anything else has dots turned into `_`. Codes
-    are distinct and sorted.
+  - `!code` is `short_code(rule)`: the catalog's code (`rules.short`: the group,
+    or `group_x` when the group has several rules), `render.<x>` gives `x`, and
+    anything else has dots turned into `_`. Codes are distinct and sorted.
+  - A `+props:`/`+params:` name that is also a field or row key (`text`, `hint`,
+    `state`, `src` ...) renders namespaced (`params.text=`, `props.hint=`;
+    `lines.proj_key`), so no line carries a key twice. Other names stay bare
+    (`textSize=14sp`). Json rows keep `props`/`params` as nested objects.
   - Tail values are one token: numbers compact, lists comma-joined, dicts as
     `k:v,…`. Anything with spaces or quotes is JSON-quoted. Values are capped at
     120 characters.
@@ -438,9 +442,16 @@ with every consumer.
   - `window` takes a window selector or a z index.
   - `sort="area"` puts the smallest nodes first. `sort="reading"` puts stops
     first, in order.
-  - A single hit gets `path`: the landmark ancestors from the root.
+  - A single hit gets `path`: the landmark ancestors from the root, joined by
+    ` / ` (it skips levels, so it is not a selector; ` > ` means a direct child).
   - Breadcrumbs are the 2 nearest ancestors with a rid, tag, label or a11y
-    collection.
+    collection. A crumb whose tag or rid other nodes share (list cells) adds the
+    label: `in n749 Card @card "Item 3" < n733 RecyclerView #feed`.
+  - A filter that can only match slot data (`src`, `in="slots"`, `has=slots`) on
+    a Compose capture without the slot table is `facet_unavailable` with the
+    recapture hint; `in="all"` and `+params:` there add a `notes` entry.
+  - `find(issue=...)` takes a rule id or prefix, a short code, a group
+    (`label` = both label rules) or a severity.
 - **node.**
   - Facets: `core issues a11y layout compose text props children ancestors`,
     or `all`. `core` is always included. For slot nodes, `compose` renders
@@ -453,6 +464,16 @@ with every consumer.
     `"<facet>(detail): node(...)"` is used when it fits.
   - Batch errors are reported per item as `{sel, error}`. A single-node error
     raises.
+  - A props facet cut to fit says so: `{mode, n (values shown), of, more,
+    values}` and the omitted entry `props(all,+52 more): node(...)`. When even
+    the short omitted entries do not fit, each node keeps a count marker
+    (`"3 facets: raise max_bytes"`); when the nodes' core fields alone exceed
+    `max_bytes` it is `bad_args` naming the size that fits. `omitted` is never
+    silently emptied.
+  - `tap_xy` is the centre of the visible part: `b` clipped to the node's window
+    and the screen. A hidden, offscreen, zero-size or out-of-window node has no
+    `tap_xy`; `tap` says why (`not tappable: offscreen (scroll it into view, then
+    capture again)`). `query.visible_rect(ix, n)` is the shared helper.
 - **Selectors (extensions to 6.1).**
   - Atoms can also be refs or keys, so `n10 > @x` works and a generated
     `<parent sel> > Type"label"` always parses.
@@ -464,6 +485,15 @@ with every consumer.
   - `bad_selector` errors start with `column N:` (1-based) and set
     `OpError.column`. The column is the first character that breaks the
     grammar: for a bad separator, the character right after the atom.
+  - `not_found` on a path whose last atom matches deeper (not as a direct child)
+    says ` > ` means a direct child, suggests `find(within=..., ...)` and lists
+    the deeper matches. A sel pasted with its outer JSON quotes (one label atom
+    whose text is a matching selector) gets that sel as hint and candidate.
+  - `ref_not_in_capture` says why: last seen (lineage tombstone), newer than
+    every ref of this capture (`capture="latest"`), or no record in the lineage
+    (another app's ref, or a typo; only claimed when `tomb` is passed).
+  - Type atoms and the `type` glob also match the display type lines show
+    (`RowMeasurePolicy` for the composable `rowMeasurePolicy`).
 - **Cursors.**
   - Letters: `o` outline, `f` find, plus `l` lint and `d` diff for C7/C8 (see
     `TOOL_LETTERS`, `make_cursor`, `parse_cursor`, `args_hash`).
@@ -473,13 +503,23 @@ with every consumer.
   - `cursor_capture(cursor)` lets the ops layer resolve the capture a cursor
     belongs to.
 - **Budgets.**
-  - Defaults: outline 6,000, find 3,000, node 3,000 (6,000 for a batch). `0`
-    means the 32,000 ceiling, and other values are clamped to 300..32,000.
+  - Defaults: outline 6,000, find 3,000, node 3,000 (6,000 for a batch), lint
+    4,000, diff 4,000. Every tool (C6, C7 and C8) goes through
+    `query.resolve_max_bytes`: `0` means the 32,000 ceiling, and other values are
+    clamped to 500..32,000.
   - `query.pack()` uses `output.Budget` and reserves the page footer's exact
     cost before each entry. When nothing fits it emits a minimal `ref` line,
     so every page advances. C7 and C8 can reuse `pack` and `assemble`.
 - **`next`** (`call()`, `next_hints()`): at most 3 hints and at most 200 B. A
-  cursor hint repeats the caller's non-default arguments.
+  cursor hint (`cursor_call(tool, args, page, cursor)`, used by outline, find,
+  lint and diff) repeats every non-default argument the cursor hash covers plus
+  the page shape (`max_lines`/`limit`, `max_bytes`, `format`); the page-shape
+  arguments are dropped only when the hint would not fit 200 B. `image(ref)` is
+  suggested only for a node with pixels on screen. The destructive
+  `capture(slots="enable")` is never a hint: the compose facet's `slots` string
+  carries the warning. An outline that hid collapsed or zero-size nodes offers
+  `outline(detail="all", ...)`. Every hint runs verbatim
+  (`tests/capture_hints.py`, `test_every_next_hint_runs_verbatim`).
 
 ## Offline scenes (F1, `tests/fakescenes.py`)
 
@@ -609,9 +649,18 @@ with every consumer.
   `b` (when it differs from the node's `b`), `extras` (empty SPANS dropped) and the
   links above.
 - **Slots.**
-  - Slot groups are the COMPOSABLE children of each window's synthetic root,
-    kept as the agent's forest. Subcompositions (lazy items, Scaffold slots) are
-    separate roots and are not re-nested.
+  - Slot groups are the COMPOSABLE children of each window's synthetic root.
+    The agent sends one root per composition in hash order; `graft_slot_roots`
+    makes one tree of them: the main composition (`ProvideAndroidCompositionLocals`,
+    else the largest root) first, then every other sized root grafted under the
+    smallest already-placed group whose box holds its top-left or bottom-right
+    corner (Lazy items under their list even when clipped, TopAppBar and the
+    content under Scaffold), after that group's own children, top then left. The
+    graft is `conf.slots = "inferred"`. Roots nothing holds follow the main one;
+    zero-size roots (effects) come last, by name. Slot nodes are stored in this
+    tree's pre-order, and their anchors and keys follow it. On the launcher,
+    `outline(view="slots", depth=99, max_children=1000)` is the spec's 56 app
+    lines (4.7 KB).
   - Facet: `slot {name, params (normalize.compose_value, modifiers removed), mods
     (the brief modifier chain), sem: [ids]}`.
   - `ids`: `slot_path` (`"<acv>/<i.j.k>"` into the synthetic root's children),
@@ -793,12 +842,17 @@ with every consumer.
   pair counts as shared), the result is `{..., verdict: "new screen", shared:
   "6 of 20 refs (30%)", summary: {added, removed, kept, rebound?}, outline,
   next: ["outline(capture=...)"]}` with no `lines`.
-- **Budget and cursor**: at most `limit` (1..200) lines and `max_bytes` (0 =
-  unlimited, else 500..32,000, clamped above) bytes of compact JSON. Pages
-  always make progress. The cursor is `<b id>:d:<hash8>:<offset>`; the hash
-  covers a, b, within, the effective include and min_move_px (not limit or
-  max_bytes). A cursor used with other arguments raises `bad_args`. The
-  continuation hint is `diff(a=..., b=..., [within=...,] cursor=...)`.
+- **Budget and cursor**: at most `limit` (1..200) lines and `max_bytes`
+  (`query.resolve_max_bytes`: 0 = the 32,000 ceiling, else clamped to
+  500..32,000) bytes of compact JSON. Pages always make progress. The cursor is
+  `<b id>:d:<hash8>:<offset>`; the hash covers a, b, within, the effective
+  include and min_move_px (not limit or max_bytes). A cursor used with other
+  arguments raises `bad_args`. The continuation hint repeats a, b and every
+  non-default argument: `diff(a=..., b=..., [within=, include=, min_move_px=,
+  image=, limit=, max_bytes=,] cursor=...)`.
+- **Line grammar.** Diff segments are rendered by `lines.seg_row`/`seg_text`
+  (display types, JSON-quoted odd rids and tags), so a diff line names a node
+  exactly as an outline line does and its tag or rid pastes as a selector.
 
 ## Analyzers (C7, `capture/analyzers.py` + `capture/rules.py`)
 
@@ -871,6 +925,10 @@ with every consumer.
   - `resolve()` accepts ids, aliases, ATF check names, short codes and family
     prefixes (`a11y.`, `render.`), all case-insensitive. Anything else raises
     `OpError("bad_args")`.
+  - Short codes are unique: a group with one rule keeps the group (`role`), a
+    group with several gets `group_x` (`label_missing`, `label_redundant`,
+    `text_fixed_scaling`, `text_too_small`). The bare group still selects all of
+    them (`resolve("label")`, `find(issue="label")`).
   - An issue id the catalog does not know is still shown, with a generic entry.
 - **`lint_view()`.**
   - By default it reports `a11y.*` rules. `render.*` issues appear with
@@ -878,7 +936,13 @@ with every consumer.
   - `contrast=True` and `wcag=True` results are cached as `lint.<hash8>.json`,
     stored by canonical key.
   - Cursors are `<capture>:l:<hash8 of args>:<offset>`. A cursor from other
-    arguments or another capture is `bad_args`.
+    arguments or another capture is `bad_args`. `limit` and `max_bytes` are not
+    hashed, so the page size may change between pages, and the cursor hint
+    repeats every non-default argument (rules, severity, within, contrast, wcag,
+    group, per_rule, limit, max_bytes).
+  - A page always holds at least one finding: when nothing fits, the first one
+    in its smallest form (one example node, then no msg/fix), and the optional
+    fields are shed to stay within `max_bytes` (500 at least).
   - `lint_summary(ix)` returns the `lint` and `issues` one-liners for `capture()`.
 
 ## Images (C9, `capture/images.py`)

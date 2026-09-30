@@ -50,6 +50,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from ..output import Budget, dumps, json_cost, utf8_len
+from . import lines as L
 from .model import FLAGS, Index, OpError, UNode
 from .refs import preorder
 
@@ -57,6 +58,7 @@ DEFAULT_INCLUDE = ("text", "state", "bounds", "visibility", "a11y", "issues")
 OPTIONAL_INCLUDE = ("props", "params", "pixels")
 INCLUDE_VALUES = DEFAULT_INCLUDE + OPTIONAL_INCLUDE
 DEFAULT_LIMIT = 40
+MIN_MOVE_PX = 4
 MAX_LIMIT = 200
 DEFAULT_MAX_BYTES = 4000
 MIN_MAX_BYTES = 500
@@ -118,47 +120,28 @@ def box(b: Sequence[int] | None) -> str:
     return f"[{int(b[0])},{int(b[1])} {int(b[2])}x{int(b[3])}]"
 
 
+_SEG_FIELDS = L.Fields(line=("ref", "type", "rid", "tag", "label"))
+_SEG_FIELDS_FLAGS = L.Fields(line=("ref", "type", "rid", "tag", "label", "flags"))
+_SEG_FIELDS_NOLABEL = L.Fields(line=("ref", "type", "rid", "tag"))
+
+
 def seg(n: UNode, *, flags: bool = False, label: bool = True) -> str:
-    """``ref [Type] [#rid] [@tag] ["label"] (flag)*``."""
-    parts = [n.id]
-    if n.type:
-        parts.append(n.type)
-    if n.rid:
-        parts.append(f"#{n.rid}")
-    if n.tag:
-        parts.append(f"@{n.tag}")
-    if label and n.label:
-        parts.append(quote(n.label))
-    if flags:
-        have = set(n.flags)
-        parts.extend(f for f in FLAGS if f in have)
-    return " ".join(parts)
+    """``ref [Type] [#rid] [@tag] ["label"] (flag)*``, exactly as grammar v1 writes
+    a segment (:func:`lines.seg_row`): display types, quoted odd rids and tags."""
+    fields = _SEG_FIELDS_FLAGS if flags else (_SEG_FIELDS if label else _SEG_FIELDS_NOLABEL)
+    if flags and not label:
+        fields = L.Fields(line=("ref", "type", "rid", "tag", "flags"))
+    return L.seg_text(L.seg_row(n, fields))
 
 
 def issue_short(rule: str) -> str:
-    """``a11y.<group>.<x>`` -> group, ``render.<x>`` -> x (spec 3.8)."""
-    parts = rule.split(".")
-    if parts[0] == "a11y" and len(parts) >= 2:
-        return parts[1]
-    if parts[0] == "render" and len(parts) >= 2:
-        return parts[1]
-    return parts[-1]
+    """The rule's ``!issue`` short code (:func:`lines.short_code`, spec 3.8)."""
+    return L.short_code(rule)
 
 
 def node_line(n: UNode, depth: int = 0, hidden: int = 0) -> str:
     """An outline line: indent, seg with flags, visible bounds, ``!issue``, ``+N``."""
-    out = "  " * depth + seg(n, flags=True)
-    if n.b:
-        out += " " + box(n.b)
-    seen: list[str] = []
-    for i in n.issues:
-        s = issue_short(i.id)
-        if s not in seen:
-            seen.append(s)
-    out += "".join(f" !{s}" for s in seen)
-    if hidden:
-        out += f" +{hidden}"
-    return out
+    return L.format_line(L.node_row(None, n, L.Fields(), depth=depth, hidden=hidden))
 
 
 def _fmt_value(v: Any) -> str:
@@ -224,15 +207,11 @@ def _int_arg(name: str, value: Any, lo: int, hi: int | None = None) -> int:
 
 
 def _max_bytes(value: Any) -> int:
-    """0 means unlimited; otherwise at least 500 and at most 32,000 (clamped)."""
-    if value is None:
-        return DEFAULT_MAX_BYTES
-    v = _int_arg("max_bytes", value, 0)
-    if v == 0:
-        return 0
-    if v < MIN_MAX_BYTES:
-        raise _bad(f"max_bytes must be 0 (unlimited) or >= {MIN_MAX_BYTES}")
-    return min(v, HARD_MAX_BYTES)
+    """As in every query tool (``query.resolve_max_bytes``): None is the 4,000
+    default, 0 the 32,000 ceiling, anything else clamped to 500..32,000."""
+    from .query import resolve_max_bytes  # C6
+
+    return resolve_max_bytes(value, DEFAULT_MAX_BYTES)
 
 
 def _cap_name(ix: Index) -> str:
@@ -524,7 +503,7 @@ def outline_preview(ix: Index, root: str | None = None, *, depth: int = PREVIEW_
 # diff
 # --------------------------------------------------------------------------- #
 def diff(a: Index, b: Index, *, within: str | None = None, include: Any = None,
-         min_move_px: int = 4, limit: int = DEFAULT_LIMIT, max_bytes: int | None = DEFAULT_MAX_BYTES,
+         min_move_px: int = MIN_MOVE_PX, limit: int = DEFAULT_LIMIT, max_bytes: int | None = None,
          cursor: str | None = None, image: bool = False, props_a: PropsFn | None = None,
          props_b: PropsFn | None = None, pixel_diff: PixelFn | None = None,
          resolve: ResolveFn | None = None, preview: PreviewFn | None = None) -> dict:
@@ -740,7 +719,7 @@ def diff(a: Index, b: Index, *, within: str | None = None, include: Any = None,
                 s += f" (+{inside[i]} inside)"
             d.insert(shift_at[i], s)
         # a label change already shows the new label; do not repeat it in the name
-        name = seg(y, label=not any(s.startswith("label ") for s in d))
+        name = seg(y, label=not any(s.startswith(("label ", "params text ")) for s in d))
         if i in moved:
             lines.append(f"> {name}: {moved[i]}")
             lines.extend(f"~ {i} {s}" for s in d)
@@ -800,6 +779,25 @@ def diff(a: Index, b: Index, *, within: str | None = None, include: Any = None,
     def next_cursor(k: int) -> str:
         return f"{_cid(b)}:{CURSOR_LETTER}:{h}:{offset + k}"
 
+    # the cursor's follow-up repeats every argument the hash covers, plus the
+    # caller's page size, so it can be run exactly as given
+    from .query import cursor_call  # C6
+
+    hint_args: dict[str, Any] = {"a": _cid(a), "b": _cid(b)}
+    if root is not None:
+        hint_args["within"] = root
+    if include is not None:
+        hint_args["include"] = include
+    if mm != MIN_MOVE_PX:
+        hint_args["min_move_px"] = mm
+    if image:
+        hint_args["image"] = True
+    hint_page: dict[str, Any] = {}
+    if lim != DEFAULT_LIMIT:
+        hint_page["limit"] = lim
+    if max_bytes is not None and budget_max != DEFAULT_MAX_BYTES:
+        hint_page["max_bytes"] = max_bytes
+
     def assemble(k: int, why: str) -> dict:
         out = dict(base)
         out["lines"] = lines[offset:offset + k]
@@ -807,10 +805,7 @@ def diff(a: Index, b: Index, *, within: str | None = None, include: Any = None,
         nxt: list[str] = []
         if rest > 0:
             out["truncated"] = {"omitted": rest, "why": why, "cursor": next_cursor(k)}
-            call = f'diff(a="{_cid(a)}",b="{_cid(b)}"'
-            if root is not None:
-                call += f',within="{root}"'
-            nxt.append(call + f',cursor="{next_cursor(k)}")')
+            nxt.append(cursor_call("diff", hint_args, hint_page, next_cursor(k)))
         if focus:
             nxt.append(f'image(ref="{focus[0]}",capture="{_cid(b)}")')
         if issues_new_n:
