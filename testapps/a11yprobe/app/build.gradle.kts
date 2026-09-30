@@ -72,5 +72,11 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.0")
     implementation("androidx.core:core-ktx:1.13.1")
 
+    // Mixed View/Compose interop scenarios (InteropActivity): a Fragment host,
+    // RecyclerView lists whose cells are ComposeView / classic View / hybrid rows,
+    // and a DialogFragment window.
+    implementation("androidx.fragment:fragment-ktx:1.8.3")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

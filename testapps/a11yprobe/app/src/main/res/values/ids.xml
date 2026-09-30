@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Interop screen (InteropActivity / InteropFragment). -->
+    <item name="interop_container" type="id" />
+    <item name="interop_root" type="id" />
+    <item name="interop_header" type="id" />
+    <item name="interop_list" type="id" />
+    <item name="open_dialog" type="id" />
+    <item name="compose_cell" type="id" />
+    <!-- View tag key holding a classic notify toggle's on/off state. -->
+    <item name="tag_notify_on" type="id" />
+</resources>

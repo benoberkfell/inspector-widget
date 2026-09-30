@@ -68,11 +68,11 @@ host/                         Python host driver + entry points
                               proto/, skia_grpc/, _cli.py/_mcp.py console-script wrappers)
   cli.py                      CLI entry point (13 subcommands)
   mcp_server.py               MCP server (15 tools) + `--self-check`
-  tests/                      device-free pytest suite (+ one @device smoke test)
+  tests/                      device-free pytest suite (+ @device smoke and a11y golden tests)
   pyproject.toml              packaging (wheel ships cli.py + mcp_server.py as py-modules)
   README.md  PACKAGING.md     host driver + packaging docs
 scripts/                      build.sh, run.sh, test.sh, install-a11yprobe.sh
-testapps/a11yprobe/           Compose app with deliberate a11y mistakes (lint corpus)
+testapps/a11yprobe/           GOOD/BAD a11y corpus: Compose, classic View, mixed View/Compose, dialogs
 skill/inspector-widget-a11y/  the a11y debugging Skill (SKILL.md, tools.md, rules.md)
 build-out/                    generated artifacts (gitignored): libviewspector.so, bootstrap.dex, payload.jar
 ```
@@ -124,6 +124,29 @@ host/mcp_server.py --self-check                  # prints proto status + the 15 
 ./scripts/test.sh                                   # device-free suite
 cd host && .venv/bin/python -m pytest tests -q -m "not device"
 cd host && .venv/bin/python -m pytest tests -q -m device   # live emulator smoke (needs adb)
+```
+
+**A11yProbe test corpus** (`testapps/a11yprobe`, package `com.oberkfell.a11yprobe`). Every
+scenario pairs a GOOD variant with a BAD one; the BAD ones are deliberate defects, so never
+"fix" them. Install with `scripts/install-a11yprobe.sh <serial>` (add `--scenario <id>` to open
+one), then launch any scenario directly by intent extra:
+```bash
+# Compose GOOD/BAD pairs (ids in ScenarioRegistry.kt, e.g. icon_button, traversal; "all" stacks every one)
+adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.MainActivity --es scenario icon_button
+# Classic-View GOOD/BAD pairs (XML)
+adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.ViewScenarioActivity
+# Mixed View/Compose hierarchies and dialog windows (ids in InteropFragment.kt):
+#   S1 RecyclerView of ComposeView cells   S2 of View cells   S3 mixed + View-containing-ComposeView cells
+#   S4 LazyColumn with AndroidView rows    S5 ComposeView > AndroidView > RecyclerView > cells
+#   S6 RecyclerView grid                   D1 DialogFragment (Views + ComposeView)   D2 Compose Dialog
+adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S3
+```
+`host/tests/test_device_a11y_golden.py` (marked `device`) launches each scenario that way and
+asserts the golden answers: every BAD node flagged with its rule id, GOOD nodes not flagged,
+unique a11y node keys, one Compose window per ComposeView, and a known reading order. It runs
+only when `ANDROID_SERIAL` names the device:
+```bash
+cd host && ANDROID_SERIAL=<serial> .venv/bin/python -m pytest tests/test_device_a11y_golden.py -q -m device
 ```
 
 ---
