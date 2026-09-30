@@ -255,3 +255,62 @@ def test_duplicate_keys_are_diagnosed():
     b = n(1, 5, text="b")
     ro = a11y.reading_order([n(1, -1, children=[a, b])])
     assert any(d["kind"] == "duplicate_key" for d in ro["diagnostics"])
+
+
+def test_linkage_in_the_wrong_key_space_is_called_out():
+    # The pre-fix agent emitted getSourceNodeId-packed targets: nothing resolves.
+    a = n(1, 1, text="A", flags=FOCUS, traversal_before=(7 << 32) | 99)
+    b = n(1, 2, text="B", flags=FOCUS, traversal_after=(7 << 32) | 98)
+    ro = a11y.reading_order([n(1, -1, children=[a, b])])
+    diag = [d for d in ro["diagnostics"] if d["kind"] == "unresolved_target"][0]
+    assert diag.get("suspect_key_space") is True
+    # A single dangling target (the mixed fixture's holder View) is not flagged as such.
+    d = a11y.a11y_to_dict(mf.a11y_response())
+    assert "suspect_key_space" not in d["reading_order_diagnostics"][0]
+
+
+def _chain(nodes):
+    """Link nodes the way Compose does: prev.before = next and next.after = prev."""
+    for prev, nxt in zip(nodes, nodes[1:]):
+        prev["traversal_before"] = nxt["id"]
+        nxt["traversal_after"] = prev["id"]
+
+
+def test_compose_scaffold_chain_reads_top_bar_first():
+    # The live IconButton screen: Compose composes the content group before the top
+    # bar, so ANI order is content-first; its traversal chain puts the top bar first.
+    back = n(7, 150, flags=FOCUS, children=[n(7, 151, cd="Back to scenario list")])
+    label = n(7, 9, text="Icon button label", flags=FOCUS)
+    top_bar = n(7, 5, is_traversal_group=True, children=[back, label])
+    title = n(7, 153, text="IconButton contentDescription", flags=FOCUS + ["heading"])
+    good = n(7, 155, text="GOOD", flags=FOCUS)
+    fav = n(7, 157, flags=FOCUS, children=[n(7, 158, cd="Add to favorites")])
+    content = n(7, 152, cls="android.widget.ScrollView", is_traversal_group=True,
+                children=[title, good, fav])
+    group = n(7, 2, is_traversal_group=True, children=[content, top_bar])
+    _chain([group, top_bar, back, label, content, title, good, fav])
+    host = n(7, -1, children=[group])
+    ro = a11y.reading_order([host])
+    assert [e["speak"] for e in ro["focus_order"]] == [
+        "Back to scenario list", "Icon button label", "IconButton contentDescription, heading",
+        "GOOD", "Add to favorites"]
+    assert not [d for d in ro["diagnostics"] if d["kind"] != "traversal_group"]
+
+
+def test_traversal_before_moves_the_node_not_its_target():
+    # B (deep in C) asks to be read before header H: TalkBack moves B up to H; H and
+    # everything between stay where they are.
+    h = n(1, 10, text="H", flags=FOCUS)
+    x = n(1, 11, text="X", flags=FOCUS)
+    y = n(1, 21, text="Y", flags=FOCUS)
+    b = n(1, 22, text="B", flags=FOCUS, traversal_before=a11y_key(1, 10))
+    z = n(1, 23, text="Z", flags=FOCUS)
+    c = n(1, 20, children=[y, b, z])
+    assert speech([n(1, -1, children=[h, x, c])]) == ["B", "H", "X", "Y", "Z"]
+
+
+def test_long_compose_chain_has_no_recursion_limit():
+    items = [n(1, i, text=f"item {i}", flags=FOCUS) for i in range(1, 3001)]
+    _chain(list(reversed(items)))  # ANI order is the reverse of the chain
+    out = speech([n(1, -1, children=items)])
+    assert out[0] == "item 3000" and out[-1] == "item 1" and len(out) == 3000

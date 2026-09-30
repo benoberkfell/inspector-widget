@@ -467,11 +467,14 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
 #    ViewGroup's ChildListForAccessibility; Compose: the delegate's geometric
 #    grouping), so the host must not re-sort by geometry.
 # 2. Apply traversal_before / traversal_after across the WHOLE tree (not per
-#    sibling group): a node with traversal_before=T is re-parented into T's place
-#    and T becomes its last child; a node with traversal_after=T becomes T's last
-#    child. Constraints that form a cycle are skipped and reported.
-#    is_traversal_group is honoured: a node inside a traversal group that is
-#    ordered relative to a node outside that group moves together with the group.
+#    sibling group), as TalkBack's OrderedTraversalController does: the node with
+#    the attribute moves, its target stays; traversal_before=T reads the node (and
+#    its subtree) immediately before T, traversal_after=T immediately after T's
+#    subtree. Constraints compose, so Compose's traversal chain (every focusable
+#    node linked to the next) is realised wherever its nodes sit in the ANI tree.
+#    Constraints that form a cycle are skipped and reported. is_traversal_group is
+#    honoured: a node inside a traversal group that is ordered relative to a node
+#    outside that group moves together with the group.
 # 3. Walk the re-arranged tree depth-first; a node is a focus stop when TalkBack
 #    would focus it: it is visible and actionable/focusable (clickable,
 #    long-clickable, focusable, screen-reader-focusable, or a top-level list/
@@ -735,30 +738,6 @@ def announcement(n: Dict[str, Any], focus: _Focus,
     return ", ".join(dedup), unlabeled
 
 
-class _WT:
-    """Working-tree node used to apply traversal constraints."""
-
-    __slots__ = ("node", "parent", "children")
-
-    def __init__(self, node: Optional[Dict[str, Any]], parent: Optional["_WT"]):
-        self.node = node
-        self.parent = parent
-        self.children: List["_WT"] = []
-
-    def is_ancestor_of(self, other: "_WT") -> bool:
-        p = other.parent
-        while p is not None:
-            if p is self:
-                return True
-            p = p.parent
-        return False
-
-    def detach(self) -> None:
-        if self.parent is not None:
-            self.parent.children = [c for c in self.parent.children if c is not self]
-            self.parent = None
-
-
 def _find_cycles(edges: List[Tuple[int, int]]) -> List[List[int]]:
     """Strongly connected components with >1 member (or a self-loop), via Tarjan."""
     graph: Dict[int, List[int]] = {}
@@ -827,79 +806,93 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
     """
     roots = [r for r in roots if r]
     focus = _Focus(roots)
+    parent = focus.parent
     diagnostics: List[Dict[str, Any]] = []
 
-    # ---- 1. working tree in ANI child order ---------------------------------
-    super_root = _WT(None, None)
-    preorder: List[_WT] = []
+    # ---- 1. index the ANI tree -------------------------------------------------
+    preorder: List[Dict[str, Any]] = []
     window_of: Dict[int, int] = {}
-
-    def build(node: Dict[str, Any], parent: _WT, win: int) -> _WT:
-        wt = _WT(node, parent)
-        preorder.append(wt)
-        window_of[id(node)] = win
-        for c in node.get("children") or []:
-            wt.children.append(build(c, wt, win))
-        return wt
-
     for wi, r in enumerate(roots):
-        super_root.children.append(build(r, super_root, wi))
-
-    by_key: Dict[int, _WT] = {}
+        for node in _iter_nodes([r]):
+            preorder.append(node)
+            window_of[id(node)] = wi
+    by_key: Dict[int, Dict[str, Any]] = {}
     dupes: List[str] = []
-    for wt in preorder:
-        k = _node_int_key(wt.node)
+    for node in preorder:
+        k = _node_int_key(node)
         if k is None:
             continue
         if k in by_key:
-            dupes.append(_node_label_key(wt.node))
+            dupes.append(_node_label_key(node))
             continue
-        by_key[k] = wt
+        by_key[k] = node
     if dupes:
         diagnostics.append({
             "kind": "duplicate_key", "count": len(dupes), "keys": sorted(set(dupes))[:10],
             "message": (f"{len(dupes)} a11y nodes share a node key with an earlier node; "
                         "linkage to them is ambiguous (the agent's ids are not unique)."),
         })
-    node_by_key = {k: wt.node for k, wt in by_key.items()}
 
-    # ---- 2. traversal constraints across the whole tree ---------------------
-    # Effective constraint per node (TalkBack: traversal_before wins over after).
-    constraints: List[Tuple[str, _WT, _WT]] = []
+    def is_ancestor(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        p = parent.get(id(b))
+        while p is not None:
+            if p is a:
+                return True
+            p = parent.get(id(p))
+        return False
+
+    # ---- 2. effective constraints ----------------------------------------------
+    # TalkBack uses a node's traversal_before when it resolves, else its
+    # traversal_after. An edge (pred, succ) means pred is read immediately before
+    # succ; Compose states each link twice (prev.before = next, next.after = prev),
+    # so an after-edge that repeats a before-edge is dropped.
+    edges: Dict[Tuple[int, int], Tuple[Dict[str, Any], str, Dict[str, Any]]] = {}
     unresolved: List[Dict[str, Any]] = []
-    for wt in preorder:
-        n = wt.node
-        for field, kind in (("traversal_before", "before"), ("traversal_after", "after")):
-            tv = n.get(field)
+    linked = 0
+    has_before: set = set()
+    for field, kind in (("traversal_before", "before"), ("traversal_after", "after")):
+        for node in preorder:
+            tv = node.get(field)
             if not tv:
+                continue
+            linked += 1
+            if kind == "after" and id(node) in has_before:
                 continue
             target = by_key.get(int(tv))
             if target is None:
-                # TalkBack's getTraversalBefore() returns null here and it falls
-                # through to traversal_after.
-                unresolved.append({"key": _node_label_key(n), "field": field, "target": int(tv)})
+                # TalkBack's getTraversalBefore() returns null; it falls through to after.
+                unresolved.append({"key": _node_label_key(node), "field": field,
+                                   "target": int(tv)})
                 continue
-            if target is not wt:
-                constraints.append((kind, wt, target))
-            break  # only the first resolvable field is effective
+            if kind == "before":
+                has_before.add(id(node))
+            if target is node:
+                continue
+            pred, succ = (node, target) if kind == "before" else (target, node)
+            edges.setdefault((id(pred), id(succ)), (node, kind, target))
     if unresolved:
-        diagnostics.append({
+        diag: Dict[str, Any] = {
             "kind": "unresolved_target", "count": len(unresolved), "items": unresolved[:10],
             "message": (f"{len(unresolved)} traversal_before/after targets are not in this dump "
                         "(off-screen or not important for accessibility); TalkBack ignores them."),
-        })
+        }
+        if len(unresolved) == linked and linked >= 2:
+            # Nothing resolved at all: the agent's linkage ids are almost certainly not in
+            # the node-key space, so the order below may differ from TalkBack's.
+            diag["suspect_key_space"] = True
+            diag["message"] = (
+                f"none of the {linked} traversal_before/after targets resolve to a node in "
+                "this dump: the agent's linkage ids do not match the node keys, so this "
+                "reading order ignores them and may differ from TalkBack's.")
+        diagnostics.append(diag)
 
-    # Cycle detection on "u precedes v" edges.
-    edges = []
-    for kind, m, t in constraints:
-        a, b = (m, t) if kind == "before" else (t, m)
-        edges.append((id(a), id(b)))
+    # Cycles among the constraints: ignore them and say so.
+    node_by_pyid = {id(node): node for node in preorder}
     scc_of: Dict[int, int] = {}
-    wt_by_pyid = {id(wt): wt for wt in preorder}
-    for ci, comp in enumerate(_find_cycles(edges)):
+    for ci, comp in enumerate(_find_cycles(list(edges))):
         for member in comp:
             scc_of[member] = ci
-        keys = [_node_label_key(wt_by_pyid[i].node) for i in comp]
+        keys = [_node_label_key(node_by_pyid[i]) for i in comp]
         diagnostics.append({
             "kind": "cycle", "keys": keys,
             "message": ("traversal_before/after constraints form a cycle ("
@@ -907,61 +900,49 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
                         "so TalkBack's order among them is undefined."),
         })
 
-    orig_parent = focus.parent
-
-    def group_unit(m: _WT, t: _WT) -> _WT:
-        """Outermost traversal-group ancestor of m (inclusive) that doesn't contain t."""
+    def group_unit(m: Dict[str, Any], t: Dict[str, Any]) -> Dict[str, Any]:
+        """Outermost traversal-group ancestor of m (else m) that does not contain t."""
         t_anc = set()
-        p = t.node
+        p: Optional[Dict[str, Any]] = t
         while p is not None:
             t_anc.add(id(p))
-            p = orig_parent.get(id(p))
+            p = parent.get(id(p))
         unit = m
-        p = orig_parent.get(id(m.node))
-        while p is not None:
-            if id(p) in t_anc:
-                break
+        p = parent.get(id(m))
+        while p is not None and id(p) not in t_anc:
             if p.get("is_traversal_group") or "is_traversal_group" in _flags(p):
-                cand = by_key.get(_node_int_key(p) or -1)
-                if cand is not None and cand.node is p:
-                    unit = cand
-            p = orig_parent.get(id(p))
+                unit = p
+            p = parent.get(id(p))
         return unit
 
-    before_target: Dict[int, _WT] = {id(m): t for kind, m, t in constraints if kind == "before"}
+    # ---- 3. placement ------------------------------------------------------------
+    # The node carrying the attribute moves; its target stays put. traversal_before=T
+    # places the node (with its subtree) immediately before T; traversal_after=T
+    # immediately after T's subtree. Constraints compose, so a Compose chain
+    # a->b->c is read a, b, c wherever it starts, and an ancestor already precedes
+    # its descendants (no move needed).
+    before_att: Dict[int, List[Dict[str, Any]]] = {}
+    after_att: Dict[int, List[Dict[str, Any]]] = {}
+    moved: set = set()
     unsatisfiable: List[Dict[str, Any]] = []
     grouped_moves = 0
-    for kind, m, t in constraints:
-        if id(m) in scc_of and scc_of.get(id(m)) == scc_of.get(id(t)):
+    pos = {id(node): i for i, node in enumerate(preorder)}
+    for (pk, sk), (holder, kind, target) in sorted(
+            edges.items(), key=lambda kv: pos[id(kv[1][0])]):
+        if pk in scc_of and scc_of.get(pk) == scc_of.get(sk):
             continue
-        unit = group_unit(m, t)
-        if unit is not m and (unit is t or unit.is_ancestor_of(t)):
-            unit = m  # earlier moves already nested t inside the group
-        if unit is not m:
+        if is_ancestor(holder, target):
+            if kind == "after":
+                unsatisfiable.append({"key": _node_label_key(holder),
+                                      "target": _node_label_key(target)})
+            continue  # before: pre-order already reads an ancestor first
+        unit = group_unit(holder, target)
+        if unit is not holder:
             grouped_moves += 1
-        if kind == "before":
-            # TalkBack getParentsThatAreMovedBeforeOrSameNode: if the unit's parent
-            # was itself moved before the unit, move that parent (and so on).
-            while (unit.parent is not None and unit.parent.node is not None
-                   and before_target.get(id(unit.parent)) is unit):
-                unit = unit.parent
-            if unit is t or unit.is_ancestor_of(t):
-                continue  # pre-order already visits an ancestor first
-            unit.detach()
-            tp = t.parent
-            idx = tp.children.index(t)
-            tp.children[idx] = unit
-            unit.parent = tp
-            t.parent = unit
-            unit.children.append(t)
-        else:
-            if unit.is_ancestor_of(t) or unit is t:
-                unsatisfiable.append({"key": _node_label_key(m.node),
-                                      "target": _node_label_key(t.node)})
-                continue
-            unit.detach()
-            t.children.append(unit)
-            unit.parent = t
+        if id(unit) in moved:
+            continue  # already placed by another constraint (e.g. its group's)
+        moved.add(id(unit))
+        (before_att if kind == "before" else after_att).setdefault(id(target), []).append(unit)
     if unsatisfiable:
         diagnostics.append({
             "kind": "unsatisfiable", "count": len(unsatisfiable), "items": unsatisfiable[:10],
@@ -975,36 +956,67 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
                         "boundary; the enclosing group was moved as a unit."),
         })
 
-    # ---- 3. walk + focus stops ----------------------------------------------
+    # ---- 4. walk (iterative: Compose chains can be long) -------------------------
+    walk: List[Dict[str, Any]] = []
+    emitted: set = set()
+    active: set = set()
+    stack: List[Tuple[str, Dict[str, Any]]] = [
+        ("visit", r) for r in reversed(roots) if id(r) not in moved]
+    while stack:
+        op, node = stack.pop()
+        k = id(node)
+        if op == "visit":
+            if k in emitted or k in active:
+                continue
+            active.add(k)
+            tasks = [("visit", u) for u in before_att.get(k, [])]
+            tasks.append(("emit", node))
+            tasks += [("visit", c) for c in (node.get("children") or []) if id(c) not in moved]
+            tasks += [("visit", u) for u in after_att.get(k, [])]
+            tasks.append(("done", node))
+            stack.extend(reversed(tasks))
+        elif op == "emit":
+            emitted.add(k)
+            walk.append(node)
+        else:
+            active.discard(k)
+    lost = [node for node in preorder if id(node) not in emitted]
+    if lost:
+        diagnostics.append({
+            "kind": "placement_cycle", "count": len(lost),
+            "keys": [_node_label_key(node) for node in lost[:10]],
+            "message": ("traversal constraints place nodes inside each other's subtrees; "
+                        f"{len(lost)} nodes were appended at the end in tree order."),
+        })
+        walk.extend(lost)
+
+    # ---- 5. focus stops ------------------------------------------------------------
     multi_window = len(roots) > 1
     entries: List[Dict[str, Any]] = []
     nodes: List[Dict[str, Any]] = []
     counter = 0
-    stack = list(reversed(super_root.children))
-    while stack:
-        wt = stack.pop()
-        n = wt.node
-        stack.extend(reversed(wt.children))
-        stop = focus.is_stop(n)
+    for node in walk:
+        stop = focus.is_stop(node)
         if not stop and not include_structural:
             continue
-        entry: Dict[str, Any] = {"order": None, "key": n.get("node_key") or _node_label_key(n),
-                                 "id": _node_int_key(n)}
+        entry: Dict[str, Any] = {"order": None,
+                                 "key": node.get("node_key") or _node_label_key(node),
+                                 "id": _node_int_key(node)}
         if stop:
             counter += 1
             entry["order"] = counter
-            speak, unlabeled = announcement(n, focus, node_by_key)
+            speak, unlabeled = announcement(node, focus, by_key)
             entry["speak"] = speak
             if unlabeled:
                 entry["unlabeled"] = True
         else:
-            entry["speak"] = n.get("speakable")
+            entry["speak"] = node.get("speakable")
         if include_structural:
             entry["is_focus_stop"] = stop
         if multi_window:
-            entry["window"] = window_of.get(id(n), 0)
+            entry["window"] = window_of.get(id(node), 0)
         entries.append(entry)
-        nodes.append(n)
+        nodes.append(node)
     return {"focus_order": entries, "diagnostics": diagnostics, "_nodes": nodes}
 
 
