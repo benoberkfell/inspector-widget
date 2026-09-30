@@ -437,6 +437,8 @@ def test_a_32_bit_app_is_refused_before_pushing(arm64_agent):
                           f"'{PKG}' (pid {PID}) runs as a 32-bit armeabi-v7a process "
                           "(app_process32)")
     assert "ships only 32-bit native libraries" in err.value.hint
+    assert "built for arm64-v8a only" in err.value.hint and "arm64 emulator image" in err.value.hint
+    assert "build the agent for its ABI" not in err.value.hint  # there is no such build option
     assert not arm64_agent.pushed and not arm64_agent.attach_calls
 
 

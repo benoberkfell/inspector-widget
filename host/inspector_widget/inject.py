@@ -539,7 +539,10 @@ def _check_abi(serial: str, package: str, pid: int, so_path: str) -> None:
         hint=(f"Inspect the app on a device or emulator image where it runs as {so_abi}"
               + (" (an app that ships only 32-bit native libraries runs 32-bit even on a "
                  "64-bit device)" if bits == 32 else "")
-              + f", or build the agent for its ABI."),
+              + (". The agent is built for arm64-v8a only (abiFilters in "
+                 "agent/build.gradle.kts), so use an arm64 device or an arm64 emulator image; "
+                 "scripts/build.sh has no option for another ABI." if so_abi == "arm64-v8a"
+                 else ".")),
     )
 
 
