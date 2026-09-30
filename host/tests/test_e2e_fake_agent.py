@@ -367,7 +367,7 @@ def test_cli_dump_json_with_properties_resolution_and_screenshot(fake_device, ru
 
 
 def test_cli_compose_json(fake_device, run_cli):
-    res = run_cli("compose", "--json", "-")
+    res = run_cli("compose", "--json", "-", "--enable-inspection")
     assert res.rc == 0, res
     req = fake_device.requests("dump_compose")[-1]
     assert (req.include_semantics, req.include_slot_table, req.enable_inspection) == (True, True, True)
@@ -731,7 +731,7 @@ def test_mcp_screenshot_scale_is_clamped(mcp, fake_device, scale, wire):
 
 
 def test_mcp_dump_compose(mcp, fake_device):
-    res = mcp("dump_compose")
+    res = mcp("dump_compose", enable_inspection=True)
     req = fake_device.requests("dump_compose")[-1]
     assert (req.include_semantics, req.include_slot_table, req.enable_inspection) == (True, True, True)
     [window] = res["windows"]
