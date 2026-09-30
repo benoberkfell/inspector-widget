@@ -25,7 +25,7 @@ import pytest
 from capture_harness import nbytes, ok
 
 from inspector_widget import ops
-from inspector_widget.capture import images, query
+from inspector_widget.capture import images
 
 #: Spec section 7: each tool's default max_bytes.
 BUDGET = {"capture": 3000, "captures": 2000, "outline": 6000, "find": 3000, "node": 3000,

@@ -30,7 +30,6 @@ import contextlib
 import json
 import os
 import re
-import shutil
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
