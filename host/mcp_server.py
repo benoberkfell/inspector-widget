@@ -914,11 +914,12 @@ def tool_dump_accessibility(
     exactly as TalkBack/UiAutomator see it, plus the host-computed reading order."""
     _require(serial, "serial")
     _require(package, "package")
-    from inspector_widget import a11y as a11ymod
+    from inspector_widget import a11y as a11ymod, correlate
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_a11y(root_id=0, include_extras=bool(include_extras),
                              include_rendering_info=bool(include_rendering_info))
     data = a11ymod.a11y_to_dict(resp)
+    correlate.record_a11y(session, data)  # its Compose keys re-resolve in inspect_node
     data.update({"serial": serial, "package": package})
     return data
 
@@ -934,7 +935,7 @@ def tool_a11y_lint(
     typed node keys plus a summary and diagnostics. Contrast samples each window."""
     _require(serial, "serial")
     _require(package, "package")
-    from inspector_widget import a11y_lint
+    from inspector_widget import a11y_lint, correlate
     enabled = _a11y_lint_rules(rules)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
@@ -943,6 +944,7 @@ def tool_a11y_lint(
         session, density=density, font_scale=fscale,
         include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
         rules=enabled, include_rendering_info=bool(include_rendering_info))
+    correlate.record_a11y(session, report.a11y_data, (report.compose_data or {}).get("windows"))
     out = report.to_dict()
     out.update({"serial": serial, "package": package,
                 "contrast_sampled": bool(out["stats"].get("contrast_windows"))})
@@ -1403,22 +1405,18 @@ def tool_inspect(serial: str, package: str, include_properties: bool = False,
     }
     if include_overlay:
         from inspector_widget import overlay as ov
-        shot = session.screenshot(root_id=0, scale=1.0)
-        if shot.HasField("screenshot"):
-            base = _tmp_png_path(serial, package, "integrated_base")
-            _save_screenshot_png(session, shot.screenshot, base)
-            out = _tmp_png_path(serial, package, "integrated_overlay")
-            base_scale = float(shot.screenshot.scale) or 1.0
+        base = _tmp_png_path(serial, package, "integrated_base")
+        out = _tmp_png_path(serial, package, "integrated_overlay")
+        try:  # every window (a dialog included), composited at its screen origin
+            base_scale = ov.write_windows_png(session, correlate.window_origins(merged), base)
+            result["overlay"] = ov.render_integrated_overlay(base, merged, out, scale=base_scale)
+        except (RuntimeError, AttributeError) as exc:
+            result["overlay_error"] = str(exc)
+        finally:
             try:
-                summary = ov.render_integrated_overlay(base, merged, out, scale=base_scale)
-                result["overlay"] = summary
-            except (RuntimeError, AttributeError) as exc:
-                result["overlay_error"] = str(exc)
-            finally:
-                try:
-                    os.remove(base)
-                except OSError:
-                    pass
+                os.remove(base)
+            except OSError:
+                pass
     return result
 
 
@@ -1436,11 +1434,14 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
     session = SESSIONS.get_or_attach(serial, package)
     image_path = _tmp_png_path(serial, package, "dossier") if include_image else None
+    density, fscale = _a11y_device_metrics(serial)
     try:
+        # lint=True: the a11y_lint report (same rules, Compose detail, rendering info,
+        # contrast of the node's window) filtered to this node.
         dossier = correlate.inspect_node(
             session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
             include_image=bool(include_image), image_path=image_path,
-            lint_fn=_lint_fn(), density=_device_density(serial),
+            lint=True, density=density or _device_density(serial), font_scale=fscale,
         )
     except correlate.NodeKeyError as exc:
         raise ToolError(str(exc)) from None
@@ -1471,7 +1472,7 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
     if node is None:
         raise ToolError("no matching element found for the given selector")
     out = _tmp_png_path(serial, package, "component")
-    img = correlate.component_image(session, node, out_path=out)
+    img = correlate.component_image(session, node, out_path=out, merged=merged)
     img.update({"serial": serial, "package": package, "node_key": node.get("node_key")})
     return img
 

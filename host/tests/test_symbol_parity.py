@@ -146,7 +146,7 @@ def test_scan_actually_finds_contract_symbols() -> None:
     expected = {
         ("adb", "display_density"),
         ("adb", "font_scale"),
-        ("a11y_lint", "lint_a11y"),
+        ("a11y_lint", "run_lint"),
         ("overlay", "render_integrated_overlay"),
         ("png", "_decode_to_rgba"),
     }

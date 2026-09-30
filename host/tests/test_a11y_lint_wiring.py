@@ -123,3 +123,106 @@ def test_cli_a11y_with_lint_adds_lint_to_json(monkeypatch, capsys):
     out = json.loads(captured.out)
     assert out["lint"]["summary"]["total"] == 0
     assert "a11y lint: 0 error, 0 warn, 0 info" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# Entry-point wiring the unit tests of the engines cannot see (mutation-tested:
+# each test below fails if its entry point drops the argument it checks).
+# --------------------------------------------------------------------------- #
+def _shot(w, h, rgba=(255, 255, 255, 255), scale=0.5):
+    import struct
+    import zlib
+    raw = struct.pack("<ii", w, h) + bytes([2]) + bytes(rgba) * (w * h)
+    return pb.ScreenshotResponse(screenshot=pb.Screenshot(
+        width=w, height=h, bitmap_type=2, data=zlib.compress(raw), scale=scale))
+
+
+class _ScreenSession(_FakeSession):
+    """A fake device showing the mixed View/Compose fixture (it has R1 findings)."""
+
+    def dump_a11y(self, **kw):
+        import mixed_fixture as mf
+        self.calls.append(("dump_a11y", kw))
+        return mf.a11y_response()
+
+    def screenshot(self, **kw):
+        self.calls.append(("screenshot", kw))
+        return _shot(540, 1200)
+
+    def hello(self):
+        return pb.HelloResponse()
+
+
+def test_mcp_a11y_overlay_colours_the_lint_findings(monkeypatch):
+    pytest.importorskip("PIL")
+    sess = _ScreenSession()
+    monkeypatch.setattr(mcp_server.SESSIONS, "get_or_attach", lambda s, p: sess)
+    monkeypatch.setattr(mcp_server, "_a11y_device_metrics", lambda serial: (420, 1.0))
+    out = mcp_server.tool_a11y_overlay("emulator-5556", "com.example", include_contrast=False)
+    assert out["finding_count"] > 0
+    assert out["flagged"] > 0, "the overlay drew no severity colour for the lint findings"
+
+
+def test_cli_a11y_overlay_colours_the_lint_findings_and_asks_for_rendering_info(
+        monkeypatch, capsys, tmp_path):
+    pytest.importorskip("PIL")
+    from inspector_widget import adb
+    client = _ScreenSession()
+    monkeypatch.setattr(cli.injectmod, "inject_and_connect", lambda **k: _FakeInjection())
+    monkeypatch.setattr(cli, "Client", lambda *a, **k: client)
+    monkeypatch.setattr(adb, "display_density", lambda serial: 420)
+    monkeypatch.setattr(adb, "font_scale", lambda serial: 1.0)
+    args = cli.build_parser().parse_args(
+        ["a11y", "--lint", "--no-contrast", "--overlay", str(tmp_path / "o.png")])
+    assert args.func(args) == 0
+    err = capsys.readouterr().err
+    import re
+    flagged = int(re.search(r"(\d+) flagged", err).group(1))
+    assert flagged > 0, err
+    # --lint implies ExtraRenderingInfo (R11/R18 text sizes).
+    assert ("dump_a11y", {"root_id": 0, "include_extras": True,
+                          "include_rendering_info": True}) in client.calls
+
+
+def test_mcp_a11y_lint_forwards_include_rendering_info(monkeypatch):
+    sess = _FakeSession()
+    monkeypatch.setattr(mcp_server.SESSIONS, "get_or_attach", lambda s, p: sess)
+    monkeypatch.setattr(mcp_server, "_a11y_device_metrics", lambda serial: (420, 1.0))
+    mcp_server.tool_a11y_lint("emulator-5556", "com.example", include_rendering_info=False)
+    dumps = [kw for name, kw in sess.calls if name == "dump_a11y"]
+    assert dumps == [{"root_id": 0, "include_extras": True, "include_rendering_info": False}]
+
+
+def test_mcp_inspect_node_turns_a_key_error_into_a_tool_error(monkeypatch):
+    from inspector_widget import correlate
+
+    def raise_key(*a, **k):
+        raise correlate.NodeKeyError("compose:4 is ambiguous: use one of compose:22:4, compose:32:4")
+
+    monkeypatch.setattr(mcp_server.SESSIONS, "get_or_attach", lambda s, p: _FakeSession())
+    monkeypatch.setattr(mcp_server, "_a11y_device_metrics", lambda serial: (420, 1.0))
+    monkeypatch.setattr(correlate, "inspect_node", raise_key)
+    with pytest.raises(mcp_server.ToolError) as ei:
+        mcp_server.tool_inspect_node("emulator-5556", "com.example", node_key="compose:4",
+                                     include_image=False)
+    assert "ambiguous" in str(ei.value)
+
+
+def test_cli_inspect_node_exits_1_on_a_key_error(monkeypatch, capsys):
+    import inspector_widget as iw
+    from inspector_widget import adb, correlate
+
+    class Sess:
+        def detach(self):
+            pass
+
+    def raise_key(*a, **k):
+        raise correlate.NodeKeyError("compose:32:4 is not in the current dump")
+
+    monkeypatch.setattr(iw, "attach", lambda *a, **k: Sess())
+    monkeypatch.setattr(adb, "display_density", lambda serial: 420)
+    monkeypatch.setattr(adb, "font_scale", lambda serial: 1.0)
+    monkeypatch.setattr(correlate, "inspect_node", raise_key)
+    args = cli.build_parser().parse_args(["inspect-node", "--node-key", "compose:32:4"])
+    assert args.func(args) == 1
+    assert "not in the current dump" in capsys.readouterr().err

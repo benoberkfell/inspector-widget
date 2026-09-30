@@ -230,6 +230,11 @@ def cmd_a11y(args) -> int:
             s = report.summary
             print(f"a11y lint: {s['error']} error, {s['warn']} warn, {s['info']} info",
                   file=sys.stderr)
+        # Remember its Compose keys so a later inspect-node can re-resolve them.
+        from inspector_widget import correlate
+        correlate.record_a11y(client, data, (report.compose_data or {}).get("windows")
+                              if report is not None else None, serial=args.serial,
+                              package=args.package, pid=getattr(inj, "pid", None))
 
         if args.json:
             text = json.dumps(data, indent=2)
@@ -282,6 +287,10 @@ def cmd_a11y_lint(args) -> int:
             font_scale=adb.font_scale(args.serial),
             include_contrast=not args.no_contrast, scale=args.scale, wcag_mode=args.wcag,
             rules=rules, include_rendering_info=args.include_rendering_info)
+        from inspector_widget import correlate
+        correlate.record_a11y(client, report.a11y_data,
+                              (report.compose_data or {}).get("windows"), serial=args.serial,
+                              package=args.package, pid=getattr(inj, "pid", None))
         out = report.to_dict()
         if args.json:
             text = json.dumps(out, indent=2)
@@ -358,12 +367,11 @@ def cmd_inspect(args) -> int:
     try:
         merged = correlate.inspect_tree(session, include_properties=args.properties)
         if args.overlay:
-            shot = session.screenshot(root_id=0, scale=args.scale)
             base = args.overlay + ".base.png"
-            pngmod.write_png(shot.screenshot, base)
-            summary = ovmod.render_integrated_overlay(
-                base, merged, args.overlay,
-                scale=(float(shot.screenshot.scale) or args.scale))
+            base_scale = ovmod.write_windows_png(
+                session, correlate.window_origins(merged), base, scale=args.scale)
+            summary = ovmod.render_integrated_overlay(base, merged, args.overlay,
+                                                      scale=base_scale)
             os.remove(base)
             print(f"wrote integrated overlay -> {args.overlay} "
                   f"({summary.get('boxes')} boxes)", file=sys.stderr)
@@ -379,7 +387,7 @@ def cmd_inspect(args) -> int:
 
 
 def cmd_inspect_node(args) -> int:
-    from inspector_widget import correlate, a11y_lint as lintmod
+    from inspector_widget import correlate
     import inspector_widget as iw
     node_key, view_id, semantics_id, bounds = _node_selector(args)
     session = iw.attach(args.serial, args.package, build_out=args.build_out)
@@ -388,9 +396,9 @@ def cmd_inspect_node(args) -> int:
             dossier = correlate.inspect_node(
                 session, node_key=node_key, view_id=view_id,
                 semantics_id=semantics_id, bounds=bounds,
-                include_image=not args.no_image,
-                lint_fn=lintmod.lint_a11y,
-                density=adb.display_density(args.serial))
+                include_image=not args.no_image, lint=True,
+                density=adb.display_density(args.serial),
+                font_scale=adb.font_scale(args.serial))
         except correlate.NodeKeyError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -422,7 +430,8 @@ def cmd_component_image(args) -> int:
         if node is None:
             print("error: no matching element found for the given selector", file=sys.stderr)
             return 1
-        img = correlate.component_image(session, node, out_path=args.out, scale=args.scale)
+        img = correlate.component_image(session, node, out_path=args.out, scale=args.scale,
+                                        merged=merged)
         if img.get("path"):
             print(f"wrote component image -> {img['path']} (source={img.get('source')})",
                   file=sys.stderr)
