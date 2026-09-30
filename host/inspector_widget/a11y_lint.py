@@ -1262,15 +1262,22 @@ def _dominant_colors(counts: Counter, perim: Counter) -> Optional[Dict[str, Any]
     for (r, g, b), k in colors.items():
         q = (r >> 4, g >> 4, b >> 4)
         bins[q] = bins.get(q, 0) + k
+    mode_q = max(bins.items(), key=lambda kv: kv[1])[0]
+
+    def best_in(q: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        return max((c for c in colors if (c[0] >> 4, c[1] >> 4, c[2] >> 4) == q),
+                   key=lambda c: colors[c])
+
     if pcount / ptotal >= 0.5:
         bg = prgb
         bg_q = (bg[0] >> 4, bg[1] >> 4, bg[2] >> 4)
         bg_source = "perimeter"
+        if mode_q != bg_q and bins[mode_q] / total >= 0.5:
+            # The rim is the window showing through the node's insets (a MaterialButton's
+            # touch bounds are taller than its fill): the text sits on the fill.
+            bg_q, bg, bg_source = mode_q, best_in(mode_q), "fill"
     else:
-        bg_q = max(bins.items(), key=lambda kv: kv[1])[0]
-        bg = max((c for c in colors if (c[0] >> 4, c[1] >> 4, c[2] >> 4) == bg_q),
-                 key=lambda c: colors[c])
-        bg_source = "mode"
+        bg_q, bg, bg_source = mode_q, best_in(mode_q), "mode"
     bg_frac = bins.get(bg_q, 0) / total
     lb = _rel_lum(bg)
     ink = []
@@ -1291,6 +1298,12 @@ def _dominant_colors(counts: Counter, perim: Counter) -> Optional[Dict[str, Any]
         if acc >= 0.25 * ink_count:
             break
     fg = max(top, key=lambda t: (t[1], t[0]))[2]
+    if bg_source == "fill":
+        # Ink here is text plus the lower-contrast rim, which can outnumber the glyphs;
+        # take the most contrasting colour with real support (anti-aliased pixels sit
+        # between text and fill, so they never win).
+        support = max(3, int(0.02 * ink_count))
+        fg = max((t for t in ink if t[1] >= support), key=lambda t: t[0], default=top[0])[2]
     lf = _rel_lum(fg)
     return {"fg": fg, "bg": bg, "ratio": round(_contrast(lf, lb), 2), "fg_lum": lf, "bg_lum": lb,
             "bg_fraction": round(bg_frac, 3), "ink_fraction": round(ink_frac, 3),

@@ -1050,3 +1050,24 @@ def test_r15_per_row_action_in_a_list_takes_its_purpose_from_the_row():
     alone = view(30, "android.widget.Button", flags=CLICK, text="More info", b=(40, 2100, 400, 160))
     f = of(lint(screen(decor(1, rv, alone))), "a11y.link.purpose_unclear")
     assert [(x.node_key, x.severity) for x in f] == [("view:30", "info")]
+
+
+def test_r3_button_text_is_measured_against_its_fill_not_the_inset_rim():
+    # Live D1 "OPEN DIALOG": a MaterialButton's a11y bounds include top/bottom insets where
+    # the window (#FEF7FF) shows, so the rim is window colour while the text (#1D1B20)
+    # sits on the grey fill (#D6D7D7). Measuring the fill as "text" gave 1.37:1.
+    win, fill, ink = (0xFE, 0xF7, 0xFF), (0xD6, 0xD7, 0xD7), (0x1D, 0x1B, 0x20)
+    w, h = 240, 60
+    body = _text_image(w, 40, ink, stroke=2, aa=True, bg=fill, period=20)
+    rim = bytes((*win, 255)) * (w * 10)
+    img = rim + body + rim
+    tv = view(10, "android.widget.Button", text="OPEN DIALOG", flags=CLICK, b=(0, 0, w, h),
+              text_size_px=14, text_size_unit=2)
+    rep = lint(screen(decor(1, tv, b=(0, 0, 1080, 2400))), window_images=_ctx_img(img, w, h))
+    assert of(rep, "a11y.contrast.low") == []
+    # the same text actually drawn in the fill colour's neighbourhood still fails
+    faint = _text_image(w, 40, (0xB0, 0xB0, 0xB0), stroke=2, aa=True, bg=fill, period=20)
+    rep2 = lint(screen(decor(1, tv, b=(0, 0, 1080, 2400))),
+                window_images=_ctx_img(rim + faint + rim, w, h))
+    f = of(rep2, "a11y.contrast.low")
+    assert len(f) == 1 and f[0].evidence["bg_hex"] == "#D6D7D7" and f[0].evidence["fg_hex"] == "#B0B0B0"
