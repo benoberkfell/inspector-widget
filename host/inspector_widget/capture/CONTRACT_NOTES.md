@@ -690,12 +690,24 @@ with every consumer.
     a View whose class is RecyclerView, ListView, GridView (and relatives), a
     `Lazy*` display type, an `a11y.collection` facet, a Compose `CollectionInfo`
     attr, or any node whose anchor's last segment has `[i]`. The cell's identity
-    label is its first label that no other cell of that collection has. The cell
-    keeps its refs when that identity is unchanged or absent on both sides, or
-    when it stays at the same position (`adapter_pos`, else the anchor's `[i]`,
-    else the child index) and its data did not move to another cell. Otherwise
-    every node of the cell gets a new ref, and the ones that matched by key get
-    `rebound_of`.
+    label is its first label that no other cell of that collection has (with two
+    or more cells on screen). The cell keeps its refs when that identity is
+    unchanged. Otherwise it must stay at the same position: the same adapter
+    position (`adapter_pos`, else the CollectionItemInfo position, which is
+    `row * columns + column` in a grid) when both sides have one, else the same
+    child index after the list's scroll offset (the most common index shift of the
+    cells matched by key; a tie means no offset). At the same position a cell with
+    no identity label on either side keeps its refs; a cell whose identity label
+    changed keeps them only when its old data did not move to another cell and
+    another distinguishing label or testTag of the cell is unchanged (an in-place
+    edit). A lone label changing in place is a data-set change (a page-sized
+    scroll, a filter, a refresh) and rebinds. Otherwise every node of the cell
+    gets a new ref, and the ones that matched by key get `rebound_of`.
+  - Locators (pass 2) respect the guard too: a node inside a cell carries by a
+    locator only when its cell is already matched to the other node's cell, and a
+    cell root only when both collections are matched and show two or more cells.
+    A lone section header or a one-page pager is unique on both sides and still a
+    different item.
   - Structure matches a sibling that is unique by `(kind, type, rid, tag,
     label)` on both sides even when its ordinal changed. Look-alikes are split by
     content. True twins match by ordinal only when the whole twin group is

@@ -14,8 +14,9 @@ the ``slots`` tree):
 * Slot: ``Name@File.kt:line[key]:k`` (``[key]`` only when the group has a ``key``
   parameter, e.g. a lazy list item).
 * Children of a collection (a11y CollectionInfo, a RecyclerView/ListView/GridView,
-  a Compose lazy list) get ``[i]`` in place of ``:k``: the CollectionItemInfo row
-  (or column) when every sibling has a distinct one, else the sibling position.
+  a Compose lazy list) get ``[i]`` in place of ``:k``: the CollectionItemInfo
+  position (the row of a list, the column of a horizontal list, ``row * columns +
+  column`` in a grid; see :func:`item_positions`), else the sibling position.
 
 Labels, tags and rids are escaped (``\\``, ``/``, ``"``, ``[`` and ``]`` get a
 backslash) so ``/`` only ever separates segments and ``[i]`` is unambiguous. The
@@ -120,18 +121,51 @@ def is_collection(node: UNode) -> bool:
     return any(a in COLLECTION_COMPOSE_KEYS for a in comp.get("actions") or ())
 
 
-def _item_indexes(children: Sequence[UNode]) -> list[int]:
-    """Collection positions of ``children``: the CollectionItemInfo row (or column)
-    when every child has a distinct one, else the sibling position."""
-    rows, cols = [], []
+def _is_pos(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def item_positions(children: Sequence[UNode], cols: int | None = None) -> list[int] | None:
+    """Collection positions of ``children`` from their CollectionItemInfo, or None
+    when they carry none.
+
+    When every child reports both a row and a column and the (row, column) pairs
+    are distinct, the position is ``row * width + column``, where ``width`` is the
+    collection's column count (``cols``) or the widest column seen plus one. That
+    is the row of a vertical list, the column of a horizontal one and the adapter
+    position of a grid (whose rows repeat across columns and columns across rows).
+    Otherwise the row (or the column) is used when every child has a distinct one."""
+    rows, columns = [], []
     for c in children:
         item = (c.facets.get("a11y") or {}).get("item") or {}
         rows.append(item.get("row"))
-        cols.append(item.get("col"))
-    for axis in (rows, cols):
-        if all(isinstance(v, int) and v >= 0 for v in axis) and len(set(axis)) == len(axis):
+        columns.append(item.get("col"))
+    rows_ok = all(_is_pos(v) for v in rows)
+    cols_ok = all(_is_pos(v) for v in columns)
+    if rows_ok and cols_ok and children:
+        pairs = list(zip(rows, columns))
+        if len(set(pairs)) != len(pairs):
+            return None
+        width = max(int(cols) if _is_pos(cols) else 0, max(columns) + 1)
+        return [r * width + c for r, c in pairs]
+    for ok, axis in ((rows_ok, rows), (cols_ok, columns)):
+        if ok and len(set(axis)) == len(axis):
             return list(axis)
-    return list(range(len(children)))
+    return None
+
+
+def _item_indexes(children: Sequence[UNode], cols: int | None = None) -> list[int]:
+    """Collection positions of ``children`` (:func:`item_positions`), else the
+    sibling position."""
+    pos = item_positions(children, cols)
+    return pos if pos is not None else list(range(len(children)))
+
+
+def collection_cols(node: UNode) -> int | None:
+    """The column count a collection node reports (a11y CollectionInfo), if any."""
+    col = (node.facets.get("a11y") or {}).get("collection") or {}
+    v = col.get("cols") if isinstance(col, Mapping) else None
+    return v if _is_pos(v) else None
 
 
 def _base(node: UNode) -> tuple[str, str]:
@@ -149,11 +183,13 @@ def _base(node: UNode) -> tuple[str, str]:
     return "plain", typ
 
 
-def ui_segments(children: Sequence[UNode], collection: bool) -> list[str]:
-    """Anchor segments of one sibling group (in ui order)."""
+def ui_segments(children: Sequence[UNode], collection: bool,
+                cols: int | None = None) -> list[str]:
+    """Anchor segments of one sibling group (in ui order). ``cols`` is the
+    collection's column count (a grid's positions use it)."""
     bases = [_base(c) for c in children]
     if collection:
-        idx = _item_indexes(children)
+        idx = _item_indexes(children, cols)
         return [f"{base}[{i}]" for (_, base), i in zip(bases, idx)]
     counts = Counter(b for _, b in bases)
     # a view whose rid is shared with a sibling falls back to Class:k
@@ -209,7 +245,8 @@ def assign_ui_anchors(ix: Index) -> None:
             kids = [nodes[c] for c in ui.children.get(parent.id, ()) if c in nodes]
             if not kids:
                 continue
-            for kid, seg in zip(kids, ui_segments(kids, is_collection(parent))):
+            segs = ui_segments(kids, is_collection(parent), collection_cols(parent))
+            for kid, seg in zip(kids, segs):
                 kid.anchor = f"{parent.anchor}/{seg}"
             stack.extend(reversed(kids))
 
@@ -381,9 +418,11 @@ __all__ = [
     "COLLECTION_VIEW_CLASSES",
     "assign_sels",
     "assign_ui_anchors",
+    "collection_cols",
     "collection_index",
     "esc",
     "is_collection",
+    "item_positions",
     "match_sel",
     "parse_atom",
     "quote",

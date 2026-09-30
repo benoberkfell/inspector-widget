@@ -17,14 +17,31 @@ Matching runs these passes, each over the nodes the earlier ones left unmatched:
    content agree as well.
    **Collection guard**: inside a collection item (a child of a RecyclerView,
    ListView, GridView, Lazy list or any node with CollectionInfo), the cell must
-   still show the same item. It does when its identity label (the first label in
-   the cell that no other cell of that collection has) is unchanged or absent on
-   both sides, or when the cell sits at the same position and its data did not
-   move to another cell. Otherwise the whole cell gets new refs with
-   ``rebound_of`` (a recycled cell). When the cell root itself lost its identity
-   match (re-minted), nothing inside it carries by id; the later passes decide.
+   still show the same item:
+
+   * its identity label (the first label in the cell that no other cell of that
+     collection has) is unchanged: the same item, even if an insertion shifted it;
+   * otherwise it must sit at the same position: the same adapter position
+     (``adapter_pos``, or the CollectionItemInfo row/column, ``row * columns +
+     column`` in a grid) when both sides report one, else the same sibling index
+     after the list's scroll offset (the most common index shift of the cells
+     both captures hold; a tie means no offset is known and nothing agrees);
+   * at the same position, a cell with no identity label on either side agrees;
+     a cell whose identity label changed, appeared or vanished agrees only when
+     its old data did not move to another cell and another distinguishing label
+     or testTag of the cell is still there (an in-place edit). A data-set change
+     (``notifyDataSetChanged``, a search filter, a refresh) rebinds every View in
+     place with nothing else in common, so it is a rebinding.
+
+   Otherwise the whole cell gets new refs with ``rebound_of`` (a recycled cell).
+   When the cell root itself lost its identity match (re-minted), nothing inside
+   it carries by id; the later passes decide.
 2. **Unique locators** present once on each side: ``(window z, #rid)``, ``@tag``
-   and the a11y uniqueId.
+   and the a11y uniqueId. A node inside a collection cell carries by a locator only
+   when its cell is already matched to the cell of the other node (a lone section
+   header or pager page is unique on both sides and still a different item). A
+   cell root carries only when both collections are matched and show two or more
+   cells, so the locator tells cells apart (a per-item testTag).
 3. **Structure**: the parent is matched, and the kind, type, rid, tag and label
    are equal. A node that is the only such sibling on both sides matches even if
    its ordinal changed (so an insertion above keeps the refs below it). Look-alike
@@ -53,10 +70,12 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from .anchors import collection_cols, item_positions
 from .model import (
     Index,
     LineageState,
@@ -306,45 +325,74 @@ class _Side:
     def _items(self) -> None:
         self.item_of: dict[str, str] = {}  # node -> nearest enclosing item root
         self.item_container: dict[str, str] = {}  # item root -> its container
-        self.item_pos: dict[str, int | None] = {}
+        self.item_pos: dict[str, int] = {}  # item root -> position (see item_real)
+        self.item_real: dict[str, bool] = {}  # True: an adapter position, else a sibling index
+        self.item_sib: dict[str, int] = {}  # item root -> sibling index
         self.containers = containers = {nid for nid in self.order
                                         if _is_container(self.nodes[nid])}
-        child_idx = {c: i for kids in self.kids.values() for i, c in enumerate(kids)}
         for nid in self.order:
             n = self.nodes[nid]
             p = self.parent[nid]
             if p != _ROOT and (p in containers or _anchor_index(n.anchor) is not None):
                 self.item_of[nid] = nid
                 self.item_container[nid] = p
-                if n.adapter_pos is not None:
-                    pos: int | None = int(n.adapter_pos)
-                else:
-                    pos = _anchor_index(n.anchor)
-                    if pos is None:
-                        pos = child_idx[nid]
-                self.item_pos[nid] = pos
             elif p in self.item_of:
                 self.item_of[nid] = self.item_of[p]
-        item_labels: dict[str, list[str]] = {i: [] for i in self.item_container}
+        by_container: dict[str, list[str]] = {}
+        for item, c in self.item_container.items():
+            by_container.setdefault(c, []).append(item)
+        for c, items in by_container.items():
+            items.sort(key=self.pos.__getitem__)
+            real = item_positions([self.nodes[i] for i in items],
+                                  collection_cols(self.nodes[c]))
+            for k, item in enumerate(items):
+                n = self.nodes[item]
+                self.item_sib[item] = k
+                if n.adapter_pos is not None:
+                    self.item_pos[item], self.item_real[item] = int(n.adapter_pos), True
+                elif real is not None:
+                    self.item_pos[item], self.item_real[item] = real[k], True
+                else:
+                    self.item_pos[item], self.item_real[item] = k, False
+        # Per cell: its labels (identity) and testTags (corroboration), in order.
+        # A token distinguishes a cell when no other cell of its collection has it,
+        # and only in a collection of two or more cells (with one cell on screen,
+        # everything in it is trivially "unique").
+        item_tokens: dict[str, list[tuple[str, str]]] = {i: [] for i in self.item_container}
+        n_labels: dict[str, int] = {i: 0 for i in self.item_container}
         for nid in self.order:
-            label = self.nodes[nid].label
             item = self.item_of.get(nid)
-            if (label and item is not None and len(item_labels[item]) < _ITEM_LABELS
-                    and label not in item_labels[item]):
-                item_labels[item].append(label)
-        counts: dict[tuple[str, str], int] = {}
-        for item, labels in item_labels.items():
-            for label in labels:
-                key = (self.item_container[item], label)
-                counts[key] = counts.get(key, 0) + 1
-        self.item_ident: dict[str, str | None] = {}
-        self.ident_items: dict[str, dict[str, str]] = {}  # container -> identity -> item
-        for item, labels in item_labels.items():
+            if item is None:
+                continue
+            n = self.nodes[nid]
+            toks = item_tokens[item]
+            if n.tag and ("tag", n.tag) not in toks:
+                toks.append(("tag", n.tag))
+            if n.label and n_labels[item] < _ITEM_LABELS and ("label", n.label) not in toks:
+                toks.append(("label", n.label))
+                n_labels[item] += 1
+        counts: dict[tuple[str, tuple[str, str]], int] = {}
+        self.cells: dict[str, int] = {}  # container -> how many cells it shows
+        cells = self.cells
+        for item, toks in item_tokens.items():
             c = self.item_container[item]
-            ident = next((lb for lb in labels if counts[(c, lb)] == 1), None)
-            self.item_ident[item] = ident
-            if ident is not None:
-                self.ident_items.setdefault(c, {})[ident] = item
+            cells[c] = cells.get(c, 0) + 1
+            for t in toks:
+                counts[(c, t)] = counts.get((c, t), 0) + 1
+        self.item_ident: dict[str, str | None] = {}
+        #: item root -> its distinguishing tokens (("label"|"tag", value))
+        self.item_uniq: dict[str, frozenset[tuple[str, str]]] = {}
+        #: container -> distinguishing label -> the item that has it
+        self.uniq_owner: dict[str, dict[str, str]] = {}
+        for item, toks in item_tokens.items():
+            c = self.item_container[item]
+            uniq = [t for t in toks if cells[c] > 1 and counts[(c, t)] == 1]
+            self.item_ident[item] = next((v for k, v in uniq if k == "label"), None)
+            self.item_uniq[item] = frozenset(uniq)
+            owners = self.uniq_owner.setdefault(c, {})
+            for k, v in uniq:
+                if k == "label":
+                    owners[v] = item
 
     # ---------------------------------------------------------------- locators
     def locators(self, nid: str) -> list[tuple]:
@@ -444,13 +492,14 @@ class _Matcher:
                 continue
             tent[nid] = pid  # canonical keys are unique per index, so this is 1:1
         memo: dict[str, bool | None] = {}
+        shifts = self._list_shifts(tent)
 
         def item_state(item: str) -> bool | None:
             """True: same item; False: the cell was rebound; None: the cell root
             has no identity match (e.g. re-minted), so nothing inside carries by id."""
             if item in memo:
                 return memo[item]
-            state = self._item_agrees(item, tent) if item in tent else None
+            state = self._item_agrees(item, tent, shifts) if item in tent else None
             outer = new.item_of.get(new.parent.get(item, _ROOT))
             if state is not False and outer is not None and item_state(outer) is False:
                 state = False  # a rebound outer cell rebinds everything inside it
@@ -468,25 +517,53 @@ class _Matcher:
             elif state and pid is not None:
                 self._pair(nid, pid, "id")
 
-    def _item_agrees(self, item: str, tent: Mapping[str, str]) -> bool:
+    def _list_shifts(self, tent: Mapping[str, str]) -> dict[str, int | None]:
+        """Per new container: how far the list scrolled, as the most common
+        (prev sibling index - new sibling index) of the cells both captures hold
+        by device identity; None when two shifts tie (no offset is known)."""
+        new, prev = self.new, self.prev
+        counts: dict[str, Counter] = {}
+        for item, c in new.item_container.items():
+            p_item = tent.get(item)
+            if p_item is None or p_item not in prev.item_container:
+                continue
+            counts.setdefault(c, Counter())[prev.item_sib[p_item] - new.item_sib[item]] += 1
+        out: dict[str, int | None] = {}
+        for c, cnt in counts.items():
+            top = cnt.most_common(2)
+            out[c] = top[0][0] if len(top) == 1 or top[0][1] > top[1][1] else None
+        return out
+
+    def _same_position(self, item: str, p_item: str, shifts: Mapping[str, int | None]) -> bool:
+        new, prev = self.new, self.prev
+        if new.item_real[item] and prev.item_real[p_item]:
+            return new.item_pos[item] == prev.item_pos[p_item]
+        shift = shifts.get(new.item_container[item])
+        return shift is not None and prev.item_sib[p_item] - new.item_sib[item] == shift
+
+    def _item_agrees(self, item: str, tent: Mapping[str, str],
+                     shifts: Mapping[str, int | None]) -> bool:
         new, prev = self.new, self.prev
         p_item = tent[item]
         if p_item not in prev.item_container:
             return True  # not a collection item before: nothing to compare
         ln, lp = new.item_ident.get(item), prev.item_ident.get(p_item)
-        if ln == lp:
-            # the same identity label, or none on either side (e.g. image-only cells):
-            # nothing contradicts the device identity
-            return True
-        if new.item_pos.get(item) != prev.item_pos.get(p_item):
+        if ln is not None and ln == lp:
+            return True  # the same distinguishing label: the same item
+        if not self._same_position(item, p_item, shifts):
+            return False  # recycled for another position
+        if ln is None and lp is None:
+            return True  # e.g. image-only cells: the position is all there is, and it agrees
+        # The identity label changed, appeared or vanished in place: an edit of this
+        # item only when its old data did not move to another cell and some other
+        # distinguishing content of the cell is still there; else a rebinding.
+        owners_new = new.uniq_owner.get(new.item_container[item], {})
+        owners_prev = prev.uniq_owner.get(prev.item_container[p_item], {})
+        if lp is not None and owners_new.get(lp, item) != item:
             return False
-        # same position, different identity: an in-place update, unless the data
-        # moved to another cell (a rebinding without scrolling)
-        other_new = new.ident_items.get(new.item_container[item], {})
-        other_prev = prev.ident_items.get(prev.item_container[p_item], {})
-        if lp is not None and other_new.get(lp, item) != item:
+        if ln is not None and owners_prev.get(ln, p_item) != p_item:
             return False
-        return not (ln is not None and other_prev.get(ln, p_item) != p_item)
+        return bool(new.item_uniq[item] & prev.item_uniq[p_item])
 
     # ---------------------------------------------------------------- pass 2
     def _locators(self) -> None:
@@ -508,9 +585,31 @@ class _Matcher:
                 if cnt_new.get(loc) != 1 or cnt_prev.get(loc) != 1:
                     continue
                 pid = by_prev[loc]
-                if self._free_prev(pid) and prev.nodes[pid].kind == new.nodes[nid].kind:
+                if (self._free_prev(pid) and prev.nodes[pid].kind == new.nodes[nid].kind
+                        and self._same_cell(nid, pid)):
                     self._pair(nid, pid, "locator")
                     break
+
+    def _same_cell(self, nid: str, pid: str) -> bool:
+        """The collection guard for locators. Outside collections anything goes.
+        A node inside a cell carries only when the two cells are already matched.
+        A cell root carries only when the two collections are matched and each
+        shows two or more cells: then a unique locator tells the cells apart (a
+        per-item testTag); with one cell on screen (a pager page, a lone header)
+        unique says nothing about which item it is."""
+        new, prev = self.new, self.prev
+        ni, pi = new.item_of.get(nid), prev.item_of.get(pid)
+        if ni is None and pi is None:
+            return True
+        if ni is None or pi is None:
+            return False
+        if ni != nid and pi != pid:
+            return self.n2p.get(ni) == pi
+        if ni != nid or pi != pid:
+            return False
+        cn, cp = new.item_container[nid], prev.item_container[pid]
+        return (self.n2p.get(cn) == cp and new.cells.get(cn, 0) > 1
+                and prev.cells.get(cp, 0) > 1)
 
     # ---------------------------------------------------------------- pass 3
     def _structure(self) -> int:

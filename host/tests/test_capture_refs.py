@@ -21,8 +21,8 @@ from capture_keyscenes import (
     shift_udids,
 )
 
+from inspector_widget.capture import anchors, refs
 from inspector_widget.capture import model as m
-from inspector_widget.capture import refs
 
 
 def plan(new, prev, *, same_pid=True, same_generation=True, start=1000):
@@ -216,12 +216,214 @@ def test_rebinding_in_place_with_shifted_data_is_a_rebound():
         assert b.nodes[b.by_key[key]].rebound_of == a.by_key[key]
 
 
+def _mail(cells, *, cid):
+    """RecyclerView #inbox: each cell has a subject and a sender (both per item)."""
+    rows = [V("LinearLayout", u,
+              V("TextView", u + 1, rid="subject", label=subject, b=(0, 100 * i, 400, 50)),
+              V("TextView", u + 2, rid="sender", label=sender, b=(0, 100 * i + 50, 400, 50)),
+              b=(0, 100 * i, 400, 100))
+            for i, (u, subject, sender) in enumerate(cells)]
+    return scene(V("DecorView", 1, V("RecyclerView", 3, *rows, rid="inbox", b=(0, 0, 400, 600)),
+                   b=(0, 0, 400, 600)), cid=cid)
+
+
 def test_in_place_cell_update_keeps_refs():
     chain = Chain()
-    a = chain.publish(_feed([(100, "Item 0"), (200, "Item 1")], cid="c00001"))
-    b = chain.publish(_feed([(100, "Item 0 (edited)"), (200, "Item 1")], cid="c00002"))
+    a = chain.publish(_mail([(100, "Lunch?", "Ana"), (200, "Standup", "Bo")], cid="c00001"))
+    # the subject is edited in place; the sender (also per item) is still there
+    b = chain.publish(_mail([(100, "Lunch at 1?", "Ana"), (200, "Standup", "Bo")],
+                            cid="c00002"))
     assert all(b.by_key[k] == a.by_key[k] for k in a.by_key if k in b.by_key)
     assert chain.last.rebound == {}
+
+
+def test_a_cell_whose_only_distinguishing_label_changes_in_place_is_a_rebound():
+    """A page-sized scroll, a search filter or a refresh (notifyDataSetChanged)
+    hands every View back at its own child index, bound to another item. Nothing
+    but the one label tells an edit from a rebinding, so the cell is rebound."""
+    chain = Chain()
+    a = chain.publish(_feed([(100, "Item 0"), (200, "Item 1"), (300, "Item 2")], cid="c00001"))
+    b = chain.publish(_feed([(100, "Item 3"), (200, "Item 4"), (300, "Item 5")], cid="c00002"))
+    for u in (100, 101, 102, 200, 201, 202, 300, 301, 302):
+        key = m.view_key(u)
+        new = b.nodes[b.by_key[key]]
+        assert new.ref != a.by_key[key] and new.rebound_of == a.by_key[key], key
+    assert b.by_key["view:3"] == a.by_key["view:3"]  # the list itself stays
+
+
+def _photos(cells, *, cid, first_row=None):
+    """A vertical RecyclerView #photos of image-only cells (no label anywhere).
+    ``first_row`` gives each cell its CollectionItemInfo row (adapter position)."""
+    kids = []
+    for i, u in enumerate(cells):
+        kw = {"a11y": {"item": {"row": first_row + i, "col": 0}}} if first_row is not None \
+            else {}
+        kids.append(V("FrameLayout", u, V("ImageView", u + 1, rid="photo",
+                                          b=(0, 200 * i, 400, 200)),
+                      b=(0, 200 * i, 400, 200), flags=["click"], **kw))
+    col = {"a11y": {"collection": {"rows": 99, "cols": 1}}} if first_row is not None else {}
+    ix = scene(V("DecorView", 1, V("RecyclerView", 3, *kids, rid="photos", b=(0, 0, 400, 600),
+                                   **col),
+                 b=(0, 0, 400, 600)), cid=cid)
+    anchors.assign_ui_anchors(ix)
+    return ix
+
+
+@pytest.mark.parametrize("rows", [True, False], ids=["adapter-rows", "sibling-shift"])
+def test_recycled_image_only_cell_gets_a_new_ref(rows):
+    chain = Chain()
+    a = chain.publish(_photos([100, 200, 300], cid="c00001", first_row=0 if rows else None))
+    # scroll by one: 200 and 300 move up; 100 is recycled at the bottom for row 3
+    b = chain.publish(_photos([200, 300, 100], cid="c00002", first_row=1 if rows else None))
+    for u in (200, 201, 300, 301):
+        key = m.view_key(u)
+        assert b.by_key[key] == a.by_key[key] and b.nodes[b.by_key[key]].match == "id"
+    for u in (100, 101):
+        key = m.view_key(u)
+        new = b.nodes[b.by_key[key]]
+        assert new.ref != a.by_key[key] and new.rebound_of == a.by_key[key]
+
+
+def test_image_only_cells_without_positions_keep_refs_when_nothing_moved():
+    chain = Chain()
+    a = chain.publish(_photos([100, 200, 300], cid="c00001"))
+    b = chain.publish(_photos([100, 200, 300], cid="c00002"))
+    assert all(b.by_key[k] == a.by_key[k] for k in a.by_key)
+
+
+def _grid(cells, *, cid, first_row, cols=2):
+    """A GridLayoutManager RecyclerView #grid; a11y (row, col) per cell."""
+    kids = []
+    for i, (u, label) in enumerate(cells):
+        r, c = first_row + i // cols, i % cols
+        kids.append(V("FrameLayout", u,
+                      V("TextView", u + 1, rid="name", label=label,
+                        b=(200 * c, 300 * (i // cols) + 200, 200, 50)),
+                      b=(200 * c, 300 * (i // cols), 200, 300),
+                      a11y={"item": {"row": r, "col": c}}))
+    ix = scene(V("DecorView", 1, V("RecyclerView", 3, *kids, rid="grid", b=(0, 0, 400, 600),
+                                   a11y={"collection": {"rows": 50, "cols": cols}}),
+                 b=(0, 0, 400, 600)), cid=cid)
+    anchors.assign_ui_anchors(ix)
+    return ix
+
+
+def test_grid_cells_use_row_and_column_as_their_position():
+    ix = _grid([(100, "Photo 0"), (200, "Photo 1"), (300, "Photo 2"), (400, "Photo 3")],
+               cid="c00001", first_row=2)
+    got = [ix.nodes[ix.by_key[m.view_key(u)]].anchor.rsplit("/", 1)[-1]
+           for u in (100, 200, 300, 400)]
+    assert got == ["FrameLayout[4]", "FrameLayout[5]", "FrameLayout[6]", "FrameLayout[7]"]
+
+
+def test_grid_page_jump_rebinds_every_cell():
+    chain = Chain()
+    a = chain.publish(_grid([(100, "Photo 0"), (200, "Photo 1"), (300, "Photo 2"),
+                             (400, "Photo 3")], cid="c00001", first_row=0))
+    # the same Views at the same child indexes now show photos 4-7
+    b = chain.publish(_grid([(100, "Photo 4"), (200, "Photo 5"), (300, "Photo 6"),
+                             (400, "Photo 7")], cid="c00002", first_row=2))
+    for u in (100, 101, 200, 201, 300, 301, 400, 401):
+        key = m.view_key(u)
+        new = b.nodes[b.by_key[key]]
+        assert new.ref != a.by_key[key] and new.rebound_of == a.by_key[key], key
+
+
+def test_grid_scroll_by_one_row_keeps_the_cells_that_stayed():
+    chain = Chain()
+    a = chain.publish(_grid([(100, "Photo 0"), (200, "Photo 1"), (300, "Photo 2"),
+                             (400, "Photo 3")], cid="c00001", first_row=0))
+    # row 1 moved up; the row-0 Views were recycled for row 2 (photos 4 and 5)
+    b = chain.publish(_grid([(300, "Photo 2"), (400, "Photo 3"), (100, "Photo 4"),
+                             (200, "Photo 5")], cid="c00002", first_row=1))
+    for u in (300, 301, 400, 401):
+        assert b.by_key[m.view_key(u)] == a.by_key[m.view_key(u)]
+    for u in (100, 200):
+        assert b.nodes[b.by_key[m.view_key(u)]].rebound_of == a.by_key[m.view_key(u)]
+
+
+def test_an_insertion_above_keeps_labelled_cells_whose_positions_shifted():
+    def rows(cells, *, cid):
+        kids = [V("FrameLayout", u, V("TextView", u + 1, rid="t", label=lab,
+                                      b=(0, 100 * i, 400, 100)),
+                  b=(0, 100 * i, 400, 100), a11y={"item": {"row": r, "col": 0}})
+                for i, (u, lab, r) in enumerate(cells)]
+        return scene(V("DecorView", 1, V("RecyclerView", 3, *kids, rid="l", b=(0, 0, 400, 600),
+                                         a11y={"collection": {"rows": 9, "cols": 1}}),
+                       b=(0, 0, 400, 600)), cid=cid)
+
+    chain = Chain()
+    a = chain.publish(rows([(100, "Ana", 0), (200, "Bo", 1)], cid="c00001"))
+    # a new message was inserted at the top: every item moved one position down
+    b = chain.publish(rows([(300, "Cy", 0), (100, "Ana", 1), (200, "Bo", 2)], cid="c00002"))
+    for u in (100, 101, 200, 201):
+        assert b.by_key[m.view_key(u)] == a.by_key[m.view_key(u)]
+
+
+def _inbox(cells, *, cid, first_row):
+    """A RecyclerView with one section header cell (#section_title) plus rows."""
+    kids = []
+    for i, (u, kind, label) in enumerate(cells):
+        inner = V("TextView", u + 1, rid="section_title" if kind == "h" else "msg", label=label,
+                  b=(0, 100 * i, 400, 50))
+        kids.append(V("FrameLayout", u, inner, b=(0, 100 * i, 400, 100),
+                      a11y={"item": {"row": first_row + i, "col": 0}}))
+    return scene(V("DecorView", 1, V("RecyclerView", 3, *kids, rid="inbox", b=(0, 0, 400, 600),
+                                     a11y={"collection": {"rows": 99, "cols": 1}}),
+                   b=(0, 0, 400, 600)), cid=cid)
+
+
+def test_a_freshly_inflated_header_never_inherits_the_old_headers_ref_by_locator():
+    chain = Chain()
+    a = chain.publish(_inbox([(100, "h", "Today"), (200, "m", "Lunch?"), (300, "m", "Standup")],
+                             cid="c00001", first_row=0))
+    # scrolled: "Today" left; the "Yesterday" header is a new ViewHolder
+    b = chain.publish(_inbox([(400, "m", "Invoice"), (500, "h", "Yesterday"), (600, "m", "Hi")],
+                             cid="c00002", first_row=7))
+    title = b.nodes[b.by_key["view:501"]]
+    assert title.ref != a.by_key["view:101"] and title.match == "new"
+    assert a.by_key["view:101"] in chain.last.tomb
+
+
+def test_a_single_page_pager_never_carries_a_page_title_to_another_page():
+    def pager(u, title, *, cid):
+        return scene(V("DecorView", 1,
+                       V("RecyclerView", 3,
+                         V("FrameLayout", u,
+                           V("TextView", u + 1, rid="page_title", label=title,
+                             b=(0, 100, 400, 60)),
+                           V("Button", u + 2, rid="next", label="Next", b=(0, 700, 400, 80)),
+                           b=(0, 0, 400, 800)),
+                         rid="pager", b=(0, 0, 400, 800)),
+                       b=(0, 0, 400, 800)), cid=cid)
+
+    chain = Chain()
+    a = chain.publish(pager(100, "Welcome", cid="c00001"))
+    b = chain.publish(pager(200, "Pick a plan", cid="c00002"))
+    assert b.by_key["view:200"] != a.by_key["view:100"]
+    assert b.by_key["view:201"] != a.by_key["view:101"]  # #page_title
+    assert b.by_key["view:202"] != a.by_key["view:102"]  # #next
+    assert b.by_key["view:3"] == a.by_key["view:3"]
+
+
+def test_a_compose_pager_page_tag_does_not_carry_across_pages():
+    def page(sid, title, *, cid):
+        return scene(V("DecorView", 1,
+                       V("AndroidComposeView", 82,
+                         C(1, C(40, C(sid, C(sid + 1, tag="page_title", label=title,
+                                             b=(0, 100, 400, 60)),
+                                        b=(0, 0, 400, 800)),
+                                tag="pager", attrs={"CollectionInfo": "CollectionInfo"},
+                                b=(0, 0, 400, 800)),
+                           b=(0, 0, 400, 800)),
+                         b=(0, 0, 400, 800)),
+                       b=(0, 0, 400, 800)), cid=cid)
+
+    chain = Chain()
+    a = chain.publish(page(10, "Welcome", cid="c00001"))
+    b = chain.publish(page(20, "Pick a plan", cid="c00002"))
+    assert b.by_key["sem:82:21"] != a.by_key["sem:82:11"]
+    assert b.by_key["sem:82:40"] == a.by_key["sem:82:40"]  # @pager itself carries
 
 
 def test_a_fresh_cell_never_inherits_a_scrolled_off_cells_ref():
