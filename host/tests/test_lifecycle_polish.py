@@ -1,12 +1,14 @@
 """Lifecycle polish, offline: no retry during exit cleanup or after a detach,
 retries only for calls that are safe to repeat, the session note on every
-session tool (CLI parity), argument normalization.
+session tool (CLI parity), argument normalization, JSON-RPC notifications.
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
 
 from __future__ import annotations
 
+import io
+import json
 import sys
 import threading
 import time
@@ -370,3 +372,51 @@ def test_cli_scale_takes_the_mcp_range(run_cli, fake_device, value, capsys):
         run_cli("screenshot", "--out", "x.png", "--scale", value)
     assert "--scale" in capsys.readouterr().err
     assert fake_device.wire == []
+
+
+# =========================================================================== #
+# 5. The JSON-RPC fallback never answers a notification
+# =========================================================================== #
+@pytest.mark.parametrize("message", [
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}},
+    {"jsonrpc": "2.0", "method": "ping"},
+    {"jsonrpc": "2.0", "method": "no/such/method"},
+    {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "list_devices"}},
+    {"jsonrpc": "2.0", "method": "tools/list", "params": "not an object"},
+])
+def test_a_notification_gets_no_reply_and_runs_nothing(message, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_call_tool_text",
+                        lambda *a: pytest.fail("a notification ran a tool"))
+    assert mcp_server._fallback_handle(message) is None
+
+
+def test_requests_with_an_id_are_still_answered():
+    assert mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 0, "method": "ping"}) == \
+        {"jsonrpc": "2.0", "id": 0, "result": {}}
+    bad = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": None, "method": "nope"})
+    assert bad["error"]["code"] == -32601 and bad["id"] is None
+    params = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 4, "method": "tools/list",
+                                          "params": []})
+    assert params["error"]["code"] == -32602
+    as_request = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 5,
+                                              "method": "notifications/initialized"})
+    assert as_request == {"jsonrpc": "2.0", "id": 5, "result": {}}  # a request is answered
+    # Not a valid request object at all (JSON-RPC 2.0 section 5.1): answered with id null.
+    invalid = mcp_server._fallback_handle({"jsonrpc": "2.0", "method": 1})
+    assert invalid["error"]["code"] == -32600 and invalid["id"] is None
+
+
+def test_an_internal_error_on_a_notification_is_not_answered(monkeypatch):
+    def broken(message):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mcp_server, "_fallback_handle", broken)
+    lines = [{"jsonrpc": "2.0", "method": "notifications/initialized"},
+             {"jsonrpc": "2.0", "id": 7, "method": "ping"}]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(m) + "\n" for m in lines)))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    mcp_server._serve_fallback()
+    replies = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [(r["id"], r["error"]["code"]) for r in replies] == [(7, -32603)]

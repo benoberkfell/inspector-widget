@@ -2332,15 +2332,24 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
     req_id = message.get("id")
     if not isinstance(method, str):
         return _jsonrpc_error(req_id, -32600, "invalid request: 'method' must be a string")
+    if "id" not in message:
+        # A notification: never answered, not even with an error (JSON-RPC 2.0
+        # section 4.1). MCP's are notifications/* (initialized, cancelled, ...),
+        # which need nothing from this server; any other is ignored rather than
+        # run, since its result could never be reported.
+        if not method.startswith("notifications/"):
+            log.debug("ignoring JSON-RPC notification %r", method)
+        return None
     params = message.get("params")
     if params is None:
         params = {}
     if not isinstance(params, dict):
         return _jsonrpc_error(req_id, -32602, "invalid params: 'params' must be an object")
 
-    # Notifications (no id) get no response.
-    if method == "notifications/initialized" or (method and method.startswith("notifications/")):
-        return None
+    if method.startswith("notifications/"):
+        # Sent as a request (with an id) by mistake: a request is always
+        # answered, and there is nothing to report but that it arrived.
+        return _jsonrpc_result(req_id, {})
 
     if method == "initialize":
         return _jsonrpc_result(
@@ -2376,9 +2385,7 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
             req_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
         )
 
-    if req_id is not None:
-        return _jsonrpc_error(req_id, -32601, f"method not found: {method}")
-    return None
+    return _jsonrpc_error(req_id, -32601, f"method not found: {method}")
 
 
 def _serve_fallback() -> None:
@@ -2401,6 +2408,8 @@ def _serve_fallback() -> None:
             response = _fallback_handle(message)
         except Exception as exc:  # pragma: no cover - the traceback goes to stderr only
             log.exception("internal error handling a JSON-RPC message")
+            if isinstance(message, dict) and "id" not in message:
+                continue  # a notification: no reply, not even an error
             req_id = message.get("id") if isinstance(message, dict) else None
             response = _jsonrpc_error(req_id, -32603, f"internal error: {type(exc).__name__}: {exc}")
         if response is not None:
