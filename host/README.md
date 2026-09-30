@@ -86,7 +86,9 @@ host/.venv/bin/python host/mcp_server.py --self-check
 
 Useful flags / env:
 
-- `--self-check` — print tool surface + import status and exit.
+- `--self-check` — print the tool surface and dependency status (mcp SDK, Pillow, grpcio,
+  with the tools each missing one degrades), then exit. Exits 1 if the host package,
+  the proto gencode, or the installed mcp SDK is broken.
 - `--log-level DEBUG|INFO|WARNING|ERROR` (or `INSPECTOR_WIDGET_LOG=DEBUG`) — log
   verbosity (to stderr).
 
