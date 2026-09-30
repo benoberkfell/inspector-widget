@@ -47,7 +47,9 @@
  * at the end of the MainThread.run block.
  *
  * Bounds: getBoundsInScreen() — absolute screen px, the same space as ViewNode.bounds
- * and ComposeNode.bounds.
+ * and ComposeNode.bounds. In query mode the connection returns them relative to the window,
+ * so a window away from the screen origin (dialog, popup) is shifted back by the offset
+ * connectionOffset measures (diagnostics: window-offset=dx,dy).
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -158,6 +160,13 @@ object AccessibilityInspector {
          * id resolves to the current root rather than through the index.
          */
         var currentRoot: View? = null
+
+        /**
+         * Added to the bounds of every node the in-process connection returns for the current
+         * window (see [connectionOffset]); 0,0 for a window at the screen origin.
+         */
+        var boundsDx = 0
+        var boundsDy = 0
         var indexBuilds = 0
         var unresolvedNodes = 0
         var unresolvedLinks = 0
@@ -243,8 +252,12 @@ object AccessibilityInspector {
                         if (hostNode != null) {
                             hostNode.setQueryFromAppProcessEnabled(root, true)
                             enabledNode = hostNode
+                            val (dx, dy) = connectionOffset(hostNode, ctx)
+                            ctx.boundsDx = dx
+                            ctx.boundsDy = dy
                             node = walk(hostNode, identify(hostNode, null, ctx), ctx, 0, local = false)
                             diag.append("; root#${idOf(root)} query-from-app-process")
+                            if (dx != 0 || dy != 0) diag.append("; root#${idOf(root)} window-offset=$dx,$dy")
                         } else {
                             diag.append("; root#${idOf(root)} null host node")
                         }
@@ -256,6 +269,8 @@ object AccessibilityInspector {
                         resetQueryMode(enabledNode, root)
                         enabledNode = null
                         ctx.count = countBefore
+                        ctx.boundsDx = 0
+                        ctx.boundsDy = 0
                         node = null
                     }
                 }
@@ -283,6 +298,39 @@ object AccessibilityInspector {
         if (ctx.unenumerable > 0) diag.append("; provider-children-unreachable=${ctx.unenumerable}")
         if (ctx.reflectFailures > 0) diag.append("; reflect-failures=${ctx.reflectFailures}")
         return windows to diag.toString()
+    }
+
+    /**
+     * The shift that puts connection-served bounds back in screen px. For each node it serves,
+     * AccessibilityInteractionController translates boundsInScreen by -mWindowLeft/-mWindowTop
+     * (into window coordinates) and relies on the caller's window-to-screen matrix to map them
+     * back; system_server supplies that matrix for a real service, the in-process
+     * query-from-app-process connection supplies none. So in a window that does not start at the
+     * screen origin (a dialog, a popup) every node but the locally built root came back
+     * window-relative. Measure the shift on the first child of the root that is a real View: its
+     * node as served by the connection against the same View's node built locally
+     * (createAccessibilityNodeInfo, screen px). 0,0 when they agree or the probe fails.
+     */
+    private fun connectionOffset(hostNode: AccessibilityNodeInfo, ctx: Ctx): Pair<Int, Int> {
+        return try {
+            for (i in 0 until hostNode.childCount) {
+                val child = hostNode.getChild(i) ?: continue
+                val packed = sourceNodeId(child, ctx) ?: continue
+                if (A11yIds.isUndefined(packed) || A11yIds.virtualIdOf(packed) != HOST_VIEW_ID) continue
+                val view = viewFor(A11yIds.accessibilityViewIdOf(packed), ctx) ?: continue
+                val local = view.createAccessibilityNodeInfo() ?: continue
+                val viaConnection = Rect()
+                val direct = Rect()
+                child.getBoundsInScreen(viaConnection)
+                local.getBoundsInScreen(direct)
+                if (direct.isEmpty || viaConnection.isEmpty) continue
+                return (direct.left - viaConnection.left) to (direct.top - viaConnection.top)
+            }
+            0 to 0
+        } catch (t: Throwable) {
+            ctx.fail("a11y window-offset probe", t)
+            0 to 0
+        }
     }
 
     private fun resetQueryMode(node: AccessibilityNodeInfo?, root: View) {
@@ -489,6 +537,12 @@ object AccessibilityInspector {
         }
 
         mapNode(node, ident, b, ctx, local)
+        if (!local && depth > 0 && (ctx.boundsDx != 0 || ctx.boundsDy != 0)) {
+            val l = b.bounds.layout
+            b.bounds = b.bounds.toBuilder()
+                .setLayout(l.toBuilder().setX(l.x + ctx.boundsDx).setY(l.y + ctx.boundsDy))
+                .build()
+        }
 
         if (depth < MAX_DEPTH && ctx.count < MAX_NODES) {
             val n = safeInt { node.childCount }
