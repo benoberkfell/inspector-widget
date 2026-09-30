@@ -28,13 +28,24 @@
  * Responsibilities (CONTRACT.md §2, modeled on
  *   tools-base/ui-inspector/agent/native/agent.cc and
  *   tools-base/app-inspection/native/src/app_inspection_service.cc):
- *   1. GetEnv a stand-alone JVMTI 1.2 environment and add all potential caps.
+ *   1. GetEnv a stand-alone JVMTI 1.2 environment. No capabilities are requested:
+ *      nothing below needs one, and potential capabilities such as
+ *      can_retransform_classes / can_access_local_variables switch ART into a
+ *      slower, deoptimized mode for the whole app. (Only if silencing hidden-API
+ *      enforcement fails without them are they added for a retry.)
  *   2. (Best effort) silence hidden-API enforcement so the payload may reach
  *      framework internals (WindowInspector, getUniqueDrawingId, Inspection
  *      companions, ...). Same mechanism as HiddenApiSilencer in tools-base.
- *   3. AddToBootstrapClassLoaderSearch(bootstrapDexPath).
- *   4. FindClass com/oberkfell/viewspector/agent/Bootstrap, get its static
+ *   3. AddToBootstrapClassLoaderSearch(bootstrapDexPath), unless an earlier
+ *      attach already made Bootstrap loadable (re-injection must not append the
+ *      same dex to the boot class path again).
+ *   4. DisposeEnvironment: both effects above are process-wide and outlive the
+ *      env, which (with any capabilities it held) is released at once.
+ *   5. FindClass com/oberkfell/viewspector/agent/Bootstrap, get its static
  *      initialize(String payloadPath, String socketName)V and call it.
+ *
+ * Only the attach path is supported: Agent_OnLoad (loading at VM start with
+ * -agentpath) runs before the VM and the app exist, so it refuses with JNI_ERR.
  *
  * Self-contained on purpose: only <jni.h>, <jvmti.h>, <android/log.h>, <string>.
  */
@@ -126,34 +137,45 @@ jvmtiEnv* CreateJvmtiEnv(JavaVM* vm) {
   return jvmti;
 }
 
+// How bad a JVMTI error is for the install: kFatal ones abort it (logged at
+// E), kRecoverable ones are worked around (logged at W). The host reads the
+// agent's E lines while it waits for the socket and fails the attach on a
+// fatal one, so a recoverable error must never be logged at E.
+enum class JvmtiSeverity { kFatal, kRecoverable };
+
 // Logs and returns true when err is not JVMTI_ERROR_NONE. Mirrors
 // profiler::CheckJvmtiError in jvmti_helper.cc:47.
-bool CheckJvmtiError(jvmtiEnv* jvmti, jvmtiError err, const char* what) {
+bool CheckJvmtiError(jvmtiEnv* jvmti, jvmtiError err, const char* what,
+                     JvmtiSeverity severity) {
   if (err == JVMTI_ERROR_NONE) {
     return false;
   }
   char* name = nullptr;
   jvmti->GetErrorName(err, &name);
-  VS_LOGE("JVMTI error %d(%s) during %s", err,
-          name == nullptr ? "Unknown" : name, what);
+  const int priority = severity == JvmtiSeverity::kFatal ? ANDROID_LOG_ERROR
+                                                          : ANDROID_LOG_WARN;
+  __android_log_print(priority, kLogTag, "JVMTI error %d(%s) during %s", err,
+                      name == nullptr ? "Unknown" : name, what);
   if (name != nullptr) {
     jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
   }
   return true;
 }
 
-// Adds all potential capabilities. Mirrors profiler::SetAllCapabilities in
-// jvmti_helper.cc:61. We don't strictly need the bytecode-rewriting caps, but
-// requesting the full potential set is harmless on a debuggable app and matches
-// the reference agents.
-void AddAllCapabilities(jvmtiEnv* jvmti) {
+// Adds every potential capability. Mirrors profiler::SetAllCapabilities in
+// jvmti_helper.cc:61. Used ONLY as a fallback when silencing hidden-API
+// enforcement fails without capabilities: several potential capabilities make
+// ART deoptimize the whole app, so the default path requests none. The env is
+// disposed right after install, which relinquishes them again.
+bool AddPotentialCapabilities(jvmtiEnv* jvmti) {
   jvmtiCapabilities caps;
   std::memset(&caps, 0, sizeof(caps));
   if (CheckJvmtiError(jvmti, jvmti->GetPotentialCapabilities(&caps),
-                      "GetPotentialCapabilities")) {
-    return;
+                      "GetPotentialCapabilities", JvmtiSeverity::kRecoverable)) {
+    return false;
   }
-  CheckJvmtiError(jvmti, jvmti->AddCapabilities(&caps), "AddCapabilities");
+  return !CheckJvmtiError(jvmti, jvmti->AddCapabilities(&caps),
+                          "AddCapabilities", JvmtiSeverity::kRecoverable);
 }
 
 // ------------------------------------------------ hidden-api enforcement
@@ -164,14 +186,16 @@ void AddAllCapabilities(jvmtiEnv* jvmti) {
 // tools-base/transport/native/jvmti/hidden_api_silencer.cc:30. It is purely
 // additive: if the extension is unavailable we log and continue (the app is
 // debuggable, so most APIs are reachable regardless).
-void DisableHiddenApiEnforcement(jvmtiEnv* jvmti) {
+enum class HiddenApiResult { kDisabled, kUnavailable, kFailed };
+
+HiddenApiResult DisableHiddenApiEnforcement(jvmtiEnv* jvmti) {
   jint count = 0;
   jvmtiExtensionFunctionInfo* extensions = nullptr;
   if (CheckJvmtiError(jvmti, jvmti->GetExtensionFunctions(&count, &extensions),
-                      "GetExtensionFunctions") ||
+                      "GetExtensionFunctions", JvmtiSeverity::kRecoverable) ||
       extensions == nullptr) {
     VS_LOGW("Hidden-API extension functions unavailable; continuing");
-    return;
+    return HiddenApiResult::kUnavailable;
   }
 
   jvmtiExtensionFunction disable_fn = nullptr;
@@ -185,10 +209,15 @@ void DisableHiddenApiEnforcement(jvmtiEnv* jvmti) {
     }
   }
 
+  HiddenApiResult result = HiddenApiResult::kUnavailable;
   if (disable_fn != nullptr) {
     const jvmtiError err = disable_fn(jvmti);
-    if (!CheckJvmtiError(jvmti, err, "disable_hidden_api_enforcement_policy")) {
+    if (!CheckJvmtiError(jvmti, err, "disable_hidden_api_enforcement_policy",
+                         JvmtiSeverity::kRecoverable)) {
       VS_LOGI("Hidden-API enforcement disabled for this process");
+      result = HiddenApiResult::kDisabled;
+    } else {
+      result = HiddenApiResult::kFailed;
     }
   } else {
     VS_LOGW(
@@ -210,6 +239,7 @@ void DisableHiddenApiEnforcement(jvmtiEnv* jvmti) {
     jvmti->Deallocate(reinterpret_cast<unsigned char*>(ext.id));
   }
   jvmti->Deallocate(reinterpret_cast<unsigned char*>(extensions));
+  return result;
 }
 
 // ----------------------------------------------------------------- jni env
@@ -250,8 +280,48 @@ bool ClearPendingException(JNIEnv* env, const char* what) {
 }
 
 // ----------------------------------------------------------------- core
-// Shared body for both OnAttach (cmd activity attach-agent) and OnLoad
-// (-agentpath). Returns JNI_OK on success, JNI_ERR otherwise.
+// Detaches the current thread on scope exit when this agent attached it.
+struct ThreadDetacher {
+  JavaVM* vm;
+  bool attached;
+  ~ThreadDetacher() {
+    // The agent thread that runs Payload is spawned by the Java side, so
+    // nothing here needs to stay attached.
+    if (attached) vm->DetachCurrentThread();
+  }
+};
+
+// Disposes the JVMTI env (releasing any capabilities it holds) on scope exit,
+// unless Dispose() already did.
+struct JvmtiEnvDisposer {
+  jvmtiEnv* jvmti;
+  void Dispose() {
+    if (jvmti == nullptr) return;
+    CheckJvmtiError(jvmti, jvmti->DisposeEnvironment(), "DisposeEnvironment",
+                    JvmtiSeverity::kRecoverable);
+    jvmti = nullptr;
+  }
+  ~JvmtiEnvDisposer() { Dispose(); }
+};
+
+// Looks up Bootstrap through the system class loader (which delegates to the
+// boot class path). Returns nullptr, with the pending exception cleared, when
+// it is not loadable (yet). |quiet| skips the log for the expected first miss.
+jclass FindBootstrapClass(JNIEnv* env, bool quiet) {
+  jclass cls = env->FindClass(kBootstrapClassName);
+  if (env->ExceptionCheck()) {
+    if (quiet) {
+      env->ExceptionClear();
+    } else {
+      ClearPendingException(env, "FindClass(Bootstrap)");
+    }
+    return nullptr;
+  }
+  return cls;
+}
+
+// The attach path (`cmd activity attach-agent <pkg> <so>=<options>`). Returns
+// JNI_OK on success, JNI_ERR otherwise.
 jint InstallAgent(JavaVM* vm, char* options) {
   VS_LOGI("ViewSpector native agent attaching (options='%s')",
           options == nullptr ? "<null>" : options);
@@ -271,35 +341,50 @@ jint InstallAgent(JavaVM* vm, char* options) {
   if (env == nullptr) {
     return JNI_ERR;
   }
+  ThreadDetacher detacher{vm, we_attached};
 
   jvmtiEnv* jvmti = CreateJvmtiEnv(vm);
   if (jvmti == nullptr) {
-    if (we_attached) vm->DetachCurrentThread();
     return JNI_ERR;
   }
+  JvmtiEnvDisposer disposer{jvmti};
 
-  AddAllCapabilities(jvmti);
-  DisableHiddenApiEnforcement(jvmti);
+  // Step 2, with no capabilities. Should this ART refuse without them, retry
+  // once with the potential set (relinquished when the env is disposed below).
+  if (DisableHiddenApiEnforcement(jvmti) == HiddenApiResult::kFailed) {
+    VS_LOGW("Retrying hidden-API silencing with the potential capabilities added");
+    if (AddPotentialCapabilities(jvmti)) {
+      DisableHiddenApiEnforcement(jvmti);
+    }
+  }
 
   // Step 3: make the bootstrap dex visible to the bootstrap class loader so the
   // upcoming FindClass can resolve com/oberkfell/viewspector/agent/Bootstrap.
-  VS_LOGI("AddToBootstrapClassLoaderSearch('%s')",
-          parsed.bootstrap_dex_path.c_str());
-  if (CheckJvmtiError(
-          jvmti,
-          jvmti->AddToBootstrapClassLoaderSearch(
-              parsed.bootstrap_dex_path.c_str()),
-          "AddToBootstrapClassLoaderSearch")) {
-    if (we_attached) vm->DetachCurrentThread();
-    return JNI_ERR;
+  // A re-injection finds it already there and must not append it again.
+  jclass bootstrap_class = FindBootstrapClass(env, /*quiet=*/true);
+  if (bootstrap_class != nullptr) {
+    VS_LOGI("Bootstrap already on the boot class path (earlier attach); not re-appending");
+  } else {
+    VS_LOGI("AddToBootstrapClassLoaderSearch('%s')",
+            parsed.bootstrap_dex_path.c_str());
+    if (CheckJvmtiError(
+            jvmti,
+            jvmti->AddToBootstrapClassLoaderSearch(
+                parsed.bootstrap_dex_path.c_str()),
+            "AddToBootstrapClassLoaderSearch", JvmtiSeverity::kFatal)) {
+      return JNI_ERR;
+    }
   }
 
-  // Step 4: locate Bootstrap and its static initialize(String,String)V.
-  jclass bootstrap_class = env->FindClass(kBootstrapClassName);
-  if (ClearPendingException(env, "FindClass(Bootstrap)") ||
-      bootstrap_class == nullptr) {
+  // Step 4: both JVMTI effects are process-wide; the env is no longer needed.
+  disposer.Dispose();
+
+  // Step 5: locate Bootstrap and its static initialize(String,String)V.
+  if (bootstrap_class == nullptr) {
+    bootstrap_class = FindBootstrapClass(env, /*quiet=*/false);
+  }
+  if (bootstrap_class == nullptr) {
     VS_LOGE("Could not find class %s", kBootstrapClassName);
-    if (we_attached) vm->DetachCurrentThread();
     return JNI_ERR;
   }
 
@@ -310,7 +395,6 @@ jint InstallAgent(JavaVM* vm, char* options) {
     VS_LOGE("Could not find %s.%s%s", kBootstrapClassName,
             kInitializeMethodName, kInitializeMethodSignature);
     env->DeleteLocalRef(bootstrap_class);
-    if (we_attached) vm->DetachCurrentThread();
     return JNI_ERR;
   }
 
@@ -322,7 +406,6 @@ jint InstallAgent(JavaVM* vm, char* options) {
     if (payload_arg != nullptr) env->DeleteLocalRef(payload_arg);
     if (socket_arg != nullptr) env->DeleteLocalRef(socket_arg);
     env->DeleteLocalRef(bootstrap_class);
-    if (we_attached) vm->DetachCurrentThread();
     return JNI_ERR;
   }
 
@@ -343,12 +426,6 @@ jint InstallAgent(JavaVM* vm, char* options) {
   env->DeleteLocalRef(payload_arg);
   env->DeleteLocalRef(socket_arg);
   env->DeleteLocalRef(bootstrap_class);
-
-  // Detach only if we performed the attach; the agent thread that ran Payload
-  // is spawned by the Java side, so nothing here needs to stay attached.
-  if (we_attached) {
-    vm->DetachCurrentThread();
-  }
   return rc;
 }
 
@@ -361,10 +438,19 @@ extern "C" JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM* vm, char* options,
   return InstallAgent(vm, options);
 }
 
-// -agentpath path (load at VM start): delegates to the same install body.
-extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char* options,
+// -agentpath path (load at VM start): NOT supported. Agent_OnLoad runs in the
+// OnLoad phase, before the VM has started and long before the app exists, so
+// FindClass / Bootstrap.initialize (which needs the app's class loader) cannot
+// work there. Refuse clearly instead of failing halfway through the install.
+extern "C" JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* /*vm*/, char* options,
                                                void* /*reserved*/) {
-  return InstallAgent(vm, options);
+  VS_LOGE(
+      "ViewSpector cannot load at VM start (-agentpath / Agent_OnLoad, "
+      "options='%s'); attach it to the running app instead: "
+      "adb shell cmd activity attach-agent <package> "
+      "<path>/libviewspector.so=<bootstrap.dex>:<payload.jar>:<socket>",
+      options == nullptr ? "<null>" : options);
+  return JNI_ERR;
 }
 
 // Symmetric unload hook. The payload owns its own LocalServerSocket/thread and

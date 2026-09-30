@@ -30,6 +30,10 @@
     <string name="view_section_form">6. EditText label (labelFor)</string>
     <string name="view_section_switch">7. Switch stateDescription</string>
     <string name="view_section_heading">8. Heading semantics</string>
+    <string name="view_section_password">9. Password fields</string>
+    <string name="password_label">Password</string>
+    <string name="pin_label">PIN</string>
+    <string name="visible_password_label">Password (shown)</string>
 
     <string name="label_good">GOOD</string>
     <string name="label_bad">BAD</string>

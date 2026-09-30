@@ -7,7 +7,7 @@
   The BAD views are DELIBERATE defects (the host golden test,
   host/tests/test_device_a11y_golden.py, asserts each one is flagged). Sections
   1-6 carry lint expectations and are kept compact so they all fit above the
-  fold of a phone screen without scrolling; 7-8 are dump-only checks.
+  fold of a phone screen without scrolling; 7-9 are dump-only checks.
   GOOD and BAD labels differ so the duplicate-label rule never pairs them.
 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
@@ -278,6 +278,63 @@
             android:layout_height="wrap_content"
             android:text="@string/account_body"
             android:textColor="@color/text_good_contrast" />
+
+        <!-- ============ 9. Password fields (dump-only: redaction) ============ -->
+        <!-- Both fields get a known secret in the Activity; the agent must never send it:
+             the View tree, the properties and the a11y text carry one bullet per character. -->
+        <TextView
+            style="@style/SectionTitle"
+            android:text="@string/view_section_password" />
+
+        <TextView
+            android:id="@+id/passwordLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:labelFor="@+id/passwordField"
+            android:text="@string/password_label"
+            android:textColor="@color/text_good_contrast" />
+
+        <EditText
+            android:id="@+id/passwordField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:importantForAutofill="no"
+            android:inputType="textPassword"
+            android:minHeight="48dp" />
+
+        <TextView
+            android:id="@+id/pinLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:labelFor="@+id/pinField"
+            android:text="@string/pin_label"
+            android:textColor="@color/text_good_contrast" />
+
+        <EditText
+            android:id="@+id/pinField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:importantForAutofill="no"
+            android:inputType="numberPassword"
+            android:minHeight="48dp" />
+
+        <!-- A "show password" field: no transformation, so its text (and the text of the
+             accessibility events it sends) is the plaintext; only the input type says secret. -->
+        <TextView
+            android:id="@+id/visiblePasswordLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:labelFor="@+id/visiblePasswordField"
+            android:text="@string/visible_password_label"
+            android:textColor="@color/text_good_contrast" />
+
+        <EditText
+            android:id="@+id/visiblePasswordField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:importantForAutofill="no"
+            android:inputType="textVisiblePassword"
+            android:minHeight="48dp" />
 
     </LinearLayout>
 </ScrollView>
