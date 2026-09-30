@@ -21,6 +21,8 @@
 
 package com.oberkfell.a11yprobe
 
+import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.WebView
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -95,18 +97,20 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.node.RootForTest
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.getAllSemanticsNodes
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.isTraversalGroup
-import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.traversalIndex
@@ -114,9 +118,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
 
 /**
  * One TalkBack navigation scenario.
@@ -550,24 +554,25 @@ private fun C11SwipeDismiss(variant: String) = TbColumn("C11 ${label(variant)}: 
 }
 
 // ---------------------------------------------------------------------------
-// C12 focus_steal: BAD a LaunchedEffect keyed on a ticking value keeps calling
-// requestFocus() on the field, which pulls TalkBack back to it every 2s. GOOD
-// asks once.
+// C12 focus_steal: BAD a LaunchedEffect keyed on a ticking value (a refresh
+// every 2s) puts accessibility focus back on the search button each time, so
+// TalkBack is pulled back there mid-walk. GOOD does it once, on arrival.
+// (TalkBack 17 does not follow input focus from requestFocus() here, for a
+// Button or a TextField, so the steal is the explicit kind.)
 // ---------------------------------------------------------------------------
 @Composable
 private fun C12FocusSteal(variant: String) = TbColumn("C12 ${label(variant)}: search") {
-    val fr = remember { FocusRequester() }
-    var text by remember { mutableStateOf("") }
+    val view = LocalView.current
     var tick by remember { mutableIntStateOf(0) }
     if (variant == "bad") {
         LaunchedEffect(Unit) { while (true) { delay(2000); tick++ } }
-        LaunchedEffect(tick) { fr.requestFocus() }
+        LaunchedEffect(tick) { focusA11yNode(view, "tb_c12_search") }
     } else {
-        LaunchedEffect(Unit) { fr.requestFocus() }
+        LaunchedEffect(Unit) { delay(300); focusA11yNode(view, "tb_c12_search") }
     }
-    TextField(value = text, onValueChange = { text = it }, label = { Text("Search") },
-        modifier = Modifier.fillMaxWidth().focusRequester(fr).testTag("tb_c12_field"))
-    for (s in listOf("Recent: shoes", "Recent: lamps", "Recent: desks", "Recent: chairs", "Recent: rugs")) {
+    Button(onClick = {}, modifier = Modifier.fillMaxWidth().testTag("tb_c12_search")) { Text("Search") }
+    for (s in listOf("Recent: shoes", "Recent: lamps", "Recent: desks", "Recent: chairs", "Recent: rugs",
+                     "Recent: vases", "Recent: clocks", "Recent: mugs")) {
         TextButton(onClick = {}, Modifier.fillMaxWidth()) { Text(s) }
     }
 }
@@ -608,17 +613,21 @@ private fun C13DialogInitial(variant: String) = TbColumn("C13 ${label(variant)}:
 }
 
 // ---------------------------------------------------------------------------
-// C14 nav_restore (Now in Android: Interests -> topic -> back lands on "Search"):
-// two destinations in one Activity. BAD the list's state lives inside the
-// destination (so it is re-created) and no destination has a pane title:
-// TalkBack has no record to restore and starts over at the top bar. GOOD the
-// list state is hoisted and each destination is a pane with its own title.
+// C14 nav_restore (Now in Android: Interests -> topic -> back): two
+// destinations in one Activity under a shared top bar. The window does not
+// change, so TalkBack keeps no per-window record to restore, and the row it
+// was on was disposed with the list: BAD focus starts over at the top. A pane
+// title per destination does not help on TalkBack 17. GOOD keeps the list
+// state and, back on the list, puts accessibility focus on the row it opened
+// itself (explicit restoration).
 // ---------------------------------------------------------------------------
 @Composable
 private fun C14NavRestore(variant: String) {
     var topic by rememberSaveable { mutableStateOf<Int?>(null) }
+    var opened by rememberSaveable { mutableStateOf<Int?>(null) }
     BackHandler(enabled = topic != null) { topic = null }
     val hoisted = rememberLazyListState()
+    val view = LocalView.current
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             TbTitle(if (topic == null) "C14 ${label(variant)}: interests" else "Topic ${topic!! + 1}")
@@ -626,18 +635,31 @@ private fun C14NavRestore(variant: String) {
             IconButton(onClick = {}) { Icon(Icons.Filled.Search, contentDescription = "Search") }
         }
         AnimatedContent(targetState = topic, label = "tb_c14_nav") { t ->
-            val pane = if (variant == "good") Modifier.semantics {
-                paneTitle = if (t == null) "Interests" else "Topic ${t + 1}"
-            } else Modifier
             if (t == null) {
                 val state: LazyListState = if (variant == "good") hoisted else rememberLazyListState()
-                LazyColumn(Modifier.fillMaxSize().then(pane).testTag("tb_c14_list"), state = state) {
+                if (variant == "good") {
+                    LaunchedEffect(Unit) {
+                        val row = opened ?: return@LaunchedEffect
+                        repeat(10) {  // until the list is laid out again
+                            delay(100)
+                            if (focusA11yNode(view, "tb_c14_topic_$row")) return@LaunchedEffect
+                        }
+                    }
+                }
+                LazyColumn(Modifier.fillMaxSize().testTag("tb_c14_list"), state = state) {
                     items(30, key = { it }) { i ->
-                        Text("Topic ${i + 1}", Modifier.fillMaxWidth().clickable { topic = i }.padding(16.dp))
+                        Text(
+                            "Topic ${i + 1}",
+                            Modifier
+                                .fillMaxWidth()
+                                .testTag("tb_c14_topic_$i")
+                                .clickable { opened = i; topic = i }
+                                .padding(16.dp),
+                        )
                     }
                 }
             } else {
-                Column(Modifier.fillMaxSize().then(pane).padding(16.dp)) {
+                Column(Modifier.fillMaxSize().padding(16.dp)) {
                     Text("Topic ${t + 1}", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
                     Text("Follow this topic to see its news in For you.")
                     Button(onClick = {}) { Text("Follow") }
@@ -647,11 +669,27 @@ private fun C14NavRestore(variant: String) {
     }
 }
 
+/**
+ * Puts accessibility focus on the node tagged [tag], as TalkBack itself would:
+ * ACTION_ACCESSIBILITY_FOCUS through the Compose host's node provider (a
+ * semantics id is the virtual view id). False while the node is not there yet.
+ */
+private fun focusA11yNode(view: View, tag: String): Boolean {
+    val owner = (view as? RootForTest)?.semanticsOwner ?: return false
+    val node = owner.getAllSemanticsNodes(mergingEnabled = false)
+        .firstOrNull { it.config.getOrNull(SemanticsProperties.TestTag) == tag } ?: return false
+    val provider = view.accessibilityNodeProvider ?: return false
+    return provider.performAction(node.id, AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null)
+}
+
 // ---------------------------------------------------------------------------
-// C15 grid_partial (Now in Android's For-you feed): a two-column grid of
-// clickable news cards of mixed heights, each with its own bookmark button, so
-// cards are often half on screen. BAD as NiA ships it. GOOD each card is one
-// traversal group of equal height.
+// C15 grid_partial (Now in Android's For-you feed): a two-column LazyVerticalGrid
+// of clickable news cards, each with its own bookmark button. BAD at the bottom
+// of the screen TalkBack pages the grid forward and lands on the first visible
+// card, a sliver scrolled half off the top; its bookmark is above the viewport,
+// so TalkBack scrolls back to show it, then forward again: it reads the same
+// few stops over and over (a loop). GOOD each card is one stop, with the
+// bookmark as a custom action, so no stop hides above a partly visible card.
 // ---------------------------------------------------------------------------
 @Composable
 private fun C15Grid(variant: String) = Column(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp)) {
@@ -663,20 +701,29 @@ private fun C15Grid(variant: String) = Column(Modifier.fillMaxSize().safeDrawing
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         gridItemsIndexed((1..16).toList(), key = { _, n -> n }) { i, n ->
-            val h = if (variant == "good") 220 else if (i % 3 == 0) 300 else 200
-            Card(
+            NewsCard(n, if (i % 3 == 0) 300 else 200, bookmarkAction = variant == "good")
+        }
+    }
+}
+
+@Composable
+private fun NewsCard(n: Int, height: Int, bookmarkAction: Boolean) {
+    Card(
+        onClick = {},
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(height.dp)
+            .then(if (bookmarkAction) Modifier.semantics {
+                customActions = listOf(CustomAccessibilityAction("Bookmark news $n") { true })
+            } else Modifier),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text("News $n", style = MaterialTheme.typography.titleMedium)
+            Text("Story $n in brief.")
+            IconButton(
                 onClick = {},
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(h.dp)
-                    .then(if (variant == "good") Modifier.semantics { isTraversalGroup = true } else Modifier),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    Text("News $n", style = MaterialTheme.typography.titleMedium)
-                    Text("Story $n in brief.")
-                    IconButton(onClick = {}) { Icon(Icons.Filled.Favorite, contentDescription = "Bookmark news $n") }
-                }
-            }
+                modifier = if (bookmarkAction) Modifier.clearAndSetSemantics {} else Modifier,
+            ) { Icon(Icons.Filled.Favorite, contentDescription = "Bookmark news $n") }
         }
     }
 }
@@ -685,14 +732,25 @@ private fun C15Grid(variant: String) = Column(Modifier.fillMaxSize().safeDrawing
 // C16 pager_webview (AntennaPod): a pager keeps its neighbouring page, a WebView
 // of show notes, composed off screen. BAD the offscreen WebView stays in the
 // accessibility tree, so TalkBack walks into content nobody can see. GOOD pages
-// that are not showing are hidden from accessibility.
+// that are not showing are hidden from accessibility, and tabs change the page
+// (TalkBack does not scroll a pager, so a swipe-only pager strands the rest).
 // ---------------------------------------------------------------------------
 @Composable
 private fun C16PagerWebView(variant: String) = TbColumn("C16 ${label(variant)}: episode") {
     val pager = rememberPagerState { 3 }
+    val scope = rememberCoroutineScope()
+    if (variant == "good") {
+        TabRow(selectedTabIndex = pager.currentPage) {
+            listOf("Episode", "Show notes", "Chapters").forEachIndexed { p, tab ->
+                Tab(selected = pager.currentPage == p, onClick = { scope.launch { pager.animateScrollToPage(p) } },
+                    text = { Text(tab) })
+            }
+        }
+    }
     HorizontalPager(
         state = pager,
         beyondViewportPageCount = 1,
+        userScrollEnabled = variant != "good",
         modifier = Modifier.fillMaxWidth().height(420.dp).testTag("tb_c16_pager"),
     ) { page ->
         val hidden = variant == "good" && page != pager.currentPage

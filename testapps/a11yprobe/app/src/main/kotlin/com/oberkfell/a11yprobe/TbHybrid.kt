@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
@@ -172,13 +173,14 @@ private fun h2RecycledCells(ctx: Context, title: String, bad: Boolean): View {
 // ---------------------------------------------------------------------------
 // H3 androidview_boundary: LazyColumn rows whose AndroidView root is
 // importantForAccessibility=no, with TextViews inside. BAD the holder links the
-// root, which TalkBack never sees. GOOD an important root, and each row a
-// traversal group.
+// root, which TalkBack never sees (TalkBack 17 still reaches the TextViews, as
+// separate stops). GOOD the root is one screen-reader stop for the row, inside
+// a traversal group.
 // ---------------------------------------------------------------------------
 private fun h3AndroidViewRows(ctx: Context, title: String, bad: Boolean): View = ComposeView(ctx).apply {
     setContent {
         ProbeRoot {
-            Column(Modifier.fillMaxSize().padding(top = 24.dp)) {
+            Column(Modifier.fillMaxSize().safeDrawingPadding()) {
                 Text(title, style = MaterialTheme.typography.titleLarge,
                     modifier = Modifier.padding(16.dp).semantics { heading() })
                 LazyColumn(Modifier.fillMaxSize()) {
@@ -192,7 +194,7 @@ private fun h3AndroidViewRows(ctx: Context, title: String, bad: Boolean): View =
                                         orientation = LinearLayout.VERTICAL
                                         importantForAccessibility = if (bad) View.IMPORTANT_FOR_ACCESSIBILITY_NO
                                         else View.IMPORTANT_FOR_ACCESSIBILITY_YES
-                                        if (!bad) contentDescription = null
+                                        if (!bad) isScreenReaderFocusable = true
                                         setPadding(c.dp(16), c.dp(12), c.dp(16), c.dp(12))
                                         addView(TextView(c).apply { text = "Product ${i + 1}"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f) })
                                         addView(TextView(c).apply { text = "Sold out" })

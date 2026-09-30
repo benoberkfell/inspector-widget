@@ -36,7 +36,12 @@ import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
+import androidx.core.view.AccessibilityDelegateCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat.AccessibilityActionCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat.CollectionInfoCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat.CollectionItemInfoCompat
 import androidx.core.widget.NestedScrollView
 import androidx.fragment.app.DialogFragment
 import androidx.recyclerview.widget.DefaultItemAnimator
@@ -44,6 +49,7 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
+import androidx.recyclerview.widget.RecyclerViewAccessibilityDelegate
 import androidx.viewpager2.widget.ViewPager2
 
 /** One classic-View TalkBack scenario (`--es scenario <id>`). */
@@ -455,6 +461,10 @@ class TbViewActivity : AppCompatActivity() {
     }
 
     // ------------------------------------------------------------------ V12
+    // Thunderbird's message list: an empty header item at adapter position 0,
+    // and rows that report their adapter position as the collection row (the
+    // list reports its item count), so TalkBack's "N of M" counts the header:
+    // the first message is "2 of 21". GOOD counts messages only.
     private class HeaderMailAdapter(val header: Boolean, val count: Int, val make: (Context) -> TextView) :
         RecyclerView.Adapter<RecyclerView.ViewHolder>() {
         override fun getItemCount() = count + if (header) 1 else 0
@@ -472,10 +482,28 @@ class TbViewActivity : AppCompatActivity() {
 
     private fun v12ListHeader(title: String): View {
         val col = column(title)
-        col.addView(RecyclerView(this).apply {
-            layoutManager = LinearLayoutManager(this@TbViewActivity)
-            adapter = HeaderMailAdapter(bad, 20) { mailView(it) }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val list = RecyclerView(this).apply { layoutManager = LinearLayoutManager(this@TbViewActivity) }
+        val adapter = HeaderMailAdapter(bad, 20) { mailView(it) }
+        list.adapter = adapter
+        list.setAccessibilityDelegateCompat(object : RecyclerViewAccessibilityDelegate(list) {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfoCompat) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                info.setCollectionInfo(CollectionInfoCompat.obtain(adapter.itemCount, 1, false))
+            }
+
+            private val items = object : ItemDelegate(this) {
+                override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfoCompat) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    val row = list.getChildAdapterPosition(host)
+                    if (row != RecyclerView.NO_POSITION) {
+                        info.setCollectionItemInfo(CollectionItemInfoCompat.obtain(row, 1, 0, 1, false, false))
+                    }
+                }
+            }
+
+            override fun getItemDelegate(): AccessibilityDelegateCompat = items
+        })
+        col.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         return col
     }
 
@@ -507,7 +535,26 @@ class TbViewActivity : AppCompatActivity() {
         // Keep the neighbouring page (the WebView) attached, as AntennaPod does.
         pager.offscreenPageLimit = 1
         if (!bad) {
+            // GOOD: only the current page is in the accessibility tree, and tabs
+            // (not a swipe TalkBack cannot make) change the page.
+            pager.isUserInputEnabled = false
+            col.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                listOf("Episode", "Show notes", "Chapters").forEachIndexed { i, tab ->
+                    addView(button(tab).apply { setOnClickListener { pager.currentItem = i } })
+                }
+            })
             val recycler = pager.getChildAt(0) as RecyclerView
+            // With swiping off, the pager offers TalkBack no scroll it would not do.
+            recycler.setAccessibilityDelegateCompat(object : RecyclerViewAccessibilityDelegate(recycler) {
+                override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfoCompat) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    info.isScrollable = false
+                    listOf(AccessibilityActionCompat.ACTION_SCROLL_FORWARD, AccessibilityActionCompat.ACTION_SCROLL_BACKWARD,
+                        AccessibilityActionCompat.ACTION_SCROLL_LEFT, AccessibilityActionCompat.ACTION_SCROLL_RIGHT)
+                        .forEach { info.removeAction(it) }
+                }
+            })
             fun hideOffscreen() {
                 for (i in 0 until pager.adapter!!.itemCount) {
                     recycler.findViewHolderForAdapterPosition(i)?.itemView?.importantForAccessibility =
