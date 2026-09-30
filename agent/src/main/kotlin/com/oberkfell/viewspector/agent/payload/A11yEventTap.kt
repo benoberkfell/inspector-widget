@@ -333,15 +333,22 @@ object A11yEventTap {
         var hostViewId = 0L
         var hostClass: String? = null
         var virtualId = A11yIds.HOST_VIEW_ID
+        var sourceView: View? = null
         val packed = A11yViews.sourceNodeId(event)
         if (packed != null && !A11yIds.isUndefined(packed)) {
             virtualId = A11yIds.virtualIdOf(packed)
             A11yViews.viewFor(root, A11yIds.accessibilityViewIdOf(packed))?.let {
                 hostViewId = ViewReflect.uniqueDrawingId(it)
                 hostClass = it.javaClass.name
+                // The View itself is the source; a virtual node's host View is not the field.
+                if (virtualId == A11yIds.HOST_VIEW_ID) sourceView = it
             }
         }
-        val text = textOf(event)
+        // A password field's event text is its content (TYPE_VIEW_TEXT_CHANGED): mask it like
+        // every other text path (Redaction.kt). The event says so for a masked field (and a
+        // Compose Password node); a visible-password field only by its View's input type.
+        val secret = event.isPassword || sourceView?.let { Redaction.isPasswordView(it) } == true
+        val text = textOf(event, secret)
         val changes = event.contentChangeTypes
         val pane = if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && (changes and PANE_CHANGES) != 0) {
             text
@@ -371,10 +378,18 @@ object A11yEventTap {
         )
     }
 
-    /** The event's text (else its content description), at most [MAX_TEXT] chars. */
-    private fun textOf(event: AccessibilityEvent): String? {
+    /**
+     * The event's text (else its content description), at most [MAX_TEXT] chars; the text of
+     * a [secret] (password) source masked. A masked field's own text is mostly dots already,
+     * but not the character just typed (PasswordTransformationMethod shows it briefly), and a
+     * visible-password field's is the plaintext.
+     */
+    private fun textOf(event: AccessibilityEvent, secret: Boolean): String? {
         val joined = event.text?.filter { !it.isNullOrEmpty() }?.joinToString(" ")
-        val s = if (!joined.isNullOrEmpty()) joined else event.contentDescription?.toString()
+        val s = when {
+            !joined.isNullOrEmpty() -> if (secret) Redaction.mask(joined) else joined
+            else -> event.contentDescription?.toString()
+        }
         if (s.isNullOrEmpty()) return null
         return if (s.length > MAX_TEXT) s.substring(0, MAX_TEXT) else s
     }
