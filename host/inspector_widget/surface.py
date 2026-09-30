@@ -848,6 +848,25 @@ def cli_names() -> list[str]:
     return [s.cli_name for s in SPECS]
 
 
+def cli_argv(argv: Iterable[str]) -> list[str]:
+    """``argv`` with ``--json -`` read as ``--json`` on the capture subcommands:
+    the legacy subcommands take ``--json OUT.json|-``, these always print to
+    stdout, and the habit should not be an argparse error."""
+    argv = list(argv)
+    if not argv or argv[0] not in cli_names():
+        return argv
+    out: list[str] = []
+    skip = False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        out.append(a)
+        if a == "--json" and i + 1 < len(argv) and argv[i + 1] == "-":
+            skip = True
+    return out
+
+
 def names(specs: Iterable[ToolSpec] | None = None) -> list[str]:
     return [s.name for s in (specs if specs is not None else SPECS)]
 
@@ -871,6 +890,7 @@ __all__ = [
     "active_toolset",
     "add_cli",
     "cli_args",
+    "cli_argv",
     "describe",
     "error_result",
     "execute",

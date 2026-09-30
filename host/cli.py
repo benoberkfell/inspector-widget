@@ -886,7 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(surface.cli_argv(sys.argv[1:] if argv is None else argv))
     try:
         return _run(args)
     finally:

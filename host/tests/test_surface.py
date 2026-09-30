@@ -337,3 +337,13 @@ def test_inline_images_ride_beside_the_text(monkeypatch):
         name="image", arguments={"ref": "n1", "inline": True})))
     assert [c.type for c in out.content] == ["text", "image"]
     assert out.content[1].mimeType == "image/png"
+
+
+def test_json_dash_is_json_on_the_capture_subcommands():
+    """The legacy subcommands take --json OUT.json|-; on the capture ones (which
+    always print to stdout) --json - must not be an argparse error."""
+    assert surface.cli_argv(["capture", "--json", "-", "-s", "x"]) == ["capture", "--json",
+                                                                         "-s", "x"]
+    assert surface.cli_argv(["node", "n22", "--json", "-"]) == ["node", "n22", "--json"]
+    assert surface.cli_argv(["dump", "--json", "-"]) == ["dump", "--json", "-"]  # legacy
+    assert surface.cli_argv([]) == []
