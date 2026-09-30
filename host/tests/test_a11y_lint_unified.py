@@ -466,9 +466,25 @@ def test_r5_inner_role_node_counts():
 # R6 -- images.
 # --------------------------------------------------------------------------- #
 def test_r6_meaningful_view_image_without_cd_warns():
-    iv = view(10, "android.widget.ImageView")
+    # importantForAccessibility="yes" (or a focusable image): TalkBack stops on it and
+    # has nothing to say.
+    iv = view(10, "android.widget.ImageView", important_for_accessibility="YES")
     f = of(lint(screen(decor(1, iv))), "a11y.image.no_description")
     assert [(x.node_key, x.severity) for x in f] == [("view:10", "warn")]
+
+
+def test_r6_skips_an_auto_image_talkback_never_sees():
+    # <ImageView android:src=.../> with no contentDescription, left at auto: not important
+    # for accessibility, so TalkBack (and ATF) never see it. The agent reports AUTO only for
+    # such a View; a leading icon inside a clickable row is the common case.
+    icon = view(4, "android.widget.ImageView", b=(48, 340, 63, 63))
+    row = view(3, "android.widget.LinearLayout", flags=CLICK, b=(0, 300, 1080, 170),
+               kids=[icon, view(5, "android.widget.TextView", text="Wi-Fi",
+                                important_for_accessibility="YES", b=(160, 340, 600, 63))])
+    banner = view(6, "android.widget.ImageView", b=(0, 600, 1080, 500))
+    rep = lint(screen(decor(1, view(2, "android.widget.LinearLayout", b=(0, 0, 1080, 2400),
+                                    kids=[row, banner]))), density=420)
+    assert of(rep, "a11y.image.no_description") == []
 
 
 def test_r6_decorative_and_labelled_images_pass():
@@ -747,7 +763,8 @@ def test_r17_linear_chain_passes():
 def test_view_only_screen_produces_findings():
     ib = view(10, "android.widget.ImageButton", flags=CLICK, b=(48, 149, 144, 144))
     small = view(11, "android.widget.Button", flags=CLICK, text="Play", b=(48, 418, 90, 90))
-    iv = view(12, "android.widget.ImageView", b=(48, 1451, 192, 192))
+    iv = view(12, "android.widget.ImageView", important_for_accessibility="YES",
+              b=(48, 1451, 192, 192))
     role = view(13, "android.widget.TextView", flags=CLICK, text="Submit", b=(48, 1768, 205, 144))
     field = view(14, "android.widget.EditText", flags=CLICK + ("editable",), b=(48, 2438, 1184, 144))
     fixed = view(15, "android.widget.TextView", text="Fixed size", b=(48, 900, 500, 60),
@@ -1071,3 +1088,187 @@ def test_r3_button_text_is_measured_against_its_fill_not_the_inset_rim():
                 window_images=_ctx_img(rim + faint + rim, w, h))
     f = of(rep2, "a11y.contrast.low")
     assert len(f) == 1 and f[0].evidence["bg_hex"] == "#D6D7D7" and f[0].evidence["fg_hex"] == "#B0B0B0"
+
+
+# --------------------------------------------------------------------------- #
+# Rules judged as TalkBack reads the screen.
+# --------------------------------------------------------------------------- #
+FAKE_ROLE = 1_000_000_000
+
+
+def _view_tab(hv, x, label, selected, with_info=True):
+    fl = ("focusable",) + (("selected",) if selected else ("clickable",))
+    extra = {"collection_item_info": {"row_index": 0, "column_index": x // 360, "row_span": 1,
+                                      "column_span": 1, "heading": False,
+                                      "selected": selected}} if with_info else {}
+    return view(hv, "android.widget.LinearLayout", role_description="Tab", flags=fl,
+                b=(x, 200, 360, 147), **extra,
+                kids=[view(hv + 100, "android.widget.TextView", text=label,
+                           b=(x + 100, 250, 160, 47))])
+
+
+def test_r7_unselected_material_tabs_are_not_stateless():
+    # TabLayout.TabView / NavigationBarItemView: roleDescription "Tab", CollectionItemInfo
+    # (selected), and only the unselected tabs are clickable.
+    strip = view(10, "android.widget.HorizontalScrollView", b=(0, 200, 1080, 147),
+                 collection_info={"row_count": 1, "column_count": 3},
+                 kids=[_view_tab(11, 0, "Photos", True), _view_tab(12, 360, "Albums", False),
+                       _view_tab(13, 720, "Shared", False)])
+    assert of(lint(screen(decor(1, strip)), density=420), "a11y.state.not_exposed") == []
+    # Without CollectionItemInfo, a selected sibling still tells TalkBack users the state.
+    bare = view(10, "android.widget.LinearLayout", b=(0, 200, 1080, 147),
+                kids=[_view_tab(11, 0, "Photos", True, False), _view_tab(12, 360, "Albums", False, False)])
+    assert of(lint(screen(decor(1, bare)), density=420), "a11y.state.not_exposed") == []
+
+
+def test_r7_a_lone_tab_without_selection_still_warns_with_a_tab_fix():
+    tab = _view_tab(12, 0, "Albums", False, with_info=False)
+    f = of(lint(screen(decor(1, view(10, "android.widget.LinearLayout", b=(0, 200, 1080, 147),
+                                     kids=[tab]))), density=420), "a11y.state.not_exposed")
+    assert [x.node_key for x in f] == ["view:12"]
+    assert "setSelected" in f[0].message and "CompoundButton" not in f[0].message
+
+
+def _m3_tabs():
+    def ctab(sem, x, label, selected):
+        fl = CLICK + ("screen_reader_focusable",) + (("selected",) if selected else ())
+        return comp(50, sem, flags=fl, b=(x, 200, 360, 147), layout_size={"w": 360, "h": 147},
+                    kids=[comp(50, sem + 1, "android.widget.TextView", text=label,
+                               b=(x + 100, 250, 160, 47)),
+                          comp(50, sem + FAKE_ROLE, role_description="Tab", b=(x, 200, 360, 147))])
+    return screen(view(50, ACV, provider_class=ACV, b=(0, 0, 1080, 2400), kids=[
+        comp(50, 1, b=(0, 200, 1080, 147), kids=[
+            ctab(2, 0, "Photos", True), ctab(4, 360, "Albums", False), ctab(6, 720, "Shared", False)])]))
+
+
+def test_compose_tab_role_rides_on_the_fake_childs_role_description():
+    # Compose serves Role.Tab / Role.Switch of a merging node on its synthetic role child as
+    # roleDescription (class android.view.View); the fold must pick it up, with or without
+    # the Compose join, so no "clickable without a role" (R5) and no R7 on unselected tabs.
+    rep = lint(_m3_tabs(), density=420)
+    assert of(rep, "a11y.role.missing_on_clickable") == []
+    assert of(rep, "a11y.state.not_exposed") == []
+    sw = comp(60, 3, flags=CLICK + ("screen_reader_focusable",), b=(0, 400, 1080, 147),
+              kids=[comp(60, 4, "android.widget.TextView", text="Wi-Fi", b=(40, 440, 400, 60)),
+                    comp(60, 3 + FAKE_ROLE, role_description="Switch", b=(0, 400, 1080, 147))])
+    rep = lint(screen(view(60, ACV, provider_class=ACV, b=(0, 0, 1080, 2400), kids=[sw])), density=420)
+    assert [(f.alias, f.node_key) for f in rep.findings
+            if f.alias in ("R5", "R7")] == [("R7", "compose:60:3")]
+
+
+def _blend(fg, bg, a):
+    return tuple(round(f * a + b * (1 - a)) for f, b in zip(fg, bg))
+
+
+def test_r3_skips_the_label_of_a_disabled_compose_button():
+    # M3 disabled Button: container onSurface@12%, content onSurface@38% (~2.3:1). Compose
+    # puts the label on a child Text whose own node reports enabled; WCAG 1.4.3 exempts
+    # inactive components.
+    surface, on = (0xFE, 0xF7, 0xFF), (0x1D, 0x1B, 0x20)
+    cont = _blend(on, surface, 0.12)
+    txt = _blend(on, cont, 0.38)
+    W, H = 1080, 600
+    px = bytearray()
+    for y in range(H):
+        for x in range(W):
+            c = surface
+            if 100 <= x < 500 and 100 <= y < 205:
+                c = cont
+            if 180 <= x < 420 and 135 <= y < 170 and ((x // 3 + y // 3) % 2 == 0):
+                c = txt
+            px += bytes((c[0], c[1], c[2], 255))
+    label = comp(20, 9, "android.widget.TextView", text="Continue", b=(180, 130, 240, 45))
+    btn = comp(20, 7, "android.widget.Button", flags=CLICK + ("screen_reader_focusable",),
+               b=(100, 90, 400, 126), layout_size={"w": 400, "h": 126}, kids=[label])
+    btn["flags"].remove("enabled")
+    data = screen(view(20, ACV, provider_class=ACV, b=(0, 0, W, H), kids=[btn]))
+
+    def contrast_findings():
+        ctx = L.LintContext(density=420)
+        ctx.window_images[20] = L.WindowImage(W, H, bytes(px), 1.0, 0, 0, 20)
+        return of(L.lint_unified(data, ctx), "a11y.contrast.low")
+
+    assert contrast_findings() == []
+    btn["flags"].append("enabled")  # the same pixels on an enabled button are a real failure
+    assert [f.node_key for f in contrast_findings()] == ["compose:20:9"]
+
+
+def test_r4_judges_a_merged_icon_by_the_role_talkback_announces():
+    # IconButton { Icon(Icons.Default.Upload, contentDescription = "Upload image") }:
+    # TalkBack focuses the IconButton and says "Upload image, button".
+    ib = comp(30, 5, flags=CLICK + ("screen_reader_focusable",), b=(100, 100, 126, 126),
+              layout_size={"w": 126, "h": 126},
+              kids=[comp(30, 6, cd="Upload image", b=(134, 134, 58, 58)),
+                    comp(30, 5 + FAKE_ROLE, "android.widget.Button", b=(100, 100, 126, 126))])
+    data = screen(view(30, ACV, provider_class=ACV, b=(0, 0, 1080, 2400), kids=[ib]))
+    cd = {"windows": [{"view_id": 30, "root": {"kind": "SEMANTICS", "id": 5,
+                                               "attrs": {"Role": "Button", "OnClick": "x"},
+                                               "children": [{"kind": "SEMANTICS", "id": 6, "attrs": {
+                                                   "ContentDescription": "[Upload image]",
+                                                   "Role": "Image"}}]}}]}
+    assert of(lint(data, density=420, compose=cd), "a11y.label.redundant") == []
+    assert of(lint(data, density=420), "a11y.label.redundant") == []
+    # A standalone image (its own stop) that says "image" is still redundant.
+    logo = comp(30, 8, "android.widget.ImageView", cd="Company logo image", b=(100, 400, 200, 200))
+    data = screen(view(30, ACV, provider_class=ACV, b=(0, 0, 1080, 2400), kids=[logo]))
+    assert [f.node_key for f in of(lint(data, density=420), "a11y.label.redundant")] == ["compose:30:8"]
+
+
+def _article(scroll_focusable: bool):
+    texts = [view(10 + i, "android.widget.TextView", text=f"Paragraph {i} of the article body.",
+                  important_for_accessibility="YES", b=(0, 100 + i * 110, 1080, 100))
+             for i in range(20)]
+    fl = ("focusable", "scrollable") if scroll_focusable else ("scrollable",)
+    return screen(decor(1, view(2, "android.widget.ScrollView", flags=fl, actions=["SCROLL_FORWARD"],
+                                b=(0, 0, 1080, 2400),
+                                kids=[view(3, "android.widget.LinearLayout", b=(0, 0, 1080, 2400),
+                                           kids=texts)])))
+
+
+def test_r9_fires_inside_a_focusable_scroll_view():
+    # ScrollView is focusable by default; its content is still read item by item.
+    for focusable in (True, False):
+        f = of(lint(_article(focusable), density=420, enabled=["R9"]), "a11y.heading.structure")
+        assert [x.evidence["reason"] for x in f] == ["no_headings"], focusable
+
+
+def test_r10_fires_for_rows_under_a_focusable_recycler_view():
+    def row(hv, y, a, b):
+        return view(hv, "android.widget.LinearLayout", b=(0, y, 1080, 150),
+                    kids=[view(hv + 1, "android.widget.TextView", text=a, b=(48, y + 20, 600, 50)),
+                          view(hv + 2, "android.widget.TextView", text=b, b=(48, y + 75, 600, 50))])
+    grid = view(20, "android.widget.LinearLayout", b=(0, 200, 1080, 400), kids=[
+        view(21, "android.widget.TextView", text="Name", b=(48, 220, 600, 50)),
+        view(22, "android.widget.TextView", text="Ada Lovelace", b=(48, 275, 600, 50)),
+        view(23, "android.widget.TextView", text="Analyst", b=(48, 330, 600, 50))])
+    scroll = view(2, "androidx.core.widget.NestedScrollView", flags=("focusable", "scrollable"),
+                  b=(0, 0, 1080, 2400), kids=[grid])
+    f = of(lint(screen(decor(1, scroll)), density=420, enabled=["R10"]), "a11y.grouping.missing")
+    assert [x.node_key for x in f] == ["view:20"]
+
+
+def test_r14_stock_m3_search_field_is_info_and_the_message_is_accurate():
+    sb = comp(40, 3, "android.widget.EditText", cd="Search",
+              flags=CLICK + ("editable", "screen_reader_focusable"), b=(40, 150, 1000, 147),
+              kids=[comp(40, 4, "android.widget.TextView", text="Search messages", b=(150, 195, 500, 55))])
+    f = of(lint(screen(view(40, ACV, provider_class=ACV, b=(0, 0, 1080, 2400), kids=[sb])),
+                density=420), "a11y.editable.content_description")
+    assert [(x.node_key, x.severity) for x in f] == [("compose:40:3", "info")]
+    assert "SearchBar" in f[0].message
+    own = view(7, "android.widget.EditText", cd="Email", flags=CLICK + ("editable",), b=(40, 400, 1000, 147))
+    f = of(lint(screen(decor(1, own)), density=420), "a11y.editable.content_description")
+    assert [(x.node_key, x.severity) for x in f] == [("view:7", "error")]
+    assert "instead of the text the user typed" not in f[0].message
+    assert "only while the field is empty" in f[0].message
+
+
+def test_findings_on_a_window_under_a_modal_dialog_say_so():
+    activity = decor(2, view(3, "android.widget.ImageButton", flags=CLICK, b=(100, 300, 160, 160)))
+    dialog = view(9, "android.widget.FrameLayout", b=(100, 800, 880, 600),
+                  kids=[view(10, "android.widget.ImageButton", flags=CLICK, b=(140, 840, 160, 160))])
+    data = screen(activity, dialog)
+    data["windows"][0]["covered_by"] = 9
+    f = of(lint(data), "a11y.label.missing")
+    by_key = {x.node_key: x for x in f}
+    assert by_key["view:3"].window == {"index": 0, "root_view_id": 2, "covered_by": 9}
+    assert "covered_by" not in by_key["view:10"].window

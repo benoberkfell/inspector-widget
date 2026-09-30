@@ -303,7 +303,7 @@ _HIDE_TREE = {"NO_HIDE_DESCENDANTS", 4}
 
 
 class _Win:
-    __slots__ = ("index", "root_view_id", "x", "y", "w", "h", "root")
+    __slots__ = ("index", "root_view_id", "x", "y", "w", "h", "root", "covered_by")
 
     def __init__(self, index: int, root_view_id: Optional[int], rect: Dict[str, int]):
         self.index = index
@@ -313,9 +313,15 @@ class _Win:
         self.w = int(rect.get("w", 0))
         self.h = int(rect.get("h", 0))
         self.root: Optional["_Node"] = None
+        # root_view_id of the modal window (dialog) above this one: TalkBack cannot reach
+        # this window while it is open. Findings here are still real, but not reachable now.
+        self.covered_by: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"index": self.index, "root_view_id": self.root_view_id}
+        d: Dict[str, Any] = {"index": self.index, "root_view_id": self.root_view_id}
+        if self.covered_by is not None:
+            d["covered_by"] = self.covered_by
+        return d
 
 
 class _Node:
@@ -325,7 +331,7 @@ class _Node:
         "raw", "origin", "key", "a11y_id", "host_view_id", "virtual_id", "win",
         "x", "y", "w", "h", "class_name", "simple_class", "compose_role", "role_description",
         "text", "cd", "hint", "state", "flags", "actions", "extras", "important",
-        "hidden", "collection_info", "collection_item_info", "labeled_by", "label_for",
+        "hidden", "ignored", "collection_info", "collection_item_info", "labeled_by", "label_for",
         "traversal_before", "traversal_after", "text_size_px", "text_size_unit",
         "test_tag", "source", "compose", "compose_label", "provider_class",
         "render_node_id", "range_info", "children", "parent", "depth", "order",
@@ -350,7 +356,11 @@ class _Node:
         self.actions: Set[str] = set()
         self.extras: Dict[str, str] = {}
         self.important: Any = None
+        # hidden: TalkBack never sees this node or its subtree (noHideDescendants on it or
+        # an ancestor, InvisibleToUser). ignored: a real View that is not important for
+        # accessibility; TalkBack skips it but reads its children in its place.
         self.hidden = False
+        self.ignored = False
         self.collection_info: Optional[Dict[str, Any]] = None
         self.collection_item_info: Optional[Dict[str, Any]] = None
         self.labeled_by: List[int] = []
@@ -531,7 +541,9 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         n.actions = {str(a.get("name")) for a in (d.get("actions") or []) if isinstance(a, dict)}
         n.extras = dict(d.get("extras") or {})
         n.important = d.get("important_for_accessibility")
-        n.hidden = hidden_tree or n.important in _HIDE_SELF or n.important in _HIDE_TREE
+        why = _talkback_exclusion(d, parent.raw if parent is not None else None)
+        n.hidden = hidden_tree or why == "hidden"
+        n.ignored = why == "not_important"
         n.collection_info = d.get("collection_info")
         n.collection_item_info = d.get("collection_item_info")
         n.range_info = d.get("range_info")
@@ -563,8 +575,7 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         if cnode is not None and (vid != -1 or hv in hosts):
             _apply_compose_detail(n, cnode)
             stats["compose_joined"] += 1
-        child_hidden = hidden_tree or n.important in _HIDE_TREE
-        n.children = [mk(c, n, win, child_hidden) for c in (d.get("children") or [])]
+        n.children = [mk(c, n, win, n.hidden) for c in (d.get("children") or [])]
         if vid != -1 and n.children:
             _fold_compose_fakes(n)
         return n
@@ -574,6 +585,8 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         if not root:
             continue
         win = _Win(i, w.get("root_view_id"), _rect_of(root))
+        if w.get("covered_by") is not None:
+            win.covered_by = int(w["covered_by"])
         rn = mk(root, None, win, False)
         win.root = rn
         windows.append(win)
@@ -597,7 +610,10 @@ def _fold_compose_fakes(n: _Node) -> None:
                 n.cd = n.cd or c.cd
                 continue
             if c.virtual_id == n.virtual_id + _FAKE_ROLE_OFFSET:
-                n.compose_role = n.compose_role or _ROLE_BY_CLASS.get(c.simple_class)
+                # The role rides on the class name (Button, Checkbox, ...) or, for Tab and
+                # Switch, on roleDescription with class android.view.View.
+                n.compose_role = (n.compose_role or _ROLE_BY_CLASS.get(c.simple_class)
+                                  or _KNOWN_ROLE_DESC.get(c.role_description.lower()))
                 continue
         kept.append(c)
     n.children = kept
@@ -722,8 +738,19 @@ def _build_compose(roots_in: List[Dict[str, Any]], ctx: LintContext
 # --------------------------------------------------------------------------- #
 # Predicates.
 # --------------------------------------------------------------------------- #
-def _visible(n: _Node) -> bool:
+def _on_screen(n: _Node) -> bool:
+    """Visible to the user and not hidden from TalkBack with its subtree."""
     return (not n.hidden) and ("visible_to_user" in n.flags) and n.w > 0 and n.h > 0
+
+
+def _visible(n: _Node) -> bool:
+    """On screen and a node TalkBack sees (not a View that is not important for a11y)."""
+    return _on_screen(n) and not n.ignored
+
+
+def _talkback_exclusion(d: Dict[str, Any], parent: Optional[Dict[str, Any]]) -> Optional[str]:
+    from .a11y import talkback_exclusion
+    return talkback_exclusion(d, parent)
 
 
 def _enabled(n: _Node) -> bool:
@@ -789,6 +816,7 @@ class _Run:
         self.label_for_targets: Set[int] = set()
         self._label_memo: Dict[Tuple[int, bool], Tuple[str, str]] = {}
         self._stop_memo: Dict[int, bool] = {}
+        self._ro_stops: Optional[Set[int]] = None
         self._cand_desc: Dict[int, bool] = {}
         self.stats: Dict[str, int] = {}
         self.identity_ok = True
@@ -809,7 +837,8 @@ class _Run:
             self.nodes.append(n)
             p = n.parent
             if p is not None:
-                n.focus_ancestor = p if (_focus_candidate(p) and not p.hidden) else p.focus_ancestor
+                n.focus_ancestor = (p if (_focus_candidate(p) and not p.hidden and not p.ignored)
+                                    else p.focus_ancestor)
                 if _is_collection(p):
                     n.collection_ctx = (p, n)
                 else:
@@ -834,7 +863,8 @@ class _Run:
         # bottom-up: does any visible descendant take its own focus?
         for n in reversed(self.nodes):
             self._cand_desc[id(n)] = any(
-                (not c.hidden and "visible_to_user" in c.flags and _focus_candidate(c))
+                (not c.hidden and not c.ignored and "visible_to_user" in c.flags
+                 and _focus_candidate(c))
                 or self._cand_desc.get(id(c), False) for c in n.children)
         if self.mode == "a11y" and len(self.nodes) > 4 and dup > len(self.nodes) * 0.1:
             self.identity_ok = False
@@ -871,7 +901,7 @@ class _Run:
 
     def owner(self, n: _Node) -> _Node:
         """The node TalkBack focuses to speak ``n`` (itself or its focusable ancestor)."""
-        if _focus_candidate(n) or n.focus_ancestor is None:
+        if (_focus_candidate(n) and not n.ignored) or n.focus_ancestor is None:
             return n
         return n.focus_ancestor
 
@@ -881,6 +911,9 @@ class _Run:
             return
         for c in n.children:
             if c.hidden or ("visible_to_user" not in c.flags and not include_offscreen):
+                continue
+            if c.ignored:  # not important for a11y: TalkBack reads its children instead
+                self._collect_desc(c, parts, depth + 1, include_offscreen, with_state)
                 continue
             if _focus_candidate(c):
                 continue  # its own focus stop; TalkBack does not fold it into the parent
@@ -942,7 +975,12 @@ class _Run:
         stack = list(reversed(n.children))
         while stack:
             c = stack.pop()
-            if c.hidden or "visible_to_user" not in c.flags or _focus_candidate(c):
+            if c.hidden or "visible_to_user" not in c.flags:
+                continue
+            if c.ignored:
+                stack.extend(reversed(c.children))
+                continue
+            if _focus_candidate(c):
                 continue
             if c.text:
                 parts.append(c.text)
@@ -959,7 +997,12 @@ class _Run:
         stack = list(n.children)
         while stack:
             c = stack.pop()
-            if c.hidden or "visible_to_user" not in c.flags or _focus_candidate(c):
+            if c.hidden or "visible_to_user" not in c.flags:
+                continue
+            if c.ignored:
+                stack.extend(c.children)
+                continue
+            if _focus_candidate(c):
                 continue
             if c.text:
                 return True
@@ -968,6 +1011,16 @@ class _Run:
         return False
 
     def is_stop(self, n: _Node) -> bool:
+        """Is ``n`` a TalkBack focus stop? On the unified a11y tree this is exactly the
+        reading order's stop set (:func:`a11y.reading_order`: the tree TalkBack sees,
+        top-level scroll items, focusable containers that do not swallow their content);
+        the legacy Compose-semantics input keeps the approximation below."""
+        if self.mode == "a11y":
+            if self._ro_stops is None:
+                from .a11y import reading_order
+                ro = reading_order([r.raw for r in self.roots])
+                self._ro_stops = {id(x) for x in ro["_nodes"]}
+            return id(n.raw) in self._ro_stops
         k = id(n)
         if k in self._stop_memo:
             return self._stop_memo[k]
@@ -1324,8 +1377,23 @@ def _image_for(n: _Node, run: _Run) -> Optional[WindowImage]:
     return None
 
 
+def _inactive(n: _Node) -> bool:
+    """``n`` is disabled or part of a disabled control. WCAG 1.4.3 exempts inactive UI
+    components, and Compose puts a Button's or TextField's label on a child Text whose
+    own node reports enabled while the control is disabled, so look up to the nearest
+    actionable / focusable ancestor too."""
+    if not _enabled(n):
+        return True
+    p = n.parent
+    while p is not None:
+        if not p.ignored and (_actionable(p) or _focus_candidate(p)):
+            return not _enabled(p)
+        p = p.parent
+    return False
+
+
 def rule_contrast(n: _Node, run: _Run) -> List[Finding]:
-    if not n.text or not _visible(n) or not _enabled(n) or "password" in n.flags:
+    if not n.text or not _visible(n) or _inactive(n) or "password" in n.flags:
         return []
     ctx = run.ctx
     sample_src = None
@@ -1416,7 +1484,10 @@ def rule_redundant_label(n: _Node, run: _Run) -> List[Finding]:
     if not norm:
         return []
     owner = run.owner(n)
-    role = run.role(n) or (run.role(owner) if owner is not n else None)
+    # The role TalkBack announces with this description: the node's own when it is the
+    # stop, else its focus owner's. A merged Compose Icon keeps Role.Image in the
+    # semantics, but Compose does not expose it and TalkBack says "Upload image, button".
+    role = run.role(n) if owner is n else run.role(owner)
     padded = f" {norm} "
     for w in _ROLE_WORDS.get(role or "", ()):
         if f" {w} " in padded:
@@ -1545,6 +1616,8 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
     reason = None
     sev = "warn"
     if role in _STATEFUL_ROLES:
+        if role == "Tab" and _tab_state_known(n):
+            return []
         reason = "stateful_role"
     elif "toggle" in words:
         reason = "label_mentions_toggle"
@@ -1556,7 +1629,12 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
         reason, sev = "possible_toggle", "info"  # icon-only control named like a toggle
     if reason is None:
         return []
-    if n.kind == "view":
+    if role == "Tab":
+        fix = ("mark the selected tab selected (View.setSelected(true), as TabLayout, "
+               "BottomNavigationView and NavigationRailView do)" if n.kind == "view" else
+               "use Tab(selected = ...) / NavigationBarItem(selected = ...), or "
+               "Modifier.selectable(selected = ..., role = Role.Tab)")
+    elif n.kind == "view":
         fix = ("use a CompoundButton (Switch/CheckBox/ToggleButton), or set "
                "AccessibilityNodeInfo checkable/checked or stateDescription "
                "(ViewCompat.setStateDescription)")
@@ -1571,6 +1649,19 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
         f"announce whether it is on. Fix: {fix}.",
         {"role": role, "label": label, "reason": reason, "has_checkable": False,
          "has_selected": False, "has_statedesc": False})]
+
+
+def _tab_state_known(n: _Node) -> bool:
+    """A tab's state is its selection: TalkBack says "selected" on the selected tab and
+    "Tab, 2 of 3" from CollectionItemInfo; an unselected tab carries no flag of its own.
+    Material TabLayout / BottomNavigationView and Compose Tab set exactly that."""
+    if n.collection_item_info is not None:
+        return True
+    p = n.parent
+    if p is None:
+        return False
+    return any(("selected" in s.flags or (s.collection_item_info or {}).get("selected"))
+               for s in p.children if s is not n)
 
 
 # --------------------------------------------------------------------------- #
@@ -1644,16 +1735,26 @@ def rule_text_too_small(n: _Node, run: _Run) -> List[Finding]:
 def rule_editable_content_desc(n: _Node, run: _Run) -> List[Finding]:
     if not _visible(n) or not _editable(n) or not n.cd:
         return []
+    ev = {"content_description": n.cd, "text": n.text or None, "hint": n.hint or None}
+    why = (f"Editable field has contentDescription \"{n.cd}\". TalkBack reads it only while "
+           f"the field is empty, in place of the hint or label, and drops it once text is "
+           f"entered, so the field loses its name when the user reviews what they typed "
+           f"(ATF EditableContentDescCheck).")
+    if n.kind != "view" and _norm(n.cd) == "search":
+        ev["stock_component"] = "material3 SearchBarDefaults.InputField"
+        return [run.finding(
+            "a11y.editable.content_description", "info", n,
+            f"{why} Material3's SearchBar input field (SearchBarDefaults.InputField) sets this "
+            f"contentDescription itself; if this is that stock component there is nothing to "
+            f"change. If you set it yourself, remove it and use the placeholder.", ev)]
     if n.kind == "view":
         fix = ("remove android:contentDescription and label the field with android:hint, "
                "android:labelFor on a visible TextView, or TextInputLayout")
     else:
-        fix = ("remove the contentDescription and use the TextField label/placeholder parameters")
+        fix = ("if you set this contentDescription yourself (Modifier.semantics), remove it and "
+               "use the TextField label/placeholder parameters")
     return [run.finding(
-        "a11y.editable.content_description", "error", n,
-        f"Editable field has contentDescription \"{n.cd}\", which TalkBack reads instead of "
-        f"the text the user typed. Fix: {fix}.",
-        {"content_description": n.cd, "text": n.text or None, "hint": n.hint or None})]
+        "a11y.editable.content_description", "error", n, f"{why} Fix: {fix}.", ev)]
 
 
 def rule_form_label(n: _Node, run: _Run) -> List[Finding]:
@@ -1809,10 +1910,11 @@ def rule_grouping(run: _Run) -> List[Finding]:
     """R10 -- short, tightly stacked text stops inside one row/card read separately."""
     out: List[Finding] = []
     for p in run.nodes:
-        if not _visible(p) or _focus_candidate(p) or "scrollable" in p.flags or _is_collection(p):
+        # A not-important container (a View screen's LinearLayout) still groups its texts.
+        if (not _on_screen(p) or (_focus_candidate(p) and not p.ignored)
+                or "scrollable" in p.flags or _is_collection(p)):
             continue
-        if p.focus_ancestor is not None:
-            continue  # already folded into a focusable ancestor
+        # Texts folded into a focusable ancestor are not stops, so they never count below.
         leaves = [c for c in p.children
                   if run.is_stop(c) and not _actionable(c) and not _editable(c)
                   and c.own_label and len(c.own_label) <= 60
@@ -2174,6 +2276,12 @@ def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
     if not run.nodes:
         ctx.diag("tree.empty", "The accessibility dump has no nodes; nothing was linted.",
                  level="warn")
+    covered = [f for f in findings if (f.window or {}).get("covered_by") is not None]
+    if covered:
+        ctx.diag("window.covered",
+                 f"{len(covered)} finding(s) are on window(s) under an open modal window (a "
+                 f"dialog); TalkBack cannot reach them until it closes (finding.window."
+                 f"covered_by names the dialog's root_view_id).", level="info")
     if rstats.get("contrast_no_image"):
         ctx.diag("contrast.no_image",
                  f"{rstats['contrast_no_image']} text node(s) were not contrast-checked because "
