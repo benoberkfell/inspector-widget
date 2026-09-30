@@ -288,13 +288,14 @@ object A11yEventTap {
     /**
      * Stop recording, wake every long-poll, and restore the roots' delegates on the main thread.
      * Called by the server thread as the server stops; never throws. If the main thread is
-     * stuck, the posted restore still runs once it frees up.
+     * stuck, the posted restore still runs once it frees up (it is posted not to be cancelled
+     * on the timeout: a tap left installed would pin this payload's classloader).
      */
     fun shutdown() {
         closed = true
         synchronized(lock) { lock.notifyAll() }
         try {
-            val restored = MainThread.run(timeoutMs = 2000) { uninstallAll() }
+            val restored = MainThread.run(timeoutMs = 2000, cancelOnTimeout = false) { uninstallAll() }
             if (restored > 0) Log.i(TAG, "event tap removed from $restored window root(s)")
         } catch (t: Throwable) {
             Log.w(TAG, "event tap: restoring the delegates did not finish in time; it runs when the main thread frees up", t)

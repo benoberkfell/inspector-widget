@@ -49,6 +49,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.Deflater
 import kotlin.math.roundToInt
 
@@ -406,13 +407,23 @@ object Capture {
         )
         // startRenderingCommandsCapture() must run on the View's UI thread; register + invalidate
         // there, then await the captured frame OFF the main thread so rendering can proceed.
+        // A registration that completes after this thread gave up (the hop timed out while it
+        // ran) is closed by whichever side sees the other second: nobody else would, and an
+        // open handle keeps the renderer recording every frame for the life of the app.
+        val abandoned = AtomicBoolean(false)
+        val registered = AtomicReference<AutoCloseable?>(null)
         val handle: AutoCloseable? = try {
             MainThread.run {
                 val h = method.invoke(null, root, executor, streamOnce) as AutoCloseable?
-                if (h != null) root.invalidate()
+                if (h != null) {
+                    registered.set(h)
+                    if (abandoned.get()) closeCapture(registered.getAndSet(null)) else root.invalidate()
+                }
                 h
             }
         } catch (t: Throwable) {
+            abandoned.set(true)
+            closeCapture(registered.getAndSet(null))
             worker.shutdownNow()
             val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t.cause ?: t
             Log.w(TAG, "startRenderingCommandsCapture failed", cause)
@@ -435,10 +446,12 @@ object Capture {
             if (t is InterruptedException) Thread.currentThread().interrupt()
             return SkpResult(true, null, "capture error: ${t.message}")
         } finally {
-            // Stop listening first, then let an in-flight write finish before reading.
-            try { MainThread.run { handle.close() } } catch (t: Throwable) {
-                Log.w(TAG, "closing the SKP capture failed", t)
-            }
+            // Stop listening first, then let an in-flight write finish before reading. Closed
+            // right here, not through a main-thread hop: close() only sets a flag under
+            // ViewDebug's lock and clears the renderer's picture callback (ViewDebug itself
+            // calls it from the executor thread), and a hop can time out while the main thread
+            // is stalled, which would leave the capture registered for good.
+            closeCapture(handle)
             worker.shutdown()
             try {
                 if (!worker.awaitTermination(SKP_DRAIN_MS, TimeUnit.MILLISECONDS)) worker.shutdownNow()
@@ -460,4 +473,14 @@ object Capture {
 
     /** How long to let a picture being written finish after the capture is closed. */
     private const val SKP_DRAIN_MS = 1000L
+
+    /** Close an SKP capture handle (null: nothing to close); logs, never throws. */
+    private fun closeCapture(handle: AutoCloseable?) {
+        if (handle == null) return
+        try {
+            handle.close()
+        } catch (t: Throwable) {
+            Log.w(TAG, "closing the SKP capture failed", t)
+        }
+    }
 }

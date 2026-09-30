@@ -64,10 +64,14 @@ object MainThread {
      * Main-thread work that did not finish within its timeout. [started] = the work began
      * and may still be running on the main thread (it cannot be interrupted, so it still
      * owns whatever it writes to); false = it never started and was cancelled, so nothing
-     * it would have touched is in use.
+     * it would have touched is in use, unless [queued]: it never started but was left
+     * queued (run with cancelOnTimeout = false) and runs once the main thread frees up.
      */
-    class MainThreadTimeoutException(message: String, val started: Boolean) :
-        TimeoutException(message)
+    class MainThreadTimeoutException(
+        message: String,
+        val started: Boolean,
+        val queued: Boolean = false,
+    ) : TimeoutException(message)
 
     // Task states: posted and waiting, running (or done), cancelled before it ran.
     private const val PENDING = 0
@@ -85,6 +89,9 @@ object MainThread {
      *   On a timeout the post is removed from the queue and marked cancelled, so
      *   work that has not started never runs later against a request that already
      *   failed (and a wedged main thread does not pile up stale walks).
+     * - Cleanup that must happen even if late (restoring what the payload changed in
+     *   the app) passes [cancelOnTimeout] = false: the post then stays queued and runs
+     *   once the main thread frees up, and the timeout only stops the wait.
      *
      * Any [Throwable] thrown by [block] is captured and re-thrown on the calling
      * thread so the [Dispatcher] can turn it into an ERROR response. A timeout
@@ -92,11 +99,17 @@ object MainThread {
      *
      * @param timeoutMs max time to wait for the posted work; defaults to the current
      *   command's timeout ([setCommandTimeout]), else [DEFAULT_TIMEOUT_MS].
+     * @param cancelOnTimeout false to leave work that has not started queued on a
+     *   timeout (it runs later; the exception then says so), for cleanup.
      * @param block the work to run on the main thread; its return value is
      *   propagated back to the caller.
      */
     @Throws(TimeoutException::class)
-    fun <T> run(timeoutMs: Long = defaultTimeoutMs(), block: () -> T): T {
+    fun <T> run(
+        timeoutMs: Long = defaultTimeoutMs(),
+        cancelOnTimeout: Boolean = true,
+        block: () -> T,
+    ): T {
         // Fast path: already on the main thread -> run inline. Posting here and
         // awaiting would deadlock because the latch would never be counted down
         // until this same thread returned to the Looper.
@@ -131,15 +144,26 @@ object MainThread {
                 latch.await(timeoutMs, TimeUnit.MILLISECONDS)
             } catch (ie: InterruptedException) {
                 // Preserve the interrupt status and surface it to the caller.
-                state.compareAndSet(PENDING, CANCELLED)
-                mainHandler.removeCallbacks(task)
+                if (cancelOnTimeout && state.compareAndSet(PENDING, CANCELLED)) {
+                    mainHandler.removeCallbacks(task)
+                }
                 Thread.currentThread().interrupt()
                 Log.w(TAG, "MainThread.run interrupted while awaiting main-thread work", ie)
                 throw ie
             }
 
         if (!completed) {
-            if (state.compareAndSet(PENDING, CANCELLED)) {
+            if (!cancelOnTimeout && state.get() == PENDING) {
+                // Left queued on purpose: it runs when the main thread frees up.
+                Log.w(TAG, "MainThread.run: the main thread was busy for ${timeoutMs}ms; the work stays queued")
+                throw MainThreadTimeoutException(
+                    "the app's main thread was busy for ${timeoutMs}ms; the work stays queued " +
+                        "and runs once it frees up",
+                    started = false,
+                    queued = true,
+                )
+            }
+            if (cancelOnTimeout && state.compareAndSet(PENDING, CANCELLED)) {
                 // Never started: drop it from the queue so it can't run later.
                 mainHandler.removeCallbacks(task)
                 Log.w(TAG, "MainThread.run: the main thread was busy for ${timeoutMs}ms; work cancelled")
