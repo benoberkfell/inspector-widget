@@ -16,7 +16,16 @@ Two tables, both plain data (no imports, cheap to load):
     emulator-5554 (API 37, 480 dpi; scratchpad/live/scen_f/dump_props.json: 40
     views, 169 property names), and from the framework defaults of
     View/ViewGroup/LinearLayout/FrameLayout/ScrollView/TextView/ImageView/
-    CompoundButton.
+    CompoundButton. Re-recorded (WP L1) from a11yprobe's ViewDefaultsActivity on
+    emulator-5558 (API 37, 480 dpi, Material3 DayNight theme): bare View,
+    FrameLayout, LinearLayout, ScrollView, TextView, ImageView, Button, EditText,
+    CheckBox and Switch, constructed in code (framework classes) and inflated
+    with no attributes (MaterialTextView, AppCompatImageView, MaterialButton,
+    AppCompatEditText, MaterialCheckBox); fixture
+    ``tests/fixtures/captures/a11yprobe_view_defaults``. What still differs on
+    those bare widgets is theme- or density-dependent (text colours and size,
+    drawables, dp-based sizes and paddings), so it stays out of this table and
+    is left to the per-capture majority rule.
 
 ``LIBRARY_FILES``
     Basenames (without ``.kt``) of the Kotlin files in the Jetpack Compose
@@ -164,11 +173,20 @@ STATIC_VIEW_DEFAULTS = {
         "measureAllChildren": False,
     },
     "ScrollView": {
+        "descendantFocusability": "afterDescendants",
         "fillViewport": False,
+        "focusable": ("true", "auto"),
         "isScrollContainer": True,
+        "scrollbarDefaultDelayBeforeFade": (400, 300),
     },
     "TextView": {
-        "autoLink": ("none", 0),
+        # a TextView makes itself important for accessibility, autofill and
+        # content capture; "auto" on older platforms
+        "importantForAccessibility": ("yes", "auto"),
+        "importantForAutofill": ("yes", "auto"),
+        "importantForContentCapture": ("yes", "auto"),
+        "text": (None, ""),
+        "autoLink": ("none", 0, ""),
         "autoSizeMaxTextSize": -1,
         "autoSizeMinTextSize": -1,
         "autoSizeStepGranularity": -1,
@@ -209,12 +227,15 @@ STATIC_VIEW_DEFAULTS = {
         "textScaleX": 1.0,
     },
     "Button": {
+        "textAllCaps": (True, False),  # android.widget.Button caps, MaterialButton not
         "breakStrategy": "simple",
         "clickable": True,
         "focusable": "true",
         "gravity": ("center", "center_vertical|center_horizontal"),
     },
     "EditText": {
+        "defaultFocusHighlightEnabled": (False, True),
+        "inputType": ("textMultiLine|text", "text|textMultiLine"),
         "breakStrategy": "simple",
         "focusable": "true",
         "focusableInTouchMode": True,
@@ -233,6 +254,8 @@ STATIC_VIEW_DEFAULTS = {
         "thumbTextPadding": 0,
     },
     "ImageView": {
+        "importantForAutofill": ("no", "auto"),
+        "importantForContentCapture": ("yes", "auto"),
         "adjustViewBounds": False,
         "baselineAlignBottom": False,
         "cropToPadding": False,

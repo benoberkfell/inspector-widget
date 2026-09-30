@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "am start -S -n com.oberkfell.a11yprobe/.ViewDefaultsActivity; capture()",
+ "screen": "ViewDefaultsActivity: bare widgets, in code (#defaults_bare) and inflated (#defaults_inflated)"
+}

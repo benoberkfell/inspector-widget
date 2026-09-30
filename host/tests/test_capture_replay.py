@@ -228,3 +228,39 @@ def test_hardened_agent_actions_are_actions_not_values(tmp_path):
         node = run(r.ctx, "node", ref=star["lines"][0].split()[0])
         assert "OnClick" in node["compose"]["actions"]
 
+
+#: What a bare widget still shows as non-default: set by the theme (colours, text
+#: size, drawables, letter spacing) or in dp (sizes, paddings), so not static.
+THEME_OR_DP = frozenset({
+    "layout_width", "layout_height", "lineHeight", "textSize", "textColor",
+    "textColorHighlight", "textColorHint", "textColorLink", "background", "backgroundTint",
+    "elevation", "stateListAnimator", "minHeight", "minWidth", "maxWidth", "paddingTop",
+    "paddingBottom", "paddingLeft", "paddingRight", "drawablePadding", "iconPadding",
+    "letterSpacing", "button", "buttonTint", "thumb", "track", "textOn", "textOff",
+})
+
+
+def test_bare_widgets_show_only_theme_and_density_values(tmp_path):
+    """normalize_defaults.STATIC_VIEW_DEFAULTS, re-recorded live (WP L1): on bare
+    widgets (framework and AppCompat/Material classes) every other property is
+    at its static default."""
+    from inspector_widget import normalize as nz
+
+    with Replay("a11yprobe_view_defaults", str(tmp_path)) as r:
+        cid = r.capture()["capture"]
+        lc = r.ctx.store.load(cid)
+        ix = lc.index()
+        widgets = [c for col in ("defaults_bare", "defaults_inflated")
+                   for n in ix.nodes.values() if n.rid == col for c in n.children]
+        assert len(widgets) == 20
+        classes = set()
+        for ref in widgets:
+            n = ix.nodes[ref]
+            cls = n.facets["view"].get("qualified") or n.facets["view"]["class"]
+            classes.add(cls.rsplit(".", 1)[-1])
+            props = lc.props(int(n.ids["view"]))
+            kept, _omitted = nz.nondefault_props({1: props}, {1: cls}, bounds={1: n.b},
+                                                 majority_min=10 ** 9)
+            assert set(kept[1]) <= THEME_OR_DP, (cls, sorted(set(kept[1]) - THEME_OR_DP))
+        assert {"TextView", "MaterialTextView", "Button", "MaterialButton", "Switch",
+                "ImageView", "AppCompatImageView", "EditText", "CheckBox"} <= classes
