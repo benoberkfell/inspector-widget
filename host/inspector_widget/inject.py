@@ -471,6 +471,78 @@ def _check_debuggable(serial: str, package: str) -> None:
         )
 
 
+# --------------------------------------------------------------------------- #
+# ABI preflight. ART loads a JVMTI agent with a plain dlopen into the app's own
+# process and refuses native-bridge translation for agents, so the .so must be
+# built for the process's native ABI: the device's primary ABI family at the
+# process's bitness (app_process64 / app_process32). Checked before pushing:
+# otherwise the mismatch only surfaces after the attach, as a dlopen error in
+# the app's log.
+# --------------------------------------------------------------------------- #
+# (ELF class, e_machine) -> Android ABI
+_ELF_ABIS = {(2, 183): "arm64-v8a", (1, 40): "armeabi-v7a", (2, 62): "x86_64",
+             (1, 3): "x86", (2, 243): "riscv64"}
+# primary ABI -> (the family's 64-bit ABI, its 32-bit ABI)
+_ABI_FAMILIES = {
+    "arm64-v8a": ("arm64-v8a", "armeabi-v7a"),
+    "x86_64": ("x86_64", "x86"),
+    "riscv64": ("riscv64", None),
+    "armeabi-v7a": (None, "armeabi-v7a"),
+    "armeabi": (None, "armeabi-v7a"),
+    "x86": (None, "x86"),
+}
+
+
+def elf_abi(path: str) -> Optional[str]:
+    """The Android ABI a native library is built for, from its ELF header
+    (``arm64-v8a``, ``x86_64``, ...), or ``None`` if it isn't an ELF we know."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(20)
+    except OSError:
+        return None
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        return None
+    machine = int.from_bytes(head[18:20], "little" if head[5] == 1 else "big")
+    return _ELF_ABIS.get((head[4], machine))
+
+
+def _check_abi(serial: str, package: str, pid: int, so_path: str) -> None:
+    """Raise :class:`InjectionError` when libviewspector.so can't load into
+    ``pid`` because it is built for another ABI. Silent when either side can't
+    be determined: the attach then decides."""
+    so_abi = elf_abi(so_path)
+    if so_abi is None:
+        return
+    try:
+        primary = adb.device_abi(serial)
+    except adb.AdbError:
+        return
+    family = _ABI_FAMILIES.get(primary)
+    if family is None:
+        return
+    bits = adb.process_bitness(serial, package, pid)
+    if bits is None:
+        if so_abi in family:
+            return  # the process could be either; the attach decides
+        runs = f"runs {' / '.join(a for a in family if a)} processes"
+    else:
+        process_abi = family[0] if bits == 64 else family[1]
+        if process_abi is None or process_abi == so_abi:
+            return
+        runs = f"runs as a {bits}-bit {process_abi} process (app_process{bits})"
+    who = f"'{package}' (pid {pid})" if bits is not None else f"this {primary} device"
+    raise InjectionError(
+        f"{NATIVE_SO_NAME} in build-out is built for {so_abi}, but {who} {runs}: an agent "
+        f"library must match the process's native ABI (ART does not load agents through "
+        f"native-bridge translation), so injecting would only time out.",
+        hint=(f"Inspect the app on a device or emulator image where it runs as {so_abi}"
+              + (" (an app that ships only 32-bit native libraries runs 32-bit even on a "
+                 "64-bit device)" if bits == 32 else "")
+              + f", or build the agent for its ABI."),
+    )
+
+
 def _push_and_stage(serial: str, package: str, build_out: str):
     """Push the three artifacts and copy them into the app private dir.
 
@@ -850,8 +922,9 @@ def inject_and_connect(
          with ``force_reinject``, SHUTDOWN it and wait for its socket to go
       3. if this app process already failed to start this build, raise that
          error again (:class:`AgentStartupError`, unless ``force_reinject``)
-      4. check the app is debuggable and not frozen, then push .so +
-         bootstrap.dex + payload.jar to /data/local/tmp
+      4. check the app is debuggable, not frozen, and that libviewspector.so
+         matches the process's ABI; then push .so + bootstrap.dex +
+         payload.jar to /data/local/tmp
       5. run-as cp into the app private dir (.so 700, dex/jar 444)
       6. cmd activity attach-agent <pkg> <so>=<bootstrap>:<payload>:viewspector_<pid>
       7. wait for the abstract socket, reading the app's error log as it polls
@@ -921,6 +994,7 @@ def inject_and_connect(
         # attach-agent would only be queued until the app wakes, and then start
         # an agent nobody is waiting for.
         raise InjectionError(frozen, hint=FROZEN_HINT)
+    _check_abi(serial, package, pid, os.path.join(build_dir, NATIVE_SO_NAME))
     app_so, app_boot, app_payload = _push_and_stage(serial, package, build_dir)
 
     # Native agent option string: bootstrapDexPath:payloadPath:socketName.

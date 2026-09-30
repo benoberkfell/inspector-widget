@@ -381,3 +381,77 @@ def test_a_linkage_error_in_an_unrelated_class_is_not_called_shadowing():
                                            "classes (declaration of 'com.example.Bar' appears in "
                                            "/system/framework/framework.jar)"))
     assert found.error.kind == "payload_start"
+
+
+# =========================================================================== #
+# ABI preflight: libviewspector.so must match the app process's native ABI
+# =========================================================================== #
+def _elf(elf_class, machine):
+    """The first bytes of an ELF shared object: class, little-endian, e_machine."""
+    return (b"\x7fELF" + bytes([elf_class, 1, 1, 0]) + b"\x00" * 8
+            + (3).to_bytes(2, "little") + machine.to_bytes(2, "little") + b"\x00" * 44)
+
+
+ARM64_SO = _elf(2, 183)
+
+
+@pytest.mark.parametrize("header, abi", [
+    (_elf(2, 183), "arm64-v8a"), (_elf(1, 40), "armeabi-v7a"), (_elf(2, 62), "x86_64"),
+    (_elf(1, 3), "x86"), (_elf(2, 243), "riscv64"), (_elf(2, 999), None),
+    (b"fake libviewspector.so", None), (b"", None),
+])
+def test_elf_abi_reads_the_header(tmp_path, header, abi):
+    path = tmp_path / "lib.so"
+    path.write_bytes(header)
+    assert inject.elf_abi(str(path)) == abi
+    assert inject.elf_abi(str(tmp_path / "missing.so")) is None
+
+
+@pytest.fixture
+def arm64_agent(fake_device, tmp_path):
+    (tmp_path / "build-out" / inject.NATIVE_SO_NAME).write_bytes(ARM64_SO)
+    return fake_device
+
+
+def test_a_32_bit_app_is_refused_before_pushing(arm64_agent):
+    arm64_agent.apps[PKG].bitness = 32
+    with pytest.raises(inject.InjectionError) as err:
+        _inject()
+    msg = str(err.value)
+    assert msg.startswith(f"{inject.NATIVE_SO_NAME} in build-out is built for arm64-v8a, but "
+                          f"'{PKG}' (pid {PID}) runs as a 32-bit armeabi-v7a process "
+                          "(app_process32)")
+    assert "ships only 32-bit native libraries" in err.value.hint
+    assert not arm64_agent.pushed and not arm64_agent.attach_calls
+
+
+def test_an_x86_64_device_is_refused_before_pushing(arm64_agent):
+    arm64_agent.abi = "x86_64"
+    with pytest.raises(inject.InjectionError, match="runs as a 64-bit x86_64 process"):
+        _inject()
+    arm64_agent.apps[PKG].bitness = None  # the exe link can't be read: every process is x86
+    with pytest.raises(inject.InjectionError) as err:
+        _inject()
+    assert ("is built for arm64-v8a, but this x86_64 device runs x86_64 / x86 processes"
+            in str(err.value))
+    assert "native-bridge" in str(err.value)
+    assert not arm64_agent.pushed and not arm64_agent.attach_calls
+
+
+def test_a_matching_or_undecidable_abi_injects(arm64_agent):
+    inj = _inject()  # 64-bit app on an arm64 device
+    inj.close()
+    arm64_agent.restart_app(PKG, new_pid=PID + 1)
+    arm64_agent.apps[PKG].bitness = None  # unknown on arm64: could be either, the attach decides
+    inj = _inject()
+    try:
+        assert not inj.warm and len(arm64_agent.attach_calls) == 2
+    finally:
+        inj.close()
+
+
+def test_a_library_that_is_not_an_elf_skips_the_check(fake_device):
+    inj = _inject()  # the placeholder build-out .so
+    inj.close()
+    assert not any("readlink" in cmd or "ro.product.cpu.abi" in cmd
+                   for cmd in fake_device.shell_log())

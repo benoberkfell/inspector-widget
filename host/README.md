@@ -316,7 +316,12 @@ long-lived host (the MCP server, a Python caller) remembers it per `(serial,
 package, pid, build)` and reports it again without re-injecting until the app
 restarts or build-out changes; `force` injects anyway. A socket timeout with no
 such error says what the app did log since the attach, or that the attach never
-ran (the app's main thread runs it).
+ran (the app's main thread runs it). Before pushing anything the host also
+checks that the app is debuggable and that `libviewspector.so` (by its ELF
+header) matches the app process's ABI: `app_process64` or `app_process32`
+(read from `/proc/<pid>/exe`) on the device's primary ABI, since ART loads
+agents without native-bridge translation. A 32-bit app or an x86_64 emulator
+is refused with one line instead of a failed attach.
 
 ### Session lifecycle (CLI and Python API)
 
