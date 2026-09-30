@@ -108,10 +108,18 @@ class TreeBuilder(val strings: StringTable) {
             }
 
         return selected.mapNotNull { root ->
+            val mark = visitedViews.size
             try {
                 buildNode(root, 1, ancestorTransformed = false)
             } catch (t: Throwable) {
                 Log.w(TAG, "Failed to build node tree for root", t)
+                // The root is dropped: forget the Views visited under it, so [visited]
+                // (whose properties the Dispatcher reads) matches the nodes sent.
+                while (visitedViews.size > mark) {
+                    val v = visitedViews.removeAt(visitedViews.size - 1)
+                    val vid = ViewReflect.uniqueDrawingId(v)
+                    if (viewsById[vid] === v) viewsById.remove(vid)
+                }
                 null
             }
         }
