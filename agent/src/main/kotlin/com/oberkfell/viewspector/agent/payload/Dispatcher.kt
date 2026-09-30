@@ -284,7 +284,7 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         resp.supported = result.supported
         result.error?.let { resp.error = it }
         result.skp?.let {
-            resp.skp = com.google.protobuf.ByteString.copyFrom(it)
+            resp.skp = it
             resp.version = readSkpVersion(it)
         }
         return ok(id).setCaptureSkp(resp).build()
@@ -397,14 +397,14 @@ class Dispatcher(private val deviceLock: Any = Any()) {
     }
 
     /** Read the SKP version int from a serialized SkPicture: "skiapict" magic then LE uint32. */
-    private fun readSkpVersion(skp: ByteArray): Int {
+    private fun readSkpVersion(skp: com.google.protobuf.ByteString): Int {
         val magic = "skiapict".toByteArray(Charsets.US_ASCII)
-        if (skp.size < 12) return 0
-        for (i in magic.indices) if (skp[i] != magic[i]) return 0
-        return (skp[8].toInt() and 0xFF) or
-            ((skp[9].toInt() and 0xFF) shl 8) or
-            ((skp[10].toInt() and 0xFF) shl 16) or
-            ((skp[11].toInt() and 0xFF) shl 24)
+        if (skp.size() < 12) return 0
+        for (i in magic.indices) if (skp.byteAt(i) != magic[i]) return 0
+        return (skp.byteAt(8).toInt() and 0xFF) or
+            ((skp.byteAt(9).toInt() and 0xFF) shl 8) or
+            ((skp.byteAt(10).toInt() and 0xFF) shl 16) or
+            ((skp.byteAt(11).toInt() and 0xFF) shl 24)
     }
 
     private fun handleDumpCompose(

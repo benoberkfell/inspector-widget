@@ -38,6 +38,7 @@ import android.view.View
 import android.view.ViewDebug
 import com.oberkfell.viewspector.proto.ViewInspection
 import com.google.protobuf.ByteString
+import com.google.protobuf.UnsafeByteOperations
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
@@ -313,7 +314,46 @@ object Capture {
     }
 
     /** Result of an SKP capture. */
-    class SkpResult(val supported: Boolean, val skp: ByteArray?, val error: String?)
+    class SkpResult(val supported: Boolean, val skp: ByteString?, val error: String?)
+
+    /**
+     * The SKP sink: a ByteArrayOutputStream that refuses to grow past [limit] (the write fails
+     * with an IOException; ViewDebug then drops that frame) and hands its bytes to protobuf
+     * without a copy. It is written once (one frame) and never reused, so wrapping is safe.
+     */
+    private class SkpBuffer(private val limit: Long) : ByteArrayOutputStream(256 * 1024) {
+        @Volatile var overflowed = false
+            private set
+
+        private fun ensure(extra: Int) {
+            if (overflowed || count.toLong() + extra > limit) {
+                overflowed = true
+                throw java.io.IOException("SKP larger than $limit bytes")
+            }
+        }
+
+        @Synchronized override fun write(b: Int) { ensure(1); super.write(b) }
+
+        @Synchronized override fun write(b: ByteArray, off: Int, len: Int) { ensure(len); super.write(b, off, len) }
+
+        @Synchronized fun toByteString(): ByteString = UnsafeByteOperations.unsafeWrap(buf, 0, count)
+    }
+
+    /**
+     * The largest SKP this capture may hold. It all lives in the APP's heap: ViewDebug has
+     * already serialized the frame into its own byte array when it hands it over, and the
+     * picture is then held about three times over (that array, our buffer, the serialized
+     * reply). So it gets a quarter of the heap still free, and never more than
+     * [MAX_SKP_BYTES]. Past that the capture fails cleanly (the host falls back to a BITMAP
+     * crop) instead of pushing the app's own allocations into an OutOfMemoryError.
+     */
+    private fun skpLimit(): Long {
+        val rt = Runtime.getRuntime()
+        val free = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+        return minOf(MAX_SKP_BYTES, maxOf(free / 4, 0L))
+    }
+
+    private const val MAX_SKP_BYTES = 64L * 1024 * 1024
 
     /**
      * Capture one frame of [root]'s rendering as a serialized Skia picture (SKP), via the public-ish
@@ -326,7 +366,8 @@ object Capture {
         if (Build.VERSION.SDK_INT <= 32) {
             return SkpResult(false, null, "SKP capture needs API 33+ (have ${Build.VERSION.SDK_INT})")
         }
-        val os = ByteArrayOutputStream()
+        val limit = skpLimit()
+        val os = SkpBuffer(limit)
         val latch = CountDownLatch(1)
         // Hand the stream out for ONE frame. ViewDebug calls the Callable once per captured
         // frame and appends that frame's picture to the stream it returns, so a second frame
@@ -395,8 +436,15 @@ object Capture {
                 Thread.currentThread().interrupt()
             }
         }
-        val bytes = os.toByteArray()
-        return if (bytes.isEmpty()) SkpResult(true, null, "empty SKP") else SkpResult(true, bytes, null)
+        if (os.overflowed) {
+            return SkpResult(
+                true, null,
+                "SKP larger than ${limit / (1024 * 1024)} MB, the most the app's free heap allows " +
+                    "(its bitmaps are serialized into the picture); use a BITMAP crop instead",
+            )
+        }
+        if (os.size() == 0) return SkpResult(true, null, "empty SKP")
+        return SkpResult(true, os.toByteString(), null)
     }
 
     /** How long to let a picture being written finish after the capture is closed. */
