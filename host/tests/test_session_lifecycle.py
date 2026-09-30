@@ -465,3 +465,16 @@ def test_fallback_server_survives_batches_and_scalars():
     assert [r.get("error", {}).get("code") for r in replies] == [-32600, -32600, -32600, -32700, None]
     assert replies[-1] == {"jsonrpc": "2.0", "id": 9, "result": {}}
     assert "Traceback" not in proc.stdout
+
+
+# =========================================================================== #
+# E12: temp files
+# =========================================================================== #
+def test_mcp_pngs_live_in_one_per_process_directory(mcp, fake_device):
+    a = Path(mcp("screenshot")["path"])
+    b = Path(mcp("screenshot", scale=0.5)["path"])
+    assert a.parent == b.parent and a.parent.parent == fake_device.tmpdir
+    assert a.parent.name.startswith(f"inspector-widget-{os.getpid()}-")
+    mcp_server._cleanup_at_exit()
+    assert not a.parent.exists()
+    assert fake_device.forward_names() == []

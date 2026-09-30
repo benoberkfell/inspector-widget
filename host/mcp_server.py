@@ -28,9 +28,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import contextlib
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -248,6 +251,14 @@ class SessionCache:
     def all(self) -> List[Any]:
         with self._lock:
             return list(self._sessions.values())
+
+    def close_all(self) -> None:
+        """Disconnect every cached session (agents keep running). For exit."""
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            _disconnect(session)
 
 
 SESSIONS = SessionCache()
@@ -546,16 +557,74 @@ def _rgba_to_png(rgba: bytearray, width: int, height: int) -> bytes:
 
 
 _TMP_PREFIX = "viewspector_"
+# PNGs go in one directory per server process (under $TMPDIR), deleted when the
+# server exits, so they don't pile up across sessions.
+_TMP_DIRS: Dict[str, str] = {}
+_TMP_LOCK = threading.Lock()
+
+
+def _tmp_dir() -> str:
+    base = tempfile.gettempdir()
+    with _TMP_LOCK:
+        path = _TMP_DIRS.get(base)
+        if path is None or not os.path.isdir(path):
+            path = tempfile.mkdtemp(prefix=f"inspector-widget-{os.getpid()}-", dir=base)
+            _TMP_DIRS[base] = path
+        return path
 
 
 def _tmp_png_path(serial: str, package: str, tag: str) -> str:
     safe_pkg = package.replace("/", "_").replace(":", "_")
     safe_serial = serial.replace("/", "_").replace(":", "_")
     fd, path = tempfile.mkstemp(
-        prefix=f"{_TMP_PREFIX}{safe_serial}_{safe_pkg}_{tag}_", suffix=".png"
+        prefix=f"{_TMP_PREFIX}{safe_serial}_{safe_pkg}_{tag}_", suffix=".png", dir=_tmp_dir()
     )
     os.close(fd)
     return path
+
+
+def _remove_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _png_output(serial: str, package: str, tag: str) -> Iterator[str]:
+    """A new PNG path for a tool result; removed again if the tool fails."""
+    path = _tmp_png_path(serial, package, tag)
+    try:
+        yield path
+    except BaseException:
+        _remove_quietly(path)
+        raise
+
+
+@contextlib.contextmanager
+def _png_scratch(serial: str, package: str, tag: str) -> Iterator[str]:
+    """A scratch PNG path (an overlay's base screenshot); always removed."""
+    path = _tmp_png_path(serial, package, tag)
+    try:
+        yield path
+    finally:
+        _remove_quietly(path)
+
+
+def _cleanup_at_exit() -> None:
+    """Disconnect cached sessions (removing their adb forwards; agents keep
+    running for the next start) and delete this process's PNG directory."""
+    try:
+        SESSIONS.close_all()
+    except Exception:  # noqa: BLE001 - exit cleanup is best-effort
+        pass
+    with _TMP_LOCK:
+        dirs = list(_TMP_DIRS.values())
+        _TMP_DIRS.clear()
+    for path in dirs:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -675,8 +744,8 @@ def tool_dump_tree(
             for g in resp.properties
         ]
     if include_screenshot and resp.HasField("screenshot"):
-        dest = _tmp_png_path(serial, package, "tree")
-        result["screenshot"] = _save_screenshot_png(session, resp.screenshot, dest)
+        with _png_output(serial, package, "tree") as dest:
+            result["screenshot"] = _save_screenshot_png(session, resp.screenshot, dest)
     return result
 
 
@@ -715,8 +784,8 @@ def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> 
     resp = session.screenshot(root_id=0, scale=scale)
     if not resp.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
-    dest = _tmp_png_path(serial, package, "shot")
-    meta = _save_screenshot_png(session, resp.screenshot, dest)
+    with _png_output(serial, package, "shot") as dest:
+        meta = _save_screenshot_png(session, resp.screenshot, dest)
     meta.update({"serial": serial, "package": package})
     return meta
 
@@ -781,16 +850,12 @@ def tool_compose_overlay(serial: str, package: str, scale: float = 1.0,
     shot = session.screenshot(root_id=0, scale=scale)
     if not shot.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
-    base = _tmp_png_path(serial, package, "compose_base")
-    pngmod.write_png(shot.screenshot, base)
     base_scale = float(shot.screenshot.scale) or scale
-    out = _tmp_png_path(serial, package, "compose_overlay")
-    summary = ov.render_compose_overlay(base, roots, out, labeled_only=labeled_only,
-                                        scale=base_scale)
-    try:
-        os.remove(base)
-    except OSError:
-        pass
+    with _png_scratch(serial, package, "compose_base") as base, \
+            _png_output(serial, package, "compose_overlay") as out:
+        pngmod.write_png(shot.screenshot, base)
+        summary = ov.render_compose_overlay(base, roots, out, labeled_only=labeled_only,
+                                            scale=base_scale)
     on_screen: List[Dict[str, Any]] = []
 
     def _collect(n: Dict[str, Any]) -> None:
@@ -1039,16 +1104,12 @@ def tool_a11y_overlay(
     shot = session.screenshot(root_id=0, scale=scale)
     if not shot.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
-    base = _tmp_png_path(serial, package, "a11y_base")
-    pngmod.write_png(shot.screenshot, base)
     base_scale = float(shot.screenshot.scale) or scale
-    out = _tmp_png_path(serial, package, "a11y_overlay")
-    summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
-                                     scale=base_scale)
-    try:
-        os.remove(base)
-    except OSError:
-        pass
+    with _png_scratch(serial, package, "a11y_base") as base, \
+            _png_output(serial, package, "a11y_overlay") as out:
+        pngmod.write_png(shot.screenshot, base)
+        summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
+                                         scale=base_scale)
     return {
         "serial": serial, "package": package,
         "path": out, "overlay_path": out,
@@ -1220,7 +1281,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "Capture a screenshot of the app's current UI and save it as a PNG file on the host. "
             "Auto-attaches if needed. Returns the saved file path plus width/height. Use scale "
             "(0<scale<=1) to reduce size. For UI structure use dump_tree; use this when you need the "
-            "rendered pixels."
+            "rendered pixels. PNGs from every tool live in a per-server temp directory that is "
+            "deleted when the server exits; copy one elsewhere to keep it."
         ),
         "schema": {
             "type": "object",
@@ -1456,20 +1518,19 @@ def tool_inspect(serial: str, package: str, include_properties: bool = False,
         from inspector_widget import overlay as ov
         shot = session.screenshot(root_id=0, scale=1.0)
         if shot.HasField("screenshot"):
-            base = _tmp_png_path(serial, package, "integrated_base")
-            _save_screenshot_png(session, shot.screenshot, base)
-            out = _tmp_png_path(serial, package, "integrated_overlay")
             base_scale = float(shot.screenshot.scale) or 1.0
-            try:
-                summary = ov.render_integrated_overlay(base, merged, out, scale=base_scale)
-                result["overlay"] = summary
-            except (RuntimeError, AttributeError) as exc:
-                result["overlay_error"] = str(exc)
-            finally:
+            with _png_scratch(serial, package, "integrated_base") as base:
+                _save_screenshot_png(session, shot.screenshot, base)
+                out = _tmp_png_path(serial, package, "integrated_overlay")
                 try:
-                    os.remove(base)
-                except OSError:
-                    pass
+                    result["overlay"] = ov.render_integrated_overlay(
+                        base, merged, out, scale=base_scale)
+                except (RuntimeError, AttributeError) as exc:
+                    _remove_quietly(out)
+                    result["overlay_error"] = str(exc)
+                except BaseException:
+                    _remove_quietly(out)
+                    raise
     return result
 
 
@@ -1486,14 +1547,18 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
     sid = _as_int(semantics_id, "semantics_id") if semantics_id is not None else None
     serial = _serial(serial)
     session = SESSIONS.get_or_attach(serial, package)
-    image_path = _tmp_png_path(serial, package, "dossier") if include_image else None
-    dossier = correlate.inspect_node(
-        session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
-        include_image=bool(include_image), image_path=image_path,
-        lint_fn=_lint_fn(), density=_device_density(serial),
-    )
-    if dossier is None:
-        raise ToolError("no matching element found for the given selector")
+    with contextlib.ExitStack() as stack:
+        image_path = (stack.enter_context(_png_output(serial, package, "dossier"))
+                      if include_image else None)
+        dossier = correlate.inspect_node(
+            session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
+            include_image=bool(include_image), image_path=image_path,
+            lint_fn=_lint_fn(), density=_device_density(serial),
+        )
+        if dossier is None:
+            raise ToolError("no matching element found for the given selector")
+        if image_path and not (dossier.get("component_image") or {}).get("path"):
+            _remove_quietly(image_path)
     dossier.update({"serial": serial, "package": package})
     return dossier
 
@@ -1515,8 +1580,10 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
                                semantics_id=sid, bounds=bounds)
     if node is None:
         raise ToolError("no matching element found for the given selector")
-    out = _tmp_png_path(serial, package, "component")
-    img = correlate.component_image(session, node, out_path=out)
+    with _png_output(serial, package, "component") as out:
+        img = correlate.component_image(session, node, out_path=out)
+        if not img.get("path"):
+            _remove_quietly(out)
     img.update({"serial": serial, "package": package, "node_key": node.get("node_key")})
     return img
 
@@ -2111,6 +2178,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return rc
 
     _log_startup_health()
+    # Remove this server's adb forwards and PNG directory however it exits
+    # (stdin closed, an error, or SIGTERM, which is turned into SystemExit so
+    # atexit handlers run). Agents keep running for the next start.
+    atexit.register(_cleanup_at_exit)
+    try:
+        import signal
+
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    except (ImportError, ValueError, OSError):  # not the main thread / unsupported
+        pass
 
     if not _serve_with_mcp():
         _serve_fallback()

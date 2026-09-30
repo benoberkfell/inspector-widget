@@ -93,7 +93,9 @@ def hang_on(agent, command):
 
 
 def leftovers(directory, needle):
-    return sorted(p.name for p in Path(directory).iterdir() if needle in p.name)
+    """Files under ``directory`` (recursively: the MCP server keeps its PNGs in a
+    per-process subdirectory) whose name contains ``needle``."""
+    return sorted(p.name for p in Path(directory).rglob("*") if needle in p.name and p.is_file())
 
 
 needs_pil = pytest.mark.skipif(
@@ -666,7 +668,7 @@ def test_mcp_dump_tree_with_properties_and_screenshot(mcp, fake_device):
     assert [g["view_id"] for g in res["properties"]] == list(range(1001, 1007))
     shot = res["screenshot"]
     assert (shot["width"], shot["height"], shot["scale"]) == (180, 320, 0.5)
-    assert Path(shot["path"]).parent == fake_device.tmpdir and png_size(shot["path"]) == (180, 320)
+    assert fake_device.tmpdir in Path(shot["path"]).parents and png_size(shot["path"]) == (180, 320)
 
 
 def test_mcp_get_properties(mcp, fake_device):
@@ -1073,8 +1075,6 @@ def test_scenario_failed_cli_overlay_leaves_no_base_png(fake_device, run_cli, tm
     assert not Path(f"{out}.base.png").exists()
 
 
-@pytest.mark.xfail(strict=True, reason="E12: a failed MCP overlay leaves its base PNG and an empty "
-                   "output PNG in $TMPDIR")
 def test_scenario_failed_mcp_overlay_leaves_no_temp_files(mcp, fake_device, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("overlay renderer failed")
@@ -1183,8 +1183,6 @@ def test_stdio_transport_end_to_end(tmp_path, transport):
     assert exit_record["forwards"] == [] and exit_record["running_agents"] == []
 
 
-@pytest.mark.xfail(strict=True, reason="E12: no atexit cleanup; the adb forward of every cached "
-                   "session leaks when the MCP server exits")
 def test_stdio_server_exit_removes_its_adb_forwards(tmp_path):
     pytest.importorskip("mcp")
     results, wire, exits = _stdio_session(tmp_path, False, [("attach", {})])
