@@ -1812,16 +1812,40 @@ def _self_check() -> int:
             print("  mcp SDK: absent (will use JSON-RPC stdio fallback)")
         else:
             print(f"  mcp SDK: {_dist_version('mcp')} OK (real MCP transport)")
-    for mod, dist, degraded in (
-        ("PIL", "Pillow", "compose_overlay, a11y_overlay, inspect overlay, component_image crop fallback"),
-        ("grpc", "grpcio", "component_image SKP rendering (falls back to a screenshot crop)"),
-    ):
-        try:
-            __import__(mod)
+    for dist, problem, degraded in _probe_optional_deps():
+        if problem is None:
             print(f"  {dist}: {_dist_version(dist)} OK")
-        except Exception:
-            print(f"  {dist}: MISSING — degrades: {degraded} (pip install {dist})")
+        else:
+            print(f"  {dist}: {problem} — degrades: {degraded}")
     return 1 if failed else 0
+
+
+def _probe_optional_deps() -> List[Tuple[str, Optional[str], str]]:
+    """``[(dist, problem_or_None, what_it_degrades)]`` for the optional deps.
+
+    grpcio is probed by loading the SKP gRPC stubs, not just ``import grpc``:
+    the stubs refuse to load on a grpcio older than the one they were generated
+    with, so a bare import would report an unusable grpcio as OK.
+    """
+    out: List[Tuple[str, Optional[str], str]] = []
+    try:
+        import PIL  # noqa: F401
+
+        pil_problem = None
+    except Exception:
+        pil_problem = "MISSING (pip install Pillow)"
+    out.append(("Pillow", pil_problem,
+                "compose_overlay, a11y_overlay, inspect overlay, component_image crop fallback"))
+    try:
+        from inspector_widget import skia_client
+
+        skia_client._import_skia_grpc()
+        grpc_problem = None
+    except Exception as exc:
+        grpc_problem = f"UNUSABLE ({exc})"
+    out.append(("grpcio", grpc_problem,
+                "component_image SKP rendering (falls back to a screenshot crop)"))
+    return out
 
 
 def _dist_version(dist: str) -> str:
@@ -1891,8 +1915,10 @@ def _log_startup_health() -> None:
         except Exception:
             return "absent"
 
-    pillow = _present("PIL")
-    grpcio = _present("grpc")
+    deps = {dist: ("present" if problem is None else "unusable")
+            for dist, problem, _ in _probe_optional_deps()}
+    pillow = deps["Pillow"]
+    grpcio = deps["grpcio"]
     mcp_sdk = _present("mcp")
     transport = "mcp-sdk" if mcp_sdk == "present" else "jsonrpc-fallback"
     log.info(
