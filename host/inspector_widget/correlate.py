@@ -428,6 +428,10 @@ class _Merger:
                      if v.get(k) is not None},
             "children": [],
         }
+        if v.get("flags"):
+            # TEXT_REDACTED (masked password text), CHILDREN_TRUNCATED (its children were
+            # cut at the wire depth cap), IS_WEBVIEW.
+            node["view"]["flags"] = list(v["flags"])
         if (v.get("bounds") or {}).get("render"):
             node["render_quad"] = v["bounds"]["render"]
         if vid in self.props:
@@ -1286,12 +1290,16 @@ def _finding_matches(finding: dict, keys: set) -> bool:
 
 
 # --------------------------------------------------------------------------- session glue
-def _shaped_view_tree(session: Any, props: bool) -> Tuple[List[dict], Dict[int, list]]:
+def _shaped_view_tree(session: Any, props: bool, diagnostics: Optional[Dict[str, str]] = None
+                      ) -> Tuple[List[dict], Dict[int, list]]:
+    """The View roots and properties; the agent's diagnostics go into ``diagnostics["view"]``."""
     from . import strings as st
     resp = session.dump_tree(root_id=0, include_properties=props,
                              include_resolution_stack=False,
                              include_screenshot=False)
     data = st.dump_tree_to_dict(resp)
+    if diagnostics is not None and data.get("diagnostics"):
+        diagnostics["view"] = data["diagnostics"]
     prop_map: Dict[int, list] = {}
     for vid, plist in (data.get("properties") or {}).items():
         try:
@@ -1301,13 +1309,16 @@ def _shaped_view_tree(session: Any, props: bool) -> Tuple[List[dict], Dict[int, 
     return data.get("roots", []), prop_map
 
 
-def _shaped_compose(session: Any) -> List[dict]:
+def _shaped_compose(session: Any, diagnostics: Optional[Dict[str, str]] = None) -> List[dict]:
+    """The Compose windows; the agent's diagnostics go into ``diagnostics["compose"]``."""
     from . import strings as st
     from .client import TransportError
     try:
         resp = session.dump_compose(include_semantics=True, include_slot_table=False,
                                     enable_inspection=False)
         data = st.dump_compose_to_dict(resp)
+        if diagnostics is not None and data.get("diagnostics"):
+            diagnostics["compose"] = data["diagnostics"]
         return data.get("windows", []) or []
     except TransportError:
         raise  # a lost session is not "no Compose on screen"
@@ -1367,13 +1378,42 @@ def _a11y_roots(data: Any) -> List[dict]:
     return []
 
 
+# Diagnostics tokens (by prefix) that say a dump is incomplete: a tree cut at the wire
+# depth cap or the a11y node cap, Compose semantics or a slot table that could not be
+# (fully) read, properties that are missing or describe a later UI state (CONTRACT §5, §9).
+_INCOMPLETE_TOKENS = (
+    "depth-truncated", "node-cap", "properties-incomplete", "properties-failed",
+    "properties-changed", "compose_obfuscated", "semantics_failed", "semantics_unmerged",
+    "semantics_partial", "semantics_truncated", "slot_failed", "slot_partial", "slot_truncated",
+)
+
+
+def incomplete_tokens(diagnostics: Dict[str, str]) -> Dict[str, List[str]]:
+    """``{facet: [token, ...]}``: the tokens of each dump's diagnostics string that say the
+    dump is incomplete (:data:`_INCOMPLETE_TOKENS`), for facets that have any."""
+    out: Dict[str, List[str]] = {}
+    for facet, text in diagnostics.items():
+        hits = [t.strip() for t in (text or "").split(";")
+                if t.strip().startswith(_INCOMPLETE_TOKENS)]
+        if hits:
+            out[facet] = hits
+    return out
+
+
 def _merge_session(session: Any, props: bool, rendering: bool = False
                    ) -> Tuple[MergedTree, List[dict], Any]:
     """Fetch the three trees and merge them; returns (merged, compose windows, a11y data
-    as ``a11y.a11y_to_dict`` shaped it, or a bare list of roots from a fake)."""
-    view_roots, prop_map = _shaped_view_tree(session, props)
-    compose_windows = _shaped_compose(session)
+    as ``a11y.a11y_to_dict`` shaped it, or a bare list of roots from a fake).
+
+    ``merged["diagnostics"]`` keeps each dump's agent diagnostics (``view`` / ``compose`` /
+    ``a11y``), and ``summary["incomplete"]`` the tokens among them that say a tree was cut
+    or partly unreadable, so a caller never takes a truncated tree for a complete one."""
+    diagnostics: Dict[str, str] = {}
+    view_roots, prop_map = _shaped_view_tree(session, props, diagnostics)
+    compose_windows = _shaped_compose(session, diagnostics)
     a11y_data = _shaped_a11y_data(session, rendering)
+    if isinstance(a11y_data, dict) and a11y_data.get("diagnostics"):
+        diagnostics["a11y"] = a11y_data["diagnostics"]
     a11y_roots = _a11y_roots(a11y_data)
     merged = build_integrated_tree(view_roots, compose_windows, a11y_roots,
                                    props=prop_map if props else None)
@@ -1382,6 +1422,11 @@ def _merge_session(session: Any, props: bool, rendering: bool = False
         "compose": bool(compose_windows),
         "a11y": bool(a11y_roots),
     }
+    if diagnostics:
+        merged["diagnostics"] = diagnostics
+    incomplete = incomplete_tokens(diagnostics)
+    if incomplete:
+        merged["summary"]["incomplete"] = incomplete
     merged.registry = registry_for(session)
     return merged, compose_windows, a11y_data
 
@@ -1621,6 +1666,8 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
         "correlation_confidence": node.get("correlation_confidence"),
         "generation": merged.get("generation"),
     }
+    if (merged.get("summary") or {}).get("incomplete"):
+        dossier["incomplete"] = merged["summary"]["incomplete"]
     for facet in ("view", "compose", "a11y", "render_quad", "a11y_iou", "list_item",
                   "interop", "a11y_only", "a11y_parent", "compose_synthetic",
                   "resolved_from", "key_note"):

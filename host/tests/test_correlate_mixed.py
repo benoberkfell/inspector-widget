@@ -308,8 +308,10 @@ class _FakeSession:
 
 @pytest.fixture
 def fake_session(monkeypatch):
-    monkeypatch.setattr(correlate, "_shaped_view_tree", lambda s, props: (mf.view_roots(), {}))
-    monkeypatch.setattr(correlate, "_shaped_compose", lambda s: mf.compose_windows())
+    monkeypatch.setattr(correlate, "_shaped_view_tree",
+                        lambda s, props, diagnostics=None: (mf.view_roots(), {}))
+    monkeypatch.setattr(correlate, "_shaped_compose",
+                        lambda s, diagnostics=None: mf.compose_windows())
     monkeypatch.setattr(correlate, "_shaped_a11y_data",
                         lambda s, rendering=False: a11y.a11y_to_dict(mf.a11y_response()))
     return _FakeSession()
@@ -343,7 +345,7 @@ def test_inspect_node_typed_findings_and_no_cross_space_ints(fake_session):
 def test_inspect_node_reresolves_across_calls(fake_session, monkeypatch):
     correlate.inspect_tree(fake_session)  # the agent saw compose:32:4 here
     monkeypatch.setattr(correlate, "_shaped_compose",
-                        lambda s: _reminted(mf.compose_windows()))
+                        lambda s, diagnostics=None: _reminted(mf.compose_windows()))
     monkeypatch.setattr(correlate, "_shaped_a11y_data",
                         lambda s, rendering=False: {"windows": [
                             {"root_view_id": 2, "root": r} for r in _reminted_a11y()]})
@@ -546,3 +548,43 @@ def test_reresolution_refuses_a_tie():
     with pytest.raises(correlate.NodeKeyError) as ei:
         correlate.find_node(_merged_reminted(), node_key="compose:22:9", registry=reg)
     assert len(ei.value.candidates) >= 2
+
+
+def test_inspect_carries_truncation_flags_and_diagnostics(monkeypatch):
+    """A cut or partly unreadable dump says so in the integrated view (summary.incomplete,
+    the view facet's flags), so a truncated tree is never taken for a complete one."""
+    roots = mf.view_roots()
+    field = roots[0]["children"][0]["children"][0]  # the "Inbox" TextView
+    field["flags"] = ["TEXT_REDACTED", "CHILDREN_TRUNCATED"]
+
+    def view_tree(s, props, diagnostics=None):
+        diagnostics["view"] = "depth-truncated=1 (children below 80 levels not sent)"
+        return roots, {}
+
+    def compose(s, diagnostics=None):
+        diagnostics["compose"] = ("found 4 AndroidComposeView(s); bounds=screen; "
+                                  "semantics_truncated: view#32 depth>80 subtrees=2")
+        return mf.compose_windows()
+
+    monkeypatch.setattr(correlate, "_shaped_view_tree", view_tree)
+    monkeypatch.setattr(correlate, "_shaped_compose", compose)
+    monkeypatch.setattr(correlate, "_shaped_a11y_data", lambda s, rendering=False: dict(
+        a11y.a11y_to_dict(mf.a11y_response()), diagnostics="root#2 window type=1; node-cap=5000 reached"))
+    merged = correlate.inspect_tree(_FakeSession())
+    assert merged["summary"]["incomplete"] == {
+        "view": ["depth-truncated=1 (children below 80 levels not sent)"],
+        "compose": ["semantics_truncated: view#32 depth>80 subtrees=2"],
+        "a11y": ["node-cap=5000 reached"],
+    }
+    assert merged["diagnostics"]["compose"].startswith("found 4 AndroidComposeView(s)")
+    node = correlate.find_node(merged, node_key="view:11")
+    assert node["view"]["flags"] == ["TEXT_REDACTED", "CHILDREN_TRUNCATED"]
+    assert "flags" not in correlate.find_node(merged, node_key="view:10")["view"]
+    d = correlate.inspect_node(_FakeSession(), node_key="view:11", include_image=False,
+                               lint_fn=lambda roots, density: [])
+    assert d["incomplete"]["view"] and d["view"]["flags"][0] == "TEXT_REDACTED"
+
+
+def test_a_complete_dump_has_no_incomplete_summary(fake_session):
+    merged = correlate.inspect_tree(fake_session)
+    assert "incomplete" not in merged["summary"]
