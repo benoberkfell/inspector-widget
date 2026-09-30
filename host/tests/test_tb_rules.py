@@ -137,7 +137,7 @@ def test_double_stop_container_speaking_through_a_text_child_plus_a_focusable_ch
         n(4, cls="android.widget.Switch", cd="Wi-Fi", flags=FOCUS + ("checkable",),
           b=(900, 50, 150, 100))])
     assert stops(root(card)) == ["view:2", "view:4"]
-    assert speech(root(card)) == ["Wi-Fi", "off, Wi-Fi, Switch"]
+    assert speech(root(card)) == ["Wi-Fi", "off. Wi-Fi. Switch"]
 
 
 # ----------------------------------------------------------------------------------- text orphans
@@ -409,3 +409,19 @@ def test_services_state_is_read_from_the_dump_diagnostics():
 def test_rules_revision_is_exposed():
     assert tb.TB_RULES_REV == "talkback@229212f (16.2)"
     assert tb.simulate(tb.build([root()])).to_dict()["rules"] == tb.TB_RULES_REV
+
+
+def test_interactive_region_is_tested_by_its_bounding_box():
+    # AccessibilityInteractionController.adjustIsVisibleToUserIfNeeded uses
+    # Region.quickReject: a node wholly under the status bar is hidden, one merely under a
+    # floating window inside the region is not, and one straddling the bar stays visible.
+    under_bar = n(2, cls="android.widget.TextView", text="Under the bar", b=(48, 48, 700, 100))
+    straddle = n(3, cls="android.widget.Button", text="Straddles", flags=FOCUS,
+                 b=(48, 149, 144, 144))
+    covered = n(4, cls="android.widget.TextView", text="Under a popup", b=(100, 1000, 300, 80))
+    tree = tb.build([root(under_bar, straddle, covered, b=(0, 0, 1280, 2856))],
+                    obscured=[(0, 0, 1280, 156), (50, 900, 600, 400)])
+    assert [k.key for k in tree.nodes if not k.visible] == ["view:2"]
+    assert tb.explain(tree, "view:2")["why"] == "obscured_by_system_bar"
+    assert stops(root(under_bar, straddle, covered, b=(0, 0, 1280, 2856)),
+                 obscured=[(0, 0, 1280, 156)]) == ["view:3", "view:4"]

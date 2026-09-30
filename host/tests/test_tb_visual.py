@@ -89,3 +89,17 @@ def test_windows_follow_talkback_window_order():
               host=10, b=(0, 1500, 1080, 400))
     tree = tb.build([w2, w1])  # z-order says popup first; geometry says main first
     assert labels(tree, tb.visual_order(tree)["order"]) == ["Main", "Popup"]
+
+
+def test_order_items_takes_plain_boxes():
+    # For the live walk (talkback/diff.py), which has keys and bounds but no TalkBack view.
+    items = [
+        {"key": "b1", "bounds": (540, 0, 500, 100), "window": 0},
+        {"key": "a1", "bounds": (0, 0, 500, 120), "window": 0},
+        {"key": "a2", "bounds": (0, 130, 500, 160), "window": 0},
+        {"key": "b2", "bounds": (540, 110, 500, 140), "window": 0},
+        {"key": "popup", "bounds": (0, 1600, 500, 80), "window": 3},
+    ]
+    assert tb.visual.order_items(items) == ["a1", "a2", "b1", "b2", "popup"]
+    boxed = [dict(it, container=it["key"][1]) for it in items[:4]]  # rows as containers
+    assert tb.visual.order_items(boxed) == ["a1", "b1", "a2", "b2"]

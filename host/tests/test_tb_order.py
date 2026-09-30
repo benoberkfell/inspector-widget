@@ -76,7 +76,7 @@ def test_scaffold_chain_reads_the_top_bar_first():
     top = c(7, 5, b=(0, 90, 1080, 140), children=[back])
     chain(back, title, body)
     assert speech(root(compose_host(7, content, top))) == [
-        "Back", "Screen title, Heading", "Body"]
+        "Back", "Screen title. Heading", "Body"]
 
 
 def test_move_node_before_lifts_the_parent_that_points_at_it():
@@ -309,17 +309,17 @@ def test_mixed_hierarchy_recycler_of_compose_cells_and_androidview_in_compose():
     ro = tb.reading_order(d)
     assert [e["key"] for e in ro["focus_order"]] == [e["key"] for e in d["focus_order"]]
     assert [e["speak"] for e in ro["focus_order"]] == [
-        "Inbox, Heading",
-        "Item 0 (compose)", "Check box", "Delete, Button",
-        "Item 1 (compose)", "checked, Check box", "Delete, Button",
-        "Item 2 (compose)", "Check box", "Delete, Button",
+        "Inbox. Heading",
+        "Item 0 (compose)", "Check box", "Delete. Button",
+        "Item 1 (compose)", "checked. Check box", "Delete. Button",
+        "Item 2 (compose)", "Check box", "Delete. Button",
         "Item 3 (view)", "Button",
         "Compose footer",
         "Nested item",
     ]
     walk = tb.simulate(d)
-    assert walk.stops[1]["speak"] == "Item 0 (compose), 1 of 4, In list, 4 items"
-    assert walk.stops[12]["speak"] == "Compose footer, Out of list"
+    assert walk.stops[1]["speak"] == "Item 0 (compose). 1 of 4. In list. 4 items"
+    assert walk.stops[12]["speak"] == "Compose footer. Out of list"
 
 
 def test_mixed_hierarchy_with_a_modal_dialog_hides_the_activity():
@@ -385,7 +385,8 @@ def test_bad_direction_is_rejected(direction):
 # Compose screens), the IconButton screen and the View-XML screen, dumped live on
 # emulator-5554 (API 37, no accessibility service) with the host-key ids, and reduced to the
 # fields the models read.
-FIXTURES = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "data", "tb", "*.json.gz")))
+DATA = os.path.join(os.path.dirname(__file__), "data", "tb")
+FIXTURES = sorted(glob.glob(os.path.join(DATA, "a11yprobe_*.json.gz")))
 
 # Fixture -> the stops where TalkBack's model and a11y-core's reading_order may differ, with
 # the reason. Empty: on these screens the TalkBack-only rules (bounds reordering, window
@@ -433,3 +434,187 @@ def test_live_fixture_walks_to_a_wrap_and_explains_every_stop(path):
     # The dumps were taken with no service on: Compose's AndroidView holders are corrected.
     holders = [n for n in tree.nodes if n.facet == "interop"]
     assert all(not h.visible for h in holders)
+
+
+
+# ------------------------------------------------------------------ calibration: TalkBack 17.0
+# host/tests/data/tb/tb17_observed.json: what TalkBack 17.0.0 did on emulator-5554 (the spike's
+# second pass, TALKBACK_DESIGN.md part 9): each walk's focus sequence (from the a11y-core agent;
+# keys match the a11yprobe fixtures, which came from the same app build), the utterances from
+# the verbose log, the initial focus each window got, and the activity titles
+# (InteropActivity: title = scenario.title).
+OBSERVED = json.load(open(os.path.join(DATA, "tb17_observed.json"), encoding="utf-8"))
+
+
+def with_window_meta(dump, name):
+    """The fixture plus what the current agent reports and these dumps predate: window types and
+    flags (the activity; a modal dialog above it) and the activity's title."""
+    d = copy.deepcopy(dump)
+    tokens = []
+    for i, w in enumerate(d["windows"]):
+        if i == 0:
+            w["title"] = OBSERVED["window_titles"][name]
+            tokens.append(f"root#{w['root_view_id']} window type=1 flags=0x81810100")
+        else:
+            tokens.append(f"root#{w['root_view_id']} window type=2 flags=0x1820002")
+    d["diagnostics"] = (d.get("diagnostics") or "") + "; " + "; ".join(tokens)
+    return d
+
+
+def as_sequence(steps):
+    return ["<edge>" if s.get("edge") else s["key"] for s in steps]
+
+
+@pytest.mark.parametrize("name", ["S1", "S4", "D1", "D2", "view_xml"])
+def test_tb17_walks_match_the_model_press_for_press(name):
+    # a11y-core matched these at every stop; this model must too. The walk starts where the
+    # spike put focus and presses Meta+Right; an edge press is "<edge>".
+    walk = OBSERVED["walks"][name]
+    dump = _load(os.path.join(DATA, f"a11yprobe_{name}.json.gz"))
+    if name != "view_xml":
+        dump = with_window_meta(dump, name)
+    tree = tb.build(dump)
+    # The fixtures were dumped on a 2076x2152 screen, the walks ran on 1280x2856: a stop the
+    # fixture has below the fold (invisible there) cannot be one in the model.
+    below_fold = {k.key for k in tree.nodes if not k.visible}
+    observed = ["<edge>" if s.get("edge") else s["key"] for s in walk]
+    assert [k for k in observed if k in below_fold] == (
+        ["view:33"] if name == "view_xml" else [])  # "Manage your account settings."
+    observed = [k for k in observed if k not in below_fold]
+    model = tb.simulate(tree, start=walk[0]["key"], until="steps", max_steps=len(observed) - 1)
+    assert [walk[0]["key"]] + as_sequence(model.steps) == observed
+
+
+@pytest.mark.parametrize("name,key,skipped", [
+    # S1: the heading reads as the window title (InteropActivity's title), so it is skipped.
+    ("S1", "compose:14:3", ["view:10"]),
+    # S4: the same heading, but inside the LazyColumn: a list ancestor exempts it.
+    ("S4", "compose:11:5", []),
+    # D1: the dialog has no title of its own; TalkBack takes the first text of its
+    # TYPE_WINDOW_STATE_CHANGED event ("Share item") and skips the heading that says it. The
+    # unlabelled button gets the focus: a real tb.initial_focus bug.
+    ("D1", "compose:26:4", ["view:14"]),
+    # D2: a Compose Dialog populates no View text, so it has no title and the heading is kept.
+    ("D2", "compose:17:14", []),
+])
+def test_tb17_initial_focus_follows_the_window_title_rule(name, key, skipped):
+    tree = tb.build(with_window_meta(_load(os.path.join(DATA, f"a11yprobe_{name}.json.gz")), name))
+    got = tb.Navigator(tree).initial_focus()
+    assert (got["key"], got["how"], got["skipped"]) == (key, "first_content", skipped)
+    walk = tb.simulate(tree, start="initial", max_steps=1)
+    spoken = OBSERVED["initial_focus"][name]
+    if name == "D1":
+        # TalkBack also said "Out of list": its collection state still held the list the focus
+        # was in before the dialog opened. The model starts without that history.
+        spoken = spoken.replace(". Out of list", "")
+    assert walk.steps[0]["speak"] == spoken
+    assert walk.steps[0]["via"] == "initial:first_content"
+
+
+# (1) + (2): main's older View screen (no fitsSystemWindows). "1. ImageButton contentDescription"
+# sits under the status bar (y 48-149 of 0-156): outside the window's interactive region, the
+# platform serves it to TalkBack as not visible (ASSUMED; the in-process dump says visible). The
+# focusable, window-sized ScrollView has no scroll action (its content fits), so it fails
+# FILTER_AUTO_SCROLL, and that invisible text child makes it speak (UT:1109): a whole-screen stop,
+# first in order, reading the entire screen through the focus event's text.
+def _statusbar_fixture():
+    with gzip.open(os.path.join(DATA, "spike_view_statusbar.json.gz"), "rt") as f:
+        return json.load(f)
+
+
+def test_tb17_scrollview_is_a_whole_screen_stop_when_its_first_text_is_under_the_status_bar():
+    dump = _statusbar_fixture()
+    tree = tb.build(dump, obscured=[tuple(dump["status_bar"])])
+    # The observed list starts with focus already on the ScrollView; from no focus, the first
+    # press lands there.
+    walk = tb.simulate(tree, until="steps", max_steps=len(dump["observed"]))
+    observed = ["<edge>" if s.get("edge") else s["key"] for s in dump["observed"]]
+    assert [s.get("key") if not s.get("edge") else "<edge>" for s in walk.steps] == observed
+    first = walk.stops[0]
+    assert (first["key"], first["why"]) == ("view:12", "focusable")
+    assert first["parts"][0]["kind"] == "event"
+    assert first["speak"].startswith("1. ImageButton contentDescription, Like this photo, ")
+    assert first["speak"].endswith("(labelFor) Email address, name@example.com, name@example.com")
+    ex = tb.explain(tree, "view:12")
+    assert ex["ghost"] == ["invisible_children_only"] and "view:14" in ex["detail"]
+    assert tb.explain(tree, "view:14")["why"] == "obscured_by_system_bar"
+    assert any(d["kind"] == "obscured_by_system_bar" and d["conf"] == "assumed"
+               for d in tree.diagnostics)
+
+
+def test_without_the_status_bar_the_model_gives_the_old_a11y_core_answer():
+    # The two mismatches the spike found in a11y-core's order on this screen: it stops on
+    # "1. ImageButton ..." and never on the ScrollView. Without knowing the system bars, this
+    # model says the same; the agent should report the window insets (T2).
+    dump = _statusbar_fixture()
+    keys = [e["key"] for e in tb.reading_order(tb.build(dump))["focus_order"]]
+    assert keys[0] == "view:14" and "view:12" not in keys
+    assert keys == _core_keys(dump)
+
+
+# (3) ensureOnScreen: TalkBack shows a target that reaches the list's edge before focusing it
+# (ACTION_SHOW_ON_SCREEN), then scrolls the list at its edge (SCROLL_FORWARD). The spike logged
+# both on the launcher: "Section heading" (SHOW_ON_SCREEN) > "Redundant label" (SCROLL_FORWARD).
+# Both are in the 16.2 source (FocusProcessorForLogicalNavigation.java:1238 ensureOnScreen and
+# :2264 autoScrollAtEdge), so this is not a 17.x difference.
+def test_a_target_on_the_lists_edge_is_shown_first_then_the_list_scrolls():
+    rows = [n(10 + i, cls="android.widget.LinearLayout", flags=FOCUS,
+              b=(0, 348 + 219 * i, 1280, 216),
+              children=[n(20 + i, cls="android.widget.TextView", text=f"Row {i}",
+                          b=(0, 348 + 219 * i, 1280, 216))]) for i in range(3)]
+    rows[-1]["bounds"]["layout"]["h"] = 100  # the last row is cut off by the list's bottom
+    rows[-1]["children"][0]["bounds"]["layout"]["h"] = 100
+    lst = n(2, cls="androidx.recyclerview.widget.RecyclerView", flags=VIS + ("scrollable",),
+            actions=[SCROLL_FWD], collection_info={"row_count": 30, "column_count": 1},
+            b=(0, 348, 1280, 538), children=rows)
+    walk = tb.simulate(tb.build([root(lst, btn(3, "After", 1000))]))
+    assert walk.keys()[:4] == ["view:10", "view:11", "view:12", "view:3"]
+    assert [s.get("show_on_screen") for s in walk.stops[:3]] == [None, None, "view:2"]
+    assert walk.stops[3].get("autoscroll") == "view:2"
+
+
+# (4) A 27 px sliver of a scrolled-off Compose row became an "Unlabelled. In list" stop after the
+# wrap (the launcher, walk_main_log.json). Compose drops the offscreen children of the partly
+# visible row, so the clickable row is a leaf: always a stop, with nothing to say.
+def _sliver_screen(row_children=()):
+    title = c(7, 4, cls="android.widget.TextView", text="A11yProbe", flags=SRF,
+              b=(48, 210, 322, 84))
+    sliver = c(7, 20, flags=FOCUS + ("screen_reader_focusable",), b=(0, 348, 1280, 27),
+               children=list(row_children))
+    row = c(7, 31, flags=FOCUS + ("screen_reader_focusable",), b=(0, 375, 1280, 216), children=[
+        c(7, 32, cls="android.widget.TextView", text="Icon button label", b=(48, 400, 600, 80)),
+        c(7, 33, cls="android.widget.TextView", text="MissingContentDescription",
+          b=(48, 480, 800, 60))])
+    lst = c(7, 3, b=(0, 348, 1280, 2508), actions=[SCROLL_FWD, {"id": R.ACTION_SCROLL_BACKWARD}],
+            flags=VIS + ("scrollable",), collection_info={"row_count": -1, "column_count": 1},
+            children=[sliver, row])
+    return tb.build([root(compose_host(7, title, lst, b=(0, 0, 1280, 2856)), b=(0, 0, 1280, 2856))])
+
+
+def test_tb17_a_clipped_row_sliver_is_an_unlabelled_ghost_stop():
+    tree = _sliver_screen()
+    walk = tb.simulate(tree)
+    assert walk.speech()[:3] == ["A11yProbe", "Unlabelled. In list",
+                                 "Icon button label. MissingContentDescription"]
+    ex = tb.explain(tree, "compose:7:20")
+    assert ex["why"] == "leaf" and ex["ghost"] == ["unlabelled", "clipped:compose:7:3"]
+    assert "ghost" not in tb.explain(tree, "compose:7:31")
+
+
+def test_a_sliver_whose_children_are_only_invisible_is_a_ghost_too():
+    # Compose 1.11+ keeps some offscreen children and marks them invisible instead: then the row
+    # speaks only through them (UT:1109) and says nothing useful.
+    tree = _sliver_screen([c(7, 21, cls="android.widget.TextView", text="Scrolled away",
+                             flags=("enabled",), b=(48, 200, 600, 80))])
+    ex = tb.explain(tree, "compose:7:20")
+    assert ex["stop"] and "invisible_children_only" in ex["ghost"]
+
+
+# (5) Node identity across captures excludes ids and bounds.
+def test_signature_ignores_ids_and_bounds():
+    a = tb.build([root(n(2, cls="android.widget.Button", text="Play", flags=FOCUS,
+                         b=(0, 0, 100, 50)))])
+    b = tb.build([root(n(9, cls="android.widget.Button", text="Play", flags=FOCUS,
+                         b=(0, 700, 100, 50)))])
+    assert a.node("view:2").signature == b.node("view:9").signature == (
+        "view", "android.widget.Button", "Play", "")
