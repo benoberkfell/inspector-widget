@@ -698,6 +698,15 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        return _run(args)
+    finally:
+        # Whatever happened (an error, Ctrl-C mid-attach), leave no adb forward
+        # behind; a session's own is gone already, this catches the rest.
+        adb.remove_own_forwards()
+
+
+def _run(args) -> int:
+    try:
         if hasattr(args, "serial"):
             args.serial = adb.resolve_serial(args.serial)
         return args.func(args)

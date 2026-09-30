@@ -1,6 +1,7 @@
 """Lifecycle polish, offline: no retry during exit cleanup or after a detach,
 retries only for calls that are safe to repeat, the session note on every
-session tool (CLI parity), argument normalization, JSON-RPC notifications.
+session tool (CLI parity), argument normalization, JSON-RPC notifications,
+bounded forward removal and CLI exit cleanup.
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
@@ -16,6 +17,7 @@ import time
 import pytest
 
 from fakeagent import DEFAULT_PACKAGE as PKG
+from fakeagent import DEFAULT_PID as PID
 from fakeagent import DEFAULT_SERIAL as SERIAL
 
 import inspector_widget as iw
@@ -420,3 +422,61 @@ def test_an_internal_error_on_a_notification_is_not_answered(monkeypatch):
     mcp_server._serve_fallback()
     replies = [json.loads(line) for line in out.getvalue().splitlines()]
     assert [(r["id"], r["error"]["code"]) for r in replies] == [(7, -32603)]
+
+
+# =========================================================================== #
+# 6. Forward removal is bounded; the CLI removes its forwards at exit
+# =========================================================================== #
+def _record_adb_timeouts(monkeypatch):
+    seen = []
+    real = adb._run
+
+    def run(argv, **kwargs):
+        seen.append((list(argv), kwargs.get("timeout", adb.DEFAULT_TIMEOUT)))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(adb, "_run", run)
+    return seen
+
+
+def test_exit_cleanup_bounds_every_forward_removal(mcp, fake_device, monkeypatch):
+    assert mcp("attach")["attached"]
+    adb.forward(SERIAL, 0, f"viewspector_{PID}")  # an attach cut short
+    seen = _record_adb_timeouts(monkeypatch)
+    mcp_server._cleanup_at_exit()
+    removals = [t for argv, t in seen if "--remove" in argv]
+    assert len(removals) == 2 and all(t <= adb.FORWARD_REMOVE_TIMEOUT for t in removals)
+    assert fake_device.forward_names() == []
+
+
+def test_a_wedged_adb_stops_the_exit_forward_sweep(monkeypatch):
+    monkeypatch.setattr(adb, "_OWN_FORWARDS", {(SERIAL, 1): "a", (SERIAL, 2): "b", (SERIAL, 3): "c"})
+    calls = []
+
+    def wedged(argv, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        raise adb.AdbError(argv, -1, "", f"timed out after {kwargs.get('timeout')}s")
+
+    monkeypatch.setattr(adb, "_run", wedged)
+    assert adb.remove_own_forwards() == 0
+    assert calls == [adb.FORWARD_REMOVE_TIMEOUT]  # one bounded wait, not one per forward
+    assert adb._OWN_FORWARDS == {(SERIAL, 2): "b", (SERIAL, 3): "c"}
+
+
+def test_the_cli_removes_its_leftover_forwards_at_exit(run_cli, fake_device):
+    adb.forward(SERIAL, 0, f"viewspector_{PID}")  # e.g. an attach cut short
+    assert run_cli("devices").rc == 0
+    assert fake_device.forward_names() == []
+
+
+def test_the_cli_removes_its_forwards_when_a_subcommand_fails(run_cli, fake_device, monkeypatch):
+    def interrupted(self, timeout=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(clientmod.Client, "hello", interrupted)
+    removed = []
+    real = adb.remove_own_forwards
+    monkeypatch.setattr(adb, "remove_own_forwards", lambda *a, **k: removed.append(1) or real())
+    with pytest.raises(KeyboardInterrupt):
+        run_cli("dump")
+    assert removed == [1] and fake_device.forward_names() == []
