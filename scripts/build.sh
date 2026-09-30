@@ -3,7 +3,9 @@
 # Inspector Widget — build all three on-device artifacts into build-out/:
 #   libviewspector.so   (JVMTI native agent, arm64-v8a)
 #   bootstrap.dex       (the FindClass target; d8'd from bootstrap.jar)
-#   payload.jar         (dex-in-jar: Kotlin payload + generated proto, for DexClassLoader)
+#   payload.jar         (dex-in-jar: Kotlin payload + generated proto, for DexClassLoader;
+#                        its Kotlin stdlib and protobuf-lite relocated under
+#                        com.oberkfell.viewspector.shaded, see agent/build.gradle.kts)
 #   BUILD_ID            (sha256 of payload.jar; a running agent reports the same
 #                        value in Hello, so the host can spot and replace a stale one)
 #
@@ -11,6 +13,7 @@
 #   1. ./gradlew :agent:assembleDebug :bootstrap:jar
 #   2. From the agent APK: pull lib/arm64-v8a/libviewspector.so
 #                          and repackage classes*.dex -> payload.jar
+#      then check payload.jar's classloader isolation (scripts/shadow_check.py)
 #   3. d8 the bootstrap jar -> bootstrap.dex
 #   4. copy all three into build-out/
 #
@@ -115,6 +118,21 @@ rm -f "$PAYLOAD_JAR"
     zip -q -X "$PAYLOAD_JAR" classes*.dex
 ) || die "Failed to build payload.jar."
 ok "-> $PAYLOAD_JAR ($(unzip -Z1 "$PAYLOAD_JAR" | tr '\n' ' '))"
+
+# The payload runs in a child of the app's classloader, which is asked first, so
+# it must define only com.oberkfell.viewspector.* classes (the Gradle build
+# relocates its Kotlin stdlib and protobuf-lite; see agent/build.gradle.kts).
+# Otherwise an app's own, often R8-shrunk, copies replace them at runtime.
+log "Checking payload.jar classloader isolation..."
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$PROJECT_ROOT/scripts/shadow_check.py" --payload "$PAYLOAD_JAR"; then
+        rm -f "$PAYLOAD_JAR" "$OUT_DIR/BUILD_ID"  # never leave a payload the host would push
+        die "payload.jar is not isolated from the app classloader (see above)."
+    fi
+    ok "payload.jar defines and links only com.oberkfell.viewspector.* and platform classes"
+else
+    printf '\033[1;33m[warn]\033[0m %s\n' "python3 not found; skipping scripts/shadow_check.py"
+fi
 
 # BUILD_ID: the payload hashes the jar it was loaded from and reports it in
 # Hello; the host compares that with payload.jar (this file is for people and
