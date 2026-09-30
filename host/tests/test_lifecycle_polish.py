@@ -1,7 +1,8 @@
 """Lifecycle polish, offline: no retry during exit cleanup or after a detach,
 retries only for calls that are safe to repeat, the session note on every
 session tool (CLI parity), argument normalization, JSON-RPC notifications,
-bounded forward removal and CLI exit cleanup, overlay temp files.
+bounded forward removal, CLI exit cleanup and overlay temp files, and lost
+sessions inside lint rules.
 
 Runs against the fake agent + fake adb in ``tests/fakeagent.py``.
 """
@@ -23,6 +24,7 @@ from fakeagent import DEFAULT_SERIAL as SERIAL
 
 import inspector_widget as iw
 import mcp_server
+from inspector_widget import a11y_lint as L
 from inspector_widget import adb, client as clientmod, inject
 from inspector_widget.client import NotSentError, SessionLostError
 from inspector_widget.proto import view_inspection_pb2 as pb
@@ -501,3 +503,31 @@ def test_an_overlay_leaves_a_users_base_png_alone(run_cli, fake_device, tmp_path
     assert res.rc == 0, res
     assert out.is_file() and mine.read_bytes() == b"the user's file"
     assert list(fake_device.tmpdir.glob("inspector-widget-base-*")) == []
+
+
+# =========================================================================== #
+# 8. A lost session inside a lint rule propagates
+# =========================================================================== #
+def _text_node():
+    return {"id": 1, "name": "Node", "kind": "SEMANTICS", "attrs": {"Text": "Hello"},
+            "bounds": {"layout": {"x": 0, "y": 0, "w": 100, "h": 40}}, "children": [],
+            "render_node_id": 7}
+
+
+def test_a_lost_session_in_component_image_fn_propagates():
+    def lost(_render_node_id):
+        raise SessionLostError("agent session lost: disconnected")
+
+    ctx = L.LintContext(density=160, component_image_fn=lost)
+    with pytest.raises(SessionLostError):
+        L.lint_tree([_text_node()], ctx)
+
+
+def test_any_other_rule_failure_is_still_a_rule_error():
+    def broken(_render_node_id):
+        raise ValueError("bad pixels")
+
+    ctx = L.LintContext(density=160, component_image_fn=broken)
+    L.lint_tree([_text_node()], ctx)
+    errors = [d for d in ctx.diagnostics if d.get("code") == "rule.error"]
+    assert errors and "ValueError: bad pixels" in errors[0]["message"]
