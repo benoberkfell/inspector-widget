@@ -223,8 +223,14 @@ def test_remap_ids_moves_every_reference():
     refmap = {n.key: nid for nid, n in ix.nodes.items()}
     back = m.remap_ids(kx, refmap)
     assert back == ix
-    # the input is not mutated
+    # the input is not mutated, and the copy shares no mutable state with it
     assert kx.nodes["sem:82:448"].ref is None
+    back.nodes["n22"].ids["x"] = 1
+    back.nodes["n22"].facets["a11y"]["flags"].append("zzz")
+    back.nodes["n22"].issues[0].evidence["x"] = 1
+    back.nodes["n22"].b[0] = 99
+    assert "x" not in ix.nodes["n22"].ids and "zzz" not in ix.nodes["n22"].facets["a11y"]["flags"]
+    assert "x" not in ix.nodes["n22"].issues[0].evidence and ix.nodes["n22"].b[0] == 0
 
 
 def test_index_helpers():

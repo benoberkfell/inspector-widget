@@ -12,7 +12,8 @@ with every consumer.
   aliases (`w:<udid>`, legacy `compose:<id>` when unique) to ids.
   `build_index()` (C4) returns a key-space index (`ref=None`).
   `apply_refs(ix, refmap)` is `model.remap_ids(ix, refmap)`, where refmap maps keys to refs.
-  `remap_ids` also sets `UNode.ref`.
+  `remap_ids` also sets `UNode.ref`. The copy it returns shares no mutable state
+  with its input.
 - **Node links inside facets** use ids and must sit under a name in
   `model.REF_FIELDS`, so that `remap_ids` rewrites them:
   - `a11y.labeled_by/label_for/traversal/traversal_before/traversal_after`
@@ -159,6 +160,16 @@ with every consumer.
   - The per-capture class majority: at least 3 views, more than 50%, and not a
     `MAJORITY_EXEMPT` property.
   - The family comes from the property set first and the class name second.
+- **Brief a11y node** (`normalize.a11y_node_brief`). Beyond spec 2.3 it also
+  drops:
+  - None values;
+  - `important_for_accessibility` when it is `YES` (counted);
+  - the `is_virtual` flag, which `virtual_id` implies;
+  - `-1` and `false` fields inside `collection_info`.
+
+  The brief Compose facet likewise drops the text-substitution actions
+  `SetTextSubstitution`, `ShowTextSubstitution` and `ClearTextSubstitution`
+  (counted as `boilerplate_actions`).
 - **dump_tree brief node**: the strings.py shape, with these changes:
   - `bounds` is `[x,y,w,h]`, plus `render` when the view is transformed.
   - `qualified_name` is dropped when it equals package.class.

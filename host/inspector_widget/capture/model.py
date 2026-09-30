@@ -20,6 +20,7 @@ Id spaces (see CONTRACT_NOTES.md in this directory):
 
 from __future__ import annotations
 
+import copy
 import gzip
 import hashlib
 import json
@@ -684,7 +685,8 @@ class Index:
 
 
 def remap_ids(ix: Index, mapping: Mapping[str, str], *, set_refs: bool = True) -> Index:
-    """Return a copy of ``ix`` with node ids rewritten through ``mapping``.
+    """Return a copy of ``ix`` (sharing no mutable state with it) with node ids
+    rewritten through ``mapping``.
 
     Ids missing from ``mapping`` stay as they are. Rewrites ``Index.nodes`` keys,
     ``UNode.parent/children/window``, the REF_FIELDS facet links, every Tree,
@@ -719,9 +721,14 @@ def remap_ids(ix: Index, mapping: Mapping[str, str], *, set_refs: bool = True) -
                 if link in facet2:
                     facet2[link] = m_value(facet2[link])
             facets[fname] = facet2
-        n2.facets = facets
+        n2.facets = copy.deepcopy(facets)
+        n2.ids = dict(node.ids)
+        n2.conf = dict(node.conf)
         n2.flags = list(node.flags)
-        n2.issues = list(node.issues)
+        n2.issues = [Issue(i.id, i.sev, copy.deepcopy(i.evidence), i.conf) for i in node.issues]
+        for name in ("b", "declared_b"):
+            if getattr(node, name) is not None:
+                setattr(n2, name, list(getattr(node, name)))
         new_nodes[new_id] = n2
     trees = {name: Tree(roots=[m(r) for r in t.roots],
                         children={m(p): [m(c) for c in kids] for p, kids in t.children.items()})
