@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pytest
@@ -245,6 +246,9 @@ def fake_device(monkeypatch, tmp_path):
     monkeypatch.setattr(tempfile, "tempdir", str(dev.tmpdir))
     cache = mcp_server.SessionCache()
     monkeypatch.setattr(mcp_server, "SESSIONS", cache)
+    # A test that runs the exit cleanup leaves the server "closing" (no more
+    # attaches); every test starts with a fresh flag.
+    monkeypatch.setattr(mcp_server, "_closing", threading.Event())
     # Forwards this process "made" (adb.remove_own_forwards cleans them up at
     # exit) belong to this test's fake device only.
     from inspector_widget import adb

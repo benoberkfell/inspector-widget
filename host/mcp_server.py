@@ -198,18 +198,47 @@ HOST = HostFacade()
 
 
 # --------------------------------------------------------------------------- #
+# Shutdown and per-call state.
+#
+# _closing is set first thing in exit cleanup: from then on no tool retries
+# and no session is attached (or cached), so a call the cleanup cut off can't
+# re-attach behind it and leave a session or an adb forward nobody removes.
+#
+# _CALL holds the state of the tool call running on this thread (_run_tool
+# sets it): the detach count it first saw per app, so its retry never
+# re-injects an agent that a concurrent detach just stopped.
+# --------------------------------------------------------------------------- #
+_closing = threading.Event()
+_CALL = threading.local()
+
+
+class _CallState:
+    """What one tool call touched: for each (serial, package), the stop count
+    it saw first (see SessionCache.detaching)."""
+
+    def __init__(self) -> None:
+        self.stops_seen: Dict[Tuple[str, str], int] = {}
+
+
+def _current_call() -> Optional[_CallState]:
+    return getattr(_CALL, "state", None)
+
+
+# --------------------------------------------------------------------------- #
 # Session cache, keyed by (serial, package).
 #
 # A cached session is reused only while Session.is_alive() holds (the socket
 # is open and the app still runs under the same pid); otherwise it is dropped
 # and re-attached. Each key has its own lock, so a slow cold inject into one
-# app never blocks tools on another.
+# app never blocks tools on another; detach holds it too.
 # --------------------------------------------------------------------------- #
 class SessionCache:
     def __init__(self) -> None:
         self._sessions: Dict[Tuple[str, str], Any] = {}
         self._key_locks: Dict[Tuple[str, str], threading.Lock] = {}
-        self._lock = threading.Lock()  # guards the two dicts only
+        # How many times detach stopped (or set out to stop) each key's agent.
+        self._stops: Dict[Tuple[str, str], int] = {}
+        self._lock = threading.Lock()  # guards the dicts only
 
     def _key(self, serial: str, package: str) -> Tuple[str, str]:
         return (serial, package)
@@ -221,6 +250,7 @@ class SessionCache:
     def get_or_attach(self, serial: str, package: str, force: bool = False) -> Any:
         key = self._key(serial, package)
         with self._key_lock(key):
+            self._check_may_attach(key, serial, package)
             with self._lock:
                 session = self._sessions.get(key)
             if session is not None and not force and _session_alive(session):
@@ -232,8 +262,46 @@ class SessionCache:
                 _disconnect(session)
             session = HOST.attach(serial, package, force_reinject=force)
             with self._lock:
-                self._sessions[key] = session
-            return session
+                if not _closing.is_set():
+                    self._sessions[key] = session
+                    return session
+            # Exit cleanup began while this attach ran and has emptied the
+            # cache already: release the new session (and its forward) here.
+            _disconnect(session)
+            raise ServerClosingError(_CLOSING_MESSAGE)
+
+    def _check_may_attach(self, key: Tuple[str, str], serial: str, package: str) -> None:
+        """Refuse while the server shuts down, and, within one tool call, once
+        a detach stopped this app's agent (the call's retry must not re-inject
+        it). The next call attaches as usual."""
+        if _closing.is_set():
+            raise ServerClosingError(_CLOSING_MESSAGE)
+        call = _current_call()
+        if call is None:
+            return
+        with self._lock:
+            stops = self._stops.get(key, 0)
+        if call.stops_seen.setdefault(key, stops) != stops:
+            raise ToolError(f"{package} on {serial} was detached while this call ran; "
+                            f"call the tool again to attach afresh")
+
+    @contextlib.contextmanager
+    def detaching(self, serial: str, package: str, stop: bool) -> Iterator[Optional[Any]]:
+        """Hold the key's lock for a detach; yield the cached session (dropped
+        from the cache), or None. ``stop``: the agent is about to be stopped,
+        so no call that was using it may re-attach (retry) afterwards."""
+        key = self._key(serial, package)
+        with self._key_lock(key):
+            with self._lock:
+                if stop:
+                    self._stops[key] = self._stops.get(key, 0) + 1
+                session = self._sessions.pop(key, None)
+            yield session
+
+    def stopped_during(self, call: _CallState) -> bool:
+        """Whether a detach stopped an agent ``call`` used, after it first used it."""
+        with self._lock:
+            return any(self._stops.get(key, 0) != seen for key, seen in call.stops_seen.items())
 
     def _forget(self, key: Tuple[str, str], session: Any) -> None:
         with self._lock:
@@ -253,7 +321,8 @@ class SessionCache:
             return list(self._sessions.values())
 
     def close_all(self) -> None:
-        """Disconnect every cached session (agents keep running). For exit."""
+        """Disconnect every cached session (agents keep running). For exit,
+        once ``_closing`` is set, so that no attach caches a session after it."""
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
@@ -262,6 +331,8 @@ class SessionCache:
 
 
 SESSIONS = SessionCache()
+
+_CLOSING_MESSAGE = "the MCP server is shutting down; not attaching"
 
 
 def _session_alive(session: Any) -> bool:
@@ -616,7 +687,12 @@ def _png_scratch(serial: str, package: str, tag: str) -> Iterator[str]:
 def _cleanup_at_exit() -> None:
     """Disconnect cached sessions (removing their adb forwards; agents keep
     running for the next start), remove any other forward this process still
-    holds (an attach cut short), and delete this process's PNG directory."""
+    holds (an attach cut short), and delete this process's PNG directory.
+
+    ``_closing`` goes up first: a tool call this cuts off must not retry, and
+    no attach may cache a session behind the cleanup.
+    """
+    _closing.set()
     try:
         SESSIONS.close_all()
     except Exception:  # noqa: BLE001 - exit cleanup is best-effort
@@ -817,10 +893,19 @@ def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> 
 def tool_detach(serial: Optional[str], package: str, shutdown: bool = True) -> Dict[str, Any]:
     """shutdown=True (default): stop the agent for every client, whether or not
     this server attached it (never injects one). shutdown=False: only drop this
-    server's cached connection and leave the agent running."""
+    server's cached connection and leave the agent running.
+
+    Holds the app's session lock throughout, so no tool attaches to the app
+    in between; a call that loses its session to this shutdown won't retry."""
     _require(package, "package")
     serial = _serial(serial)
-    cached = SESSIONS.drop(serial, package)
+    with SESSIONS.detaching(serial, package, stop=bool(shutdown)) as cached:
+        return _detach_locked(serial, package, bool(shutdown), cached)
+
+
+def _detach_locked(serial: str, package: str, shutdown: bool,
+                   cached: Optional[Any]) -> Dict[str, Any]:
+    """tool_detach's body; the caller holds the key lock and dropped ``cached``."""
     if not shutdown:
         if cached is None:
             return {"serial": serial, "package": package, "detached": False,
@@ -945,6 +1030,10 @@ def _session_get_windows(session: Any) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 class ToolError(Exception):
     """Raised for invalid arguments / tool-level failures; surfaced to the agent."""
+
+
+class ServerClosingError(ToolError):
+    """The server is shutting down (exit cleanup began): nothing attaches any more."""
 
 
 def _require(value: Any, name: str) -> None:
@@ -1791,8 +1880,24 @@ TOOLS.update({
 
 
 # Tools that manage the session themselves (attach re-attaches once on its own;
-# detach must never re-attach), so _run_tool doesn't retry them.
+# detach must never re-attach), so _run_tool never retries them.
 _NO_RETRY = frozenset({"attach", "detach"})
+
+
+def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
+                   call: _CallState) -> Optional[str]:
+    """Why a call that lost its session must not be retried, or None to retry.
+
+    Never while the server shuts down, never for attach/detach, and never once
+    a detach stopped the agent the call used (the retry would re-inject it).
+    """
+    if _closing.is_set():
+        return "the server is shutting down"
+    if name in _NO_RETRY:
+        return "this tool manages its own session"
+    if SESSIONS.stopped_during(call):
+        return "the app was detached while this call ran"
+    return None
 
 
 def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1805,7 +1910,8 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     Arguments are validated against the tool's inputSchema first, the same way
     for every transport. If the agent drops the session mid-call (idle timeout,
-    app restart), the call is retried once on a fresh attach.
+    app restart), the call is retried once on a fresh attach (see
+    _retry_refusal for when it isn't).
     """
     entry = TOOLS.get(name)
     if entry is None:
@@ -1813,12 +1919,27 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 "available_tools": sorted(TOOLS.keys())}
     if args is None:
         args = {}
+    call = _CallState()
+    outer = _current_call()
+    _CALL.state = call
+    try:
+        result = _run_tool_call(name, entry, args, call)
+    finally:
+        _CALL.state = outer
+    return result
+
+
+def _run_tool_call(name: str, entry: Dict[str, Any], args: Any,
+                   call: _CallState) -> Dict[str, Any]:
+    """_run_tool's body, with ``call`` as this thread's call state."""
     try:
         _validate_arguments(name, entry["schema"], args)
         try:
             return entry["handler"](args)
         except _session_lost_error() as exc:
-            if name in _NO_RETRY:
+            refusal = _retry_refusal(name, args, exc, call)
+            if refusal is not None:
+                log.info("tool %s: %s; not retrying: %s", name, exc, refusal)
                 raise
             # The client closed itself, so the retry's get_or_attach sees a dead
             # session and re-attaches.
