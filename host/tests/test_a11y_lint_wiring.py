@@ -80,3 +80,46 @@ def test_mcp_a11y_lint_returns_the_unified_report(monkeypatch):
                           "include_rendering_info": True}) in sess.calls
     # rule subset without R3 -> no screenshot requested
     assert not [c for c in sess.calls if c[0] == "screenshot"]
+
+
+class _FakeInjection:
+    sock = None
+
+    def close(self):
+        pass
+
+
+class _FakeClient(_FakeSession):
+    def __init__(self, *a, **k):
+        super().__init__()
+
+    def hello(self):
+        return pb.HelloResponse()
+
+
+def _fake_device(monkeypatch):
+    from inspector_widget import adb
+    monkeypatch.setattr(cli.injectmod, "inject_and_connect", lambda **k: _FakeInjection())
+    monkeypatch.setattr(cli, "Client", _FakeClient)
+    monkeypatch.setattr(adb, "display_density", lambda serial: 420)
+    monkeypatch.setattr(adb, "font_scale", lambda serial: 1.0)
+
+
+def test_cli_a11y_lint_runs_device_free(monkeypatch, capsys):
+    import json
+    _fake_device(monkeypatch)
+    args = cli.build_parser().parse_args(["a11y-lint", "--rule", "R1", "--json", "-"])
+    assert args.func(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["summary"]["total"] == 0 and out["stats"]["rules"] == ["a11y.label.missing"]
+
+
+def test_cli_a11y_with_lint_adds_lint_to_json(monkeypatch, capsys):
+    import json
+    _fake_device(monkeypatch)
+    args = cli.build_parser().parse_args(["a11y", "--lint", "--no-contrast", "--json", "-"])
+    assert args.func(args) == 0
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["lint"]["summary"]["total"] == 0
+    assert "a11y lint: 0 error, 0 warn, 0 info" in captured.err
