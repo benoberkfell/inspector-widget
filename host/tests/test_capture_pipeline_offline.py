@@ -384,9 +384,19 @@ def test_launcher_walk(world: dict[str, Captured]) -> None:
     assert nbytes(listing) <= 2000
     assert listing["shown"] == listing["total"] == 13  # the list and its 12 rows
 
+    # the slot tree is one tree: subcompositions (the list's items, the Scaffold's
+    # TopAppBar and content) are grafted under their groups, rows in screen order
     slots = p.outline(lc, view="slots")
-    assert nbytes(slots) <= 6000 and slots["total"] == 56  # spec 5.5: 56 app lines
-    assert all("src=MainActivity.kt:" in line for line in slots["lines"])
+    assert nbytes(slots) <= 6000
+    assert [ln.split(" [")[0].strip().split(" ", 1)[1] for ln in slots["lines"]] == [
+        "MaterialTheme", "AppRoot", "Scaffold", "TopAppBar", "Box"]
+    walk = p.outline(lc, view="slots", depth=99, max_children=1000, max_lines=400)
+    assert nbytes(walk) <= 6000 and walk["total"] == 56  # spec 5.5: 56 app lines
+    assert all("src=MainActivity.kt:" in line for line in walk["lines"])
+    lazy = p.find(lc, in_="slots", type="LazyColumn")["lines"][0].split()[0]
+    rows = p.outline(lc, root=lazy, depth=1, max_children=1000)["lines"][1:]
+    tops = [int(re.search(r"\[\d+,(\d+) ", ln).group(1)) for ln in rows]
+    assert len(rows) == 24 and tops == sorted(tops)  # 12 ListItems + dividers, top down
 
     reading = p.outline(lc, view="reading")
     assert nbytes(reading) <= 2000 and reading["total"] == 13  # 13 TalkBack stops

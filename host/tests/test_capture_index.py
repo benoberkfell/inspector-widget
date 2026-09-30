@@ -282,6 +282,39 @@ def launcher_raw_for_reader():
     return cs.raw_from_scene(fs.replay_scene("launcher"))
 
 
+def test_launcher_slot_subcompositions_are_grafted_in_screen_order(launcher):
+    """The recording has 29 top-level slot groups in the device's hash order (the
+    main composition plus one per Lazy item and Scaffold slot). The slots tree is
+    one tree: the main composition first, each subcomposition under the group whose
+    box holds it, the list's items top down; zero-size effects stay roots, last."""
+    tree = launcher.tree("slots")
+    roots = [launcher.nodes[r] for r in tree.roots]
+    sized = [n for n in roots if n.b and n.b[2] > 0 and n.b[3] > 0]
+    assert [n.type for n in sized] == ["ProvideAndroidCompositionLocals"]
+    assert all(not (n.b and n.b[2] and n.b[3]) for n in roots[1:])
+
+    def find(t, src=None):
+        return next(n for n in launcher.nodes.values() if n.kind == "slot" and n.type == t
+                    and (src is None or n.src == src))
+
+    top_bar, lazy = find("TopAppBar"), find("LazyColumn")
+    content = find("Box", "MainActivity.kt:96")
+    for n in (top_bar, content):
+        assert launcher.nodes[n.parent].b == [0, 0, 1280, 2856]  # a Scaffold-sized group
+        assert n.conf.get("slots") == "inferred"
+    items = [n for n in launcher.nodes.values() if n.type == "SkippableItem"]
+    assert len(items) == 12 and all(n.conf.get("slots") == "inferred" for n in items)
+    anc = {n.id: {a.id for a in launcher.ancestors(n.id)} for n in items}
+    assert all(lazy.id in a for a in anc.values())  # every item is under the list
+    parent = launcher.nodes[items[0].parent]
+    kids = [launcher.nodes[c] for c in parent.children if launcher.nodes[c].type == "SkippableItem"]
+    assert [k.b[1] for k in kids] == sorted(k.b[1] for k in kids)  # screen order
+    assert kids[-1].b[1] == 2757  # the clipped last row still found its list
+    # nodes are stored in the slot tree's pre-order, and keys are deterministic
+    again = cx.build_index(launcher_raw_for_reader())
+    assert [n.key for n in again.nodes.values()] == [n.key for n in launcher.nodes.values()]
+
+
 def test_launcher_build_time(launcher_raw):
     times = []
     for _ in range(5):

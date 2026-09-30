@@ -143,6 +143,10 @@ def _rect(bounds: Any) -> list[int]:
     return [int(lay.x), int(lay.y), int(lay.w), int(lay.h)]
 
 
+#: The first group of a ComposeView's main composition (AndroidComposeView.setContent).
+MAIN_COMPOSITION = "ProvideAndroidCompositionLocals"
+
+
 def _area(r: Sequence[int] | None) -> int:
     return max(0, r[2]) * max(0, r[3]) if r else 0
 
@@ -434,6 +438,7 @@ class _Builder:
         self.view_text: dict[str, str] = {}
         self.slots: list[_S] = []
         self.acv_slot_roots: dict[int, list[int]] = defaultdict(list)
+        self.grafted_slots: set[int] = set()  # subcomposition roots grafted by bounds
         self.primary: dict[str, int] = {}  # sem key -> slot idx (emitter link)
         self.a11y: list[_A] = []
         self.a11y_roots: list[int] = []
@@ -705,6 +710,84 @@ class _Builder:
             cidx = self._add_slot(c, acv, idx, path + (i,), depth + 1, res, dx, dy)
             s.children.append(cidx)
         return idx
+
+    # ------------------------------------------------------------------ slot roots
+    def graft_slot_roots(self) -> None:
+        """Order each ComposeView's slot-table roots and graft subcompositions.
+
+        The slot table arrives as one top-level group per composition, in the
+        device's hash order: the main composition (``ProvideAndroidCompositionLocals``
+        under ``AndroidComposeView.setContent``, else the largest root) plus one
+        root per subcomposition (each Lazy list item, each Scaffold slot). Every
+        other root with a box is grafted under the smallest group of the trees
+        already placed (largest roots first) whose box holds the root's top-left or
+        bottom-right corner: a Lazy item goes under its list, even when the list
+        clips it, TopAppBar and the content under Scaffold. Grafts are marked
+        ``conf.slots = "inferred"``. A grafted root follows its new parent's own
+        children, by top then left. Roots nothing holds stay roots after the main
+        one, by top then left; zero-size roots (effects) come last, by name."""
+        for acv, roots in list(self.acv_slot_roots.items()):
+            if len(roots) < 2:
+                continue
+            slots = self.slots
+
+            def place_key(i: int) -> tuple:
+                s = slots[i]
+                return (s.box[1], s.box[0], s.name, s.src or "")
+
+            sized = [r for r in roots if _area(slots[r].box)]
+            zero = sorted((r for r in roots if not _area(slots[r].box)),
+                          key=lambda i: (slots[i].name, slots[i].src or ""))
+            if not sized:
+                self.acv_slot_roots[acv] = zero
+                continue
+            mains = [r for r in sized if slots[r].name == MAIN_COMPOSITION]
+            main = min(mains or sized, key=lambda i: (-_area(slots[i].box), *place_key(i)))
+            rest = sorted((r for r in sized if r != main),
+                          key=lambda i: (-_area(slots[i].box), *place_key(i)))
+            placed: list[int] = list(self._slot_subtree(main))
+            kept: list[int] = []
+            grafts: dict[int, list[int]] = defaultdict(list)
+            for r in rest:
+                rb = slots[r].box
+                corners = ((rb[0], rb[1]), (rb[0] + rb[2] - 1, rb[1] + rb[3] - 1))
+                best, best_key = None, None
+                for i in placed:
+                    b = slots[i].box
+                    a = _area(b)
+                    if not a or not any(b[0] <= x < b[0] + b[2] and b[1] <= y < b[1] + b[3]
+                                        for x, y in corners):
+                        continue
+                    k = (a, -slots[i].depth)
+                    if best_key is None or k < best_key:
+                        best, best_key = i, k
+                if best is None:
+                    kept.append(r)
+                else:
+                    grafts[best].append(r)
+                    self._graft_slot(r, best)
+                placed.extend(self._slot_subtree(r))
+            for parent, grafted in grafts.items():
+                own = [c for c in slots[parent].children if c not in grafted]
+                slots[parent].children = own + sorted(grafted, key=place_key)
+            self.acv_slot_roots[acv] = [main] + sorted(kept, key=place_key) + zero
+
+    def _slot_subtree(self, idx: int) -> list[int]:
+        out, stack = [], [idx]
+        while stack:
+            i = stack.pop()
+            out.append(i)
+            stack.extend(reversed(self.slots[i].children))
+        return out
+
+    def _graft_slot(self, root: int, parent: int) -> None:
+        r, p = self.slots[root], self.slots[parent]
+        r.parent = parent
+        p.children.append(root)
+        shift = p.depth + 1 - r.depth
+        for i in self._slot_subtree(root):
+            self.slots[i].depth += shift
+        self.grafted_slots.add(root)
 
     # ------------------------------------------------------------------ interop
     def reparent_interop(self) -> None:
@@ -1467,8 +1550,11 @@ class _Builder:
             host = ix.nodes.get(view_key(acv))
             base = host.anchor if host is not None and host.anchor else f"composeview:{acv}"
             place(roots, base)
+        # the slot tree's pre-order (roots as ordered by graft_slot_roots)
+        order = [self.slots[i] for roots in self.acv_slot_roots.values()
+                 for r in roots for i in self._slot_subtree(r)]
         seen: set[str] = set()
-        for s in self.slots:
+        for s in order:
             anchor = anchor_of[s.idx]
             key = f"slot:{s.acv}:{anchor_hash(anchor)}"
             n = 1
@@ -1478,7 +1564,7 @@ class _Builder:
             seen.add(key)
             keys[s.idx] = key
         by_src: dict[tuple[int, str], int] = defaultdict(int)
-        for s in self.slots:
+        for s in order:
             key = keys[s.idx]
             params: dict[str, str] = {}
             mods = None
@@ -1518,6 +1604,8 @@ class _Builder:
                 node.text = _cap(nz.compose_value("text", text) or text)
             if s.sem:
                 node.conf["sem"] = "inferred"
+            if s.idx in self.grafted_slots:
+                node.conf["slots"] = "inferred"  # its parent is inferred from bounds
             ix.nodes[key] = node
         for acv, roots in self.acv_slot_roots.items():
             tree.roots.extend(keys[i] for i in roots)
@@ -1565,6 +1653,7 @@ def build_index(raw: RawCapture) -> Index:
     b = _Builder(raw)
     b.build_views()
     b.build_compose()
+    b.graft_slot_roots()
     b.reparent_interop()
     b.build_a11y()
     b.link_slots()
