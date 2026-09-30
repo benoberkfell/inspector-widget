@@ -213,6 +213,70 @@ def get_windows_to_dict(response: "pb.GetWindowsResponse") -> Dict[str, Any]:
     return {"root_ids": list(response.root_ids)}
 
 
+_INSET_TYPES = ("status_bars", "navigation_bars", "ime", "display_cutout")
+
+
+def _inset_rects(frame: Optional[Dict[str, int]], i: "pb.WindowInsetsInfo") -> List[Dict[str, int]]:
+    """The screen-px strips an inset covers along each edge of ``frame``."""
+    if not frame:
+        return []
+    x, y, w, h = frame["x"], frame["y"], frame["w"], frame["h"]
+    out = []
+    if i.top > 0:
+        out.append({"x": x, "y": y, "w": w, "h": i.top})
+    if i.bottom > 0:
+        out.append({"x": x, "y": y + h - i.bottom, "w": w, "h": i.bottom})
+    if i.left > 0:
+        out.append({"x": x, "y": y, "w": i.left, "h": h})
+    if i.right > 0:
+        out.append({"x": x + w - i.right, "y": y, "w": i.right, "h": h})
+    return out
+
+
+# Insets drawn by windows above the app: where it is not interactive while they show.
+_OBSCURING_INSETS = ("status_bars", "navigation_bars", "ime")
+
+
+def window_info_to_dict(info: "pb.WindowInfo", resolver: StringResolver) -> Dict[str, Any]:
+    """A ``WindowInfo`` as a flat dict: ``title``? (what accessibility services call the
+    window), ``layout_title``?, ``window_type``, ``window_flags`` ("0x..."), ``frame``
+    (screen px), ``z`` (0 = bottom), ``has_window_focus``, ``display_id``, ``insets``?:
+    ``{status_bars|navigation_bars|ime|display_cutout: {left, top, right, bottom, visible,
+    rects}}`` (amounts in px within the window, ``rects`` the strips they cover in screen
+    px; only the types the agent reported, API 30+), and ``obscured``?: the screen-px rects
+    of the visible status bar, navigation bar and IME, which sit in windows above this one
+    (a node wholly inside them is outside the window's interactive region)."""
+    out: Dict[str, Any] = {}
+    title = resolver.opt(info.title)
+    if title is not None:
+        out["title"] = title
+    layout_title = resolver.opt(info.layout_title)
+    if layout_title is not None:
+        out["layout_title"] = layout_title
+    out["window_type"] = info.window_type
+    out["window_flags"] = "0x%x" % (info.wm_flags & 0xFFFFFFFF)
+    if info.HasField("frame"):
+        out["frame"] = _rect_to_dict(info.frame.layout)
+    out["z"] = info.z
+    out["has_window_focus"] = info.has_window_focus
+    out["display_id"] = info.display_id
+    insets = {}
+    obscured = []
+    for name in _INSET_TYPES:
+        if info.HasField(name):
+            i = getattr(info, name)
+            rects = _inset_rects(out.get("frame"), i)
+            insets[name] = {"left": i.left, "top": i.top, "right": i.right, "bottom": i.bottom,
+                            "visible": i.visible, "rects": rects}
+            if i.visible and name in _OBSCURING_INSETS:
+                obscured.extend(rects)
+    if insets:
+        out["insets"] = insets
+    if obscured:
+        out["obscured"] = obscured
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Compose
 # --------------------------------------------------------------------------- #

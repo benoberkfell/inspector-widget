@@ -179,6 +179,46 @@ class Session:
             root_id=root_id, include_extras=include_extras,
             include_rendering_info=include_rendering_info)
 
+    def a11y_focus(self, after_seq: int = 0, wait_ms: int = 0, quiet_ms: int = 0,
+                   include_input_focus: bool = False, subtree_depth: int = 0,
+                   max_events: int = 0):
+        """Accessibility focus now (``wait_ms`` 0), or after the next focus move (a long-poll).
+
+        Returns the ``A11yFocusResponse`` proto; ``a11y.a11y_focus_to_dict`` shapes it.
+        Pass its ``seq`` as the next ``after_seq``. A long-poll's deadline is the base
+        deadline plus ``wait_ms + quiet_ms``, so a slow step is not mistaken for a frozen app.
+        """
+        return self.client.a11y_focus(
+            after_seq=after_seq, wait_ms=wait_ms, quiet_ms=quiet_ms,
+            include_input_focus=include_input_focus, subtree_depth=subtree_depth,
+            max_events=max_events)
+
+    def a11y_act(self, node_key=None, action="accessibility_focus", host_view_id: int = None,
+                 virtual_id: int = -1, raw_action_id: int = 0, args: dict = None,
+                 subtree_depth: int = 0):
+        """Perform an accessibility action on one node; returns the ``A11yActResponse`` proto.
+
+        Name the node by ``node_key`` (``view:<id>``, ``compose:<acv>:<id>``,
+        ``virtual:<host>:<id>``, ``composeview:<acv>``) or by ``host_view_id`` +
+        ``virtual_id`` (-1 = the View itself). ``action``: see ``client.node_action``.
+        ``a11y.a11y_act_to_dict`` shapes the reply.
+        """
+        if node_key is not None:
+            from . import a11y as _a11y
+            parsed = _a11y.parse_node_key(node_key)
+            if parsed[0] in ("view", "composeview"):
+                host_view_id, virtual_id = parsed[1], -1
+            elif parsed[0] == "virt":
+                host_view_id, virtual_id = parsed[1], parsed[2]
+            else:
+                raise ValueError(f"node key {node_key!r} names no ComposeView; use "
+                                 "compose:<acvId>:<semanticsId> from a dump")
+        if host_view_id is None:
+            raise ValueError("a11y_act needs node_key or host_view_id")
+        return self.client.a11y_act(
+            host_view_id=host_view_id, virtual_id=virtual_id, action=action,
+            raw_action_id=raw_action_id, args=args, subtree_depth=subtree_depth)
+
     def capture_skp(self, root_id: int = 0):
         return self.client.capture_skp(root_id=root_id)
 

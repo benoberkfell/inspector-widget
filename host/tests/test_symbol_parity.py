@@ -589,6 +589,8 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("<call>", "Client"),               # cli / inject / Session constructing a Client
         ("Client", "dump_tree"),            # Session -> Client kwarg translation
         ("Client", "dump_compose"),
+        ("Client", "a11y_focus"),           # Session -> Client: the TalkBack focus long-poll
+        ("Client", "a11y_act"),
         ("Session", "dump_tree"),           # mcp_server / correlate -> Session
         ("Session", "get_properties"),
         ("correlate", "inspect_node"),

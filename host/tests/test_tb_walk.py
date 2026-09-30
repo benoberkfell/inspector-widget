@@ -697,8 +697,8 @@ def test_focus_cleared_by_a_scroll_is_waited_out_then_reported_lost(probe):
 
 
 def _index(scene, focus):
-    scene.a11y_focus = focus
     agent = fakeagent.FakeAgent(scene)
+    agent.a11y_focus = focus
     try:
         req = fakeagent.pb.Request(id=1)
         req.dump_a11y.SetInParent()
