@@ -1259,6 +1259,10 @@ def install(monkeypatch, *devices: FakeDevice, build_out: str) -> FakeAdb:
     product and may not exist in a fresh checkout).
     """
     fake = FakeAdb(*devices)
+    # The artifacts env vars outrank DEFAULT_BUILD_OUT (inject.resolve_build_out);
+    # a developer who exported one must not steer the fake cold path elsewhere.
+    for var in (injectmod.ARTIFACTS_ENV, injectmod.LEGACY_ARTIFACTS_ENV):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(adbmod, "_run", fake.run)
     make_build_out(build_out)
     old = injectmod.DEFAULT_BUILD_OUT
@@ -1272,6 +1276,8 @@ def install(monkeypatch, *devices: FakeDevice, build_out: str) -> FakeAdb:
 def install_global(*devices: FakeDevice, build_out: str) -> FakeAdb:
     """Like :func:`install` but permanent; for a child process (the stdio tests)."""
     fake = FakeAdb(*devices)
+    for var in (injectmod.ARTIFACTS_ENV, injectmod.LEGACY_ARTIFACTS_ENV):
+        os.environ.pop(var, None)
     adbmod._run = fake.run  # type: ignore[assignment]
     make_build_out(build_out)
     old = injectmod.DEFAULT_BUILD_OUT
