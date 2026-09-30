@@ -26,6 +26,17 @@
             android:label="@string/view_screen_title"
             android:theme="@style/Theme.A11yProbe" />
 
+        <!--
+          Mixed View/Compose interop screens: a Fragment hosting one of S1..S6
+          (RecyclerView / LazyColumn / AndroidView nesting) or a dialog window
+          (D1, D2), picked by the "scenario" intent extra.
+        -->
+        <activity
+            android:name=".InteropActivity"
+            android:exported="true"
+            android:label="Interop"
+            android:theme="@style/Theme.A11yProbe" />
+
     </application>
 
 </manifest>
