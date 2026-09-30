@@ -30,10 +30,13 @@ are written to temp PNG files and the **path** is returned (not inlined).
   each focus stop and what TalkBack announces there) and
   `reading_order_diagnostics`.
 - **`a11y_lint(serial, package, include_contrast=true, scale=1.0,
-  wcag_mode=false, rules=[...])`** → `{summary, findings:[{rule, severity, node,
-  bounds, bounds_dp, message, evidence}], density, font_scale, ...}`. The DETECT
-  and VERIFY engine. `rules` runs a subset; `wcag_mode` uses 44dp targets;
-  `include_contrast=false` skips the pixel rule. See **rules.md**.
+  wcag_mode=false, rules=[...], include_rendering_info=true)`** → `{summary,
+  findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window,
+  collection, message, evidence}], diagnostics, stats, density, font_scale, ...}`.
+  The DETECT and VERIFY engine, run over the unified a11y tree (Views + Compose).
+  `rules` runs a subset (ids, `R1`..`R18` aliases or ATF names; unknown ids are a
+  tool error); `wcag_mode` uses 44dp targets; `include_contrast=false` skips the
+  pixel rule. See **rules.md**.
 - **`a11y_overlay(serial, package, scale=1.0, include_contrast=true,
   wcag_mode=false)`** → `{path, boxes, labels, flagged, flagged_by_bounds,
   summary, ...}`. Screenshot with every a11y node boxed, each focus stop numbered
@@ -92,7 +95,7 @@ python host/cli.py attach     --serial SERIAL --package PKG
 python host/cli.py dump       --serial SERIAL --package PKG [--json -] [--screenshot out.png] [--properties]
 python host/cli.py compose    --serial SERIAL --package PKG [--json -] [--overlay out.png] [--all-boxes]
 python host/cli.py a11y       --serial SERIAL --package PKG [--json -] [--overlay out.png] [--lint] [--wcag] [--no-contrast]
-python host/cli.py a11y-lint  --serial SERIAL --package PKG [--json -] [--rule RULE_ID]... [--overlay out.png] [--wcag] [--no-contrast]
+python host/cli.py a11y-lint  --serial SERIAL --package PKG [--json -] [--rule RULE_ID|R#]... [--overlay out.png] [--wcag] [--no-contrast] [--no-rendering-info]
 ```
 
 ### MCP ↔ CLI mapping
@@ -102,7 +105,7 @@ python host/cli.py a11y-lint  --serial SERIAL --package PKG [--json -] [--rule R
 | `list_devices` | `devices` |
 | `list_processes` | `packages --serial …` |
 | `attach` | `attach --serial … --package …` |
-| `a11y_lint` | `a11y-lint …` ( `--rule` per rule, `--wcag`, `--no-contrast`, `--overlay` ) |
+| `a11y_lint` | `a11y-lint …` ( `--rule` per rule, `--wcag`, `--no-contrast`, `--no-rendering-info`, `--overlay` ) |
 | `dump_accessibility` | `a11y …` ( `--json -` for the tree ) |
 | `a11y_overlay` | `a11y --overlay out.png --lint` (or `a11y-lint --overlay out.png`) |
 | `dump_compose` | `compose --json -` |

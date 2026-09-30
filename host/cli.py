@@ -215,10 +215,21 @@ def cmd_a11y(args) -> int:
         client = Client(inj.sock, owns_socket=False)
         client.hello()
         data = a11ymod.a11y_to_dict(client.dump_a11y(
-            root_id=0, include_extras=args.include_extras,
-            include_rendering_info=args.include_rendering_info))
+            root_id=0, include_extras=args.include_extras or args.lint,
+            include_rendering_info=args.include_rendering_info or args.lint))
         if data.get("diagnostics"):
             print(f"a11y: {data['diagnostics']}", file=sys.stderr)
+        report = None
+        if args.lint:
+            report = lintmod.run_lint(
+                client, density=adb.display_density(args.serial),
+                font_scale=adb.font_scale(args.serial),
+                include_contrast=not args.no_contrast, scale=args.scale,
+                wcag_mode=args.wcag, a11y_data=data)
+            data["lint"] = report.to_dict()
+            s = report.summary
+            print(f"a11y lint: {s['error']} error, {s['warn']} warn, {s['info']} info",
+                  file=sys.stderr)
 
         if args.json:
             text = json.dumps(data, indent=2)
@@ -238,22 +249,7 @@ def cmd_a11y(args) -> int:
                 print(f"a11y: reading order: {diag.get('message')}", file=sys.stderr)
 
         if args.overlay:
-            findings = None
-            if args.lint:
-                comp = stringsmod.dump_compose_to_dict(
-                    client.dump_compose(include_semantics=True, include_slot_table=False))
-                roots = [w["root"] for w in comp.get("windows", []) if w.get("root")]
-                ctx = lintmod.LintContext(
-                    density=adb.display_density(args.serial),
-                    font_scale=adb.font_scale(args.serial),
-                    wcag_mode=args.wcag)
-                if not args.no_contrast:
-                    shot0 = client.screenshot(root_id=0, scale=args.scale)
-                    if shot0.HasField("screenshot"):
-                        w, h, rgba = pngmod._decode_to_rgba(shot0.screenshot)
-                        ctx.screenshot_rgba = rgba; ctx.screenshot_w = w; ctx.screenshot_h = h
-                        ctx.screenshot_scale = float(shot0.screenshot.scale) or args.scale
-                findings = [f.to_dict() for f in lintmod.lint_tree(roots, ctx)]
+            findings = data["lint"]["findings"] if report is not None else None
             shot = client.screenshot(root_id=0, scale=args.scale)
             base = args.overlay + ".base.png"
             pngmod.write_png(shot.screenshot, base)
@@ -272,30 +268,23 @@ def cmd_a11y(args) -> int:
 def cmd_a11y_lint(args) -> int:
     from inspector_widget import a11y_lint as lintmod
     from inspector_widget import adb
+    try:
+        rules = lintmod.resolve_rule_ids(args.rules)
+    except lintmod.UnknownRuleError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     inj = injectmod.inject_and_connect(
         serial=args.serial, package=args.package, build_out=args.build_out,
         force_reinject=args.force)
     try:
         client = Client(inj.sock, owns_socket=False)
         client.hello()
-        comp = stringsmod.dump_compose_to_dict(
-            client.dump_compose(include_semantics=True, include_slot_table=False))
-        roots = [w["root"] for w in comp.get("windows", []) if w.get("root")]
-        ctx = lintmod.LintContext(
-            density=adb.display_density(args.serial),
+        report = lintmod.run_lint(
+            client, density=adb.display_density(args.serial),
             font_scale=adb.font_scale(args.serial),
-            wcag_mode=args.wcag)
-        if not args.no_contrast:
-            shot = client.screenshot(root_id=0, scale=args.scale)
-            if shot.HasField("screenshot"):
-                w, h, rgba = pngmod._decode_to_rgba(shot.screenshot)
-                ctx.screenshot_rgba = rgba; ctx.screenshot_w = w; ctx.screenshot_h = h
-                ctx.screenshot_scale = float(shot.screenshot.scale) or args.scale
-        enabled = set(args.rules) if args.rules else None
-        findings = lintmod.lint_tree(roots, ctx, enabled=enabled)
-        summary = lintmod.summarize(findings)
-        out = {"density": ctx.density, "font_scale": ctx.font_scale,
-               "summary": summary, "findings": [f.to_dict() for f in findings]}
+            include_contrast=not args.no_contrast, scale=args.scale, wcag_mode=args.wcag,
+            rules=rules, include_rendering_info=args.include_rendering_info)
+        out = report.to_dict()
         if args.json:
             text = json.dumps(out, indent=2)
             if args.json == "-":
@@ -305,25 +294,20 @@ def cmd_a11y_lint(args) -> int:
                     f.write(text)
                 print(f"wrote a11y-lint JSON to {args.json}", file=sys.stderr)
         else:
-            print(f"density={ctx.density}dpi font_scale={ctx.font_scale} "
-                  f"-> {summary['error']} error, {summary['warn']} warn, {summary['info']} info")
-            for f in findings:
-                bdp = f.bounds_dp
-                print(f"[{f.severity.upper():5}] {f.rule} "
-                      f"({bdp['x']},{bdp['y']} {bdp['w']}x{bdp['h']}dp) "
-                      f"id={f.node.get('id')}: {f.message}")
+            print(lintmod.format_text(report))
         if args.overlay:
-            from inspector_widget import a11y as a11ymod
             from inspector_widget import overlay as ovmod
-            data = a11ymod.a11y_to_dict(client.dump_a11y(root_id=0, include_extras=True))
             shot2 = client.screenshot(root_id=0, scale=args.scale)
             base = args.overlay + ".base.png"
             pngmod.write_png(shot2.screenshot, base)
-            ovmod.render_a11y_overlay(base, data, args.overlay,
-                                      findings=[f.to_dict() for f in findings],
-                                      scale=(float(shot2.screenshot.scale) or args.scale))
+            ov = ovmod.render_a11y_overlay(base, report.a11y_data, args.overlay,
+                                           findings=out["findings"],
+                                           scale=(float(shot2.screenshot.scale) or args.scale))
             os.remove(base)
-            print(f"wrote a11y-lint overlay -> {args.overlay}", file=sys.stderr)
+            s = out["summary"]
+            print(f"wrote a11y-lint overlay -> {args.overlay} ({ov['boxes']} boxes, "
+                  f"{ov['flagged']} flagged; {s['error']} error, {s['warn']} warn, "
+                  f"{s['info']} info)", file=sys.stderr)
     finally:
         inj.close()
     return 0
@@ -587,7 +571,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--overlay", metavar="OUT.png",
                     help="render a11y nodes (box + speakable label + reading-order number) over a screenshot")
     sp.add_argument("--lint", action="store_true",
-                    help="also run the a11y lint and color the overlay by finding severity")
+                    help="also run the a11y lint (adds a 'lint' key to --json, colors --overlay "
+                         "by severity); implies --rendering-info")
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for --overlay")
     sp.add_argument("--no-contrast", action="store_true", help="skip the contrast (image) lint rule")
     sp.add_argument("--wcag", action="store_true", help="use WCAG target sizes (44dp) for the lint")
@@ -599,7 +584,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_a11y)
 
-    sp = sub.add_parser("a11y-lint", help="run the accessibility lint (R1..R12) over the Compose semantics tree")
+    sp = sub.add_parser("a11y-lint",
+                        help="run the accessibility lint (R1..R18) over the unified a11y tree "
+                             "(Views + Compose)")
     sp.add_argument("--serial", default=DEFAULT_SERIAL)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
     sp.add_argument("--json", metavar="OUT.json|-", help="emit findings as JSON")
@@ -607,7 +594,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--wcag", action="store_true", help="use WCAG target sizes (44dp) instead of Material (48dp)")
     sp.add_argument("--scale", type=float, default=1.0, help="screenshot scale for the contrast sample")
     sp.add_argument("--rule", action="append", dest="rules", metavar="RULE_ID",
-                    help="only run this rule id (repeatable); omit to run all")
+                    help="only run this rule (repeatable): an id like a11y.label.missing, an "
+                         "alias R1..R18, or an ATF name like TouchTargetSize; omit to run all")
+    sp.add_argument("--no-rendering-info", action="store_false", dest="include_rendering_info",
+                    help="skip per-node ExtraRenderingInfo (disables the text-size rules R11/R18 "
+                         "and text-size-aware contrast)")
     sp.add_argument("--overlay", metavar="OUT.png", help="also render a severity-colored overlay")
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
