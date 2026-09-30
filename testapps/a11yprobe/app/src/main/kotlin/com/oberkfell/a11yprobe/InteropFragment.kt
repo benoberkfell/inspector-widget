@@ -114,6 +114,7 @@ val INTEROP_SCENARIOS: List<InteropScenario> = listOf(
 
 fun interopScenario(id: String?): InteropScenario? =
     INTEROP_SCENARIOS.firstOrNull { it.id.equals(id, ignoreCase = true) }
+        ?: TB_HYBRID_SCENARIOS.firstOrNull { it.id.equals(id, ignoreCase = true) }
 
 class InteropFragment : Fragment() {
 
@@ -134,7 +135,10 @@ class InteropFragment : Fragment() {
             "S5" -> composeScreen { NestedRecycler(sc) }
             "D1" -> dialogHostScreen(sc)
             "D2" -> composeScreen { ComposeDialogScreen(sc) }
-            else -> error("unhandled interop scenario ${sc.id}")
+            // TalkBack corpus hybrids (TbHybrid.kt), BAD/GOOD by the "variant" extra.
+            else -> if (sc.id.startsWith("tb_h")) {
+                tbHybridScreen(this, sc.id, requireArguments().getString(ARG_VARIANT) ?: "bad")
+            } else error("unhandled interop scenario ${sc.id}")
         }
     }
 
@@ -206,10 +210,14 @@ class InteropFragment : Fragment() {
 
     companion object {
         private const val ARG_SCENARIO = "scenario"
+        private const val ARG_VARIANT = "variant"
         const val ITEM_COUNT = 30
 
-        fun newInstance(scenario: String) = InteropFragment().apply {
-            arguments = Bundle().apply { putString(ARG_SCENARIO, scenario) }
+        fun newInstance(scenario: String, variant: String? = null) = InteropFragment().apply {
+            arguments = Bundle().apply {
+                putString(ARG_SCENARIO, scenario)
+                putString(ARG_VARIANT, variant)
+            }
         }
     }
 }

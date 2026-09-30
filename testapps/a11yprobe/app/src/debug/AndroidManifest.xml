@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug builds only: TB_PROBE mutates the TalkBack corpus lists on demand
+  (TbProbe.kt; host tb_scenario survive mutate=probe:<action>).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".TbProbeReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver"
+            xmlns:tools="http://schemas.android.com/tools">
+            <intent-filter>
+                <action android:name="com.oberkfell.a11yprobe.TB_PROBE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

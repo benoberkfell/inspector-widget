@@ -10,6 +10,10 @@
 //   # Classic-View (XML) screen:
 //   adb shell am start -n com.oberkfell.a11yprobe/.ViewScenarioActivity
 //
+//   # TalkBack navigation corpus, one variant per screen (TalkBackScenarios.kt):
+//   adb shell am start -n com.oberkfell.a11yprobe/.MainActivity --es scenario tb_c1 --es variant bad
+//   (tb_v* open TbViewActivity, tb_h* open InteropActivity; same extras)
+//
 //   # Mixed View/Compose screens and dialog windows (ids in InteropFragment.kt):
 //   adb shell am start -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S1
 //     S1 RecyclerView of ComposeView cells     S4 LazyColumn with AndroidView rows
@@ -75,8 +79,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val requested = intent.getStringExtra(EXTRA_SCENARIO)
         forwardIntent(this, requested)?.let {
-            startActivity(it)
+            startActivity(it.putExtra(EXTRA_VARIANT, intent.getStringExtra(EXTRA_VARIANT)))
             finish()
+            return
+        }
+        // TalkBack corpus (TalkBackScenarios.kt): one scenario variant per screen.
+        tbScenario(requested)?.let { sc ->
+            setContent { ProbeRoot { TbScreen(sc, intent.getStringExtra(EXTRA_VARIANT)) } }
             return
         }
         setContent {
@@ -93,12 +102,16 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_SCENARIO = "scenario"
         const val SCENARIO_ALL = "all"
         const val SCENARIO_VIEW_XML = "view_xml"
+        /** TalkBack corpus: `--es variant bad|good` (TalkBackScenarios.kt). */
+        const val EXTRA_VARIANT = "variant"
 
         /** The Activity intent for a non-Compose scenario id, or null if MainActivity shows it. */
         fun forwardIntent(context: Context, id: String?): Intent? = when {
             id == SCENARIO_VIEW_XML -> Intent(context, ViewScenarioActivity::class.java)
             interopScenario(id) != null -> Intent(context, InteropActivity::class.java)
                 .putExtra(InteropActivity.EXTRA_SCENARIO, interopScenario(id)!!.id)
+            tbViewScenario(id) != null -> Intent(context, TbViewActivity::class.java)
+                .putExtra(EXTRA_SCENARIO, tbViewScenario(id)!!.id)
             else -> null
         }
     }
