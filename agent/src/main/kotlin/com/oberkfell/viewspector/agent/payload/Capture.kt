@@ -39,11 +39,15 @@ import android.view.ViewDebug
 import com.oberkfell.viewspector.proto.ViewInspection
 import com.google.protobuf.ByteString
 import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.Deflater
 import kotlin.math.roundToInt
 
@@ -314,9 +318,9 @@ object Capture {
     /**
      * Capture one frame of [root]'s rendering as a serialized Skia picture (SKP), via the public-ish
      * ViewDebug.startRenderingCommandsCapture(View, Executor, Callable<OutputStream>) (API 33+/T).
-     * The system invokes our Executor once per drawn frame with a runnable that serializes the
-     * picture into the OutputStream from our Callable; we invalidate once, await the first frame,
-     * then close. Returns the raw SKP bytes ("skiapict" magic + LE version + body).
+     * For each drawn frame the system calls our Executor with a runnable that asks the Callable
+     * for a stream and writes that frame's picture into it; we invalidate once, await the first
+     * frame, then close. Returns the raw SKP bytes ("skiapict" magic + LE version + body).
      */
     fun captureSkp(root: View, timeoutMs: Long = 4000): SkpResult {
         if (Build.VERSION.SDK_INT <= 32) {
@@ -324,12 +328,25 @@ object Capture {
         }
         val os = ByteArrayOutputStream()
         val latch = CountDownLatch(1)
+        // Hand the stream out for ONE frame. ViewDebug calls the Callable once per captured
+        // frame and appends that frame's picture to the stream it returns, so a second frame
+        // would concatenate two pictures into one invalid SKP (and race the read below).
+        // A null stream makes ViewDebug close the capture (StreamingPictureCallbackHandler.run).
+        val handedOut = AtomicBoolean(false)
+        val streamOnce = Callable<OutputStream?> { if (handedOut.compareAndSet(false, true)) os else null }
         // The system calls our Executor (on the render thread) with a runnable that serializes the
         // picture. Mirror the real CaptureExecutor: re-post that runnable to a dedicated worker
         // thread and only signal completion once it has finished writing the stream.
-        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val worker = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "ViewSpector-SKP").apply { isDaemon = true }
+        }
         val executor = Executor { command ->
-            worker.execute { try { command.run() } finally { latch.countDown() } }
+            try {
+                worker.execute { try { command.run() } finally { latch.countDown() } }
+            } catch (e: RejectedExecutionException) {
+                // A frame after we finished (the worker is shut down): drop it. Throwing here
+                // would surface on the render thread.
+            }
         }
         val method = ViewDebug::class.java.getDeclaredMethod(
             "startRenderingCommandsCapture",
@@ -337,28 +354,51 @@ object Capture {
         )
         // startRenderingCommandsCapture() must run on the View's UI thread; register + invalidate
         // there, then await the captured frame OFF the main thread so rendering can proceed.
-        val handle: AutoCloseable = try {
+        val handle: AutoCloseable? = try {
             MainThread.run {
-                val h = method.invoke(null, root, executor, Callable { os }) as AutoCloseable
-                root.invalidate()
+                val h = method.invoke(null, root, executor, streamOnce) as AutoCloseable?
+                if (h != null) root.invalidate()
                 h
             }
         } catch (t: Throwable) {
+            worker.shutdownNow()
             val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t.cause ?: t
-            Log.w("ViewSpector", "startRenderingCommandsCapture failed", cause)
+            Log.w(TAG, "startRenderingCommandsCapture failed", cause)
             return SkpResult(false, null, "startRenderingCommandsCapture: ${cause.javaClass.name}: ${cause.message}")
+        }
+        if (handle == null) {
+            // ViewDebug returns null when the window has no ThreadedRenderer.
+            worker.shutdownNow()
+            return SkpResult(
+                false, null,
+                "the window is not hardware-accelerated (no ThreadedRenderer), so it records no " +
+                    "rendering commands; use a BITMAP crop instead",
+            )
         }
         try {
             if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-                return SkpResult(true, null, "timed out waiting for an SKP frame")
+                return SkpResult(true, null, "timed out after ${timeoutMs}ms waiting for a frame to capture")
             }
         } catch (t: Throwable) {
+            if (t is InterruptedException) Thread.currentThread().interrupt()
             return SkpResult(true, null, "capture error: ${t.message}")
         } finally {
-            try { MainThread.run { handle.close() } } catch (_: Throwable) {}
-            worker.shutdownNow()
+            // Stop listening first, then let an in-flight write finish before reading.
+            try { MainThread.run { handle.close() } } catch (t: Throwable) {
+                Log.w(TAG, "closing the SKP capture failed", t)
+            }
+            worker.shutdown()
+            try {
+                if (!worker.awaitTermination(SKP_DRAIN_MS, TimeUnit.MILLISECONDS)) worker.shutdownNow()
+            } catch (ie: InterruptedException) {
+                worker.shutdownNow()
+                Thread.currentThread().interrupt()
+            }
         }
         val bytes = os.toByteArray()
         return if (bytes.isEmpty()) SkpResult(true, null, "empty SKP") else SkpResult(true, bytes, null)
     }
+
+    /** How long to let a picture being written finish after the capture is closed. */
+    private const val SKP_DRAIN_MS = 1000L
 }
