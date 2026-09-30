@@ -1363,6 +1363,9 @@ class FakeDevice:
         self.secure: Dict[str, str] = {}            # settings secure namespace
         self.talkback: Optional["FakeTalkBack"] = None
         self.activity_stack: List[str] = [f"{DEFAULT_PACKAGE}/.MainActivity"]
+        # An activity finishing by itself: the next top read still reports it, then it is gone.
+        self.leaving: Optional[str] = None
+        self.backs_to_app = 0                       # BACKs that reached the app's own activity
         self.display_size: Tuple[int, int] = (360, 640)
         self.uinput_available = True
         self.input_devices: Dict[str, int] = {}     # registered uinput name -> device id
@@ -1658,7 +1661,11 @@ class FakeDevice:
             ok = tb is not None and tb.installed
             return 0, (f"    versionName={tb.version}\n" if ok else ""), ""
         if toks[:3] == ["dumpsys", "activity", "activities"]:
-            return 0, f"  topResumedActivity=ActivityRecord{{1a2b3c u0 {self.top} t42}}\n", ""
+            top = self.top
+            if self.leaving is not None and top == self.leaving:
+                self.activity_stack.pop()
+                self.leaving = None
+            return 0, f"  topResumedActivity=ActivityRecord{{1a2b3c u0 {top} t42}}\n", ""
         if toks[:2] == ["dumpsys", "input"]:
             name = toks[-1] if len(toks) > 2 else ""
             hit = [n for n in self.input_devices if n == name or not name]
@@ -1709,13 +1716,19 @@ class FakeDevice:
 
     def back(self) -> None:
         """System BACK: closes an open settings dialog, else pops the top activity
-        (never the last one)."""
+        (never the last one). BACK on TalkBack's permission dialog also lets the
+        PermissionRequestActivity under it finish by itself (``leaving``)."""
         tb = self.talkback
         if tb is not None and self.top == tb.PREFS and tb.prefs_screen != "dev":
             tb.prefs_screen = "dev"
             return
+        if self.top.startswith(DEFAULT_PACKAGE + "/"):
+            self.backs_to_app += 1
         if len(self.activity_stack) > 1:
             self.activity_stack.pop()
+            if (tb is not None and self.top == tb.PERMISSION_REQUEST
+                    and len(self.activity_stack) > 1):
+                self.leaving = self.top
 
     def _join_talkback(self, agent: "FakeAgent") -> None:
         """A new agent sees TalkBack's current focus and service state, and focus it
@@ -2199,13 +2212,16 @@ class FakeTalkBack:
     TRAINING = f"{PACKAGE}/com.google.android.accessibility.talkback.trainingcommon.TrainingActivity"
     PERMISSION = ("com.google.android.permissioncontroller/"
                   "com.android.permissioncontroller.permission.ui.GrantPermissionsActivity")
+    # The Accessibility Suite's trampoline that raises PERMISSION (``trampoline_on_start``).
+    PERMISSION_REQUEST = f"{PACKAGE}/com.google.android.accessibility.talkback.permission.PermissionRequestActivity"
     PREFS = f"{PACKAGE}/com.android.talkback.TalkBackPreferencesActivity"
     LEVELS = ("NONE", "ASSERT", "ERROR", "WARN", "INFO", "DEBUG", "VERBOSE")
 
     def __init__(self, device: "FakeDevice", order: Sequence[Target] = (), version: str = "17.0.0",
                  installed: bool = True, keymap: str = "enhanced", pid: int = 7777,
                  verbose_log: bool = False, training_on_start: bool = False,
-                 grant_on_start: bool = False, permission_on_start: bool = True) -> None:
+                 grant_on_start: bool = False, permission_on_start: bool = True,
+                 trampoline_on_start: bool = False) -> None:
         self.device = device
         self.order: List[Target] = list(order)
         self.version = version
@@ -2217,6 +2233,7 @@ class FakeTalkBack:
         self.grant_on_start = grant_on_start
         # The Accessibility Suite asks for POST_NOTIFICATIONS on EVERY service start.
         self.permission_on_start = permission_on_start
+        self.trampoline_on_start = trampoline_on_start
         self.initial_focus: Optional[Target] = None  # where focus goes when the service starts
         self.log_level = "ERROR"      # Developer settings > Log output level
         self.prefs_screen = "dev"     # dev | levels | confirm (TalkBackPreferencesActivity)
@@ -2252,6 +2269,8 @@ class FakeTalkBack:
             if self.training_on_start and self.starts == 1:
                 self.device.activity_stack.append(self.TRAINING)
             if self.permission_on_start:
+                if self.trampoline_on_start:
+                    self.device.activity_stack.append(self.PERMISSION_REQUEST)
                 self.device.activity_stack.append(self.PERMISSION)
             if self.initial_focus is not None:
                 self.set_focus(self.initial_focus)

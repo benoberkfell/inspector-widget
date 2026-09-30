@@ -143,6 +143,16 @@ def test_tutorial_is_dismissed_with_back(tb_env):
     assert ["keyevent", "KEYCODE_BACK"] in tb_env.input_log
 
 
+def test_the_permission_trampoline_leaving_by_itself_gets_no_back(tb_env):
+    # BACK on the dialog lets TalkBack's PermissionRequestActivity finish by itself; a read
+    # right after still sees it. A BACK sent then would reach the app and close it.
+    tb_env.talkback.trampoline_on_start = True
+    out = tbdevice.enable(SERIAL, fakeagent.DEFAULT_PACKAGE)
+    assert out["dismissed"] == [fakeagent.FakeTalkBack.PERMISSION]
+    assert tb_env.backs_to_app == 0
+    assert tb_env.top == f"{fakeagent.DEFAULT_PACKAGE}/.MainActivity" and "refronted" not in out
+
+
 def test_app_not_in_front_after_enable_rolls_back(tb_env):
     tb_env.talkback.training_on_start = True
     tb_env.activity_stack.append("com.example.other/.Main")  # something else on top already
