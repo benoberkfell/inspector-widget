@@ -857,14 +857,10 @@ def _h_detach(args: Dict[str, Any]) -> Dict[str, Any]:
                        shutdown=args.get("shutdown", True))
 
 
-_SERIAL = {
-    "type": "string",
-    "description": "ADB serial from list_devices; default $ANDROID_SERIAL, else the only device.",
-}
-_PACKAGE = {
-    "type": "string",
-    "description": "Debuggable app package, e.g. 'com.example.app'.",
-}
+_SERIAL = {"type": "string", "description": "Default: $ANDROID_SERIAL or the only device"}
+_PACKAGE = {"type": "string"}  # the tools say "debuggable app"; list_processes lists them
+# Screenshot scale; 0 < scale <= 1 says it all (tools/list stays small, spec 2.4).
+_SCALE = {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0}
 
 # --------------------------------------------------------------------------- #
 # Accessibility tools (dump / lint / overlay).
@@ -1009,31 +1005,24 @@ def _h_a11y_overlay(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def _load_a11y_rule_choices() -> List[str]:
-    try:
-        from inspector_widget import a11y_lint
-        return list(a11y_lint.RULE_CHOICES)
-    except Exception:  # keep the server importable even if the lint cannot load
-        return []
-
-
-_A11Y_RULE_CHOICES = _load_a11y_rule_choices()
-_A11Y_RULE_ITEMS: Dict[str, Any] = (
-    {"type": "string", "enum": _A11Y_RULE_CHOICES} if _A11Y_RULE_CHOICES else {"type": "string"})
+# Rule ids are checked by _a11y_lint_rules (a clear error naming the valid ids), not
+# by an enum in the schema: listing all 47 ids and aliases would cost ~900 B of
+# tools/list on every session (spec 2.4).
+_A11Y_RULE_ITEMS: Dict[str, Any] = {"type": "string"}
 
 
 TOOLS: Dict[str, Dict[str, Any]] = {
     "list_devices": {
         "handler": _h_list_devices,
         "description": (
-            "List adb-visible devices and emulators with serial, API level and ABI. Call first."
+            "List adb devices and emulators (serial, API level, ABI). Call first."
         ),
         "schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     "list_processes": {
         "handler": _h_list_processes,
         "description": (
-            "List a device's debuggable packages (only those can be inspected), with the pid of "
+            "List a device's debuggable packages (only those can be inspected) and the pid of "
             "each running one."
         ),
         "schema": {
@@ -1045,11 +1034,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "attach": {
         "handler": _h_attach,
         "description": (
-            "Inject the agent into a RUNNING debuggable app and open a session (idempotent per "
-            "serial+package; other tools auto-attach). Returns pid, warm (agent already running), "
-            "reused (cached session), API level, ABI, agent version and windows (window_count, "
-            "root_ids for dump_tree). A dropped session (idle timeout, app restart) re-attaches "
-            "automatically; an agent from another build is replaced."
+            "Inject the agent into a RUNNING debuggable app and open a session (idempotent; "
+            "other tools auto-attach): pid, warm, reused, API level, ABI, agent version, "
+            "window_count, root_ids. A dropped session re-attaches by itself."
         ),
         "schema": {
             "type": "object",
@@ -1057,8 +1044,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "force": {"type": "boolean", "default": False,
-                          "description": "Stop any running agent (for every client) and inject a "
-                                         "fresh one."},
+                          "description": "Stop any running agent and inject a fresh one."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1067,9 +1053,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_tree": {
         "handler": _h_dump_tree,
         "description": (
-            "The live View hierarchy as a JSON tree (auto-attaches). Nodes carry id "
-            "(uniqueDrawingId, for get_properties), class_name, package_name, screen bounds "
-            "{layout:{x,y,w,h}, render?}, resource, TextView text and IS_WEBVIEW."
+            "The View hierarchy (auto-attaches). Nodes carry id (uniqueDrawingId, for "
+            "get_properties), class_name, screen-px bounds, resource, text and flags."
         ),
         "schema": {
             "type": "object",
@@ -1079,7 +1064,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_properties": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Inline every view's attributes (large; see get_properties).",
+                    "description": "Add each view's attributes (large; see get_properties).",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
@@ -1091,13 +1076,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "default": False,
                     "description": "Also save a screenshot PNG (screenshot.path).",
                 },
-                "scale": {
-                    "type": "number",
-                    "default": 1.0,
-                    "exclusiveMinimum": 0,
-                    "maximum": 1.0,
-                    "description": "Screenshot scale in (0, 1].",
-                },
+                "scale": _SCALE,
                 "root_id": {
                     "type": "integer",
                     "default": 0,
@@ -1121,7 +1100,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "view_id": {
                     "type": "integer",
-                    "description": "The view's uniqueDrawingId (its 'id' in dump_tree).",
+                    "description": "Its 'id' in dump_tree (uniqueDrawingId).",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
@@ -1136,21 +1115,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "screenshot": {
         "handler": _h_screenshot,
         "description": (
-            "Save a PNG of the app's current UI; returns path, width, height (auto-attaches). "
-            "Every tool's PNGs live in a per-server temp dir deleted on exit: copy one to keep it."
+            "Save a PNG of the app's UI; returns path, width, height. PNGs live in a "
+            "per-server temp dir deleted on exit: copy one to keep it."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {
-                    "type": "number",
-                    "default": 1.0,
-                    "exclusiveMinimum": 0,
-                    "maximum": 1.0,
-                    "description": "Scale in (0, 1]; 1 = full resolution.",
-                },
+                "scale": _SCALE,
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1159,9 +1132,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_compose": {
         "handler": _h_dump_compose,
         "description": (
-            "The Jetpack Compose layer dump_tree cannot see (it stops at AndroidComposeView): the "
-            "semantics tree (text, contentDescription, role, state, bounds of every on-screen "
-            "element) and, when populated, slot-table composables with file:line. Auto-attaches."
+            "The Jetpack Compose layer dump_tree stops at: the semantics tree (text, "
+            "contentDescription, role, state, bounds of each on-screen element) and, when "
+            "populated, the slot table's composables with file:line. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1171,12 +1144,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_semantics": {"type": "boolean", "default": True,
                     "description": "Include the semantics tree."},
                 "include_slot_table": {"type": "boolean", "default": True,
-                    "description": "Include the slot table (composables, parameters, file:line)."},
+                    "description": "Include the slot table (composables, file:line)."},
                 "enable_inspection": {"type": "boolean", "default": False,
                     "description": "Populate the slot table by hot-reloading. DESTRUCTIVE: "
-                                   "resets remember{} state in every composition (open dialogs, "
-                                   "text input, scroll, toggles) and re-mints Compose ids once. "
-                                   "The semantics tree does not need it."},
+                                   "resets remember{} state in every composition (dialogs, text "
+                                   "input, scroll, toggles) and re-mints Compose ids."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1185,16 +1157,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "compose_overlay": {
         "handler": _h_compose_overlay,
         "description": (
-            "Screenshot with every on-screen Compose element boxed and labelled (text/role). "
-            "Returns the PNG path and the on-screen text: the quickest look at a Compose screen."
+            "Screenshot with each on-screen Compose element boxed and labelled (text/role); "
+            "returns the PNG path and the on-screen text."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0,
-                          "description": "Screenshot scale in (0, 1]."},
+                "scale": _SCALE,
                 "all_boxes": {"type": "boolean", "default": False,
                               "description": "Box every node, not only those with text or a role."},
             },
@@ -1205,15 +1176,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_accessibility": {
         "handler": _h_dump_accessibility,
         "description": (
-            "The unified accessibility tree TalkBack sees: Views and Compose virtual nodes in one "
-            "tree. Nodes carry host_view_id+virtual_id, a node_key (view:<id> | "
-            "compose:<acvId>:<semId>) for inspect_node (valid for this dump's generation), "
-            "text/contentDescription/state/role, flags, bounds, decoded actions, collection/range "
-            "info and extras. focus_order is TalkBack's reading order ([{order, key, speak}], "
-            "e.g. 'Delete, button'): Views not important for accessibility are skipped (ignored; "
-            "their children read in their place) and windows under an open modal dialog are "
-            "unreachable (covered_by). reading_order_diagnostics lists cycles, dangling targets "
-            "and covered windows. Auto-attaches."
+            "The accessibility tree TalkBack sees: Views and Compose virtual nodes in one tree. "
+            "Nodes carry node_key (view:<id> | compose:<acvId>:<semId>, for inspect_node), "
+            "text/contentDescription/state/role, flags, bounds, actions, collection/range info. "
+            "focus_order is TalkBack's reading order ({order, key, speak}); nodes under an "
+            "open dialog are unreachable (covered_by). Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1221,7 +1188,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "include_extras": {"type": "boolean", "default": True,
-                    "description": "Read each node's extras (roleDescription, Compose testTag)."},
+                    "description": "Read extras (roleDescription, Compose testTag)."},
                 "include_rendering_info": {"type": "boolean", "default": False,
                     "description": "Add layout and text sizes (slow)."},
             },
@@ -1232,15 +1199,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_lint": {
         "handler": _h_a11y_lint,
         "description": (
-            "Lint the unified a11y tree (Views, Compose, RecyclerView cells, "
-            "AndroidView-in-Compose) with rules R1..R18: missing labels, small touch targets, "
-            "low contrast (sampled per window), redundant/duplicate labels, clickables without a "
-            "role, images without descriptions, toggles without state, empty stops, "
-            "headings/grouping, fixed or tiny text, duplicate clickable bounds, text fields with "
-            "a contentDescription, form labels, unclear links, traversal cycles. A finding has "
-            "rule, alias (R#), severity, node_key (for inspect_node), node, bounds (px, dp), "
-            "window (covered_by: under an open dialog), collection position, message and "
-            "evidence; plus summary, diagnostics, generation. Auto-attaches."
+            "Lint the a11y tree (Views, Compose, RecyclerView cells, AndroidView-in-Compose), "
+            "rules R1..R18: labels, touch targets, contrast (per window), roles, state, empty "
+            "stops, headings, grouping, text size, duplicates, forms, links, traversal. A finding "
+            "has rule, severity, node_key (for inspect_node), bounds (px, dp), window, message "
+            "and evidence; plus summary, diagnostics, generation."
         ),
         "schema": {
             "type": "object",
@@ -1249,12 +1212,12 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "include_contrast": {"type": "boolean", "default": True,
                     "description": "Sample screenshots for the contrast rule (R3)."},
-                "scale": {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0,
-                    "description": "Screenshot scale in (0, 1]."},
+                "scale": _SCALE,
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "WCAG 44dp targets instead of Material 48dp."},
                 "rules": {"type": "array", "items": _A11Y_RULE_ITEMS,
-                    "description": "Rules to run; omit for all."},
+                    "description": "Rule ids (a11y.label.missing, ...), R1..R18 or ATF check "
+                                   "names; omit for all."},
                 "include_rendering_info": {"type": "boolean", "default": True,
                     "description": "Read View text sizes (R11, R18, size-aware contrast)."},
             },
@@ -1265,17 +1228,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_overlay": {
         "handler": _h_a11y_overlay,
         "description": (
-            "Screenshot with every a11y node boxed: its spoken label and TalkBack order number, "
-            "colored by lint severity (red error, amber warn, blue info, green clean). Returns the "
-            "PNG path and the lint summary."
+            "Screenshot with each a11y node boxed with its spoken label and TalkBack order, "
+            "colored by lint severity. Returns the PNG path and the lint summary."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0,
-                    "description": "Screenshot scale in (0, 1]."},
+                "scale": _SCALE,
                 "include_contrast": {"type": "boolean", "default": True,
                     "description": "Run the contrast rule too."},
                 "wcag_mode": {"type": "boolean", "default": False,
@@ -1288,9 +1249,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "detach": {
         "handler": _h_detach,
         "description": (
-            "End a session. shutdown=true (default) stops the agent for every client, even one "
-            "this server did not attach (it never injects one just to stop it); shutdown=false "
-            "only drops this server's connection. Safe when not attached."
+            "End a session. shutdown=true (default) stops the agent for every client (it never "
+            "injects one to stop it); shutdown=false only drops this server's connection."
         ),
         "schema": {
             "type": "object",
@@ -1298,8 +1258,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "shutdown": {"type": "boolean", "default": True,
-                             "description": "Stop the agent (true) or only drop this server's "
-                                            "connection (false)."},
+                             "description": "false: only drop this server's connection."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1430,7 +1389,7 @@ def _h_component_image(args: Dict[str, Any]) -> Dict[str, Any]:
 
 _BOUNDS_SCHEMA = {
     "type": "object",
-    "description": "Screen px {x,y,w,h}: the deepest covering element.",
+    "description": "Screen px; the deepest covering element.",
     "properties": {
         "x": {"type": "integer"}, "y": {"type": "integer"},
         "w": {"type": "integer"}, "h": {"type": "integer"},
@@ -1443,12 +1402,10 @@ TOOLS.update({
     "inspect": {
         "handler": _h_inspect,
         "description": (
-            "The whole screen as one merged tree: the View hierarchy with every ComposeView's "
-            "semantics grafted in (RecyclerView cells, AndroidView nesting included) and a11y "
-            "facets joined by id (a one-to-one bounds fallback within a window). Keys view:<id>, "
-            "compose:<acvId>:<semId>, composeview:<acvId>. Nodes carry view{}, compose{}, a11y{} "
-            "(with TalkBack order), list_item{}, image_ref{} and correlation_confidence "
-            "(exact|overlap|none); summary has counts and the Compose id generation."
+            "The whole screen as one merged tree: Views with every ComposeView's semantics "
+            "grafted in (RecyclerView cells, AndroidView nesting) and a11y joined by id. Keys "
+            "view:<id>, compose:<acvId>:<semId>, composeview:<acvId>. Nodes carry bounds, view{}, "
+            "compose{}, a11y{} (TalkBack order) and correlation_confidence; summary has counts."
         ),
         "schema": {
             "type": "object",
@@ -1458,7 +1415,7 @@ TOOLS.update({
                 "include_properties": {"type": "boolean", "default": False,
                     "description": "Inline view properties (view.properties)."},
                 "include_overlay": {"type": "boolean", "default": False,
-                    "description": "Also render a labelled, colored overlay PNG (overlay.path)."},
+                    "description": "Also render an overlay PNG (overlay.path)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1467,14 +1424,11 @@ TOOLS.update({
     "inspect_node": {
         "handler": _h_inspect_node,
         "description": (
-            "Everything about ONE element, chosen by node_key (any key inspect, "
-            "dump_accessibility or a11y_lint gives), view_id, semantics_id or bounds. An older "
-            "Compose key is re-resolved (resolved_from); a rebound RecyclerView cell gets "
-            "key_note; Compose children merged into a parent are a11y_only (a11y_parent). Returns "
-            "every facet (view properties, full a11y, compose attrs; source file:line when the "
-            "slot table is populated), context (window > list row > ComposeView), a component "
-            "image PNG cut from its own window (SKP by layerId, else a crop), and its a11y_lint "
-            "findings (with those merged into it), lint_summary and lint_diagnostics."
+            "Everything about ONE element, by node_key (from inspect, dump_accessibility or "
+            "a11y_lint), view_id, semantics_id or bounds: view properties, a11y, compose attrs "
+            "(file:line when the slot table is populated), context (window > list row > "
+            "ComposeView), a component image PNG and its lint findings. Old Compose keys are "
+            "re-resolved (resolved_from)."
         ),
         "schema": {
             "type": "object",
@@ -1485,11 +1439,10 @@ TOOLS.update({
                     "description": "view:<id> | compose:<acvId>:<semId> | composeview:<acvId>."},
                 "view_id": {"type": "integer", "description": "A view's uniqueDrawingId."},
                 "semantics_id": {"type": "integer",
-                    "description": "A Compose semantics id; ambiguous across ComposeViews, so "
-                                   "prefer node_key."},
+                    "description": "Ambiguous across ComposeViews: prefer node_key."},
                 "bounds": _BOUNDS_SCHEMA,
                 "include_image": {"type": "boolean", "default": True,
-                    "description": "Cut and save the component image (component_image.path)."},
+                    "description": "Cut the component image (component_image.path)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1499,8 +1452,8 @@ TOOLS.update({
         "handler": _h_component_image,
         "description": (
             "Save one element's image as a PNG: from the SKP by its Compose graphicsLayer id when "
-            "available, else cropped from its own window's screenshot (a dialog node from the "
-            "dialog). Returns path, source (skp | bitmap_crop) and window (root view id)."
+            "available, else cropped from its own window's screenshot. Returns path, source "
+            "(skp | bitmap_crop) and window."
         ),
         "schema": {
             "type": "object",
@@ -1525,9 +1478,8 @@ TOOLS.update({
 # system screen reader on (snapshotting the settings first) and restore it.
 # --------------------------------------------------------------------------- #
 _DEVICE_WIDE = (
-    "DEVICE-WIDE: TalkBack runs for every app on the device (and anyone using it), and a11y "
-    "dumps change. Settings are snapshotted first and restored afterwards, at server exit, or "
-    "with talkback(action='restore'). ")
+    "DEVICE-WIDE: TalkBack runs for every app; settings are snapshotted and restored "
+    "afterwards, at exit, or by talkback(action='restore'). ")
 _TB_ANNOTATIONS = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
                    "openWorldHint": False}
 _TB_WALK_ARGS = ("start", "direction", "max_steps", "until", "expect", "step_timeout_ms",
@@ -1583,11 +1535,10 @@ TOOLS.update({
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack status / on / off / restore",
                             idempotentHint=True),
         "description": (
-            _DEVICE_WIDE + "status (read-only): installed/enabled, touch exploration, enabled "
-            "services, a pending restore, injectors. on: snapshot, add TalkBack to the enabled "
-            "services (others stay) and wait for touch exploration; stays on until off/restore/exit. "
-            "off: TalkBack off (exact restore if it was off). restore: write the snapshot back and "
-            "verify."
+            _DEVICE_WIDE + "status (read-only): installed/enabled, touch exploration, services, "
+            "a pending restore, injectors. on: add TalkBack to the enabled services and wait for "
+            "touch exploration (stays on until off/restore/exit). off: TalkBack off. restore: "
+            "write the snapshot back and verify."
         ),
         "schema": {
             "type": "object",
@@ -1596,9 +1547,8 @@ TOOLS.update({
                 "action": {"type": "string", "enum": ["status", "on", "off", "restore"]},
                 "package": dict(_PACKAGE, description="on: the app to keep in the foreground."),
                 "verbose_log": {"type": "boolean", "default": False,
-                                "description": "on: set TalkBack's log level to VERBOSE first, so "
-                                               "walks read exact announcements from logcat; "
-                                               "restore resets it."},
+                                "description": "on: TalkBack log level VERBOSE first (walks read "
+                                               "exact announcements); restore resets it."},
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -1606,13 +1556,13 @@ TOOLS.update({
     },
     "tb_walk": {
         "handler": _h_tb_walk,
-        "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus through the app"),
+        "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus"),
         "description": (
             _DEVICE_WIDE + "Presses REAL TalkBack's next/previous (uinput keyboard, touch "
-            "fallback), records where focus lands, and diffs that order against the model's "
-            "prediction and a visual order. Returns one line per step, how it ended (wrap, edge, "
-            "loop, stuck, left_app, max_steps), vs_model and tb.* findings with fixes; the full "
-            "walk is saved. TalkBack is restored afterwards unless leave_on. ~0.1-0.4s per step."
+            "fallback), records where focus lands and diffs that order with the model's and a "
+            "visual order. Returns one line per step, how it ended (wrap, edge, loop, stuck, "
+            "left_app, max_steps), vs_model and tb.* findings with fixes; the full walk is saved. "
+            "~0.1-0.4s per step."
         ),
         "schema": {
             "type": "object",
@@ -1641,13 +1591,12 @@ TOOLS.update({
                                              "node."},
                 "utterance": {"type": "string", "enum": ["auto", "model", "logcat"],
                               "default": "auto",
-                              "description": "auto: TalkBack's logcat if its log is VERBOSE, else "
-                                             "the model's announcement; logcat: set VERBOSE first "
-                                             "(~5s) and back after."},
+                              "description": "auto: TalkBack's logcat when VERBOSE, else the "
+                                             "model; logcat: set VERBOSE (~5s) first."},
                 "injector": {"type": "string", "enum": ["auto", "uinput", "touch"],
                              "default": "auto"},
                 "leave_on": {"type": "boolean", "default": False,
-                             "description": "Leave TalkBack on (talkback action=restore later)."},
+                             "description": "Leave TalkBack on (restore it later)."},
                 "max_lines": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
                 "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 100000,
                               "default": 5000},
@@ -1660,10 +1609,10 @@ TOOLS.update({
         "handler": _h_tb_scenario,
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack focus scenarios"),
         "description": (
-            _DEVICE_WIDE + "Checks where REAL TalkBack focus goes. focus_after: do action, "
-            "classify the landing (tb.initial_focus). restore: activate the target, go back, "
-            "classify (tb.restore_failed). survive: focus the target, apply mutate, classify over "
-            "wait_ms (tb.focus_reset/lost/drift). The target is reached by pressing next."
+            _DEVICE_WIDE + "Where REAL TalkBack focus goes. focus_after: do action, classify "
+            "the landing (tb.initial_focus). restore: activate the target, go back, classify "
+            "(tb.restore_failed). survive: focus the target, apply mutate, classify over wait_ms "
+            "(tb.focus_reset/lost/drift). The target is reached by pressing next."
         ),
         "schema": {
             "type": "object",
@@ -1674,8 +1623,8 @@ TOOLS.update({
                 "target": {"type": "string",
                            "description": "Node key or part of a label; default: current focus."},
                 "action": {"type": "string", "default": "activate",
-                           "description": "focus_after: activate (TalkBack's click) | back | tap "
-                                          "(bypasses TalkBack) | key:<combo>, e.g. key:META+SPACE."},
+                           "description": "activate (TalkBack's click) | back | tap (bypasses "
+                                          "TalkBack) | key:<combo>, e.g. key:META+SPACE"},
                 "mutate": {"type": "string",
                            "description": "survive: tap:<selector> | activate | key:<combo> | "
                                           "broadcast:<args> | probe:<action>."},

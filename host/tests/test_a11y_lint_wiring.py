@@ -64,12 +64,19 @@ def test_mcp_a11y_lint_unknown_rule_is_a_tool_error(monkeypatch):
         mcp_server.tool_a11y_lint("emulator-5556", "com.example", rules=5)
 
 
-def test_mcp_schema_enumerates_rule_ids_and_aliases():
+def test_mcp_rule_ids_are_checked_before_the_device(monkeypatch):
+    """The schema takes strings (an enum of all 47 ids and aliases would cost ~900 B
+    of tools/list); the handler checks them first and names the valid ones."""
     props = mcp_server.TOOLS["a11y_lint"]["schema"]["properties"]
-    enum = props["rules"]["items"]["enum"]
-    assert set(L.ALL_RULE_IDS) <= set(enum)
-    assert {"R1", "R12", "R18", "TouchTargetSize"} <= set(enum)
+    assert props["rules"]["items"] == {"type": "string"}
+    assert "R1..R18" in props["rules"]["description"]
     assert props["include_rendering_info"]["default"] is True
+    monkeypatch.setattr(mcp_server.SESSIONS, "get_or_attach", _explode)
+    res = mcp_server._run_tool("a11y_lint", {"package": "com.example", "serial": "s",
+                                             "rules": ["R1", "TouchTargetSize", "bogus"]})
+    assert "bogus" in res["error"]
+    for rule in ("R18", "TouchTargetSize", L.ALL_RULE_IDS[0]):
+        assert mcp_server._a11y_lint_rules([rule])
 
 
 class _FakeSession:
