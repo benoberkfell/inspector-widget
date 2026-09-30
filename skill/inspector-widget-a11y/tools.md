@@ -13,7 +13,10 @@ All take `package` (except `list_devices` / `list_processes`) and an optional
 `serial` (default: `$ANDROID_SERIAL`, else the only attached device). All
 auto-attach, and re-attach on their own if the agent went away. Images are
 written to temp PNG files (deleted when the MCP server exits) and the **path**
-is returned (not inlined). A failed call returns `{error, hint?}`.
+is returned (not inlined). A failed call returns `{error, hint?}`. Every tool
+that used a session (not `list_*` or `detach`) adds that session's `note`, if
+it has one, to its result or error, as the CLI prints it as a warning: e.g. the
+agent runs another build than the local one; `attach(force=true)` replaces it.
 
 ### Discovery / session
 - **`list_devices()`** → `{devices:[{serial, api, abi, model, state}], count}`.
