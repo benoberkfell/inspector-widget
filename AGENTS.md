@@ -87,7 +87,10 @@ build-out/                    generated artifacts (gitignored): libviewspector.s
 ```
 `BUILD_ID` is the sha256 of `payload.jar`; the agent reports the same hash in Hello
 (`viewspector-0.1+<sha256>`), and the host replaces a running agent whose build differs, so a
-rebuild takes effect on the next attach without restarting the app.
+rebuild takes effect on the next attach without restarting the app. The exception: while
+another client (an MCP server, say) is connected to that agent, it is kept and the attach warns
+instead (`--force` / `force=true` replaces it anyway), so two checkouts with different builds
+don't evict each other's agent on every call.
 Pinned for reproducibility (in `settings.gradle.kts` / `agent/build.gradle.kts`): AGP 8.7.2,
 Kotlin 2.0.21, protobuf-plugin 0.9.4, NDK `27.1.12297006`, build-tools `36.1.0`, compileSdk/targetSdk 36.
 The real requirements are looser: **any JDK 17–23** to run Gradle (`build.sh` honours an in-range
@@ -117,11 +120,18 @@ emulators up, pass it or set `ANDROID_SERIAL`.
 
 **Session lifecycle.** Every subcommand except `detach` disconnects when it finishes and leaves the
 agent running (the next run is a warm connect, and a concurrent MCP session is untouched); `detach`
-sends SHUTDOWN, which stops the agent for every client, and never injects one first. `--force` (MCP
-`attach(force=true)`) stops a running agent and injects afresh. The MCP server re-attaches a cached
-session that died (idle timeout, app restart) and retries a call once if the connection drops
-mid-way. Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`, default 30s, 4x for
-screenshots/Compose/a11y dumps; `0` disables it), so a frozen app returns an error, not a hang.
+sends SHUTDOWN, which stops the agent for every client (each one sees EOF at once), and never
+injects one first; it reports the agent stopped only once nothing listens on its socket (exit 1,
+MCP `agent_stopped: false`, otherwise). `--force` (MCP `attach(force=true)`) stops a running agent
+and injects afresh. The MCP server re-attaches a cached session that died (idle timeout, app
+restart, another client's SHUTDOWN) and retries a call once if the connection drops mid-way; a
+timeout is reported, not retried. Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`,
+default 30s, 4x for screenshots/Compose/a11y dumps; `0` disables it), so a frozen app returns an
+error, not a hang. An app in the background can be frozen by Android (the cached-apps freezer);
+attach then says so rather than queuing an injection, and asks for the app in the foreground.
+In `/proc/net/unix` only the listening entry means an agent is there: every client connection is
+listed under the same `@viewspector_<pid>` for as long as it is open (`adb.socket_exists` vs
+`adb.socket_connections`).
 
 **Run (MCP)**:
 ```bash
@@ -182,7 +192,9 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
    subcommand or tool; the coverage guards fail otherwise. Open ledger bugs are strict xfails
    carrying the ledger id: fixing one flips it to XPASS, so remove the marker in the same change.
    If you change the agent's wire behaviour, update the fake to match (it also models older
-   agents: `build_id=None`, `reply_to_shutdown=False`, `linger_after_stop=True`).
+   agents: `build_id=None`, `reply_to_shutdown=False`, `linger_after_stop=True`,
+   `close_clients_on_stop=False`, `hello_waits_for_other_clients=True`). Its a11y ids are the
+   A1-fixed agent's; `legacy_a11y_ids=True` reproduces what the agent on this branch sends.
    Session-lifecycle behaviour (deadlines, poisoning, re-attach, detach, serials, the build
    handshake) is covered in `host/tests/test_session_lifecycle.py`.
 3. **Live-verify on the emulator**, not just pytest. Launch the test app

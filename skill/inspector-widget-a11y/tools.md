@@ -21,10 +21,13 @@ is returned (not inlined). A failed call returns `{error, hint?}`.
   debuggable apps only, running first.
 - **`attach(serial, package, force=false)`** → `{attached, pid, warm, reused,
   api_level, abi, agent_version, build_id, window_count, root_ids, session}`.
-  Optional warm-up; idempotent. `force=true` replaces a running agent.
-- **`detach(serial, package, shutdown=true)`** → `{detached, agent_stopped}`.
-  Stops the agent for every client; `shutdown=false` only drops this server's
-  connection. Safe even if not attached.
+  Optional warm-up; idempotent. `force=true` replaces a running agent. A `note`
+  means the agent runs another build than the local one (kept because another
+  client uses it); `force=true` replaces it.
+- **`detach(serial, package, shutdown=true)`** → `{detached, agent_stopped, note?}`.
+  Stops the agent for every client; `agent_stopped:false` (with a `note`) means
+  it is still running. `shutdown=false` only drops this server's connection.
+  Safe even if not attached.
 
 ### Accessibility (the core of this skill)
 - **`dump_accessibility(serial, package, include_extras=true,

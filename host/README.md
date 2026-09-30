@@ -212,7 +212,7 @@ before anything touches the device, the same way on every transport.
 | `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation; can render the integrated overlay |
 | `inspect_node` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, view?, compose?, a11y?, component_image{path}, lint[]}` — `compose` carries source `file:line` + modifiers, `view` typed properties, `lint` the element-focused findings |
 | `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source}` — cropped PNG of one element (`source`: `skp` \| `bitmap_crop`) |
-| `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach; never injects one to stop it); `shutdown=false` only drops this server's cached connection |
+| `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped, note?}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach, or one in the app's new process after a restart; never injects one to stop it); `agent_stopped` is true only once nothing listens on the agent's socket; `shutdown=false` only drops this server's cached connection |
 
 ### Node shape (`dump_tree`)
 
@@ -261,12 +261,15 @@ Sessions are cached per `(serial, package)`; repeated calls reuse the live
 agent. A cached session is checked before each use (the connection is still
 open and the app still has the same pid); a dead one (the agent idled out, the
 app restarted, another client sent SHUTDOWN) is dropped and re-attached, and a
-call whose connection drops mid-way is retried once on a fresh attach. Errors
-are returned as `{"error": "...", "hint"?: "..."}` text content with the call
-flagged as an error, so the agent can read and recover; `hint` says where to
-look next (the agent's logcat, or the timeout setting). When the server exits
-it disconnects its sessions (removing their adb forwards) and leaves the
-agents running, so the next start re-attaches warm.
+call whose connection drops mid-way is retried once on a fresh attach (a
+timeout is not retried: it would only wait again). Errors are returned as
+`{"error": "...", "hint"?: "..."}` text content with the call flagged as an
+error, so the agent can read and recover; `hint` is the next step for that
+error (launch the app, install a debug build, bring a frozen app to the
+foreground, raise the timeout, read the agent's logcat). When the server exits,
+including on SIGTERM, it disconnects its sessions, removes every adb forward it
+made and deletes its PNGs, and leaves the agents running, so the next start
+re-attaches warm.
 
 ### Session lifecycle (CLI and Python API)
 
@@ -278,5 +281,9 @@ running; `session.shutdown()` stops the agent for every client;
 `session.info()` has the pid, warm/cold and the agent's Hello. Every CLI
 subcommand disconnects when it finishes, so a CLI run never disturbs an MCP
 session on the same app; only `detach` stops the agent, and it never injects
-one just to stop it. `--force` (every injecting subcommand) and MCP
-`attach(force=true)` stop a running agent and inject a fresh one.
+one just to stop it (it exits 1 if the agent didn't stop). `--force` (every
+injecting subcommand) and MCP `attach(force=true)` stop a running agent and
+inject a fresh one. An agent running another build than the local payload.jar
+is replaced on attach, unless other clients are connected to it: then it is
+kept, the CLI prints a warning and MCP `attach` a `note`, and `--force` /
+`force=true` replaces it.
