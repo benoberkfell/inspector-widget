@@ -70,3 +70,14 @@ Final artifacts copied to `build-out/` (gitignored): `libviewspector.so`, `boots
 - No dependency on `androidx.inspection`, no Google inspector jars — this is a clean-room re-implementation using framework APIs + our own proto.
 - Defensive: every reflective/framework call that can fail on some API level guarded and logged via `android.util.Log` tag `"ViewSpector"`.
 - Python: stdlib + `protobuf` + (optional) `mcp`; no heavyweight deps. adb via `subprocess`.
+
+## 9. Accessibility and Compose node identity
+The agent emits ids in the spaces below (agent side: `A11yIds.kt`, `AccessibilityInspector.kt`, `ComposeInspector.kt`); the host keys nodes from them. No proto change is involved.
+- AOSP packs an accessibility node id as `(virtualDescendantId << 32) | accessibilityViewId` (`AccessibilityNodeInfo.makeNodeId`). The LOW half names the backing View (`View.getAccessibilityViewId()`), the HIGH half the virtual descendant (`-1` = the View itself). The agent decodes each node from its own packed source id.
+- `A11yNode.host_view_id` = `uniqueDrawingId` of the node's own backing View: the real View for a View node, the provider host (e.g. that `AndroidComposeView`) for a virtual node. `0` = unresolvable (counted in the diagnostics as `unresolved-nodes`).
+- `A11yNode.virtual_id` = `-1` for a real View, else the virtual descendant id; for Compose it is the `SemanticsNode` id, except that Compose serves the unmerged root `SemanticsNode` as the `AndroidComposeView`'s own node (`virtual_id -1`). `is_virtual = (virtual_id != -1)`. `provider_class` is set only on provider hosts, to the host View's class name.
+- Host node key = `(host_view_id << 32) ^ (virtual_id & 0xFFFFFFFF)`. `traversal_before`, `traversal_after`, `label_for`, `labeled_by` and `labeled_by_list` are emitted in that same key space (`0` = none).
+- `is_traversal_group`: no platform accessor exists through API 37, so it comes from the Compose `IsTraversalGroup` semantics flag (false for Views).
+- `DumpComposeResponse.Window.view_id` = the `AndroidComposeView`'s `uniqueDrawingId`, and every `AndroidComposeView` gets its own Window, including ones nested in `AndroidView` or RecyclerView cells at any depth. The Window's synthetic root node carries that same id: key it `composeview:<acvId>`, never `compose:<id>`. Semantics nodes are keyed `compose:<acvId>:<semanticsId>`; semantics ids are re-minted on recomposition, so a key is only valid for the dump that produced it.
+- All bounds (`ViewNode`, `A11yNode`, `ComposeNode`) are SCREEN px. Compose's window-relative bounds are shifted by the window's on-screen origin agent-side.
+- API < 34 (or when query-from-app-process fails) the a11y walk resolves child ids locally the way `AccessibilityInteractionController` does, so provider (Compose) content is kept; the diagnostics say `local-fallback` for that root.
