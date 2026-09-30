@@ -4,7 +4,7 @@ A standalone, agent-driven re-implementation of Android Studio's **View** Layout
 Everything here is FIXED. Do not rename packages, paths, or protocol constants. Build against these.
 
 ## 0. Target environment (already verified live)
-- Host: macOS arm64. Android SDK at `~/Library/Android/sdk` (NDK `27.1.12297006`, cmake `3.22.1`, build-tools `36.1.0`, platform `android-36`). `adb`, `gradle`, `java 21`, `protoc 34.1`, `python3` on PATH. No standalone `kotlinc` (use the Kotlin Gradle plugin).
+- Host: macOS arm64. Android SDK at `~/Library/Android/sdk` (NDK `27.1.12297006`, cmake `3.22.1`, build-tools `36.1.0`, platform `android-36`). `adb`, `gradle`, a JDK 17–23, `python3` on PATH; `protoc 33.x` only to regenerate the Python bindings (`host/generate_proto.sh` enforces it). No standalone `kotlinc` (use the Kotlin Gradle plugin).
 - Device: `emulator-5554`, **API 36, arm64-v8a**.
 - Inspect target (debuggable, installed): **`com.oberkfell.a11yprobe`**, the bundled test app under `testapps/a11yprobe` (`scripts/install-a11yprobe.sh`). Any other debuggable app works the same way.
 - Project root: the repository root. Paths below are relative to it.

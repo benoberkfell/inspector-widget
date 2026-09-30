@@ -32,7 +32,7 @@ From the repo root, install the package that lives under `host/`:
 | Extra      | Pulls in        | Enables                                                              |
 |------------|-----------------|---------------------------------------------------------------------|
 | `mcp`      | `mcp>=1.19,<3`  | the real MCP stdio transport, SDK 1.x or 2.x (otherwise a built-in JSON-RPC fallback) |
-| `images`   | `grpcio>=1.60`  | `inspector_widget.skia_client` → SKP image decoding                  |
+| `images`   | `grpcio>=1.81.0`| `inspector_widget.skia_client` → SKP image decoding                  |
 | `overlay`  | `Pillow>=10`    | every overlay tool (`inspector_widget.overlay`) + the component-image crop fallback |
 | `dev`      | `pytest`, `ruff`| tests + lint                                                        |
 | `all`      | all of the above| convenience                                                         |
@@ -94,7 +94,10 @@ is runnable without re-running `protoc`:
 - `inspector_widget/skia_grpc/*.py`  — `skia_pb2.py`, `skia_pb2_grpc.py` (gRPC stubs)
 
 Regenerate the protobuf bindings with `make proto` (or `./generate_proto.sh`)
-if `proto/view_inspection.proto` changes.
+if `proto/view_inspection.proto` changes. Both need protoc 33.x: the script reads
+the protoc release from the checked-in gencode header and refuses a different
+major, since protoc 34+ emits gencode the `<7` runtime pin can't import.
+`make clean` only removes build/test byproducts, never the tracked bindings.
 
 ## Runtime artifacts are NOT package data
 
@@ -106,9 +109,15 @@ and are deliberately excluded from the wheel:
     build-out/payload.jar
 
 They are produced by the native/Gradle build (`scripts/build.sh`) and located at
-runtime via the **repo path**, not via `importlib.resources`:
-`inspector_widget.inject` computes the repo root as three directories up from
-`inject.py` and reads `build-out/` from there
-(`inject._REPO_ROOT` → `inject.DEFAULT_BUILD_OUT`). Keep this checkout intact (so
-`host/` and `build-out/` stay siblings under the repo root) and run
-`scripts/build.sh` once to produce the artifacts before injecting into a device.
+runtime by `inspector_widget.inject.resolve_build_out`, first match wins:
+
+1. the CLI's `--build-out DIR` flag (on every subcommand that injects);
+2. `$INSPECTOR_WIDGET_ARTIFACTS`;
+3. `$VIEWSPECTOR_ARTIFACTS` (legacy name);
+4. `inject.DEFAULT_BUILD_OUT`: the repo's `build-out/`, three directories up from
+   `inject.py`. This only works for an editable install from the checkout.
+
+After a **wheel** install `inject.py` lives in site-packages, so the default points
+nowhere useful: set `INSPECTOR_WIDGET_ARTIFACTS=<checkout>/build-out` (the MCP
+server reads it too) or pass `--build-out`. `inspector-widget-mcp --self-check`
+prints the directory it resolved and whether each artifact is there.

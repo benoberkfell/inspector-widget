@@ -44,11 +44,12 @@ See `CONTRACT.md` for the fixed identifiers, framing, and build matrix.
 ```bash
 ./scripts/build.sh        # -> build-out/{libviewspector.so, bootstrap.dex, payload.jar}
 ```
-**Requires** JDK 17+ and an Android SDK. The build *pins* NDK `27.1.12297006`, build-tools `36.1.0`,
+**Requires** any JDK 17–23 (Gradle 8.13 can't run on 24+) and an Android SDK. The build *pins* NDK `27.1.12297006`, build-tools `36.1.0`,
 and platform `android-36` in `agent/build.gradle.kts` for reproducible single-host builds — relax those
 to whatever you have installed (the agent only calls API 33–34 symbols, via reflection, and compiles to
 Java 17). The Gradle wrapper auto-fetches Gradle 8.13, so you don't pick it. The only hard runtime floor
-is **`minSdk 29`** on the target device. `scripts/build.sh` selects a JDK and produces all three artifacts.
+is **`minSdk 29`** on the target device. `scripts/build.sh` uses `JAVA_HOME` if it is a JDK 17–23 (else it
+finds one, preferring 21 then 17) and produces all three artifacts.
 
 ## Use (CLI)
 ```bash

@@ -15,7 +15,7 @@ import os
 import socket
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from . import adb
 from .client import Client
@@ -30,9 +30,60 @@ PAYLOAD_JAR_NAME = "payload.jar"
 
 DEVICE_TMP_DIR = "/data/local/tmp"
 
+ARTIFACT_NAMES = (NATIVE_SO_NAME, BOOTSTRAP_DEX_NAME, PAYLOAD_JAR_NAME)
+
+# Where the artifacts are read from, in precedence order (see resolve_build_out):
+#   1. an explicit directory (the CLI's --build-out DIR)
+#   2. $INSPECTOR_WIDGET_ARTIFACTS
+#   3. $VIEWSPECTOR_ARTIFACTS          (legacy name, still honoured)
+#   4. DEFAULT_BUILD_OUT               (<repo>/build-out, for a source checkout)
+# The default only makes sense when running from the checkout: after a wheel
+# install this file lives in site-packages, so point the env var (or
+# --build-out) at the checkout's build-out/ instead.
+ARTIFACTS_ENV = "INSPECTOR_WIDGET_ARTIFACTS"
+LEGACY_ARTIFACTS_ENV = "VIEWSPECTOR_ARTIFACTS"
+
 # Default build-out location relative to the repo root (host/.. = repo root).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_BUILD_OUT = os.path.join(_REPO_ROOT, "build-out")
+
+
+def _resolve_build_out(build_out: Optional[str] = None) -> Tuple[str, str]:
+    """Return ``(directory, source)``; ``source`` says which setting chose it."""
+    if build_out:
+        chosen, source = build_out, "--build-out"
+    elif os.environ.get(ARTIFACTS_ENV):
+        chosen, source = os.environ[ARTIFACTS_ENV], f"${ARTIFACTS_ENV}"
+    elif os.environ.get(LEGACY_ARTIFACTS_ENV):
+        chosen, source = os.environ[LEGACY_ARTIFACTS_ENV], f"${LEGACY_ARTIFACTS_ENV}"
+    else:
+        chosen, source = DEFAULT_BUILD_OUT, "default"
+    return os.path.abspath(os.path.expanduser(chosen)), source
+
+
+def resolve_build_out(build_out: Optional[str] = None) -> str:
+    """The directory holding the three on-device artifacts.
+
+    ``build_out`` (e.g. from ``--build-out``) wins, then ``$INSPECTOR_WIDGET_ARTIFACTS``,
+    then the legacy ``$VIEWSPECTOR_ARTIFACTS``, then the repo's ``build-out/``.
+    Read at call time, so an env var set after import still applies.
+    """
+    return _resolve_build_out(build_out)[0]
+
+
+def artifact_status(build_out: Optional[str] = None) -> Dict[str, object]:
+    """Where the artifacts are looked up and which are present (no device needed).
+
+    Returns ``{"dir", "source", "present": {name: bool}, "missing": [name, ...]}``.
+    """
+    directory, source = _resolve_build_out(build_out)
+    present = {n: os.path.isfile(os.path.join(directory, n)) for n in ARTIFACT_NAMES}
+    return {
+        "dir": directory,
+        "source": source,
+        "present": present,
+        "missing": [n for n, ok in present.items() if not ok],
+    }
 
 
 def socket_name_for_pid(pid: int) -> str:
@@ -69,7 +120,9 @@ def _artifact_path(build_out: str, name: str) -> str:
         raise InjectionError(
             f"required artifact not found: {path}\n"
             f"Run scripts/build.sh to produce {NATIVE_SO_NAME}, "
-            f"{BOOTSTRAP_DEX_NAME} and {PAYLOAD_JAR_NAME} into build-out/."
+            f"{BOOTSTRAP_DEX_NAME} and {PAYLOAD_JAR_NAME} into build-out/, then "
+            f"point Inspector Widget at that directory with --build-out DIR or "
+            f"{ARTIFACTS_ENV}=DIR (needed when running from an installed wheel)."
         )
     return path
 
@@ -164,10 +217,13 @@ def _wait_for_socket(serial: str, socket_name: str,
 def inject_and_connect(
     serial: str = adb.DEFAULT_SERIAL,
     package: str = "com.oberkfell.a11yprobe",
-    build_out: str = DEFAULT_BUILD_OUT,
+    build_out: Optional[str] = None,
     force_reinject: bool = False,
 ) -> Injection:
     """Full inject + connect, returning a connected :class:`Injection`.
+
+    ``build_out`` is the artifacts directory; ``None`` resolves it via
+    :func:`resolve_build_out` (env vars, then the repo's ``build-out/``).
 
     Sequence (CONTRACT.md section 2):
       1. resolve pid (app must be running)
@@ -198,7 +254,8 @@ def inject_and_connect(
             warm.package = package
             return warm
 
-    app_so, app_boot, app_payload = _push_and_stage(serial, package, build_out)
+    app_so, app_boot, app_payload = _push_and_stage(
+        serial, package, resolve_build_out(build_out))
 
     socket_name = socket_name_for_pid(pid)
     # Native agent option string: bootstrapDexPath:payloadPath:socketName.

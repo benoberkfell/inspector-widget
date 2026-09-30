@@ -1858,7 +1858,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if args.self_check:
-        return _self_check()
+        rc = _self_check()
+        # Artifact status is informational: a missing artifact warns, never fails.
+        print("\n".join(_artifact_report()))
+        return rc
 
     _log_startup_health()
 
@@ -1897,6 +1900,43 @@ def _log_startup_health() -> None:
         "Pillow(overlays)=%s grpcio(SKP images)=%s mcp-sdk=%s | transport=%s",
         len(TOOLS), host_status, proto_status, pillow, grpcio, mcp_sdk, transport,
     )
+    try:
+        from inspector_widget import inject
+
+        st = inject.artifact_status()
+        if st["missing"]:
+            log.warning(
+                "on-device artifacts missing from %s (%s): %s. Injecting will fail; "
+                "set %s to a directory built by scripts/build.sh.",
+                st["dir"], st["source"], ", ".join(st["missing"]), inject.ARTIFACTS_ENV,
+            )
+    except Exception:  # noqa: BLE001 - health logging must never block startup
+        pass
+
+
+def _artifact_report() -> List[str]:
+    """Self-check lines: where the on-device artifacts are looked up, and which exist.
+
+    The directory comes from ``$INSPECTOR_WIDGET_ARTIFACTS``, then the legacy
+    ``$VIEWSPECTOR_ARTIFACTS``, then the checkout's ``build-out/``. A missing
+    artifact is only a warning: re-attaching to an app that already has the
+    agent loaded does not need them.
+    """
+    try:
+        from inspector_widget import inject
+
+        st = inject.artifact_status()
+    except Exception as exc:  # noqa: BLE001
+        return [f"  artifacts: UNKNOWN (inspector_widget.inject unavailable: {exc})"]
+    lines = [f"  artifacts: {st['dir']} (from {st['source']})"]
+    lines += [f"    {name}: {'OK' if ok else 'MISSING'}" for name, ok in st["present"].items()]
+    if st["missing"]:
+        lines.append(
+            f"  WARNING: {len(st['missing'])} of {len(st['present'])} artifacts missing; "
+            f"injecting an app will fail. Run scripts/build.sh and set "
+            f"{inject.ARTIFACTS_ENV}=<checkout>/build-out."
+        )
+    return lines
 
 
 if __name__ == "__main__":
