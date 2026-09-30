@@ -65,7 +65,13 @@ Properties.kt, Capture.kt, ComposeInspector.kt, AccessibilityInspector.kt):
   long-poll waits WITHOUT the device lock and takes it only for the read; the
   focused node is ``FakeAgent.a11y_focus`` (set it with ``set_a11y_focus``,
   now or after a delay, which records the focus events as the platform does);
-  accessibility focus actions are refused while ``touch_exploration`` is off.
+  accessibility focus actions are refused while ``touch_exploration`` is off;
+* the device keeps a logcat (``FakeDevice.log``; ``logcat -d -v threadtime -v
+  epoch -v usec [--pid=N] [-t <time>] [-s] <specs>`` reads it) and a clock
+  (``date +%s.%N``). An attach logs what the native agent and payload log; a
+  ``FakeApp.startup_error`` makes the payload log that failure instead of
+  serving (the R8-shrunk-Kotlin NoSuchMethodError, say), and
+  ``FakeApp.bitness`` is what ``/proc/<pid>/exe`` names (app_process64/32).
 
 Every agent takes a ``behaviour(req) -> (delay_s, action)`` hook, where action
 is a ``pb.Response`` (sent), ``None`` (no reply), ``"close"`` (drop the
@@ -1242,6 +1248,15 @@ class FakeApp:
     # Frozen by the cached-apps freezer (in the background): attach-agent is
     # only queued, and cgroup.events says "frozen 1".
     frozen: bool = False
+    # 64 runs app_process64, 32 app_process32 (/proc/<pid>/exe); None: unreadable.
+    bitness: Optional[int] = 64
+    # Scripted start-up failure: (level, tag, message) lines the app logs right
+    # after attach-agent instead of starting an agent (a message may span
+    # several lines, like a Log.e with a stack trace).
+    startup_error: Optional[List[Tuple[str, str, str]]] = None
+    # attach-agent is accepted but nothing runs (a main thread blocked at a
+    # breakpoint): no agent, no log.
+    attach_stalls: bool = False
 
     @property
     def data_dir(self) -> str:
@@ -1288,6 +1303,10 @@ class FakeDevice:
         self.unexpected: List[str] = []
         self.behaviour: Optional[Behaviour] = None  # for agents started later
         self.log_path = log_path
+        # logcat: (time, pid, tid, level, tag, message line), in log order.
+        self.logcat: List[Tuple[float, int, int, str, str, str]] = []
+        self.clock: Callable[[], float] = time.time  # the device's wall clock
+        self.date_supports_nanos = True
         self._lock = threading.RLock()
 
     # ---- setup ------------------------------------------------------------- #
@@ -1330,6 +1349,65 @@ class FakeDevice:
             return None
         agent = self.sockets.get(f"viewspector_{app.pid}")
         return agent if agent is not None and agent.running else None
+
+    # ---- logcat ------------------------------------------------------------ #
+    def log(self, pid: int, level: str, tag: str, message: str, *, at: Optional[float] = None,
+            tid: Optional[int] = None) -> None:
+        """Append one log message; a multi-line message becomes several lines
+        with the same header, as logcat prints it."""
+        when = self.clock() if at is None else at
+        with self._lock:
+            for line in message.split("\n"):
+                self.logcat.append((when, pid, tid if tid is not None else pid, level, tag, line))
+
+    _LEVELS = "VDIWEFS"
+
+    def _logcat(self, args: List[str]) -> Tuple[int, str, str]:
+        pid: Optional[int] = None
+        since: Optional[float] = None
+        count: Optional[int] = None
+        specs: Dict[str, str] = {"*": "V"}
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "-d":
+                pass
+            elif a == "-v":
+                i += 1
+                if args[i] not in ("threadtime", "epoch", "usec"):
+                    return 1, "", f"logcat: unsupported format {args[i]}"
+            elif a.startswith("--pid="):
+                pid = int(a.split("=", 1)[1])
+            elif a == "-t":
+                i += 1
+                if args[i].isdigit():  # pure digits: a line count
+                    count = int(args[i])
+                else:
+                    since = float(args[i])
+            elif a == "-s":
+                specs["*"] = "S"
+            elif ":" in a and not a.startswith("-"):
+                tag, _, level = a.rpartition(":")
+                specs[tag] = level.upper()
+            else:
+                return 1, "", f"logcat: unexpected argument {a!r}"
+            i += 1
+        with self._lock:
+            lines = list(self.logcat)
+        out = []
+        for when, lpid, tid, level, tag, msg in lines:
+            if pid is not None and lpid != pid:
+                continue
+            if since is not None and when < since:
+                continue
+            want = specs.get(tag, specs["*"])
+            if want == "S" or self._LEVELS.index(level) < self._LEVELS.index(want):
+                continue
+            out.append(f"{when:17.6f} {lpid:5d} {tid:5d} {level} {tag:<8}: {msg}")
+        if count is not None:
+            out = out[-count:]
+        head = "--------- beginning of main\n" if out else ""
+        return 0, head + "".join(line + "\n" for line in out), ""
 
     # ---- scenario controls ------------------------------------------------- #
     def kill_clients(self, package: str = DEFAULT_PACKAGE) -> None:
@@ -1445,6 +1523,11 @@ class FakeDevice:
             return 0, f"{self.abi}\n", ""
         if toks[:2] == ["getprop", "ro.product.model"]:
             return 0, f"{self.model}\n", ""
+        if toks == ["date", "+%s.%N"]:
+            now = self.clock()
+            return 0, (f"{now:.9f}\n" if self.date_supports_nanos else f"{int(now)}.N\n"), ""
+        if toks[0] == "logcat":
+            return self._logcat(toks[1:])
         if toks[0] == "pidof" and len(toks) == 2:
             app = self.apps.get(toks[1])
             if app is None or app.pid is None:
@@ -1504,6 +1587,10 @@ class FakeDevice:
             return 0, "", ""
         if rest == ["pwd"]:
             return 0, f"{app.data_dir}\n", ""
+        if rest[:1] == ["readlink"] and len(rest) == 2 and re.fullmatch(r"/proc/\d+/exe", rest[1]):
+            if app.bitness is None or rest[1] != f"/proc/{app.pid}/exe":
+                return 1, "", f"readlink: {rest[1]}: Permission denied"
+            return 0, f"/system/bin/app_process{app.bitness}\n", ""
         if rest[:2] == ["sh", "-c"] and len(rest) == 3:
             for step in rest[2].split(" && "):
                 parts = shlex.split(step)
@@ -1537,6 +1624,9 @@ class FakeDevice:
         if app.frozen:
             call["result"] = "queued until the app is unfrozen"
             return 0, "", ""
+        if app.attach_stalls:
+            call["result"] = "queued behind a blocked main thread"
+            return 0, "", ""
 
         def staged(path: str, name: str, mode: str) -> bool:
             entry = self.staged.get((package, name))
@@ -1545,15 +1635,38 @@ class FakeDevice:
         # The native agent only comes up when every artifact is where it expects
         # it (the .so owner-executable, the dex/jar read-only); otherwise the
         # attach "succeeds" and the failure is only visible in logcat.
-        if not (staged(so_path, injectmod.NATIVE_SO_NAME, "700")
-                and staged(boot, injectmod.BOOTSTRAP_DEX_NAME, "444")
+        if not staged(so_path, injectmod.NATIVE_SO_NAME, "700"):
+            call["error"] = "artifacts not staged"
+            for _attempt in ("app class loader", "no class loader"):  # ActivityThread tries both
+                self.log(app.pid, "E", "ActivityThread",
+                         f"Attaching agent with {spec} failed: java.io.IOException: Unable to "
+                         f"dlopen {so_path}: dlopen failed: library \"{so_path}\" not found")
+            return 0, "", ""
+        # viewspector_agent.cpp InstallAgent logs this first.
+        self.log(app.pid, "I", "ViewSpector",
+                 f"ViewSpector native agent attaching (options='{options}')")
+        if not (staged(boot, injectmod.BOOTSTRAP_DEX_NAME, "444")
                 and staged(payload, injectmod.PAYLOAD_JAR_NAME, "444")):
             call["error"] = "artifacts not staged"
+            self.log(app.pid, "E", "ViewSpector",
+                     "Could not find class com/oberkfell/viewspector/agent/Bootstrap")
+            return 0, "", ""
+        if app.startup_error is not None:
+            # The payload fails ~10 ms later and logs why; no server binds.
+            later = self.clock() + 0.01
+            for level, tag, message in app.startup_error:
+                self.log(app.pid, level, tag, message, at=later)
+                later += 0.000001
+            call["result"] = "start-up failed (see logcat)"
             return 0, "", ""
         existing = self.sockets.get(socket_name)
         if existing is not None and (existing.running or existing.lingering):
             # Server.kt can't bind a name another server holds: the new payload
             # logs the error and exits, the old server keeps serving (H4).
+            self.log(app.pid, "E", "ViewSpector",
+                     f"Cannot bind @{socket_name}: another ViewSpector server (an earlier "
+                     f"injection) still holds it, so this payload will not serve.\n"
+                     f"java.io.IOException: Address already in use")
             call["result"] = "already-bound"
             return 0, "", ""
         # The payload hashes the jar it was loaded from (Payload.kt buildId).
@@ -1567,6 +1680,7 @@ class FakeDevice:
             agent.package = package  # type: ignore[attr-defined]
             self.agents.append(agent)
             self.sockets[socket_name] = agent
+        self.log(app.pid, "I", "ViewSpector", f"ViewSpector server listening on @{socket_name}")
         call["result"] = f"started generation {agent.generation}"
         return 0, "", ""
 
