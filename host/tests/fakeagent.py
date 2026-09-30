@@ -200,6 +200,8 @@ class Scene:
     skp: Optional[bytes] = None  # CaptureSkp payload; None -> "empty SKP"
     # root_view_id -> WindowInfo fields (title, layout_title, window_type, wm_flags)
     windows: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    # (host_view_id, virtual_id) of the node holding accessibility focus (FakeTalkBack).
+    a11y_focus: Optional[Tuple[int, int]] = None
 
     def all_views(self) -> List[ViewSpec]:
         return [v for r in self.roots for v in r.walk()]
@@ -254,6 +256,47 @@ class Scene:
             for yy in range(ay, by):
                 rows[yy][ax * 4:bx * 4] = px * (bx - ax)
         return sw, sh, b"".join(bytes(r) for r in rows)
+
+
+def talkback_scene(n_items: int = 6, visible: Optional[int] = None,
+                   scroll_forward: bool = False) -> "Scene":
+    """A title over a ScrollView of Buttons ("Item 0".."Item N-1"), 80px apart.
+
+    Items at index >= ``visible`` are off screen (visible_to_user false);
+    ``scroll_forward`` makes the ScrollView advertise ACTION_SCROLL_FORWARD.
+    Ids: title 1003, ScrollView 1010, its column 1011, item i 1020+i.
+    """
+    items = []
+    for i in range(n_items):
+        a11y: Dict[str, Any] = {"class_name": "android.widget.Button", "text": f"Item {i}",
+                                "clickable": True, "focusable": True,
+                                "actions": [(0x10, None), (0x40, None)]}
+        if visible is not None and i >= visible:
+            a11y["visible_to_user"] = False
+        items.append(ViewSpec(1020 + i, "Button", "android.widget", (16, 120 + i * 80, 328, 64),
+                              text=f"Item {i}", a11y=a11y))
+    column = ViewSpec(1011, "LinearLayout", "android.widget", (0, 112, 360, 528),
+                      a11y={"class_name": "android.widget.LinearLayout"}, children=items)
+    scroll = ViewSpec(1010, "ScrollView", "android.widget", (0, 112, 360, 528),
+                      a11y={"class_name": "android.widget.ScrollView", "scrollable": True,
+                            "actions": [(0x1000, None)] if scroll_forward else []},
+                      children=[column])
+    title = ViewSpec(1003, "TextView", "android.widget", (16, 24, 328, 64), text="Title",
+                     a11y={"class_name": "android.widget.TextView", "text": "Title"})
+    content = ViewSpec(1002, "LinearLayout", "android.widget", (0, 0, 360, 640),
+                       resource=("android", "id", "content"),
+                       a11y={"class_name": "android.widget.LinearLayout"}, children=[title, scroll])
+    decor = ViewSpec(1001, "DecorView", "com.android.internal.policy", (0, 0, 360, 640),
+                     a11y={"class_name": "android.widget.FrameLayout"}, children=[content])
+    return Scene(roots=[decor])
+
+
+TB_TITLE = (1003, HOST_VIEW_ID)
+
+
+def tb_item(i: int) -> Tuple[int, int]:
+    """The a11y target (host_view_id, virtual_id) of talkback_scene's item ``i``."""
+    return (1020 + i, HOST_VIEW_ID)
 
 
 def _res(name: str, ns: str = DEFAULT_PACKAGE, type_: str = "id") -> Tuple[str, str, str]:
@@ -990,7 +1033,7 @@ class FakeAgent:
             w = resp.dump_a11y.windows.add()
             w.root_view_id = r.id
             encode_a11y_view(st, r, w.root, cmd.include_extras, cmd.include_rendering_info)
-            _mark_a11y_focus(w.root, self.a11y_focus)
+            _mark_a11y_focus(w.root, self.current_a11y_focus)
             encode_window_info(st, self.scene, r, w.info)
             diag.append(f"root#{r.id} query-from-app-process")
         st.fill(resp.dump_a11y.strings)
@@ -1012,6 +1055,12 @@ class FakeAgent:
                 return n
             stack.extend(n.children)
         return None
+
+    @property
+    def current_a11y_focus(self) -> Optional[Tuple[int, int]]:
+        """The app's one accessibility focus, as every read reports it: this agent's own
+        (a11y_act / set_a11y_focus), else the one FakeTalkBack put on the scene."""
+        return self.a11y_focus if self.a11y_focus is not None else self.scene.a11y_focus
 
     def set_a11y_focus(self, host_view_id: Optional[int], virtual_id: int = -1,
                        delay: float = 0.0) -> None:
@@ -1057,7 +1106,7 @@ class FakeAgent:
                 out.stale = True
                 return
             encode_a11y_virtual(st, host.id, n, out.node, True, False)
-        _mark_a11y_focus(out.node, self.a11y_focus)
+        _mark_a11y_focus(out.node, self.current_a11y_focus)
         _prune(out.node, depth)
         out.bounds.CopyFrom(out.node.bounds)
 
@@ -1083,8 +1132,9 @@ class FakeAgent:
         with self._handle_lock:  # Dispatcher.handleA11yFocus: the read runs under the lock
             seq = tap.seq
             diag = [f"roots={len(self.scene.roots)}"]
-            if self.a11y_focus is not None:
-                self._focus_proto(st, out.a11y, *self.a11y_focus, cmd.subtree_depth, "view-root")
+            if self.current_a11y_focus is not None:
+                self._focus_proto(st, out.a11y, *self.current_a11y_focus, cmd.subtree_depth,
+                                  "view-root")
             else:
                 diag.append("no accessibility focus in the app's windows")
             if cmd.include_input_focus:
@@ -1155,8 +1205,9 @@ class FakeAgent:
                                      scroll_delta_y=120 if action_id == 0x1000 else -120)
         else:
             out.error = error
-        if self.a11y_focus is not None:
-            self._focus_proto(st, out.after, *self.a11y_focus, cmd.subtree_depth, "view-root")
+        if self.current_a11y_focus is not None:
+            self._focus_proto(st, out.after, *self.current_a11y_focus, cmd.subtree_depth,
+                              "view-root")
         out.seq = self.a11y_tap.seq
         out.diagnostics = f"roots={len(self.scene.roots)}; via=query-connection"
         st.fill(out.strings)
@@ -1260,6 +1311,25 @@ class FakeDevice:
         self.behaviour: Optional[Behaviour] = None  # for agents started later
         self.log_path = log_path
         self._lock = threading.RLock()
+        # ---- TalkBack side (see FakeTalkBack) ------------------------------ #
+        self.secure: Dict[str, str] = {}            # settings secure namespace
+        self.talkback: Optional["FakeTalkBack"] = None
+        self.activity_stack: List[str] = [f"{DEFAULT_PACKAGE}/.MainActivity"]
+        self.display_size: Tuple[int, int] = (360, 640)
+        self.uinput_available = True
+        self.input_devices: Dict[str, int] = {}     # registered uinput name -> device id
+        self.key_log: List[Tuple[str, str, bool]] = []  # (mods, key, consumed by TalkBack)
+        self.lone_meta = 0                          # lone Meta taps (All apps)
+        self.system_backs = 0                       # unconsumed Meta+Left (system BACK)
+        self.split_screens = 0                      # unconsumed Meta+Ctrl+Left/Right
+        self.input_log: List[List[str]] = []        # `input ...` commands
+        self.broadcasts: List[str] = []
+        self.logcats: List["FakeProcess"] = []
+        self.on_input: Optional[Callable[[List[str]], None]] = None
+        self.on_broadcast: Optional[Callable[[str], None]] = None
+        self.files: Dict[str, str] = {}             # /sdcard files (uiautomator dumps)
+        self.uiautomator_while_on = 0               # UiAutomation while TalkBack ran
+        self.uinputs: List["FakeUinput"] = []
 
     # ---- setup ------------------------------------------------------------- #
     def add_app(self, package: str, pid: Optional[int], debuggable: bool = True) -> FakeApp:
@@ -1290,6 +1360,7 @@ class FakeDevice:
                               on_request=self._on_request, on_stop=self._on_stop,
                               build_id=build_id)
             agent.package = package  # type: ignore[attr-defined]
+            agent.scene.a11y_focus = self.talkback.focus if self.talkback else None
             self.agents.append(agent)
             self.sockets[name] = agent
         return agent
@@ -1416,6 +1487,9 @@ class FakeDevice:
             return 0, f"{self.abi}\n", ""
         if toks[:2] == ["getprop", "ro.product.model"]:
             return 0, f"{self.model}\n", ""
+        if toks[0] == "pidof" and len(toks) == 2 and toks[1] == FakeTalkBack.PACKAGE:
+            tb = self.talkback
+            return (0, f"{tb.pid}\n", "") if tb is not None and tb.running else (1, "", "")
         if toks[0] == "pidof" and len(toks) == 2:
             app = self.apps.get(toks[1])
             if app is None or app.pid is None:
@@ -1440,8 +1514,125 @@ class FakeDevice:
         if toks[:2] == ["cat", "/proc/net/unix"] and len(toks) >= 4 and toks[2] == "|" \
                 and toks[3] == "grep":
             return 0, self._proc_net_unix(grep=toks[4]), ""
+        handled = self._talkback_shell(toks)
+        if handled is not None:
+            return handled
         self.unexpected.append(cmd)
         return 127, "", f"/system/bin/sh: {toks[0]}: inaccessible or not found"
+
+    # ---- TalkBack-side shell commands --------------------------------------- #
+    @property
+    def top(self) -> str:
+        return self.activity_stack[-1]
+
+    def _talkback_shell(self, toks: List[str]) -> Optional[Tuple[int, str, str]]:
+        tb = self.talkback
+        if toks[:3] == ["settings", "get", "secure"] and len(toks) == 4:
+            return 0, f"{self.secure.get(toks[3], 'null')}\n", ""
+        if toks[:3] == ["settings", "put", "secure"] and len(toks) == 5:
+            self.secure[toks[3]] = toks[4]
+            if tb is not None:
+                tb.sync()
+            return 0, "", ""
+        if toks[:3] == ["settings", "delete", "secure"] and len(toks) == 4:
+            self.secure.pop(toks[3], None)
+            if tb is not None:
+                tb.sync()
+            return 0, "Deleted 1 rows\n", ""
+        if toks[:3] == ["pm", "list", "packages"] and len(toks) == 4:
+            installed = tb is not None and tb.installed and toks[3] in FakeTalkBack.PACKAGE
+            return 0, (f"package:{FakeTalkBack.PACKAGE}\n" if installed else ""), ""
+        if toks[:3] == ["dumpsys", "package", FakeTalkBack.PACKAGE] and "versionName" in toks:
+            ok = tb is not None and tb.installed
+            return 0, (f"    versionName={tb.version}\n" if ok else ""), ""
+        if toks[:3] == ["dumpsys", "activity", "activities"]:
+            return 0, f"  topResumedActivity=ActivityRecord{{1a2b3c u0 {self.top} t42}}\n", ""
+        if toks[:2] == ["dumpsys", "input"]:
+            name = toks[-1] if len(toks) > 2 else ""
+            hit = [n for n in self.input_devices if n == name or not name]
+            return 0, "".join(f"    Name: {n}\n" for n in hit), ""
+        if toks == ["ls", "/system/bin/uinput"]:
+            if self.uinput_available:
+                return 0, "/system/bin/uinput\n", ""
+            return 1, "", "ls: /system/bin/uinput: No such file or directory"
+        if toks == ["wm", "size"]:
+            return 0, "Physical size: %dx%d\n" % self.display_size, ""
+        if toks[:1] == ["input"]:
+            self.input_log.append(toks[1:])
+            if toks[1:] == ["keyevent", "KEYCODE_BACK"]:
+                self.back()
+            elif toks[1:2] == ["tap"] and tb is not None and self.top == tb.PREFS:
+                tb.prefs_tap(int(toks[2]), int(toks[3]))
+            if self.on_input is not None:
+                self.on_input(toks[1:])
+            return 0, "", ""
+        if toks[:2] == ["uiautomator", "dump"] and len(toks) == 3:
+            if tb is not None and tb.running:
+                self.uiautomator_while_on += 1  # a UiAutomation connection suppresses TalkBack
+                tb.set_focus(None)
+            self.files[toks[2]] = tb.ui_xml() if tb is not None else "<hierarchy/>"
+            return 0, f"UI hierchary dumped to: {toks[2]}\n", ""
+        if toks[:1] == ["cat"] and len(toks) == 2 and toks[1].startswith("/sdcard/"):
+            if toks[1] not in self.files:
+                return 1, "", f"cat: {toks[1]}: No such file or directory"
+            return 0, self.files[toks[1]], ""
+        if toks[:2] == ["rm", "-f"] and len(toks) == 3:
+            self.files.pop(toks[2], None)
+            return 0, "", ""
+        if toks[:2] == ["am", "broadcast"]:
+            args = " ".join(toks[2:])
+            self.broadcasts.append(args)
+            if self.on_broadcast is not None:
+                self.on_broadcast(args)
+            return 0, "Broadcast completed: result=0\n", ""
+        if toks[:2] == ["am", "start"] and "-n" in toks:
+            comp = toks[toks.index("-n") + 1]
+            if comp in self.activity_stack:
+                self.activity_stack.remove(comp)
+            self.activity_stack.append(comp)
+            if tb is not None and comp == tb.PREFS:
+                tb.prefs_screen = "dev"
+            return 0, f"Starting: Intent {{ cmp={comp} }}\n", ""
+        return None
+
+    def back(self) -> None:
+        """System BACK: closes an open settings dialog, else pops the top activity
+        (never the last one)."""
+        tb = self.talkback
+        if tb is not None and self.top == tb.PREFS and tb.prefs_screen != "dev":
+            tb.prefs_screen = "dev"
+            return
+        if len(self.activity_stack) > 1:
+            self.activity_stack.pop()
+
+    def set_a11y_focus(self, target: Optional[Tuple[int, int]]) -> None:
+        for agent in self.agents:
+            agent.scene.a11y_focus = target
+
+    def live_scene(self, package: str = DEFAULT_PACKAGE) -> Optional[Scene]:
+        agent = self.agent(package)
+        return agent.scene if agent is not None else None
+
+    # ---- uinput (fed by FakeUinput) ----------------------------------------- #
+    def key_combo(self, mods: frozenset, key: str) -> None:
+        """A key-down with ``mods`` held, as InputReader would deliver it."""
+        tb = self.talkback
+        names = tuple(sorted(m[4:] for m in mods))
+        action = tb.combo_action(names, key[4:]) if tb is not None and tb.running else None
+        self.key_log.append(("+".join(names), key[4:], action is not None))
+        if action is not None:
+            tb.press(action)  # type: ignore[union-attr]
+        elif names == ("LEFTMETA",) and key == "KEY_LEFT":
+            self.system_backs += 1
+            self.back()
+        elif names == ("LEFTCTRL", "LEFTMETA") and key in ("KEY_LEFT", "KEY_RIGHT"):
+            self.split_screens += 1
+
+    def gesture(self, action: str) -> None:
+        tb = self.talkback
+        self.key_log.append(("gesture", action, bool(tb and tb.running)))
+        if tb is not None and tb.running:
+            tb.press(action)
 
     def _proc_net_unix(self, grep: str) -> str:
         # Num RefCount Protocol Flags Type St Inode Path: a listener has Flags
@@ -1536,6 +1727,7 @@ class FakeDevice:
                               on_request=self._on_request, on_stop=self._on_stop,
                               build_id=build_id)
             agent.package = package  # type: ignore[attr-defined]
+            agent.scene.a11y_focus = self.talkback.focus if self.talkback else None
             self.agents.append(agent)
             self.sockets[socket_name] = agent
         call["result"] = f"started generation {agent.generation}"
@@ -1595,6 +1787,19 @@ class FakeDevice:
                 continue
             agent.serve(conn)
 
+    def popen(self, args: List[str]) -> "FakeProcess":
+        if args in (["shell", "uinput", "-"], ["shell", "-T", "uinput", "-"]):
+            if not self.uinput_available:
+                return FakeProcess.exited(127, b"/system/bin/sh: uinput: inaccessible or not found")
+            u = FakeUinput(self)
+            self.uinputs.append(u)
+            return u.proc
+        if args[:1] == ["logcat"]:
+            proc = FakeProcess(None)
+            self.logcats.append(proc)
+            return proc
+        raise OSError(f"fake adb: unsupported long-lived command {args!r}")
+
     def forward_names(self) -> List[str]:
         with self._lock:
             return [name for name, _s in self.forwards.values()]
@@ -1607,6 +1812,410 @@ class FakeDevice:
             self.forwards.clear()
         for _name, s in forwards:
             _close(s)
+
+
+# --------------------------------------------------------------------------- #
+# TalkBack, uinput and logcat.
+# --------------------------------------------------------------------------- #
+class FakeProcess:
+    """A Popen look-alike over real pipes (binary), for ``uinput -`` / ``logcat``.
+
+    ``serve(read_line, write)`` runs on a thread with the child's side of the
+    pipes; ``handler`` None makes an output-only process fed by :meth:`emit`.
+    """
+
+    def __init__(self, serve: Optional[Callable[["FakeProcess"], None]]) -> None:
+        r_in, w_in = os.pipe()
+        r_out, w_out = os.pipe()
+        self.stdin = os.fdopen(w_in, "wb")
+        self.stdout = os.fdopen(r_out, "rb")
+        self._child_in = os.fdopen(r_in, "rb")
+        self._child_out = os.fdopen(w_out, "wb")
+        import io
+        self.stderr = io.BytesIO(b"")
+        self.returncode: Optional[int] = None
+        self._wlock = threading.Lock()
+        if serve is not None:
+            threading.Thread(target=self._run, args=(serve,), daemon=True,
+                             name="fakeproc").start()
+
+    @classmethod
+    def exited(cls, code: int, err: bytes) -> "FakeProcess":
+        p = cls(None)
+        import io
+        p.stderr = io.BytesIO(err)
+        p._finish(code)
+        return p
+
+    def _run(self, serve: Callable[["FakeProcess"], None]) -> None:
+        try:
+            serve(self)
+        finally:
+            self._finish(0)
+            try:
+                self._child_in.close()  # only this thread ever reads it
+            except OSError:
+                pass
+
+    def read_line(self) -> bytes:
+        try:
+            return self._child_in.readline()
+        except (OSError, ValueError):
+            return b""
+
+    def emit(self, data: bytes) -> bool:
+        with self._wlock:
+            if self.returncode is not None:
+                return False
+            try:
+                self._child_out.write(data)
+                self._child_out.flush()
+                return True
+            except (OSError, ValueError):
+                return False
+
+    def _finish(self, code: int) -> None:
+        with self._wlock:
+            if self.returncode is None:
+                self.returncode = code
+            try:
+                self._child_out.close()
+            except OSError:
+                pass
+
+    def poll(self) -> Optional[int]:
+        return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        deadline = time.monotonic() + (timeout if timeout is not None else 1e9)
+        while self.returncode is None:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("fake", timeout)
+            _real_sleep(0.005)
+        return self.returncode
+
+    def terminate(self) -> None:
+        self._finish(-15)
+
+    kill = terminate
+
+
+_MODIFIER_KEYS = {"KEY_LEFTMETA", "KEY_LEFTCTRL", "KEY_LEFTSHIFT", "KEY_LEFTALT"}
+
+
+class FakeUinput:
+    """``uinput -``: register / inject / delay / updateTimeBase / sync, as the
+    AOSP tool parses them. Key-downs become :meth:`FakeDevice.key_combo`; a
+    one-finger stroke becomes a TalkBack swipe or tap."""
+
+    def __init__(self, device: "FakeDevice") -> None:
+        self.device = device
+        self.names: Dict[int, str] = {}
+        self.held: set = set()
+        self.meta_alone = False
+        self.touch: Dict[str, int] = {}
+        self.start: Optional[Tuple[int, int]] = None
+        self.last_tap = 0.0
+        self.commands: List[Dict[str, Any]] = []
+        self.proc = FakeProcess(self._serve)
+
+    def _serve(self, proc: FakeProcess) -> None:
+        dec = json.JSONDecoder()
+        try:
+            while True:
+                line = proc.read_line()
+                if not line:
+                    return
+                text = line.decode().strip()
+                if not text:
+                    continue
+                obj, _ = dec.raw_decode(text)
+                self.commands.append(obj)
+                reply = self.handle(obj)
+                if reply is not None:  # like uinput: a bare object, no newline
+                    proc.emit(json.dumps(reply).encode())
+        finally:
+            with self.device._lock:
+                for name in self.names.values():
+                    self.device.input_devices.pop(name, None)
+
+    def handle(self, obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        cmd = obj.get("command")
+        if cmd == "register":
+            self.names[obj["id"]] = obj["name"]
+            with self.device._lock:
+                self.device.input_devices[obj["name"]] = obj["id"]
+        elif cmd == "inject":
+            ev = obj["events"]
+            for i in range(0, len(ev), 3):
+                self._event(ev[i], ev[i + 1], ev[i + 2])
+        elif cmd == "sync":
+            return {"reason": "sync", "id": obj["id"], "syncToken": obj["syncToken"]}
+        return None
+
+    def _event(self, etype: str, code: str, value: int) -> None:
+        if etype == "EV_KEY" and code in ("BTN_TOUCH", "BTN_TOOL_FINGER"):
+            if code == "BTN_TOUCH":
+                self._touch(value)
+            return
+        if etype == "EV_KEY":
+            if value == 1:
+                if code in _MODIFIER_KEYS:
+                    if code == "KEY_LEFTMETA":
+                        self.meta_alone = True
+                    self.held.add(code)
+                else:
+                    self.meta_alone = False
+                    self.device.key_combo(frozenset(self.held), code)
+            elif value == 0:
+                if code == "KEY_LEFTMETA" and self.meta_alone:
+                    self.device.lone_meta += 1
+                    self.meta_alone = False
+                self.held.discard(code)
+        elif etype == "EV_ABS":
+            self.touch[code] = value
+
+    def _touch(self, down: int) -> None:
+        pos = (self.touch.get("ABS_MT_POSITION_X", 0), self.touch.get("ABS_MT_POSITION_Y", 0))
+        if down:
+            self.start = pos
+            return
+        if self.start is None:
+            return
+        dx = pos[0] - self.start[0]
+        self.start = None
+        if abs(dx) > 100:
+            self.device.gesture("next" if dx > 0 else "prev")
+            return
+        now = time.monotonic()
+        if now - self.last_tap < 0.5:
+            self.last_tap = 0.0
+            self.device.gesture("click")
+        else:
+            self.last_tap = now
+
+
+Target = Tuple[int, int]
+
+
+class FakeTalkBack:
+    """TalkBack on a FakeDevice: settings-driven, moved by uinput keys/gestures.
+
+    ``order`` is TalkBack's linear traversal as (host_view_id, virtual_id)
+    targets. The default model: next/prev step through it; at either end the
+    first press only reaches the edge (no move) and the second wraps; first /
+    last jump; click records the focused target. ``on_press(tb, action)``
+    returning True replaces the model for that press (loops, stolen focus,
+    leaving the app, auto-scroll...). With ``verbose_log`` every focus move is
+    written to logcat as TalkBack 17 does (ttsOutput / Reach edge).
+    """
+
+    PACKAGE = "com.google.android.marvin.talkback"
+    COMPONENT = f"{PACKAGE}/com.google.android.marvin.talkback.TalkBackService"
+    TRAINING = f"{PACKAGE}/com.google.android.accessibility.talkback.trainingcommon.TrainingActivity"
+    PERMISSION = ("com.google.android.permissioncontroller/"
+                  "com.android.permissioncontroller.permission.ui.GrantPermissionsActivity")
+    PREFS = f"{PACKAGE}/com.android.talkback.TalkBackPreferencesActivity"
+    LEVELS = ("NONE", "ASSERT", "ERROR", "WARN", "INFO", "DEBUG", "VERBOSE")
+
+    def __init__(self, device: "FakeDevice", order: Sequence[Target] = (), version: str = "17.0.0",
+                 installed: bool = True, keymap: str = "enhanced", pid: int = 7777,
+                 verbose_log: bool = False, training_on_start: bool = False,
+                 grant_on_start: bool = False, permission_on_start: bool = True) -> None:
+        self.device = device
+        self.order: List[Target] = list(order)
+        self.version = version
+        self.installed = installed
+        self.keymap = keymap
+        self.pid = pid
+        self.verbose_log = verbose_log
+        self.training_on_start = training_on_start
+        self.grant_on_start = grant_on_start
+        # The Accessibility Suite asks for POST_NOTIFICATIONS on EVERY service start.
+        self.permission_on_start = permission_on_start
+        self.initial_focus: Optional[Target] = None  # where focus goes when the service starts
+        self.log_level = "ERROR"      # Developer settings > Log output level
+        self.prefs_screen = "dev"     # dev | levels | confirm (TalkBackPreferencesActivity)
+        self.focus: Optional[Target] = None
+        self.edge = False
+        self.presses: List[str] = []
+        self.clicks: List[Optional[Target]] = []
+        self.labels: Dict[Target, str] = {}
+        self.on_press: Optional[Callable[["FakeTalkBack", str], bool]] = None
+        self.on_click: Optional[Callable[["FakeTalkBack", Optional[Target]], None]] = None
+        self.was_running = False
+        self.starts = 0
+
+    # ---- service state ---------------------------------------------------- #
+    @property
+    def running(self) -> bool:
+        s = self.device.secure
+        services = [x for x in (s.get("enabled_accessibility_services") or "").split(":") if x]
+        return self.installed and self.COMPONENT in services and s.get("accessibility_enabled") == "1"
+
+    def sync(self) -> None:
+        """The system reacting to a settings change (AccessibilityManagerService)."""
+        s = self.device.secure
+        if self.running and not self.was_running:
+            self.was_running = True
+            self.starts += 1
+            s["touch_exploration_enabled"] = "1"
+            if self.grant_on_start:
+                s["touch_exploration_granted_accessibility_services"] = self.COMPONENT
+            # TalkBack reads its log level when it binds.
+            self.verbose_log = self.verbose_log or self.log_level == "VERBOSE"
+            if self.training_on_start and self.starts == 1:
+                self.device.activity_stack.append(self.TRAINING)
+            if self.permission_on_start:
+                self.device.activity_stack.append(self.PERMISSION)
+            if self.initial_focus is not None:
+                self.set_focus(self.initial_focus)
+        elif not self.running and self.was_running:
+            self.was_running = False
+            s["touch_exploration_enabled"] = "0"
+            self.verbose_log = False
+            self.set_focus(None)
+
+    def combo_action(self, mods: Tuple[str, ...], key: str) -> Optional[str]:
+        table = {
+            "enhanced": {(("LEFTMETA",), "RIGHT"): "next", (("LEFTMETA",), "LEFT"): "prev",
+                         (("LEFTCTRL", "LEFTMETA"), "LEFT"): "first",
+                         (("LEFTCTRL", "LEFTMETA"), "RIGHT"): "last",
+                         (("LEFTMETA",), "SPACE"): "click"},
+            "classic": {(("LEFTALT",), "RIGHT"): "next", (("LEFTALT",), "LEFT"): "prev"},
+        }[self.keymap]
+        return table.get((mods, key))
+
+    # ---- TalkBack's settings screen (driven with uiautomator + input tap) --- #
+    def _ui_elements(self) -> List[Tuple[str, Tuple[int, int, int, int], bool, int]]:
+        """(text, (x1, y1, x2, y2), checked, group) of what the screen shows."""
+        els = [("Developer settings", (48, 300, 900, 400), False, 0),
+               ("Diagnosis mode", (48, 600, 900, 660), False, 1),
+               ("Log output level", (48, 2610, 700, 2660), False, 9),
+               (self.log_level, (48, 2670, 400, 2720), False, 9)]
+        if self.prefs_screen == "levels":
+            els.append(("Log output level", (100, 1150, 900, 1230), False, 20))
+            for i, lv in enumerate(self.LEVELS):
+                els.append((lv, (100, 1250 + i * 100, 1180, 1340 + i * 100), lv == self.log_level, 21))
+        elif self.prefs_screen == "confirm":
+            els += [("Verbose logs may contain personal information. Do you want to enable "
+                     "verbose logging?", (100, 1200, 1180, 1400), False, 30),
+                    ("Yes, enable verbose logging", (600, 1450, 1180, 1550), False, 30),
+                    ("Cancel", (100, 1450, 500, 1550), False, 30)]
+        return els
+
+    def ui_xml(self) -> str:
+        if self.device.top != self.PREFS:
+            return '<?xml version="1.0"?><hierarchy rotation="0"><node text="" bounds="[0,0][1280,2856]"/></hierarchy>'
+        groups: Dict[int, List[str]] = {}
+        for text, (x1, y1, x2, y2), checked, g in self._ui_elements():
+            groups.setdefault(g, []).append(
+                f'<node text="{text}" checked="{str(checked).lower()}" bounds="[{x1},{y1}][{x2},{y2}]"/>')
+        body = "".join(f'<node text="" bounds="[0,0][1280,2856]">{"".join(v)}</node>'
+                       for v in groups.values())
+        return f'<?xml version="1.0"?><hierarchy rotation="0">{body}</hierarchy>'
+
+    def prefs_tap(self, x: int, y: int) -> None:
+        hits = [(t, g) for t, (x1, y1, x2, y2), _c, g in self._ui_elements()
+                if x1 <= x < x2 and y1 <= y < y2]
+        if self.prefs_screen == "dev":
+            if any(t == "Log output level" for t, _g in hits):
+                self.prefs_screen = "levels"
+        elif self.prefs_screen == "levels":
+            picked = [t for t, g in hits if g == 21]
+            if picked:
+                if picked[0] == "VERBOSE" and self.log_level != "VERBOSE":
+                    self.prefs_screen = "confirm"
+                else:
+                    self.log_level = picked[0]
+                    self.prefs_screen = "dev"
+        elif self.prefs_screen == "confirm":
+            if any(t.startswith("Yes, enable verbose") for t, _g in hits):
+                self.log_level = "VERBOSE"
+                self.prefs_screen = "dev"
+            elif any(t == "Cancel" for t, _g in hits):
+                self.prefs_screen = "dev"
+
+    # ---- focus ------------------------------------------------------------ #
+    def set_focus(self, target: Optional[Target]) -> None:
+        self.focus = tuple(target) if target is not None else None  # type: ignore[assignment]
+        self.device.set_a11y_focus(self.focus)
+        if target is not None:
+            self.log(f"TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:  ttsOutput= "
+                     f"{self.labels.get(tuple(target), 'Item')}    queueMode=0")
+
+    def log(self, msg: str) -> None:
+        if not self.verbose_log:
+            return
+        line = f"{time.time():.3f}  {self.pid}  {self.pid} I talkback: {msg}\n".encode()
+        for p in list(self.device.logcats):
+            p.emit(line)
+
+    def press(self, action: str) -> None:
+        self.presses.append(action)
+        if self.on_press is not None and self.on_press(self, action):
+            return
+        if action == "click":
+            self.clicks.append(self.focus)
+            if self.on_click is not None:
+                self.on_click(self, self.focus)
+            return
+        order = self.order
+        if not order:
+            return
+        if action == "first":
+            self.edge = False
+            self.set_focus(order[0])
+            return
+        if action == "last":
+            self.edge = False
+            self.set_focus(order[-1])
+            return
+        if self.focus not in order:
+            self.edge = False
+            self.set_focus(order[0] if action == "next" else order[-1])
+            return
+        i = order.index(self.focus)
+        j = i + 1 if action == "next" else i - 1
+        if 0 <= j < len(order):
+            self.edge = False
+            self.set_focus(order[j])
+        elif not self.edge:
+            self.edge = True
+            self.log("FocusProcessor-LogicalNav: Reach edge before wrap")
+        else:
+            self.edge = False
+            self.set_focus(order[0] if action == "next" else order[-1])
+
+
+def key_safety_violations(device: "FakeDevice") -> List[str]:
+    """What the TalkBack safety rules forbid, as the fake device saw it: a lone
+    Meta, an unconsumed Meta+Left (system BACK) or Meta+Ctrl+arrow (split
+    screen), or any Meta combo other than Meta+Right before TalkBack consumed a
+    Meta+Right."""
+    out = []
+    if device.lone_meta:
+        out.append(f"{device.lone_meta} lone Meta tap(s)")
+    if device.system_backs:
+        out.append(f"{device.system_backs} unconsumed Meta+Left (system BACK)")
+    if device.split_screens:
+        out.append(f"{device.split_screens} unconsumed Meta+Ctrl+arrow (split screen)")
+    proven = False
+    for mods, key, consumed in device.key_log:
+        if mods == "gesture" or "LEFTMETA" not in mods.split("+"):
+            continue
+        if mods == "LEFTMETA" and key == "RIGHT":
+            proven = proven or consumed
+        elif not proven:
+            out.append(f"{mods}+{key} before TalkBack consumed a Meta+Right")
+    return out
+
+
+def settings_changes(device: "FakeDevice", original: Dict[str, str]) -> Dict[str, Tuple[Any, Any]]:
+    """Secure settings that differ from ``original`` (unset == absent)."""
+    keys = set(original) | set(device.secure)
+    return {k: (original.get(k), device.secure.get(k)) for k in sorted(keys)
+            if original.get(k) != device.secure.get(k)}
 
 
 class FakeAdb:
@@ -1624,6 +2233,20 @@ class FakeAdb:
         if check and rc != 0:
             raise adbmod.AdbError(argv, rc, out, err)
         return subprocess.CompletedProcess(argv, rc, out.encode() if binary else out, err)
+
+    def popen(self, argv: Sequence[str]) -> "FakeProcess":
+        """Drop-in for ``inspector_widget.talkback.device._popen`` (long-lived adb)."""
+        argv = list(argv)
+        self.log.append(argv)
+        rest = argv[1:]
+        serial = None
+        if rest[:1] == ["-s"]:
+            serial, rest = rest[1], rest[2:]
+        device = self.devices.get(serial) if serial else next(iter(self.devices.values()))
+        if device is None:
+            return FakeProcess.exited(1, f"adb: device '{serial}' not found".encode())
+        device.adb_log.append(["popen", *rest])
+        return device.popen(rest)
 
     def _dispatch(self, argv: List[str]) -> Tuple[int, str, str]:
         if not argv or argv[0] != "adb":
@@ -1687,6 +2310,8 @@ def install(monkeypatch, *devices: FakeDevice, build_out: str) -> FakeAdb:
     for var in (injectmod.ARTIFACTS_ENV, injectmod.LEGACY_ARTIFACTS_ENV):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(adbmod, "_run", fake.run)
+    from inspector_widget.talkback import device as tbdevice
+    monkeypatch.setattr(tbdevice, "_popen", fake.popen)
     make_build_out(build_out)
     for d in devices:
         d.default_build_id = build_id_of(build_out)
@@ -1704,6 +2329,8 @@ def install_global(*devices: FakeDevice, build_out: str) -> FakeAdb:
     for var in (injectmod.ARTIFACTS_ENV, injectmod.LEGACY_ARTIFACTS_ENV):
         os.environ.pop(var, None)
     adbmod._run = fake.run  # type: ignore[assignment]
+    from inspector_widget.talkback import device as tbdevice
+    tbdevice._popen = fake.popen  # type: ignore[assignment]
     make_build_out(build_out)
     for d in devices:
         d.default_build_id = build_id_of(build_out)
@@ -1719,6 +2346,7 @@ def default_device(**kwargs: Any) -> FakeDevice:
     """emulator-5554 with the probe app running (pid 4242), a non-debuggable
     running app, and a debuggable app that is installed but not running."""
     dev = FakeDevice(**kwargs)
+    dev.talkback = FakeTalkBack(dev)
     dev.add_app(DEFAULT_PACKAGE, DEFAULT_PID)
     dev.add_app("com.example.release", 5151, debuggable=False)
     dev.add_app("com.example.idle", None)
@@ -1744,11 +2372,15 @@ def _mcp_child(log_path: str, build_out: str, block_mcp: bool) -> None:
 
     dev = default_device(log_path=log_path)
     install_global(dev, build_out=build_out)
+    # FAKEAGENT_TB_ORDER='[[1003,-1],[1004,-1]]': the fake TalkBack's traversal.
+    if os.environ.get("FAKEAGENT_TB_ORDER") and dev.talkback is not None:
+        dev.talkback.order = [tuple(t) for t in json.loads(os.environ["FAKEAGENT_TB_ORDER"])]
 
     def _exit_record() -> None:
         dev._log({"event": "exit", "forwards": dev.forward_names(),
                   "running_agents": [a.generation for a in dev.agents if a.running],
-                  "adb": [" ".join(a) for a in dev.adb_log]})
+                  "adb": [" ".join(a) for a in dev.adb_log], "secure": dict(dev.secure),
+                  "talkback_running": bool(dev.talkback and dev.talkback.running)})
 
     atexit.register(_exit_record)  # registered first -> runs after any server atexit hook
     script = os.path.join(_HOST_DIR, "mcp_server.py")

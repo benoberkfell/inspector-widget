@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 import fakeagent
+import test_tb_walk as tb_tests  # the TalkBack tools' e2e tests (a module: not re-collected)
 from fakeagent import DEFAULT_PACKAGE as PKG
 from fakeagent import DEFAULT_PID as PID
 from fakeagent import DEFAULT_SERIAL as SERIAL
@@ -655,6 +656,10 @@ CLI_SUBCOMMAND_TESTS = {
     "screenshot": test_cli_screenshot,
     "get-properties": test_cli_get_properties,
     "detach": test_cli_detach_shuts_down_a_running_agent,
+    # TalkBack (tests/test_tb_walk.py drives them against the fake TalkBack)
+    "talkback": tb_tests.test_cli_talkback_round_trip,
+    "tb-walk": tb_tests.test_cli_tb_walk_and_scenario,
+    "tb-scenario": tb_tests.test_cli_tb_walk_and_scenario,
 }
 
 
@@ -963,6 +968,9 @@ MCP_TOOL_TESTS = {
     "inspect": test_mcp_inspect,
     "inspect_node": test_mcp_inspect_node,
     "component_image": test_mcp_component_image,
+    "talkback": tb_tests.test_mcp_talkback_on_is_restored_at_server_exit,
+    "tb_walk": tb_tests.test_mcp_tb_walk_and_scenario,
+    "tb_scenario": tb_tests.test_mcp_tb_walk_and_scenario,
     "detach": test_mcp_detach,
 }
 

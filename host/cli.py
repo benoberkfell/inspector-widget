@@ -7,6 +7,9 @@ Subcommands (``inspector-widget --help`` lists all of them):
   attach     --serial --package  inject the agent and PING it (Hello)
   dump       --serial --package  inject + dump tree (+ optional props/screenshot/json)
   ...
+  talkback   status|on|off|restore  TalkBack control (DEVICE-WIDE; settings restored)
+  tb-walk    --serial --package  drive real TalkBack and diff its order with the model
+  tb-scenario focus-after|restore|survive  where TalkBack focus goes after an action
   detach     --serial --package  stop a running agent (never injects one)
 
 ``--serial`` defaults to ``$ANDROID_SERIAL``, else the only attached device.
@@ -499,6 +502,84 @@ def _scale(text):
     return value
 
 
+def cmd_talkback(args) -> int:
+    """TalkBack status / on / off / restore (device-wide)."""
+    from inspector_widget.talkback import device as tbdevice
+    out = tbdevice.action(args.serial, args.action, package=args.package,
+                          verbose_log=args.verbose_log)
+    print(json.dumps(out, indent=2, default=str))
+    if args.action == "on" and out.get("changed"):
+        print("note: TalkBack stays on (device-wide) until `inspector-widget talkback restore`",
+              file=sys.stderr)
+    return 0
+
+
+def _print_tb(result):
+    """Human-readable walk / scenario result (the JSON is --json -)."""
+    head = {k: v for k, v in result.items() if k not in ("lines", "findings", "next", "timeline")}
+    print(json.dumps(head, default=str))
+    for line in result.get("lines") or []:
+        print(f"  {line}")
+    for ev in result.get("timeline") or []:
+        print(f"  +{ev.get('t')}ms {json.dumps({k: v for k, v in ev.items() if k != 't'})}")
+    findings = result.get("findings") or ([result["finding"]] if result.get("finding") else [])
+    for f in findings:
+        print(f"{f['code']} [{f['sev']}/{f['basis']}] {f['msg']}")
+        if f.get("fix"):
+            print(f"  fix: {f['fix']}")
+    for hint in result.get("next") or []:
+        print(f"next: {hint}")
+
+
+def cmd_tb_walk(args) -> int:
+    from inspector_widget.talkback import walk as tbwalk
+    expect = [e.strip() for item in (args.expect or []) for e in item.split(",") if e.strip()]
+    with _session(args) as session:
+        result = tbwalk.run_walk(
+            session, start=args.start, direction="prev" if args.prev else "next",
+            max_steps=args.max_steps, until=args.until, expect=expect or None,
+            step_timeout_ms=args.step_timeout_ms, settle_ms=args.settle_ms,
+            recapture=args.recapture, utterance=args.utterance, injector=args.injector,
+            leave_on=args.leave_on, max_lines=args.max_lines, max_bytes=args.max_bytes)
+    if args.json:
+        _emit_json(result, args.json)
+    else:
+        _print_tb(result)
+    if args.leave_on:
+        print("note: TalkBack left on (device-wide); `inspector-widget talkback restore` when done",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_tb_scenario(args) -> int:
+    from inspector_widget.talkback import scenarios as tbscenarios
+    with _session(args) as session:
+        result = tbscenarios.run_scenario(
+            session, args.kind.replace("-", "_"), target=args.target, action=args.action,
+            mutate=args.mutate, wait_ms=args.wait_ms, injector=args.injector,
+            leave_on=args.leave_on, step_timeout_ms=args.step_timeout_ms,
+            settle_ms=args.settle_ms)
+    if args.json:
+        _emit_json(result, args.json)
+    else:
+        _print_tb(result)
+    return 0
+
+
+def _add_tb_common(sp):
+    """Options shared by tb-walk and tb-scenario (MCP parity)."""
+    sp.add_argument("--injector", choices=["auto", "uinput", "touch"], default="auto",
+                    help="how keys reach TalkBack: a uinput keyboard (default) or touch swipes")
+    sp.add_argument("--leave-on", action="store_true",
+                    help="leave TalkBack on afterwards (default: restore the settings)")
+    sp.add_argument("--step-timeout-ms", type=int, default=1500,
+                    help="how long a press may take to move focus before it counts as an edge")
+    sp.add_argument("--settle-ms", type=int, default=120,
+                    help="focus must stay put this long to count as landed")
+    sp.add_argument("--json", metavar="DEST", nargs="?", const="-", default=None,
+                    help="emit the result as JSON to DEST ('-' = stdout)")
+
+
 def _add_serial_arg(sp):
     sp.add_argument("--serial", default=None,
                     help="device serial (default: $ANDROID_SERIAL, else the only attached device)")
@@ -687,6 +768,50 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="force re-injection")
     _add_build_out_arg(sp)
     sp.set_defaults(func=cmd_get_properties)
+
+    sp = sub.add_parser("talkback", help="TalkBack status/on/off/restore (DEVICE-WIDE: the "
+                                         "accessibility settings are snapshotted and restored)")
+    sp.add_argument("action", choices=["status", "on", "off", "restore"])
+    _add_serial_arg(sp)
+    sp.add_argument("--package", default=None,
+                    help="on: the app that must stay in the foreground")
+    sp.add_argument("--verbose-log", action="store_true",
+                    help="on: set TalkBack's log level to VERBOSE first (restore puts it back)")
+    sp.set_defaults(func=cmd_talkback)
+
+    sp = sub.add_parser("tb-walk", help="drive the real TalkBack (DEVICE-WIDE) through the app and "
+                                        "diff its order with the model and the visual order")
+    _add_serial_arg(sp)
+    sp.add_argument("--package", default=DEFAULT_PACKAGE)
+    _add_build_out_arg(sp)
+    sp.add_argument("--start", default="current",
+                    help="current | first | a node key or part of a label to walk to first")
+    sp.add_argument("--prev", action="store_true", help="walk backwards (TalkBack previous)")
+    sp.add_argument("--max-steps", type=int, default=60)
+    sp.add_argument("--until", choices=["wrap", "edge", "loop", "steps"], default="wrap")
+    sp.add_argument("--expect", action="append", metavar="A,B,...",
+                    help="the order you expect (labels or node keys; repeat or comma-separate)")
+    sp.add_argument("--recapture", choices=["on_unknown", "never"], default="on_unknown")
+    sp.add_argument("--utterance", choices=["auto", "model", "logcat"], default="auto")
+    sp.add_argument("--max-lines", type=int, default=60)
+    sp.add_argument("--max-bytes", type=int, default=5000)
+    _add_tb_common(sp)
+    sp.set_defaults(func=cmd_tb_walk)
+
+    sp = sub.add_parser("tb-scenario", help="where real TalkBack focus goes after an action, "
+                                            "after back, or after the list updates (DEVICE-WIDE)")
+    sp.add_argument("kind", choices=["focus-after", "restore", "survive"])
+    _add_serial_arg(sp)
+    sp.add_argument("--package", default=DEFAULT_PACKAGE)
+    _add_build_out_arg(sp)
+    sp.add_argument("--target", help="node key or part of a label (default: current focus)")
+    sp.add_argument("--action", default="activate",
+                    help="focus-after: activate | back | tap | key:<combo>")
+    sp.add_argument("--mutate", help="survive: tap:<selector> | activate | key:<combo> | "
+                                     "broadcast:<args> | probe:<action>")
+    sp.add_argument("--wait-ms", type=int, default=2000)
+    _add_tb_common(sp)
+    sp.set_defaults(func=cmd_tb_scenario)
 
     sp = sub.add_parser("detach", help="stop a running agent for every client (sends SHUTDOWN; "
                                        "never injects)")

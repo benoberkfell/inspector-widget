@@ -695,14 +695,20 @@ def _png_scratch(serial: str, package: str, tag: str) -> Iterator[str]:
 
 
 def _cleanup_at_exit() -> None:
-    """Disconnect cached sessions (removing their adb forwards; agents keep
-    running for the next start), remove any other forward this process still
-    holds (an attach cut short), and delete this process's PNG directory.
+    """Restore the TalkBack settings this server changed, disconnect cached
+    sessions (removing their adb forwards; agents keep running for the next
+    start), remove any other forward this process still holds (an attach cut
+    short), and delete this process's PNG directory.
 
     ``_closing`` goes up first: a tool call this cuts off must not retry, and
     no attach may cache a session behind the cleanup.
     """
     _closing.set()
+    try:
+        from inspector_widget.talkback import device as tbdevice
+        tbdevice.restore_owned()
+    except Exception:  # noqa: BLE001 - exit cleanup is best-effort; the state file remains
+        pass
     try:
         SESSIONS.close_all()
     except Exception:  # noqa: BLE001 - exit cleanup is best-effort
@@ -1916,9 +1922,206 @@ TOOLS.update({
 })
 
 
+# --------------------------------------------------------------------------- #
+# TalkBack navigation (inspector_widget.talkback). DEVICE-WIDE: these turn the
+# system screen reader on (snapshotting the settings first) and restore it.
+# --------------------------------------------------------------------------- #
+_DEVICE_WIDE = (
+    "DEVICE-WIDE: TalkBack is a system service, so while it runs every app on this device "
+    "(and anyone else using it) gets the screen reader, and a11y dumps differ. The settings "
+    "are snapshotted to a crash-safe file first and restored afterwards, at server exit, or "
+    "with talkback(action='restore'). ")
+_TB_ANNOTATIONS = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
+                   "openWorldHint": False}
+_TB_WALK_ARGS = ("start", "direction", "max_steps", "until", "expect", "step_timeout_ms",
+                 "settle_ms", "recapture", "utterance", "injector", "leave_on", "max_lines",
+                 "max_bytes")
+_TB_SCENARIO_ARGS = ("target", "action", "mutate", "wait_ms", "injector", "leave_on",
+                     "step_timeout_ms", "settle_ms")
+
+
+def _tb_errors(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    """TalkBack failures carry a code (busy, talkback_unavailable, injector_failed,
+    keymap_unknown, start_not_found, app_left_foreground, restore_failed...)."""
+    from inspector_widget.talkback import device as tbdevice, inject as tbinject, walk as tbwalk
+    try:
+        return fn()
+    except (tbdevice.TalkBackError, tbwalk.WalkError, tbinject.InjectorError) as exc:
+        out: Dict[str, Any] = {"error": str(exc), "code": getattr(exc, "code", "error")}
+        if getattr(exc, "hint", None):
+            out["hint"] = exc.hint
+        if getattr(exc, "tried", None):
+            out["tried"] = exc.tried
+        return out
+
+
+def _h_talkback(args: Dict[str, Any]) -> Dict[str, Any]:
+    from inspector_widget.talkback import device as tbdevice
+    serial = _serial(args.get("serial"))
+    return _tb_errors(lambda: tbdevice.action(serial, args["action"], package=args.get("package"),
+                                              verbose_log=bool(args.get("verbose_log"))))
+
+
+def _h_tb_walk(args: Dict[str, Any]) -> Dict[str, Any]:
+    from inspector_widget.talkback import walk as tbwalk
+    _require(args.get("package"), "package")
+    serial = _serial(args.get("serial"))
+    session = SESSIONS.get_or_attach(serial, args["package"])
+    opts = {k: args[k] for k in _TB_WALK_ARGS if k in args}
+    return _tb_errors(lambda: tbwalk.run_walk(session, **opts))
+
+
+def _h_tb_scenario(args: Dict[str, Any]) -> Dict[str, Any]:
+    from inspector_widget.talkback import scenarios as tbscenarios
+    _require(args.get("package"), "package")
+    serial = _serial(args.get("serial"))
+    session = SESSIONS.get_or_attach(serial, args["package"])
+    opts = {k: args[k] for k in _TB_SCENARIO_ARGS if k in args}
+    return _tb_errors(lambda: tbscenarios.run_scenario(session, args["kind"], **opts))
+
+
+TOOLS.update({
+    "talkback": {
+        "handler": _h_talkback,
+        "annotations": dict(_TB_ANNOTATIONS, title="TalkBack status / on / off / restore",
+                            idempotentHint=True),
+        "description": (
+            _DEVICE_WIDE + "action=status (read-only): whether TalkBack is installed/enabled, touch "
+            "exploration, the enabled services, a pending restore, the injectors. on: snapshot the "
+            "accessibility settings, append TalkBack to the enabled services (others stay), wait "
+            "for touch exploration, dismiss TalkBack's tutorial; stays on until off/restore (or "
+            "this server exits). off: turn TalkBack off (an exact restore when it was off before). "
+            "restore: write the snapshot back exactly (and TalkBack's log level, if on changed it) "
+            "and verify it."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "serial": _SERIAL,
+                "action": {"type": "string", "enum": ["status", "on", "off", "restore"]},
+                "package": dict(_PACKAGE, description="Optional (on): the app that must stay in "
+                                                      "the foreground; brought back if covered."),
+                "verbose_log": {"type": "boolean", "default": False,
+                                "description": "on: first set TalkBack's log level to VERBOSE "
+                                               "(its settings screen, while TalkBack is still off) "
+                                               "so walks read the exact announcements from logcat; "
+                                               "restore puts the old level back."},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+    "tb_walk": {
+        "handler": _h_tb_walk,
+        "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus through the app"),
+        "description": (
+            _DEVICE_WIDE + "Drives the REAL TalkBack: presses its next/previous shortcut on a "
+            "virtual uinput keyboard (touch swipes as fallback) and records where accessibility "
+            "focus lands after each press, then diffs the actual order (A) against the model's "
+            "predicted order (P) and a visual order (V). Returns one line per step "
+            "('3. view:42 Button \"Play, Button\" via=autoscroll'), how it ended (wrap = a full "
+            "lap, edge, loop = a cycle TalkBack never leaves, stuck, left_app, max_steps), timings, "
+            "vs_model (agree/differ/first difference) and findings (tb.out_of_order, tb.loop, "
+            "tb.edge_stuck, tb.skipped, tb.ghost_stop, tb.double_stop, tb.escape, model.mismatch) "
+            "with fixes. The full walk is saved (result.saved). TalkBack is turned on if needed and "
+            "restored afterwards unless leave_on. Takes ~0.1-0.4s per step (1.5s at an edge "
+            "without TalkBack's verbose log)."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "serial": _SERIAL,
+                "package": _PACKAGE,
+                "start": {"type": "string", "default": "current",
+                          "description": "current (where focus is), first (TalkBack's first-item "
+                                         "shortcut), or a node key / part of a label to walk to first."},
+                "direction": {"type": "string", "enum": ["next", "prev"], "default": "next"},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 300, "default": 60},
+                "until": {"type": "string", "enum": ["wrap", "edge", "loop", "steps"],
+                          "default": "wrap",
+                          "description": "wrap: one full lap; edge: stop at the first edge; loop: "
+                                         "until a move repeats (past the wrap); steps: exactly "
+                                         "max_steps presses."},
+                "expect": {"type": "array", "items": {"type": "string"},
+                           "description": "The order you expect (labels or node keys); mismatches "
+                                          "become basis=expect findings."},
+                "step_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 10000,
+                                    "default": 1500,
+                                    "description": "How long a press may take to move focus before "
+                                                   "it counts as an edge."},
+                "settle_ms": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 120,
+                              "description": "Focus must stay put this long to count as landed."},
+                "recapture": {"type": "string", "enum": ["on_unknown", "never"],
+                              "default": "on_unknown",
+                              "description": "Re-model when focus reaches a node the model has not "
+                                             "seen (scrolled in)."},
+                "utterance": {"type": "string", "enum": ["auto", "model", "logcat"],
+                              "default": "auto",
+                              "description": "What each step says. auto: TalkBack's logcat when its "
+                                             "log level is already VERBOSE, else the model "
+                                             "announcement (flagged per step). logcat: also set "
+                                             "the level to VERBOSE first (when TalkBack is off; "
+                                             "~5s more) and back afterwards."},
+                "injector": {"type": "string", "enum": ["auto", "uinput", "touch"],
+                             "default": "auto"},
+                "leave_on": {"type": "boolean", "default": False,
+                             "description": "Leave TalkBack on afterwards (restore later with "
+                                            "talkback action=restore)."},
+                "max_lines": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
+                "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 100000,
+                              "default": 5000},
+            },
+            "required": ["package"],
+            "additionalProperties": False,
+        },
+    },
+    "tb_scenario": {
+        "handler": _h_tb_scenario,
+        "annotations": dict(_TB_ANNOTATIONS, title="TalkBack focus scenarios"),
+        "description": (
+            _DEVICE_WIDE + "Checks where REAL TalkBack focus goes. kind=focus_after: perform "
+            "action (activate = TalkBack's click on the focused node; back; tap = an injected tap "
+            "that bypasses TalkBack; key:<combo> e.g. key:META+SPACE) and classify the landing "
+            "(initial_ok | on_close_or_unlabeled | behind_overlay | stayed_on_opener | none | "
+            "elsewhere; tb.initial_focus). restore: activate the target, go back, classify "
+            "(restored | near | top | none; tb.restore_failed). survive: focus the target, apply "
+            "mutate (tap:<selector> | activate | key:<combo> | broadcast:<am broadcast args> | "
+            "probe:<action>) and classify over wait_ms (kept | drifted | restored | reset_top | "
+            "lost | moved; tb.focus_reset / tb.focus_lost / tb.focus_drift). The target (node key "
+            "or part of a label) is reached by pressing next."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "serial": _SERIAL,
+                "package": _PACKAGE,
+                "kind": {"type": "string", "enum": ["focus_after", "restore", "survive"]},
+                "target": {"type": "string",
+                           "description": "Node key or part of a label; default: current focus."},
+                "action": {"type": "string", "default": "activate",
+                           "description": "focus_after: activate | back | tap | key:<combo>."},
+                "mutate": {"type": "string",
+                           "description": "survive: tap:<selector> | activate | key:<combo> | "
+                                          "broadcast:<args> | probe:<action>."},
+                "wait_ms": {"type": "integer", "minimum": 300, "maximum": 20000, "default": 2000},
+                "injector": {"type": "string", "enum": ["auto", "uinput", "touch"],
+                             "default": "auto"},
+                "leave_on": {"type": "boolean", "default": False},
+                "step_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 10000,
+                                    "default": 1500},
+                "settle_ms": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 120},
+            },
+            "required": ["package", "kind"],
+            "additionalProperties": False,
+        },
+    },
+})
+
+
 # Tools that manage the session themselves (attach re-attaches once on its own;
-# detach must never re-attach), so _run_tool never retries them.
-_NO_RETRY = frozenset({"attach", "detach"})
+# detach must never re-attach), so _run_tool never retries them. The TalkBack
+# tools press keys device-wide: a retry would repeat half a walk.
+_NO_RETRY = frozenset({"attach", "detach", "talkback", "tb_walk", "tb_scenario"})
 
 # Tools that only read the app's state, so running one twice is harmless even if
 # the agent acted on the first request before the connection went. dump_compose
@@ -1940,7 +2143,7 @@ def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
                    call: _CallState) -> Optional[str]:
     """Why a call that lost its session must not be retried, or None to retry.
 
-    Never while the server shuts down, never for attach/detach, never once a
+    Never while the server shuts down, never for the _NO_RETRY tools, never once a
     detach stopped the agent the call used (the retry would re-inject it); and
     a call that changes the app (dump_compose with enable_inspection) only when
     the request provably never reached the agent (NotSentError).
@@ -1948,7 +2151,7 @@ def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
     if _closing.is_set():
         return "the server is shutting down"
     if name in _NO_RETRY:
-        return "this tool manages its own session"
+        return "this tool is never retried"
     if SESSIONS.stopped_during(call):
         return "the app was detached while this call ran"
     if _read_only(name, args) or isinstance(exc, _not_sent_error()):
@@ -2234,11 +2437,17 @@ def _build_mcp_server() -> Any:
         log.info("mcp SDK not available (%r); using JSON-RPC fallback.", exc)
         return None
 
+    def tool(name: str, entry: Dict[str, Any]) -> Any:
+        kw = dict(name=name, description=entry["description"], inputSchema=entry["schema"])
+        if entry.get("annotations"):
+            try:
+                return types.Tool(annotations=entry["annotations"], **kw)
+            except Exception:  # noqa: BLE001 - an SDK without ToolAnnotations
+                pass
+        return types.Tool(**kw)
+
     def tool_list() -> List[Any]:
-        return [
-            types.Tool(name=name, description=entry["description"], inputSchema=entry["schema"])
-            for name, entry in TOOLS.items()
-        ]
+        return [tool(name, entry) for name, entry in TOOLS.items()]
 
     async def run_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Any:
         text, is_error = await asyncio.to_thread(_call_tool_text, name, arguments or {})
@@ -2370,6 +2579,7 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
                 "name": name,
                 "description": entry["description"],
                 "inputSchema": entry["schema"],
+                **({"annotations": entry["annotations"]} if entry.get("annotations") else {}),
             }
             for name, entry in TOOLS.items()
         ]
