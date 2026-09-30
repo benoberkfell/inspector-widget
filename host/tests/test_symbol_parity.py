@@ -604,7 +604,7 @@ def test_signature_scan_catches_seeded_bugs() -> None:
 
         def run(sock, session):
             correlate.inspect_node(session, nod_key="view:1")        # kwarg typo
-            client = Client(sock, True, "extra")                     # arity
+            client = Client(sock, True, None, "extra")               # arity
             client.dump_tree(root=0)                                 # Session-style kwarg on Client
             session.dump_tree(properties=True)                       # Client-style kwarg on Session
             session.no_such_method()                                 # missing method

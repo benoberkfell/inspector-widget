@@ -406,22 +406,28 @@ def _shaped_view_tree(session: Any, props: bool) -> Tuple[List[dict], Dict[int, 
 
 def _shaped_compose(session: Any) -> List[dict]:
     from . import strings as st
+    from .client import TransportError
     try:
         resp = session.dump_compose(include_semantics=True, include_slot_table=False,
                                     enable_inspection=False)
         data = st.dump_compose_to_dict(resp)
         return data.get("windows", []) or []
+    except TransportError:
+        raise  # a lost session is not "no Compose on screen"
     except Exception:
         return []
 
 
 def _shaped_a11y(session: Any) -> List[dict]:
     """Fetch + shape the a11y tree as a list of window-root dicts. Degrades to [] if absent."""
+    from .client import TransportError
     fn = getattr(session, "dump_a11y", None)
     if not callable(fn):
         return []
     try:
         data = fn()
+    except TransportError:
+        raise  # a lost session is not "no accessibility tree"
     except Exception:
         return []
     # Session.dump_a11y() returns the raw DumpA11yResponse proto; shape it to the
@@ -482,8 +488,11 @@ def _capture_skp(session: Any) -> Optional[Tuple[bytes, int]]:
         fn = getattr(client, "capture_skp", None) if client else None
     if not callable(fn):
         return None
+    from .client import TransportError
     try:
         resp = fn(root_id=0)
+    except TransportError:
+        raise
     except Exception:
         return None
     if not getattr(resp, "supported", False):
@@ -497,8 +506,11 @@ def _capture_skp(session: Any) -> Optional[Tuple[bytes, int]]:
 def _full_screenshot_png(session: Any, dest: str) -> Optional[Tuple[str, float]]:
     """Capture a full screenshot, write to ``dest`` PNG. Returns (path, scale) or None."""
     from . import png as pngmod
+    from .client import TransportError
     try:
         resp = session.screenshot(root_id=0, scale=1.0)
+    except TransportError:
+        raise
     except Exception:
         return None
     if not resp.HasField("screenshot"):
@@ -579,7 +591,11 @@ def component_image(session: Any, node: dict, out_path: Optional[str] = None,
         return {"path": None, "source": "bitmap_crop", "scale": scale,
                 "error": "node has no bounds to crop"}
     base = _tmp_png("component_base")
-    shot = _full_screenshot_png(session, base)
+    try:
+        shot = _full_screenshot_png(session, base)
+    except BaseException:
+        _safe_remove(base)
+        raise
     if shot is None:
         _safe_remove(base)
         return {"path": None, "source": "bitmap_crop", "scale": scale,
@@ -696,8 +712,11 @@ def _finding_matches(finding: dict, keys: set) -> bool:
 
 def _fetch_properties(session: Any, view_id: int) -> Optional[list]:
     from . import strings as st
+    from .client import TransportError
     try:
         resp = session.get_properties(view_id=view_id, include_resolution_stack=False)
+    except TransportError:
+        raise
     except Exception:
         return None
     try:

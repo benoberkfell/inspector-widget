@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from . import adb
-from .client import Client
+from .client import LOGCAT_HINT, AgentTimeoutError, Client, TransportError
 
 # --------------------------------------------------------------------------- #
 # Artifact names (CONTRACT.md section 3 / section 7). The host reads these from
@@ -111,7 +111,9 @@ class Injection:
 
 
 class InjectionError(RuntimeError):
-    pass
+    """Injecting or connecting failed; ``hint`` says where to look next."""
+
+    hint = f"Check `{LOGCAT_HINT}` for agent-side errors."
 
 
 def _artifact_path(build_out: str, name: str) -> str:
@@ -129,18 +131,22 @@ def _artifact_path(build_out: str, name: str) -> str:
 
 def _connect_forward(serial: str, socket_name: str, local_port: int,
                      connect_timeout: float = 5.0) -> socket.socket:
-    """Set up the adb forward and open a TCP socket to the agent."""
+    """Set up the adb forward and open a TCP socket to the agent.
+
+    The Client sets a per-request deadline on the socket before each request.
+    """
     port = adb.forward(serial, local_port, socket_name)
-    sock = socket.create_connection(("127.0.0.1", port), timeout=connect_timeout)
-    sock.settimeout(None)  # blocking for synchronous request/response
-    return sock
+    return socket.create_connection(("127.0.0.1", port), timeout=connect_timeout)
 
 
 def _try_warm_connect(serial: str, pid: int) -> Optional[Injection]:
     """Attempt to connect to an already-running agent for ``pid``.
 
     Returns an :class:`Injection` if the abstract socket exists and a Hello
-    round-trips; otherwise ``None`` (and any partial forward is cleaned up).
+    round-trips; ``None`` if nothing is listening (any partial forward is
+    cleaned up). An agent that accepts but doesn't answer Hello in time raises
+    :class:`InjectionError`: re-injecting can't help, because the new payload
+    can't bind a name the wedged one still holds.
     """
     socket_name = socket_name_for_pid(pid)
     if not adb.socket_exists(serial, socket_name):
@@ -154,7 +160,14 @@ def _try_warm_connect(serial: str, pid: int) -> Optional[Injection]:
     # PING via Hello to confirm the agent is live and speaks our protocol.
     client = Client(sock, owns_socket=False)
     try:
-        client.hello()
+        hello = client.hello()
+    except AgentTimeoutError as exc:
+        sock.close()
+        adb.remove_forward(serial, local_port)
+        raise InjectionError(
+            f"an agent holds @{socket_name} but did not answer Hello ({exc}). The app may be "
+            f"frozen (breakpoint, ANR); resume it, or restart the app to start over."
+        ) from exc
     except Exception:
         sock.close()
         adb.remove_forward(serial, local_port)

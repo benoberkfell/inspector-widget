@@ -188,10 +188,10 @@ def test_wire_bad_magic_drops_the_connection(agent):
 def test_wire_shutdown_stops_the_server_and_closes_every_client(agent):
     first, second = _client(agent), _client(agent)
     second.hello()
-    # Dispatcher.handleShutdown stops the server before the reply is written, so
-    # the requester sees EOF rather than a ShutdownResponse (see NEW-SHUTDOWN-REPLY).
-    with pytest.raises((framing.FramingError, OSError)):
-        first.shutdown()
+    # An agent built before the reply fix stops the server before the reply is
+    # written, so the requester sees EOF; Client.shutdown() counts that as done.
+    assert first.shutdown() == pb.ShutdownResponse()
+    assert first.broken  # the client closes itself after a shutdown either way
     with pytest.raises((framing.FramingError, OSError)):
         second.hello()
     assert not agent.running
@@ -958,9 +958,6 @@ def test_scenario_app_restart_then_mcp_reinjects(mcp, fake_device):
     assert fake_device.attach_calls[-1]["socket_name"] == "viewspector_5353"
 
 
-@pytest.mark.xfail(strict=True, reason="H1: no socket timeout; a frozen app hangs the call (and a "
-                   "detach behind it) forever. The fix should honour a short deadline override; "
-                   "this test sets INSPECTOR_WIDGET_TIMEOUT=1")
 def test_scenario_hung_agent_times_out(mcp, fake_device, monkeypatch):
     monkeypatch.setenv("INSPECTOR_WIDGET_TIMEOUT", "1")
     assert mcp("attach")["attached"]
@@ -1059,8 +1056,6 @@ def test_scenario_duplicate_reply_does_not_desync_forever(mcp, fake_device, warm
     assert "error" not in res, res
 
 
-@pytest.mark.xfail(strict=True, reason="H3: the agent's malformed-request ERROR uses id 0 and the "
-                   "host reports an id mismatch instead of the agent's message")
 def test_scenario_agent_error_with_id_zero_surfaces_its_message(mcp, fake_device, warm_agent):
     warm_agent.behaviour = lambda req: (
         (0, fakeagent.error_response(0, "Malformed request: boom"))
