@@ -329,8 +329,11 @@ def test_event_tap_masks_a_password_fields_text(device):
             seq = session.a11y_focus().seq  # installs the tap
             for name in VIEW_FIELDS:
                 got, seq, sources[name] = _type_into(
-                    session, lambda: (_view_id(session, name), -1), name, seq, top_before, steps)
+                    session, lambda name=name: (_view_id(session, name), -1), name, seq,
+                    top_before, steps)
                 events += got
+    except Exception as e:  # a step that failed outright: report it with what was seen
+        raise AssertionError(report([f"{type(e).__name__}: {e}"], events, steps)) from e
     finally:
         _detach(session)
     problems: List[str] = []
@@ -398,6 +401,8 @@ def test_event_tap_masks_a_compose_visible_password(device):
             events += focus["events"] + got
             dumps["a11y"] = a11y.a11y_to_dict(session.dump_a11y())
             dumps["compose"] = _compose(session, semantics=True, slot=False)
+    except Exception as e:  # a step that failed outright: report it with what was seen
+        raise AssertionError(report([f"{type(e).__name__}: {e}"], events, steps)) from e
     finally:
         _detach(session)
     problems += field_problems(events, sources, COMPOSE_VISIBLE_TAG)
