@@ -68,6 +68,8 @@
  *       semantics/slot table unavailable, a11y still works
  *   semantics_failed: view#<acvId> <reason>   reason = classes_renamed | owner_unreachable |
  *       root_unreachable | error=<Throwable>   (no semantics tree for that ComposeView)
+ *   semantics_unmerged: view#<acvId>   (R8 removed getRootSemanticsNode and the merged root
+ *       could not be rebuilt: the tree sent is the unmerged one)
  *   semantics_partial: view#<acvId> nodes_failed=N values_failed=M   (the tree is there; N nodes
  *       lost a part, M attribute values read "<error:...>")
  *   semantics_truncated: view#<acvId> depth>80 subtrees=N
@@ -112,6 +114,7 @@ object ComposeInspector {
     private const val MAX_CONFIG_ENTRIES = 256
 
     private const val CLASSES_RENAMED = "classes_renamed"
+    private const val UNMERGED = "unmerged"
 
     /** Per-ComposeView counters and log throttling for one dump. */
     private class WalkCtx {
@@ -185,6 +188,7 @@ object ComposeInspector {
                     if (semRoot == null) {
                         if (renamed) CLASSES_RENAMED else missing
                     } else {
+                        if (missing == UNMERGED) tokens.add("semantics_unmerged: view#$acvId")
                         rootNode.addChildren(buildSemanticsNode(semRoot, strings, 0, off, ctx))
                         produced = true
                         null
@@ -539,11 +543,19 @@ object ComposeInspector {
      * The merged root SemanticsNode of [composeView] (merged root == what TalkBack sees == the
      * best human labels), or null plus the reason token: owner_unreachable (no getSemanticsOwner,
      * or it returned null) / root_unreachable. Throws when a getter itself throws.
+     *
+     * R8 drops SemanticsOwner.getRootSemanticsNode from a shrunk app that never calls it (NiA's
+     * minified release keeps only getUnmergedRootSemanticsNode, which the accessibility delegate
+     * uses). The merged root is then rebuilt from the unmerged one with the internal
+     * copyWithMergingEnabled; failing that, the unmerged root itself is returned with the reason
+     * [UNMERGED] (the tree is there, but not merged the way TalkBack reads it).
      */
     private fun semanticsRoot(composeView: View): Pair<Any?, String> {
         val owner = invokeChecked(composeView, "getSemanticsOwner") ?: return null to "owner_unreachable"
-        val root = invokeChecked(owner, "getRootSemanticsNode") ?: return null to "root_unreachable"
-        return root to ""
+        invokeChecked(owner, "getRootSemanticsNode")?.let { return it to "" }
+        val unmerged = invokeChecked(owner, "getUnmergedRootSemanticsNode") ?: return null to "root_unreachable"
+        invoke(unmerged, "copyWithMergingEnabled\$ui")?.let { return it to "" }
+        return unmerged to UNMERGED
     }
 
     /**
