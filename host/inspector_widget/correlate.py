@@ -193,7 +193,7 @@ def _a11y_facet(n: dict) -> dict:
     for src in ("host_view_id", "virtual_id", "node_key", "provider_class", "class_name"):
         if n.get(src) is not None:
             facet[src] = n[src]
-    if "node_key" not in facet and n.get("host_view_id") is not None:
+    if "node_key" not in facet and n.get("host_view_id"):
         t = _a11y_tuple(n)
         facet["node_key"] = (view_key(t[1]) if t[0] == "view" else f"virtual:{t[1]}:{t[2]}")
     # Speakable composition (TalkBack-ish): contentDescription > text > stateDescription.

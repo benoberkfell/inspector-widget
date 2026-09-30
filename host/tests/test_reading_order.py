@@ -314,3 +314,16 @@ def test_long_compose_chain_has_no_recursion_limit():
     _chain(list(reversed(items)))  # ANI order is the reverse of the chain
     out = speech([n(1, -1, children=items)])
     assert out[0] == "item 3000" and out[-1] == "item 1" and len(out) == 3000
+
+
+def test_unresolvable_views_get_no_key_and_no_duplicate_noise():
+    # host_view_id 0 = the agent could not resolve the backing View.
+    b = mf.A11yBuilder()
+    root = b.node(2, -1, (0, 0, 100, 100), children=[
+        b.node(0, -1, (0, 0, 50, 20), cls="android.widget.TextView", text="orphan one"),
+        b.node(0, -1, (0, 30, 50, 20), cls="android.widget.TextView", text="orphan two")])
+    d = a11y.a11y_to_dict(b.response([root]))
+    assert [(e["key"], e["speak"]) for e in d["focus_order"]] == [
+        (None, "orphan one"), (None, "orphan two")]
+    assert d["summary"]["unresolved_nodes"] == 2
+    assert "reading_order_diagnostics" not in d

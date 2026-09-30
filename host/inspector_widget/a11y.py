@@ -233,7 +233,11 @@ def _is_compose_provider(node: Dict[str, Any]) -> bool:
 
 def assign_node_keys(roots: List[Dict[str, Any]]) -> None:
     """Set ``node_key`` on every node, upgrading virtual nodes of Compose hosts
-    from ``virtual:<h>:<v>`` to ``compose:<h>:<v>``."""
+    from ``virtual:<h>:<v>`` to ``compose:<h>:<v>``.
+
+    A node whose backing View the agent could not resolve (``host_view_id == 0``)
+    gets ``node_key`` None: it has no id another tool could look up.
+    """
     compose_hosts = set()
     for n in _iter_nodes(roots):
         if int(n.get("virtual_id", HOST_VIEW_ID)) == HOST_VIEW_ID and _is_compose_provider(n):
@@ -241,7 +245,7 @@ def assign_node_keys(roots: List[Dict[str, Any]]) -> None:
     for n in _iter_nodes(roots):
         h = int(n.get("host_view_id", 0))
         v = int(n.get("virtual_id", HOST_VIEW_ID))
-        n["node_key"] = _typed_key(h, v, compose=h in compose_hosts)
+        n["node_key"] = _typed_key(h, v, compose=h in compose_hosts) if h else None
 
 
 def _iter_nodes(roots: List[Dict[str, Any]]):
@@ -322,7 +326,8 @@ def a11y_node_to_dict(node: "pb.A11yNode", resolver: StringResolver) -> Dict[str
         "id": a11y_key(node.host_view_id, node.virtual_id),
         # Typed key; a11y_to_dict upgrades virtual:<h>:<v> to compose:<h>:<v>
         # once it knows which hosts are Compose providers.
-        "node_key": _typed_key(node.host_view_id, node.virtual_id, compose=False),
+        "node_key": (_typed_key(node.host_view_id, node.virtual_id, compose=False)
+                     if node.host_view_id else None),
         "bounds": _bounds_to_dict(node.bounds),
     }
 
@@ -450,6 +455,9 @@ def a11y_to_dict(response: "pb.DumpA11yResponse") -> Dict[str, Any]:
         "nodes": len(by_id),
         "focus_stops": len(ro["focus_order"]),
     }
+    unresolved = sum(1 for n in by_id.values() if not n.get("host_view_id"))
+    if unresolved:
+        out["summary"]["unresolved_nodes"] = unresolved  # host_view_id 0: no node_key
     if response.diagnostics:
         out["diagnostics"] = response.diagnostics
     if ro["diagnostics"]:
@@ -824,8 +832,8 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
     dupes: List[str] = []
     for node in preorder:
         k = _node_int_key(node)
-        if k is None:
-            continue
+        if k is None or node.get("host_view_id") == 0:
+            continue  # host 0 = the agent could not resolve the View: not addressable
         if k in by_key:
             dupes.append(_node_label_key(node))
             continue
@@ -1003,9 +1011,10 @@ def reading_order(roots: List[Dict[str, Any]], include_structural: bool = False)
         stop = focus.is_stop(node)
         if not stop and not include_structural:
             continue
-        entry: Dict[str, Any] = {"order": None,
-                                 "key": node.get("node_key") or _node_label_key(node),
-                                 "id": _node_int_key(node)}
+        key = node.get("node_key")
+        if key is None and "node_key" not in node:
+            key = _node_label_key(node)  # hand-built dicts without typed keys
+        entry: Dict[str, Any] = {"order": None, "key": key, "id": _node_int_key(node)}
         if stop:
             counter += 1
             entry["order"] = counter
