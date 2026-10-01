@@ -1446,9 +1446,14 @@ def _text_fields(n: UNode) -> list[str]:
 
 
 def _min_dp(n: UNode, dpi: float | None) -> float | None:
-    if not n.b or not dpi:
+    """min(w, h) in dp of what a finger hits: the a11y (touch) bounds when the
+    node has them (a Compose control's minimumInteractiveComponentSize area is
+    48dp around a 40dp visual), else its bounds; the lint's touch-target rule
+    measures the same, so find(max_dp=47) and lint agree."""
+    b = (n.facets.get("a11y") or {}).get("b") or n.b
+    if not b or not dpi:
         return None
-    return min(n.b[2], n.b[3]) / (dpi / 160.0)
+    return min(b[2], b[3]) / (dpi / 160.0)
 
 
 def _intersects(b: Sequence[float], r: Sequence[float]) -> bool:

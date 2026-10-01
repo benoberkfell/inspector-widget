@@ -620,7 +620,7 @@ atom     := "#"rid | "@"tag | Type | Type"\"label\"" | "\"label\""   (exact labe
 - `has` / `missing`: from `label role state stop slots props issues a11y compose view`.
 - `issue`: an id prefix or short code (`render.clipped`, `clipped`, `a11y.`, or a severity such as `error`).
 - `at` and `overlaps` replace the old bounds selector.
-- `min_dp` / `max_dp`: on min(w, h) in dp, using the capture's dpi.
+- `min_dp` / `max_dp`: on min(w, h) in dp, using the capture's dpi, of the node's touch (a11y) bounds when it has them, else its bounds: a Compose control's minimumInteractiveComponentSize area counts, as it does for a finger. The touch-target lint (R2) is stricter: it also flags a clickable whose own layout is under 48dp.
 - Domain: `in="ui"` covers view, compose and a11y nodes. `slots` or `all` add slot nodes; using `src` implies `all`.
 - Evaluation is a linear scan over the immutable index, with O(1) maps for rid, tag, type and label. Measured scale is ≤5k nodes, which takes <20 ms.
 - Each hit carries a breadcrumb of its 2 nearest meaningful ancestors (those with a rid, tag, label or collection).

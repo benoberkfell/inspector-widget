@@ -208,7 +208,8 @@ D_OUTLINE = ("Tree of a capture, one line per node. view: ui (Views + Compose + 
              "stops in order). Semantic detail collapses wrappers. " + GRAMMAR)
 D_FIND = ("Find nodes in a capture; filters are ANDed. text: substring of label/text/desc/"
           "state/hint; type/rid/tag/src: globs; flags: all of; issue: rule, code or severity; "
-          "within: a selector; at: [x,y]; min_dp/max_dp: min(w,h).")
+          "within: a selector; at: [x,y]; min_dp/max_dp: min(w,h) of the touch (a11y) "
+          "bounds.")
 D_NODE = ("Everything about one node (or refs, up to 10): ids, bounds, tap_xy, layout/clip, "
           "a11y, compose (slots with file:line), issues, props, parent. ref: n23, a key "
           "(view:12), a point x,y, or #rid, @tag, Type\"label\" joined by ' > ' (direct child).")

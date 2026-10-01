@@ -335,3 +335,22 @@ def test_template_keys_wildcard_row_labels_but_keep_the_nodes_own():
     # an item whose own (merged) label differs per row is one template
     assert _template('X/List#l/Row"Inbox 1"[0]') == _template('X/List#l/Row"Inbox 2"[1]')
     assert _template("DecorView/LinearLayout#content") is None
+
+
+def test_find_max_dp_measures_the_touch_area(tmp_path):
+    """Spec W8 / 5.6: find(flags=["click"], max_dp=47) finds small touch targets.
+    On S1 the Compose controls draw 24-40dp but have 48dp touch areas: measured
+    on the visual bounds, find listed 27 "small" nodes while lint reported one.
+    On the touch (a11y) bounds it lists none the lint does not flag (the lint is
+    stricter: R2 also flags a clickable whose own layout is under 48dp, n53)."""
+    with Replay("a11yprobe_s1_a", str(tmp_path)) as r:
+        cid = r.capture()["capture"]
+        small = run(r.ctx, "find", flags=["click"], max_dp=47, limit=200)
+        lint = run(r.ctx, "lint", rules=["a11y.touch_target.small"], group="node")
+        flagged = {ln.split()[0] for ln in lint.get("lines") or []}
+        found = {ln.split()[0] for ln in small.get("lines") or []}
+        assert flagged and found <= flagged, (flagged, found)
+        ix = r.index(cid)
+        visual_small = [n for n in ix.nodes.values() if "click" in n.flags and n.b
+                        and min(n.b[2], n.b[3]) / 3 <= 47]
+        assert len(visual_small) > 20  # what the visual bounds would have listed
