@@ -130,7 +130,9 @@ DERIVED_DIRS = ("derived", "img", "out")
 
 #: What the store keeps directly under its root (and what may be tightened to 0700).
 ROOT_ENTRIES = frozenset({"store.json", "store.lock", "gc.lock", "session.json", "lineages",
-                          "captures", ".staging", ".trash", "spill"})
+                          "captures", ".staging", ".trash", "spill",
+                          # TalkBack: stored walks, the settings snapshot to restore
+                          "walks", "talkback"})
 
 PINNED_MARKER = ".pinned"
 STRIPPED_MARKER = ".stripped"

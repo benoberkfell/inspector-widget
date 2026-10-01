@@ -294,6 +294,45 @@ def test_the_walk_overlay_covers_several_windows(tb_env):
     assert fakeagent.settings_changes(tb_env, original) == {}
 
 
+def test_the_walk_overlay_stays_on_the_walks_capture(tb):
+    pytest.importorskip("PIL")
+    res = ok("tb_walk", serial=SERIAL, until="edge", **FAST)
+    later = ok("capture")["capture"]
+    img = ok("image", overlay="walk", capture="latest")  # the schema default, sent explicitly
+    assert img["capture"] == res["capture"] != later
+    other = ok("image", overlay="walk", capture=later)  # an explicit capture is honoured
+    assert other["capture"] == later and other["steps"] == img["steps"]
+
+
+def test_a_walk_that_leaves_the_app_does_not_capture_the_launcher(tb):
+    """Pressing on TalkBack took the user out of the app: no capture of a
+    backgrounded (maybe frozen) app, and the walk still reports by ref."""
+    def leave(t, action):
+        if len(t.presses) == 3:
+            t.set_focus(None)
+            t.device.activity_stack.append("com.android.launcher3/.Launcher")
+            return True
+        return False
+
+    tb.talkback.on_press = leave
+    try:
+        res = ok("tb_walk", serial=SERIAL, **FAST)
+        assert res["ended"] == "left_app" and res["diff"]["left_app"].startswith("com.android")
+        assert res["lines"][1] == '1. n3 "Title"' and "recaptured" not in res
+    finally:
+        tb.activity_stack.pop()
+    tb.talkback.on_press = None
+    # a scenario whose action opens another app: no capture after it
+    tb.on_broadcast = lambda args: tb.activity_stack.append("com.android.launcher3/.Launcher")
+    try:
+        sc = ok("tb_scenario", kind="focus_after", target="n6", action="broadcast:-a home",
+                wait_ms=300, **FAST)
+        assert "after" not in sc and any("is in front" in n for n in sc["notes"])
+    finally:
+        tb.on_broadcast = None
+        tb.activity_stack.pop()
+
+
 # --------------------------------------------------------------------------- #
 # tb_scenario
 # --------------------------------------------------------------------------- #

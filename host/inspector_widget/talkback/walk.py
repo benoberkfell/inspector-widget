@@ -1067,7 +1067,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
     TalkBack has settled (``hook.start(snapshot)``; ``hook.resolve(start)`` may
     then turn a capture ref into a node key), after every move
     (``hook.step(step, snapshot)``: it recaptures when focus reached a node no
-    capture holds) and before TalkBack is restored (``hook.finish(snapshot)``).
+    capture holds) and before TalkBack is restored (``hook.finish(snapshot,
+    ended)``).
     """
     if direction not in DIRECTIONS:
         raise ValueError(f"direction must be one of {DIRECTIONS}")
@@ -1232,7 +1233,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             time.sleep(0.3)  # the last announcement lands ~100ms after its press
             tts = _attribute_tts(steps, drv.log)
         if hook is not None:
-            hook.finish(cur)  # still with TalkBack on: the screen it walked
+            hook.finish(cur, ended)  # still with TalkBack on: the screen it walked
     return _finish(drv, steps, model, ended=ended, cycle=cycle, edge_info=edge_info, start=start,
                    initial=initial, start_resp=start_resp, start_idx=start_idx,
                    direction=direction, until=until, expect=expect, tts=tts, t_start=t_start,

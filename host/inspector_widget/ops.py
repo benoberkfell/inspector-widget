@@ -1011,6 +1011,8 @@ def _walk_image(ctx: OpContext, walk: Any, window: Any, max_side: Any, max_bytes
     if unknown:
         raise _bad(f"unknown argument(s) for image: {', '.join(unknown)}")
     spec = _explicit(p.get("capture"))
+    if spec == "latest":
+        spec = None  # the schema default: the walk is drawn on its own capture
     lineage, shared = _query_lineage(ctx, p.get("serial"), p.get("package"),
                                      [spec] if spec else [])
     store = ctx.store
@@ -1555,6 +1557,16 @@ class _TbCaptures:
     def _take(self, at: int) -> LoadedCapture | None:
         if self._failed >= 2:
             return None
+        from .talkback import device as tbdevice
+        try:
+            top = tbdevice.top_package(self.lineage[0])
+        except Exception:  # noqa: BLE001 - unknown: try the capture
+            top = None
+        if top and top != self.lineage[1]:
+            # A backgrounded app may be frozen: its agent would only time out.
+            self.notes.append(f"no capture at step {at}: {top} is in front, not "
+                              f"{self.lineage[1]}")
+            return None
         try:
             lc, _moved = publish_capture(self.ctx, self.lineage, self.session, TB_CAPTURE,
                                          diagnostics=[f"taken with TalkBack on ({self.what})"])
@@ -1603,10 +1615,10 @@ class _TbCaptures:
         if pressed:  # keys moved focus to the target and may have scrolled
             self._take(1)
 
-    def finish(self, snap: Any) -> None:
+    def finish(self, snap: Any, ended: str | None = None) -> None:
         if self.what == "tb_scenario":
             self._take(2)
-        elif self._pending and self.recapture:
+        elif self._pending and self.recapture and ended not in ("left_app", "timeout"):
             self._take(self._last_i)
 
     def binding(self) -> walks.Binding:
