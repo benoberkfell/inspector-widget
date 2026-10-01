@@ -66,21 +66,27 @@ hint says what to narrow; `max_bytes` exists on `dump_tree`, `get_properties`,
 - **`a11y_lint(serial, package, include_contrast=true, scale=1.0,
   wcag_mode=false, rules=[...], include_rendering_info=true, group_by="rule")`**
   → brief (default): `{summary, by_rule:{"<rule>":{sev, n, msg, nodes:[first 3
-  node keys], more?}}, diagnostics (warn/error), density, font_scale,
-  generation, contrast_sampled, omitted}`. `group_by="none"` (or
+  node keys], more?}}, covered_by_rule?, diagnostics (warn/error), density,
+  font_scale, generation, contrast_sampled, omitted}`. `group_by="none"` (or
   `detail="full"`): `{summary, findings:[{rule, alias, severity, node_key, node,
-  bounds, bounds_dp, window, collection, message, evidence}], diagnostics,
-  stats, ...}`. The DETECT and VERIFY engine, run over the unified a11y tree
-  (Views + Compose). `window.covered_by` marks a finding under an open dialog.
+  bounds, bounds_dp, window, collection, message, evidence}], covered_findings?,
+  diagnostics, stats, ...}`. The DETECT and VERIFY engine, run over the unified
+  a11y tree (Views + Compose). `findings`, `by_rule` and the `summary` counts are
+  what TalkBack can reach now. Findings on a window under an open dialog
+  (`window.covered_by`) are kept apart: counted in `summary.covered {error, warn,
+  info, total, windows}`, grouped in `covered_by_rule` (the shape of `by_rule`)
+  when brief, listed in full in `covered_findings`.
   `rules` runs a subset (ids, `R1`..`R18` aliases or ATF names; unknown ids are a
   tool error); `wcag_mode` uses 44dp targets; `include_contrast=false` skips the
   pixel rule. See **rules.md**.
 - **`a11y_overlay(serial, package, scale=1.0, include_contrast=true,
   wcag_mode=false)`** → `{path, boxes, labels, flagged, flagged_by_bounds,
-  summary, ...}`. Screenshot with every a11y node boxed, each focus stop numbered
-  and labelled with what TalkBack says, colored by severity (red=error,
-  amber=warn, blue=info, green=clean; a finding that maps to no a11y node is a
-  dashed box at its own bounds). The SEE step.
+  finding_count, findings_covered, covered_windows, summary, ...}`. Screenshot
+  with every a11y node boxed, each focus stop numbered and labelled with what
+  TalkBack says, colored by severity (red=error, amber=warn, blue=info,
+  green=clean; a finding that maps to no a11y node is a dashed box at its own
+  bounds). A window under an open dialog is not boxed (its boxes would cover the
+  dialog); its findings are only counted (`findings_covered`). The SEE step.
 
 ### Per-element dossier / image
 - **`inspect_node(serial, package, node_key|view_id|semantics_id|bounds,
@@ -157,7 +163,9 @@ I/O after the capture). Refs (`n23`) carry across captures of one app.
   max_dp, window, ...)`** (filters ANDed; `max_dp` on the touch bounds;
   `flags=["truncated"]` lists nodes with cut children), **`node(ref|refs)`**,
   **`image(ref|overlay)`**, **`lint(rules, within, severity, contrast, ...)`**
-  (one bug repeated in list cells is one `×N in <list> cells` line),
+  (one bug repeated in list cells is one `×N in <list> cells` line; findings
+  under an open dialog are counted apart in `covered {n, windows, by}` and listed
+  with `within=<that window>`),
   **`diff(a="prev", b="latest")`** (issue deltas only on nodes both captures
   hold: `resolved`, `new`, plus `gone_with_node` / `on_new_nodes` counts), and
   **`captures(action=list|show|pin|unpin|label|drop|export|gc)`**.

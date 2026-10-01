@@ -1238,7 +1238,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "rules R1..R18: labels, touch targets, contrast (per window), roles, state, empty "
             "stops, headings, grouping, text size, duplicates, forms, links, traversal. by_rule: "
             "each rule's count, message and first node_keys (for inspect_node); group_by=none "
-            "lists every finding (node_key, bounds px/dp, window, message, evidence)."
+            "lists every finding (node_key, bounds px/dp, window, message, evidence). Those "
+            "under an open dialog are apart: covered_by_rule, covered_findings."
         ),
         "schema": {
             "type": "object",

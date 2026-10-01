@@ -233,12 +233,13 @@ def _listing(monkeypatch, toolset: str | None) -> dict:
 
 def test_the_default_listing_is_unchanged(monkeypatch):
     """Until the flip (S4) the server lists what it listed before the capture tools:
-    the 15 legacy and 3 TalkBack tools, byte for byte (18,337 B compact)."""
+    the 15 legacy and 3 TalkBack tools, byte for byte (18,410 B compact; 18,337 before
+    a11y_lint's description said where the findings under an open dialog go)."""
     listing = _listing(monkeypatch, None)
     names = [t["name"] for t in listing["tools"]]
     assert names == [n for n in mcp_server.TOOLS if n not in surface.CAPTURE_TOOLS]
     assert set(names) == set(surface.LEGACY_TOOLS) | set(surface.TALKBACK_TOOLS)
-    assert _size(listing) == 18_337
+    assert _size(listing) == 18_410
 
 
 @pytest.mark.parametrize("toolset,count,limit", [
