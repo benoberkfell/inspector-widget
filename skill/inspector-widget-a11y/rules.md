@@ -370,8 +370,10 @@ model and TalkBack disagreed.
 ### `tb.escape` — focus walks out of a dialog or sheet  (default, error)
 - **Static:** stops drawn under a same-window overlay (a `Box` + scrim "dialog",
   a `BottomSheetScaffold` sheet, a custom View overlay) stay reachable.
-- **Walk:** focus leaves the overlay for a node behind it, or reaches a window
-  under a modal one (`diff.escape`).
+- **Walk:** focus leaves the overlay for nodes behind it, or reaches a window
+  under a modal one (`diff.escape`): one finding per run of steps ("steps 3-11:
+  ... read 9 stops behind it"). What is behind the overlay comes from the walk's
+  capture, so the walk and the lint agree on it.
 - **Fix:** a real `Dialog` / `ModalBottomSheet` (its own window), or hide what it
   covers while it is open (Compose `hideFromAccessibility`, View
   `noHideDescendants`), and give the overlay a `paneTitle`.
@@ -385,7 +387,11 @@ model and TalkBack disagreed.
 ### `tb.wrong_announcement` — TalkBack says it wrong  (default)
 - **Static:** a merged row reads its texts in composition order, not screen
   order ("$5, Socks"); "N of M" counts an empty header item TalkBack never stops
-  on. `node(ref, facets="tb")` shows every part and the ref it came from.
+  on, on screen or scrolled off. `node(ref, facets="tb")` shows every part and
+  the ref it came from. A capture taken with TalkBack off has no RecyclerView
+  item info (RecyclerView adds it only while a service runs): the model adds the
+  positions a TalkBack user hears when the list is at its start or holds every
+  item, and says so in the capture's diagnostics when it cannot.
 - **Walk:** the same at the stops TalkBack visited (`diff.speech`).
 - **Fix:** compose the texts in reading order, or
   `clearAndSetSemantics { contentDescription = "Socks, $5" }`; keep empty
@@ -402,9 +408,12 @@ model and TalkBack disagreed.
 ### `tb.custom_action_missing` — a gesture-only action  (opt-in)
 - **Static:** a swipe-to-dismiss / drag composable (from the slot table: needs
   `capture(slots="enable")`, which resets `remember{}` state) with no labelled
-  custom action.
+  custom action on the stop TalkBack focuses. An action on a container TalkBack
+  never focuses (customActions on the `SwipeToDismissBox` around a row whose
+  stop is its Text) is just as unreachable: the finding names that container.
 - **Fix:** `Modifier.semantics { customActions = listOf(CustomAccessibilityAction(
-  "Delete") { ... }) }`; View `ViewCompat.addAccessibilityAction`.
+  "Delete") { ... }) }` on the node TalkBack stops on (merge the row:
+  `semantics(mergeDescendants = true)`); View `ViewCompat.addAccessibilityAction`.
 
 ### Walk-only codes
 - **`tb.loop`** (error) — focus cycles without reaching an edge (`ended: "loop"`,

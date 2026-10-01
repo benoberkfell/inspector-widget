@@ -477,8 +477,16 @@ TalkBack).
 - Each line is one press: `i. ref "what TalkBack says" via=... !finding`.
   `via=autoscroll(n10)` (TalkBack scrolled n10 to get there), `via=window` (it
   moved to another window), `via=wrap` (past the edge, back at the top),
-  `via=stolen` (the app moved focus between presses). `— edge` is a press that
+  `via=stolen` (the app moved focus between presses), `via=screen` (the screen
+  was replaced under the walk: another activity or window took its place; the
+  model is compared with the steps before it only). `— edge` is a press that
   moved nothing; `?view:123 Button` is a node no capture holds.
+- RecyclerView items bound before TalkBack started carry no "N of M": a walk that
+  turns TalkBack on over a list already on screen hears no positions, while a
+  user who had TalkBack on before the app does (the walk's `notes` say so, and
+  the capture's model speaks what the user hears). To walk what they hear:
+  `talkback(action="on")`, restart the app, `tb_walk`, then
+  `talkback(action="restore")`.
 - `ended`: `wrap` (one full lap), `edge`, `loop` (a cycle that never reaches an
   edge), `stuck` (two presses that move nothing), `lost` (no node holds focus),
   `left_app`, `max_steps`.
