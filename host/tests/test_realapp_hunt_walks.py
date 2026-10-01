@@ -247,3 +247,50 @@ def test_nia1_auto_scroll_along_the_bottom_row_names_the_topics_it_passes_over()
     assert len(sk) == 1 and "Performance" not in sk[0]["msg"]
     # backward from Done: no auto-scroll at the start of the grid, nothing to say
     assert _codes(H.record("wox59ex"), "tb.autoscroll_row_skip") == []
+
+
+# ---------------------------------------------------------------- L1: recycled rows
+def _row_tree(title, key=5):
+    """A list (scrollable) > a row (the item) > its only text: V6 BAD_B's row title."""
+    from inspector_widget.talkback import walk
+
+    def node(k, cls, label="", text="", flags=("visible_to_user",), b=(0, 0, 1080, 2000)):
+        n = walk.Node()
+        n.key, n.window, n.host, n.virtual, n.cls = k, 1, int(k.split(":")[1]), -1, cls
+        n.label, n.text, n.cd, n.bounds, n.flags = label, text, "", b, set(flags)
+        n.actions, n.drawing_order, n.pane_title = set(), 0, ""
+        return n
+
+    lst = node("view:2", "androidx.recyclerview.widget.RecyclerView",
+               flags=("visible_to_user", "scrollable"))
+    row = node("view:3", "android.widget.LinearLayout", b=(0, 300, 1080, 150))
+    t = node(f"view:{key}", "android.widget.TextView", title, title, b=(40, 320, 600, 80))
+    for p, c in ((lst, row), (row, t)):
+        c.parent = p
+        p.children.append(c)
+    return t
+
+
+def test_l1_a_recycled_rows_only_text_showing_another_mail_is_another_stop():
+    from types import SimpleNamespace
+
+    from inspector_widget.talkback import walk
+
+    old, new = _row_tree("Mail 3"), _row_tree("Mail 31")
+    assert (old.ctx, old.item_root) == ("", False)  # in a list item, no other text
+    model = walk.Model()
+    model.stops = [walk.PStop(old.key, old.label, old.label, old.bounds, 1, "TextView",
+                              old.ctx, old.item_root)]
+    assert model.match(new.key, new.sig, new.bounds, ctx=new.ctx, item_root=False) is None
+    assert model.match(old.key, old.sig, old.bounds, ctx=old.ctx).key == "view:5"
+    snap = SimpleNamespace(focus=new, key=new.key, index=SimpleNamespace(nodes={}))
+    assert walk._seen_again(walk.Step(3, old.key, node=old), snap) is False  # no false wrap
+    snap = SimpleNamespace(focus=old, key=old.key, index=SimpleNamespace(nodes={}))
+    assert walk._seen_again(walk.Step(3, old.key, node=old), snap) is True
+    # outside any list a label that changes in place is the same node ("Play" -> "Pause")
+    a, b = _row_tree("Play"), _row_tree("Pause")
+    for n in (a, b):
+        n.parent.parent.flags.discard("scrollable")
+    assert a.ctx is None
+    model.stops = [walk.PStop(a.key, a.label, a.label, a.bounds, 1, "TextView", a.ctx)]
+    assert model.match(b.key, b.sig, b.bounds, ctx=b.ctx).key == "view:5"

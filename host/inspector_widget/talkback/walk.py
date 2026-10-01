@@ -227,6 +227,12 @@ def _ctx_ok(a: Optional[str], b: Optional[str]) -> bool:
     return a is None or b is None or a == b
 
 
+def _alone(a: Optional[str], b: Optional[str]) -> bool:
+    """Both nodes sit in a list item that has no text but theirs (``ctx`` ""): their own
+    text is all that says which item they show."""
+    return a == "" and b == ""
+
+
 def same_node(key_a: Optional[str], sig_a: str, box_a: Rect,
               key_b: Optional[str], sig_b: str, box_b: Rect, min_iou: float = 0.8,
               ctx_a: Optional[str] = None, ctx_b: Optional[str] = None) -> bool:
@@ -923,9 +929,12 @@ class Model:
                     continue
                 if not (iou(s.bounds, box) >= 0.5 or _unlabelled(sig) or _unlabelled(s.sig)):
                     continue
-                if (item_root or s.item_root) and key.startswith("view:") and s.sig != sig \
-                        and not _unlabelled(sig) and not _unlabelled(s.sig):
-                    continue  # a recycled item View showing another item
+                if (item_root or s.item_root or _alone(ctx, s.ctx)) and key.startswith("view:") \
+                        and s.sig != sig and not _unlabelled(sig) and not _unlabelled(s.sig):
+                    # a recycled item View showing another item; or a View inside a list item
+                    # whose only text is its own (the item has nothing else to tell them apart
+                    # by: V6 BAD_B's row title), showing another item's text in its old slot
+                    continue
                 return s
             if same:
                 return None
@@ -1392,6 +1401,13 @@ def _seen_again(s: "Step", new: Snapshot) -> bool:
     if s.node is None or f is None:
         return False
     if s.key is not None and s.key == new.key:
+        # a View a list rebound to another item (another label in a list item, or another
+        # item around it) is another stop: no false wrap on a recycled row (L1, V6 BAD_B)
+        if s.key.startswith("view:") and f.ctx is not None and s.node.ctx is not None \
+                and not _unlabelled(f.sig) and not _unlabelled(s.node.sig) \
+                and (not _ctx_ok(s.node.ctx, f.ctx) or (s.node.sig != f.sig and (
+                    f.item_root or s.node.item_root or _alone(s.node.ctx, f.ctx)))):
+            return False
         return True
     if s.key is not None and s.key in new.index.nodes:
         return False
