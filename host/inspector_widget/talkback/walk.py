@@ -1042,7 +1042,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
              expect: Optional[Sequence[str]] = None, step_timeout_ms: int = STEP_TIMEOUT_MS,
              settle_ms: int = SETTLE_MS, recapture: str = "on_unknown", utterance: str = "auto",
              injector: str = "auto", leave_on: bool = False, max_lines: int = 60,
-             max_bytes: int = 5000, timeout_s: float = 300.0, save: bool = True) -> Dict[str, Any]:
+             max_bytes: int = 5000, timeout_s: float = 300.0, save: bool = True,
+             hook: Optional[Any] = None, full: bool = False) -> Dict[str, Any]:
     """Walk TalkBack through the app on ``session`` and return the compact result.
 
     ``start``: ``current`` (where focus is now), ``first`` (TalkBack's "first"
@@ -1060,7 +1061,13 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
 
     The full record (every step, the predicted order, findings) is saved under
     ``<store>/walks/<walk id>.json``; the returned dict is at most ``max_bytes``
-    of JSON with one line per step.
+    of JSON with one line per step (``full``: the record itself).
+
+    ``hook`` (the capture surface's, :mod:`inspector_widget.ops`) is told when
+    TalkBack has settled (``hook.start(snapshot)``; ``hook.resolve(start)`` may
+    then turn a capture ref into a node key), after every move
+    (``hook.step(step, snapshot)``: it recaptures when focus reached a node no
+    capture holds) and before TalkBack is restored (``hook.finish(snapshot)``).
     """
     if direction not in DIRECTIONS:
         raise ValueError(f"direction must be one of {DIRECTIONS}")
@@ -1094,6 +1101,9 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
         if cur.focus is None and not drv.foreground_ok():
             raise WalkError("app_left_foreground", f"{drv.package} is not in the foreground",
                             hint=f"Open {drv.package} on the device, then retry.")
+        if hook is not None:
+            hook.start(cur)
+            start = hook.resolve(start)
         cur = _seek_start(drv, cur, start, direction, max_steps)
         steps.append(Step(0, cur.key, via="start", node=cur.focus, t=cur.t, index=cur.index))
         prev_idx = cur.index
@@ -1188,6 +1198,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                       index=new.index,
                       scrolled=scrolled, extra={"wall_ms": _ms(time.monotonic() - t_sent)})
             steps.append(st)
+            if hook is not None:
+                hook.step(st, new)
             if recapture == "on_unknown" and (
                     new.key not in model.keys() if new.focus is None
                     else model.match(new.key, new.focus.sig, new.focus.bounds) is None):
@@ -1219,10 +1231,12 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
         if drv.log is not None and drv.log.verbose:
             time.sleep(0.3)  # the last announcement lands ~100ms after its press
             tts = _attribute_tts(steps, drv.log)
+        if hook is not None:
+            hook.finish(cur)  # still with TalkBack on: the screen it walked
     return _finish(drv, steps, model, ended=ended, cycle=cycle, edge_info=edge_info, start=start,
                    initial=initial, start_resp=start_resp, start_idx=start_idx,
                    direction=direction, until=until, expect=expect, tts=tts, t_start=t_start,
-                   max_lines=max_lines, max_bytes=max_bytes, save=save)
+                   max_lines=max_lines, max_bytes=max_bytes, save=save, full=full)
 
 
 def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_presses: int) -> Snapshot:
@@ -1502,7 +1516,7 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
             start_idx: Optional[DumpIndex] = None,
             edge_info: Optional[Dict[str, Any]], start: str, direction: str, until: str,
             expect: Optional[Sequence[str]], tts: Dict[int, str], t_start: float,
-            max_lines: int, max_bytes: int, save: bool) -> Dict[str, Any]:
+            max_lines: int, max_bytes: int, save: bool, full: bool = False) -> Dict[str, Any]:
     legacy = bool(getattr(drv.reader, "legacy", False))
     refs: Dict[str, str] = {}
 
@@ -1579,6 +1593,8 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
             walk["saved"] = path
         except OSError as exc:
             walk["notes"].append(f"could not save the walk: {exc}")
+    if full:
+        return walk
     return compact(walk, max_lines=max_lines, max_bytes=max_bytes)
 
 

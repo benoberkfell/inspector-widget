@@ -177,8 +177,15 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
                  action: str = "activate", mutate: Optional[str] = None, wait_ms: int = 2000,
                  injector: str = "auto", leave_on: bool = False,
                  step_timeout_ms: int = STEP_TIMEOUT_MS, settle_ms: int = SETTLE_MS,
-                 save: bool = True) -> Dict[str, Any]:
-    """Run one scenario (see the module docstring) and return a compact verdict."""
+                 save: bool = True, hook: Optional[Any] = None) -> Dict[str, Any]:
+    """Run one scenario (see the module docstring) and return a compact verdict.
+
+    ``hook`` (the capture surface's) is told when TalkBack has settled
+    (``hook.start(snapshot)``, then ``hook.resolve(target)`` and
+    ``hook.resolve_action`` for ``tap:<ref>``), when the target
+    has focus (``hook.ready(snapshot, pressed)``: ``pressed`` says keys moved
+    focus there, which may have scrolled) and when the scenario is over, with
+    TalkBack still on (``hook.finish(snapshot)``)."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     if kind == "survive" and not mutate:
@@ -193,8 +200,14 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
         # later; let it, or it lands after (and over) the target we focus.
         cur = drv.settle_initial()
         legacy = bool(cur.index.legacy)
+        if hook is not None:
+            hook.start(cur)
+            target = hook.resolve(target) if target else target
+            action, mutate = hook.resolve_action(action), hook.resolve_action(mutate)
         if target:
             cur = _seek_start(drv, cur, target, "next", 60)
+        if hook is not None:
+            hook.ready(cur, drv.seek_presses > 0)
         out["target"] = _desc(cur.focus, legacy)
         if kind == "focus_after":
             out.update(_focus_after(drv, cur, action, wait_s, legacy))
@@ -202,6 +215,8 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
             out.update(_restore(drv, cur, wait_s, legacy))
         else:
             out.update(_survive(drv, cur, mutate or "", wait_s, legacy))
+        if hook is not None:
+            hook.finish(None)  # still with TalkBack on: the screen the scenario left
     out["talkback"] = f"{drv.enabled.get('version', '?')} {drv.inj.describe() if drv.inj else '?'}"
     out["restore"] = ("FAILED: " + drv.restore_error + " (run talkback restore)") if drv.restore_error \
         else "restored" if drv.restored is not None \
