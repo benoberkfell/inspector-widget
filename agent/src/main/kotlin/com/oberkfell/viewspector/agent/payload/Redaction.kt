@@ -10,8 +10,18 @@
  * (TreeBuilder, Properties), the a11y text (AccessibilityInspector), the recorded
  * accessibility events (A11yEventTap), and the Compose semantics and slot table
  * (ComposeInspector, through [Secrets] for the values a password field's text reaches).
- * A Compose text field is a password field by ComposeInspector.isPasswordNode, which the
+ * A Compose text field is a password field by ComposeInspector.passwordState, which the
  * semantics dump, the a11y text and the event tap all ask, so the three agree.
+ *
+ * FAIL CLOSED: every check answers a [PasswordState], not a yes/no. UNKNOWN is a source whose
+ * status could not be determined: its View or node could not be resolved, a reflective read
+ * threw, or a Compose text field holds no keyboard options the check recognises (R8 renamed
+ * the Compose classes, or a Compose release moved them). The text of an UNKNOWN source is
+ * masked when the source is editable ([mustMask]): an editable field may be a visible-password
+ * one, while a label or a button never holds a password and is what an agent needs to read.
+ * Each such value is listed in the response's diagnostics ([Unverified]): redaction_masked
+ * names it, and redaction_unverified names the AndroidComposeViews whose password fields
+ * cannot be identified at all.
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -20,6 +30,7 @@ import android.text.InputType
 import android.text.method.PasswordTransformationMethod
 import android.util.Log
 import android.view.View
+import android.widget.EditText
 import android.widget.TextView
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
@@ -30,6 +41,35 @@ object Redaction {
 
     /** PasswordTransformationMethod's dot. */
     const val MASK_CHAR = '•'
+
+    /** Whether a text's source is a password field; UNKNOWN when that could not be determined. */
+    enum class PasswordState {
+        PASSWORD,
+        NOT_PASSWORD,
+        UNKNOWN,
+        ;
+
+        /** This and [other] together: any PASSWORD wins, then any UNKNOWN. */
+        fun and(other: PasswordState): PasswordState = when {
+            this == PASSWORD || other == PASSWORD -> PASSWORD
+            this == UNKNOWN || other == UNKNOWN -> UNKNOWN
+            else -> NOT_PASSWORD
+        }
+    }
+
+    /**
+     * Whether the text of a source in [state] goes out masked: a password field's always, and
+     * one whose status is UNKNOWN when the source is [editable] (fail closed).
+     */
+    fun mustMask(state: PasswordState, editable: Boolean): Boolean =
+        state == PasswordState.PASSWORD || (state == PasswordState.UNKNOWN && editable)
+
+    /**
+     * An accessibility class name of an editable text field: android.widget.EditText (what a
+     * Compose text field reports too) or a subclass named like it.
+     */
+    fun isEditableClassName(name: CharSequence?): Boolean =
+        name != null && name.endsWith("EditText")
 
     /** One [MASK_CHAR] per UTF-16 unit of [text], as PasswordTransformationMethod draws it. */
     fun mask(text: CharSequence): String {
@@ -57,18 +97,21 @@ object Redaction {
      * Whether [view] holds a password: a TextView whose input type is a password variation
      * (this stays true while a "show password" toggle has the text visible) or whose
      * transformation method masks it, or any View whose autofill hints name a password.
-     * Any failure counts as "not a password" only when nothing points at one.
+     * UNKNOWN when nothing points at one but a check threw.
      */
-    fun isPasswordView(view: View): Boolean {
+    fun passwordStateOf(view: View): PasswordState {
+        var failed = false
         if (view is TextView) {
             try {
-                if (isPasswordInputType(view.inputType)) return true
+                if (isPasswordInputType(view.inputType)) return PasswordState.PASSWORD
             } catch (t: Throwable) {
+                failed = true
                 Log.w(TAG, "TextView.getInputType() failed", t)
             }
             try {
-                if (view.transformationMethod is PasswordTransformationMethod) return true
+                if (view.transformationMethod is PasswordTransformationMethod) return PasswordState.PASSWORD
             } catch (t: Throwable) {
+                failed = true
                 Log.w(TAG, "TextView.getTransformationMethod() failed", t)
             }
         }
@@ -76,13 +119,31 @@ object Redaction {
             try {
                 // View.AUTOFILL_HINT_PASSWORD is "password"; androidx adds "newPassword".
                 view.autofillHints?.forEach { hint ->
-                    if (hint != null && hint.contains("password", ignoreCase = true)) return true
+                    if (hint != null && hint.contains("password", ignoreCase = true)) return PasswordState.PASSWORD
                 }
             } catch (t: Throwable) {
+                failed = true
                 Log.w(TAG, "View.getAutofillHints() failed", t)
             }
         }
-        return false
+        return if (failed) PasswordState.UNKNOWN else PasswordState.NOT_PASSWORD
+    }
+
+    /** Whether [view] takes text input: an EditText, or a TextView that is a text editor. */
+    fun isEditableView(view: View): Boolean {
+        if (view is EditText) return true
+        if (view !is TextView) return false
+        return try {
+            view.onCheckIsTextEditor()
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    /** Whether [view]'s own text goes out masked ([passwordStateOf], [mustMask]). */
+    fun mustMaskView(view: View): Boolean {
+        val state = passwordStateOf(view)
+        return state != PasswordState.NOT_PASSWORD && mustMask(state, isEditableView(view))
     }
 
     private const val PASSWORD_VISUAL_TRANSFORMATION =
@@ -94,57 +155,79 @@ object Redaction {
     private const val KEYBOARD_TYPE_NUMBER_PASSWORD = 8
 
     /**
-     * Whether a Compose value marks its field as a password field: a
+     * What a Compose value says about its text field: PASSWORD for a
      * PasswordVisualTransformation, or KeyboardOptions (the composable's parameter) or
-     * ImeOptions (what the text field hands its modifiers) with a password keyboard. Matched
-     * by class name (the slot table is only readable when Compose is not renamed anyway).
-     * Never throws; anything unreadable is "no".
+     * ImeOptions (what the text field hands its modifiers) with a password keyboard;
+     * NOT_PASSWORD for KeyboardOptions / ImeOptions with another keyboard; UNKNOWN for
+     * KeyboardOptions / ImeOptions whose keyboard type cannot be read; null for any other
+     * value. Matched by class name, so R8-renamed classes are "any other value". Never throws.
      */
-    fun isComposePasswordParam(v: Any?): Boolean {
-        if (v == null) return false
-        return try {
-            val cls = v.javaClass
-            when (cls.name) {
-                PASSWORD_VISUAL_TRANSFORMATION -> true
-                "androidx.compose.foundation.text.KeyboardOptions",
-                "androidx.compose.ui.text.input.ImeOptions",
-                -> {
-                    val getter = cls.methods.firstOrNull {
-                        it.name.startsWith("getKeyboardType") && it.parameterTypes.isEmpty() &&
-                            it.returnType == Int::class.javaPrimitiveType
-                    } ?: return false
-                    val type = getter.invoke(v) as? Int
-                    type == KEYBOARD_TYPE_PASSWORD || type == KEYBOARD_TYPE_NUMBER_PASSWORD
-                }
-                else -> false
-            }
+    fun composeFieldParam(v: Any?): PasswordState? {
+        if (v == null) return null
+        val name = try {
+            v.javaClass.name
         } catch (_: Throwable) {
-            false
+            return null
+        }
+        return when (name) {
+            PASSWORD_VISUAL_TRANSFORMATION -> PasswordState.PASSWORD
+            "androidx.compose.foundation.text.KeyboardOptions",
+            "androidx.compose.ui.text.input.ImeOptions",
+            -> try {
+                val getter = v.javaClass.methods.firstOrNull {
+                    it.name.startsWith("getKeyboardType") && it.parameterTypes.isEmpty() &&
+                        it.returnType == Int::class.javaPrimitiveType
+                }
+                when (getter?.invoke(v) as? Int) {
+                    null -> PasswordState.UNKNOWN
+                    KEYBOARD_TYPE_PASSWORD, KEYBOARD_TYPE_NUMBER_PASSWORD -> PasswordState.PASSWORD
+                    else -> PasswordState.NOT_PASSWORD
+                }
+            } catch (_: Throwable) {
+                PasswordState.UNKNOWN
+            }
+            else -> null
         }
     }
 
-    // Fields read from one object by [isComposePasswordModifier] (a text field element has ~12).
+    /**
+     * Whether a Compose value marks its field as a password field ([composeFieldParam]). The
+     * slot table's test: a call whose keyboard cannot be read is not taken for one there.
+     */
+    fun isComposePasswordParam(v: Any?): Boolean = composeFieldParam(v) == PasswordState.PASSWORD
+
+    // Fields read from one object by [composePasswordModifier] (a text field element has ~12).
     private const val MAX_SCANNED_FIELDS = 32
 
     private val scannedFields = HashMap<Class<*>, List<Field>>()
 
     /**
-     * Whether a Compose modifier element holds a password-field value ([isComposePasswordParam])
-     * in one of its fields, or in a field of a function it holds. This is how a text field
+     * What a Compose modifier element says about its text field ([composeFieldParam]), from
+     * its fields and the fields of a function it holds: PASSWORD when any value is a
+     * password-field one, else UNKNOWN when any is unreadable, else NOT_PASSWORD when it holds
+     * KeyboardOptions / ImeOptions, else null (it says nothing). This is how a text field
      * without Password semantics still shows it is one: a visible-password field
      * (KeyboardOptions(keyboardType = Password), no visual transformation) passes its
      * ImeOptions to its semantics modifier, as a field (CoreTextFieldSemanticsModifier,
      * foundation 1.8+) or captured by the semantics lambda (AppendedSemanticsElement.properties,
      * 1.7), and BasicTextField(TextFieldState) keeps its KeyboardOptions on
-     * TextFieldDecoratorModifier. Only fields are read: no app code runs. Never throws.
+     * TextFieldDecoratorModifier. Only fields are read: no app code runs. Never throws; a
+     * failure is UNKNOWN.
      */
-    fun isComposePasswordModifier(element: Any): Boolean = try {
-        fieldValues(element).any { v ->
-            isComposePasswordParam(v) ||
-                (v != null && SafeString.isFunction(v.javaClass) && fieldValues(v).any { isComposePasswordParam(it) })
+    fun composePasswordModifier(element: Any): PasswordState? = try {
+        var seen: PasswordState? = null
+        fun see(v: Any?): Boolean {
+            val st = composeFieldParam(v) ?: return false
+            seen = seen?.and(st) ?: st
+            return st == PasswordState.PASSWORD
         }
+        for (v in fieldValues(element)) {
+            if (see(v)) break
+            if (v != null && SafeString.isFunction(v.javaClass) && fieldValues(v).any { see(it) }) break
+        }
+        seen
     } catch (_: Throwable) {
-        false
+        PasswordState.UNKNOWN
     }
 
     /** The values of [obj]'s reference instance fields, its non-framework superclasses' included. */
@@ -181,7 +264,7 @@ object Redaction {
     /**
      * Whether a Compose ContentType semantics value names a password: its autofill hints
      * (AndroidContentType.getAndroidAutofillHints) include "password" or "newPassword", the
-     * hints [isPasswordView] looks for on a View. Compose foundation 1.10+ sets ContentType.Password
+     * hints [passwordStateOf] looks for on a View. Compose foundation 1.10+ sets ContentType.Password
      * on a field with a password keyboard; an app may set it on any node. Never throws.
      */
     fun isPasswordContentType(v: Any?): Boolean {
@@ -233,6 +316,52 @@ object Redaction {
     }
 
     /**
+     * What one response masked for want of a password status, for its diagnostics: the
+     * values masked because their source is editable and its status UNKNOWN ([mustMask]),
+     * each named by a node key (view:<id>, compose:<acvId>:<id>, virtual:<hostId>:<id>) or an
+     * event (event:<seq>), and the AndroidComposeViews whose password fields cannot be
+     * identified at all (R8 renamed Compose, or the semantics tree is out of reach). One thread
+     * at a time.
+     */
+    class Unverified {
+        private val masked = LinkedHashSet<String>()
+        private val composeViews = LinkedHashSet<Long>()
+
+        /** Note a value masked for want of a password status; [what] names its source. */
+        fun masked(what: String) {
+            masked.add(what)
+        }
+
+        /** Note an AndroidComposeView whose password fields cannot be identified. */
+        fun composeView(acvId: Long) {
+            composeViews.add(acvId)
+        }
+
+        /**
+         * The diagnostics tokens, each preceded by "; " (the first [MAX_LISTED] values named):
+         *   redaction_unverified: view#<acvId>[,view#<acvId>...] (...)
+         *   redaction_masked: N editable value(s) ...: <what>, <what> [(+M more)]
+         */
+        fun appendTo(diag: StringBuilder) {
+            if (composeViews.isNotEmpty()) {
+                diag.append("; redaction_unverified: view#").append(composeViews.joinToString(",view#"))
+                    .append(" (Compose classes are renamed or unreadable: password fields cannot be ")
+                    .append("identified, so editable text there is masked)")
+            }
+            if (masked.isNotEmpty()) {
+                diag.append("; redaction_masked: ").append(masked.size)
+                    .append(" editable value(s) masked because their password status could not be ")
+                    .append("determined: ").append(masked.take(MAX_LISTED).joinToString(", "))
+                if (masked.size > MAX_LISTED) diag.append(" (+").append(masked.size - MAX_LISTED).append(" more)")
+            }
+        }
+
+        private companion object {
+            const val MAX_LISTED = 16
+        }
+    }
+
+    /**
      * Secret texts (a password field's content) and the masking of any string that is one or
      * embeds one. A secret shorter than [MIN_EMBEDDED] chars masks only a string equal to it:
      * masking every "a" inside every other string would garble the dump, not protect it.
@@ -278,7 +407,7 @@ object Redaction {
     /**
      * Mask the field content in a Compose semantics config ([attrs] = name -> stringified
      * value, as ComposeInspector reads it) when the node is a [password] field (by default:
-     * it carries the Password key; ComposeInspector.isPasswordNode also knows a
+     * it carries the Password key; ComposeInspector.passwordState also knows a
      * visible-password field). The plaintext is added to [secrets] first (InputText is the raw
      * content; EditableText the transformed text, dots unless the field shows its password),
      * so the slot table can mask it wherever a composable takes it as a parameter. Returns

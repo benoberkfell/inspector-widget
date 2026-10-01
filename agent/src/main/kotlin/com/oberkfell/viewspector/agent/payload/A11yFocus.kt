@@ -20,6 +20,8 @@
  *   off, or focus is in the IME / SystemUI).
  *   Input focus (optional): the focused window's findFocus() View, or the virtual node its
  *   provider reports for FOCUS_INPUT, as the controller does.
+ *   A node's text is masked as in a dump (Redaction.kt, fail closed); what was masked for want
+ *   of a password status is listed in the diagnostics (redaction_masked, redaction_unverified).
  *
  * LONG-POLL ([await], SERVER thread, never the main thread): wait for an event-tap
  * TYPE_VIEW_ACCESSIBILITY_FOCUSED newer than after_seq, then for quiet_ms without any event,
@@ -103,7 +105,11 @@ object A11yFocus {
 
     // ------------------------------------------------------------ results
 
-    /** What one read produced. [seq] is the event-tap seq at the moment of the read. */
+    /**
+     * What one read produced. [seq] is the event-tap seq at the moment of the read.
+     * [redaction] holds what the read masked for want of a password status; the caller adds
+     * the events it returns and appends the tokens to [diagnostics].
+     */
     class Read(
         val a11y: ViewInspection.A11yFocus?,
         val input: ViewInspection.A11yFocus?,
@@ -113,6 +119,7 @@ object A11yFocus {
         val touchExploration: Boolean,
         val servicesEnabled: Boolean,
         val diagnostics: String,
+        val redaction: Redaction.Unverified,
     )
 
     /** How a long-poll ended. */
@@ -211,16 +218,17 @@ object A11yFocus {
             diag.append("; event-tap replaced ${A11yEventTap.foreignUnwrapped} earlier payload tap(s)")
         }
         val depth = subtreeDepth.coerceIn(0, MAX_SUBTREE_DEPTH)
+        val redaction = Redaction.Unverified()
         // Lift the taps while mapping, so a focused root reports its own importance.
         val (a11y, input) = A11yEventTap.withoutTap {
-            val a = readA11y(roots, strings, depth, diag)
-            val i = if (includeInput) readInput(roots, strings, depth, diag) else null
+            val a = readA11y(roots, strings, depth, diag, redaction)
+            val i = if (includeInput) readInput(roots, strings, depth, diag, redaction) else null
             a to i
         }
         val seq = A11yEventTap.seq()
         val (touch, services) = a11yState(roots)
         val readUs = ((System.nanoTime() - t0) / 1000L).toInt()
-        return Read(a11y, input, seq, readUs, SystemClock.uptimeMillis(), touch, services, diag.toString())
+        return Read(a11y, input, seq, readUs, SystemClock.uptimeMillis(), touch, services, diag.toString(), redaction)
     }
 
     private fun readA11y(
@@ -228,10 +236,11 @@ object A11yFocus {
         strings: StringTable,
         depth: Int,
         diag: StringBuilder,
+        redaction: Redaction.Unverified,
     ): ViewInspection.A11yFocus? {
         if (!viewRootReachable) {
             diag.append("; ViewRootImpl focus members unreachable: find-focus fallback")
-            return findFocusFallback(roots, strings, depth, diag)
+            return findFocusFallback(roots, strings, depth, diag, redaction)
         }
         var found: ViewInspection.A11yFocus? = null
         var others = 0
@@ -243,7 +252,7 @@ object A11yFocus {
                 others++
                 continue
             }
-            found = focusOf(roots, root, z, host, vnode, strings, depth, "view-root", diag)
+            found = focusOf(roots, root, z, host, vnode, strings, depth, "view-root", diag, redaction)
         }
         if (others > 0) diag.append("; focus-recorded-in-lower-windows=$others")
         if (found == null) diag.append("; no accessibility focus in the app's windows")
@@ -278,6 +287,7 @@ object A11yFocus {
         depth: Int,
         source: String,
         diag: StringBuilder,
+        redaction: Redaction.Unverified,
     ): ViewInspection.A11yFocus {
         val provider = try {
             host.accessibilityNodeProvider
@@ -315,7 +325,7 @@ object A11yFocus {
             stale = true
             diag.append("; focused View is detached or not shown (stale)")
         }
-        return focusProto(roots, root, z, host, virtualId, node, stale, source, strings, depth)
+        return focusProto(roots, root, z, host, virtualId, node, stale, source, strings, depth, redaction)
     }
 
     private fun focusProto(
@@ -329,6 +339,7 @@ object A11yFocus {
         source: String,
         strings: StringTable,
         depth: Int,
+        redaction: Redaction.Unverified,
     ): ViewInspection.A11yFocus {
         val b = ViewInspection.A11yFocus.newBuilder()
             .setRootViewId(ViewReflect.uniqueDrawingId(root))
@@ -340,7 +351,7 @@ object A11yFocus {
         view?.let { b.hostClass = strings.intern(it.javaClass.name) }
         if (node != null) {
             val mapped = AccessibilityInspector.snapshot(
-                roots, root, view, virtualId, node, strings, depth, MAX_SUBTREE_NODES,
+                roots, root, view, virtualId, node, strings, depth, MAX_SUBTREE_NODES, redaction,
             )
             b.node = mapped
             b.bounds = mapped.bounds
@@ -354,6 +365,7 @@ object A11yFocus {
         strings: StringTable,
         depth: Int,
         diag: StringBuilder,
+        redaction: Redaction.Unverified,
     ): ViewInspection.A11yFocus? {
         if (Build.VERSION.SDK_INT < 34) {
             diag.append("; find-focus needs API 34")
@@ -385,7 +397,7 @@ object A11yFocus {
                     }
                 }
                 return focusProto(roots, root, z, view, vid, local ?: focused, local == null && view != null,
-                    "find-focus", strings, depth)
+                    "find-focus", strings, depth, redaction)
             } catch (t: Throwable) {
                 diag.append("; root#${ViewReflect.uniqueDrawingId(root)} find-focus failed (${t.javaClass.simpleName})")
             } finally {
@@ -409,6 +421,7 @@ object A11yFocus {
         strings: StringTable,
         depth: Int,
         diag: StringBuilder,
+        redaction: Redaction.Unverified,
     ): ViewInspection.A11yFocus? {
         val ordered = roots.withIndex().reversed().sortedByDescending { (_, r) ->
             try {
@@ -448,7 +461,7 @@ object A11yFocus {
                     null
                 }
             }
-            return focusProto(roots, root, z, focused, vid, node, false, "input-focus", strings, depth)
+            return focusProto(roots, root, z, focused, vid, node, false, "input-focus", strings, depth, redaction)
         }
         diag.append("; no input focus")
         return null
@@ -482,7 +495,9 @@ object A11yFocus {
         val depth = cmd.subtreeDepth.coerceIn(0, MAX_SUBTREE_DEPTH)
         val diag = StringBuilder("roots=${roots.size}")
         fun done(performed: Boolean, error: String?, actionId: Int): Act {
-            val after = A11yEventTap.withoutTap { readA11y(roots, strings, depth, diag) }
+            val redaction = Redaction.Unverified()
+            val after = A11yEventTap.withoutTap { readA11y(roots, strings, depth, diag, redaction) }
+            redaction.appendTo(diag)
             return Act(performed, error, actionId, seqBefore, after, A11yEventTap.seq(), diag.toString())
         }
 

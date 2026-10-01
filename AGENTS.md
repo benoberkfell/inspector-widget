@@ -170,6 +170,13 @@ adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.ViewScenarioAct
 #   S6 RecyclerView grid                   D1 DialogFragment (Views + ComposeView)   D2 Compose Dialog
 adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S3
 ```
+`scripts/install-a11yprobe.sh <serial> --r8` installs A11yProbe's `r8` build type next to it
+(`com.oberkfell.a11yprobe.r8`): R8-minified and obfuscated like a release app, so Compose's
+classes are renamed (`compose_obfuscated`), yet debuggable. Launch it by full component, e.g.
+`-n com.oberkfell.a11yprobe.r8/com.oberkfell.a11yprobe.MainActivity`.
+`host/tests/test_device_redaction.py` checks on it that password redaction fails closed
+(CONTRACT.md §5): no password text in any dump or event, labels still readable, and in the debug
+build no over-masking.
 `host/tests/test_device_a11y_golden.py` (marked `device`) launches each scenario that way and
 asserts the golden answers: every BAD node flagged with its rule id, GOOD nodes not flagged,
 unique a11y node keys, one Compose window per ComposeView, and known reading orders (the

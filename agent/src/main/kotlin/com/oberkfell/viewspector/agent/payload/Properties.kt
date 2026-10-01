@@ -133,7 +133,7 @@ class Properties(val strings: StringTable) {
             isLayout = false,
             includeResolutionStack = includeResolutionStack,
             // A password field's "text" property is its plaintext (Redaction.kt).
-            redactText = Redaction.isPasswordView(view),
+            redactText = Redaction.mustMaskView(view),
         )
         for (companion in viewData.companions) {
             try {
