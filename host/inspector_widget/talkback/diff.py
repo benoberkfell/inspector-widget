@@ -78,6 +78,14 @@ FIXES = {
                         "stay closed to it until it is created again: rerun with TalkBack "
                         "started first (relaunch) to see what a TalkBack user gets; and give the "
                         "page a native way in (a button that focuses the WebView).",
+    "tb.interleaved": "Make each card one traversal group (Compose: Modifier.semantics { "
+                      "isTraversalGroup = true } on the card; Views: a focusable card, or "
+                      "accessibilityTraversalBefore/After), or one stop whose controls are "
+                      "custom actions, so a card's controls are read with it.",
+    "tb.autoscroll_row_skip": "Lay the items out so the reading order follows the data and "
+                              "scrolling is vertical (a FlowRow, or rows in a vertical list), "
+                              "or make the grid a traversal group with traversalIndex = index "
+                              "per item, so TalkBack reads column by column as it scrolls.",
     "tb.covered_stop": "While the overlay is shown, hide what it covers from accessibility "
                        "(View: importantForAccessibility=noHideDescendants on the covered "
                        "View, restored when it goes; Compose: hideFromAccessibility), and move "
@@ -457,7 +465,7 @@ def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows
     return out
 
 
-def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _check_skipped(walk: Dict[str, Any], explained: Optional[set] = None) -> List[Dict[str, Any]]:
     """Predicted stops the walk went past and never read (tb.skipped, warn). A stop the model
     added on a re-model (TalkBack scrolled something new in) where the walk had already been
     (a collapsing toolbar's title that appears once the list scrolls) is the model's late
@@ -466,7 +474,7 @@ def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     pref = {p["key"]: p for p in walk.get("predicted") or []}
     visited = _visited(walk)
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
-    miss = _unvisited(walk, P, visited, covered)
+    miss = [k for k in _unvisited(walk, P, visited, covered) if k not in (explained or ())]
     if not miss:
         return []
     remodels = [s for s in walk["steps"] if s.get("remodel")]
@@ -1100,6 +1108,123 @@ def _check_list_count(walk: Dict[str, Any], skip: Sequence[str] = ()) -> List[Di
     return out[:3]
 
 
+def _check_interleaved(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """tb.interleaved: a stop read after another item's stops, though its own item (its card)
+    was read before them: the controls of side-by-side cards read in turn (NIA-3, wg0mhts:
+    the right card, the left card, the left card's Bookmark, then the right card's). Per
+    container; a stop read again (tb.revisit) is not one."""
+    out = []
+    by_c: Dict[str, List[Dict[str, Any]]] = {}
+    for s in lap:
+        if s.get("container"):
+            by_c.setdefault(s["container"], []).append(s)
+    def inst(s: Dict[str, Any], c: str) -> Tuple[str, str]:
+        # a list rebinds an item View (a ComposeView cell too) to other items as it scrolls:
+        # the model's "#n" stop says which item it shows now
+        it = _item_of(s, c)
+        pk = str(_pk(s) or "")
+        return it, (pk.split("#", 1)[1] if it.startswith("view:") and "#" in pk else "")
+
+    for c, run in by_c.items():
+        last_of: Dict[Tuple[str, str], int] = {}  # item -> its last step's index in run
+        read: List[Dict[str, Any]] = []
+        for j, s in enumerate(run):
+            it_i = inst(s, c)
+            it = it_i[0]
+            again = any(_same_stop(x, s) for x in read)
+            read.append(s)
+            if it_i in last_of and not again:
+                a = last_of[it_i]
+                between = [x for x in run[a + 1:j] if inst(x, c) != it_i]
+                if between:
+                    first = next(x for x in run if inst(x, c) == it_i)
+                    other = _item_of(between[0], c)
+                    out.append(_finding(
+                        "tb.interleaved", "warn",
+                        f"steps {first['i']}-{s['i']}: {_name(s)} of {it} is read after "
+                        f"{len(between)} stop(s) of {other} (from step {between[0]['i']}), though "
+                        f"{it} was read before them: the cards' stops are interleaved",
+                        [first, *between, s], refs=[s.get("ref"), it, other]))
+            last_of[it_i] = j
+    return _collapse(out, "stops read apart from their card")
+
+
+def _band(r: Sequence[int]) -> int:
+    return int((r[1] + r[3] / 2) // max(1, r[3] * 0.4))
+
+
+def _check_row_skip(walk: Dict[str, Any], lap: List[Dict[str, Any]]
+                    ) -> Tuple[List[Dict[str, Any]], set]:
+    """tb.autoscroll_row_skip: in a grid that scrolls sideways with more than one row,
+    TalkBack's auto-scroll moves along the bottom row (each landing in it), so the rows above
+    in every column it scrolls in are passed over (NIA-1, wvq4h1u: a 3-row
+    LazyHorizontalGrid, 6 of 19 topics never reached). Names the items never reached in
+    those rows; returns their keys too (tb.skipped leaves them to this finding)."""
+    out: List[Dict[str, Any]] = []
+    gone: set = set()
+    pred = walk.get("predicted") or []
+    P = [p["key"] for p in pred]
+    steps = _first_screen(walk["steps"])
+    visited = _visited(walk)
+    labels_read = {(s.get("label") or "").strip() for s in _moves(steps)}
+    by_c: Dict[str, List[Dict[str, Any]]] = {}
+    for s in _moves(steps):
+        if s.get("container") and _rect(s):
+            by_c.setdefault(s["container"], []).append(s)
+    for c, run in by_c.items():
+        can = set().union(*(set(x.get("container_can") or ()) for x in run))
+        if not can & {"left", "right", "page_left", "page_right"}:
+            continue
+        auto = [x for x in run if x.get("via") == "autoscroll"]
+        centers = sorted({_rect(x)[1] + _rect(x)[3] / 2 for x in run})  # type: ignore[index]
+        bands: List[float] = []
+        for y in centers:
+            if not bands or y - bands[-1] > 60:
+                bands.append(y)
+        if len(bands) < 2 or len(auto) < 2:
+            continue
+        bottom = bands[-1]
+
+        def row(x: Dict[str, Any]) -> float:
+            r = _rect(x)
+            return r[1] + r[3] / 2  # type: ignore[index]
+
+        along = [x for x in auto if abs(row(x) - bottom) <= 60]
+        if len(along) < 2 or 2 * len(along) < len(auto):
+            continue  # TalkBack does not scroll along the bottom row (a scroll to show a
+            # control of the item it is on may land elsewhere)
+        auto = along
+        box = next((tuple(x["container_rect"]) for x in run if x.get("container_rect")), None)
+        start = next((P.index(_pk(x)) for x in _moves(steps) if _pk(x) in P), 0)
+        names: List[str] = []
+        keys: List[str] = []
+        for i, p in enumerate(pred):
+            r = p.get("bounds")
+            lab = (p.get("label") or "").strip()
+            if i < start or p["key"] in visited or not r or not box \
+                    or not _contains(box, tuple(r), 0.5):  # type: ignore[arg-type]
+                continue
+            if abs((r[1] + r[3] / 2) - bottom) <= 60:
+                continue  # the row TalkBack scrolls along
+            keys.append(p["key"])
+            if lab and lab not in labels_read and lab not in names:
+                names.append(lab)
+        if not names:
+            continue
+        gone |= set(keys)
+        at = ", ".join(str(x["i"]) for x in auto[:6]) + (" …" if len(auto) > 6 else "")
+        listed = ", ".join(_q(n, 28) for n in names[:6]) + (
+            f" (+{len(names) - 6} more)" if len(names) > 6 else "")
+        f = _finding("tb.autoscroll_row_skip", "warn",
+                     f"TalkBack auto-scrolls {c} along its bottom row (steps {at}): the "
+                     f"{len(bands) - 1} row(s) above in every column it scrolls in are passed "
+                     f"over; {len(names)} item(s) never reached: {listed}", auto,
+                     refs=[c] + [pref for pref in keys][:MAX_REFS - 1], keys=keys)
+        f["missed"] = names
+        out.append(f)
+    return out, gone
+
+
 def _check_speech_order(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     """A stop that joins its children's texts (a merged row) reads them out of
     their visual order: "$5, Socks" for a row showing "Socks ... $5"."""
@@ -1206,7 +1331,10 @@ def analyze(walk: Dict[str, Any], expect: Optional[Sequence[str]] = None) -> Dic
     escapes = _check_escape(walk)
     findings += escapes
     findings += _check_covered(walk, escapes)
-    findings += _check_skipped(walk)
+    row_skip, passed = _check_row_skip(walk, lap)
+    findings += row_skip
+    findings += _check_skipped(walk, passed)
+    findings += _check_interleaved(walk, lap)
     findings += _check_ghosts(walk)
     findings += _check_double(walk)
     exp_res = None

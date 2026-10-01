@@ -221,3 +221,29 @@ def test_a_remodel_marks_the_stops_it_adds():
     model.remodel(H.to_proto(H.dump("nia_interests")), False)
     added = [p for p in model.stops if p.added]
     assert added and {p.added for p in added} == {1}
+
+
+# --------------------------------------------------------------------- G16: NIA-3, NIA-1
+def test_nia3_the_side_by_side_cards_are_read_interleaved():
+    rec = H.record("wg0mhts")  # wm density 280: two feed columns
+    f = _codes(rec, "tb.interleaved")
+    assert len(f) == 1 and f[0]["sev"] == "warn"
+    assert {19, 20, 21, 22}.issubset(f[0]["steps"]) and {26, 27, 28, 29}.issubset(f[0]["steps"])
+    assert "compose:8:219 'Bookmark' of compose:8:206" in f[0]["msg"]
+    assert f[0]["fix"].startswith("Make each card one traversal group")
+    # one column: each card is read whole
+    assert _codes(H.record("wtt0adx"), "tb.interleaved") == []
+
+
+def test_nia1_auto_scroll_along_the_bottom_row_names_the_topics_it_passes_over():
+    rec = H.record("wvq4h1u")
+    f = _codes(rec, "tb.autoscroll_row_skip")
+    assert len(f) == 1
+    assert f[0]["missed"] == ["Performance", "Kotlin", "New APIs & Libraries",
+                              "Platform & Releases", "Privacy & Security", "Accessibility"]
+    assert f[0]["steps"][:3] == [8, 9, 11] and "compose:8:85" in f[0]["msg"]
+    # tb.skipped keeps only what the row skip does not explain, with its own advice
+    sk = _codes(rec, "tb.skipped")
+    assert len(sk) == 1 and "Performance" not in sk[0]["msg"]
+    # backward from Done: no auto-scroll at the start of the grid, nothing to say
+    assert _codes(H.record("wox59ex"), "tb.autoscroll_row_skip") == []
