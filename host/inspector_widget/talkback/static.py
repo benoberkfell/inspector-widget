@@ -889,11 +889,17 @@ def _page_controls(cx: _Ctx, p: TbNode) -> bool:
 
 
 def _pagers(cx: _Ctx) -> Iterator[Finding]:
+    """A pager with more pages and nothing TalkBack reaches that turns them. Not a pager
+    that fills most of its window (a destination pager: Thunderbird's message view, where
+    each page is another message the user opens from the list, and a two-finger swipe
+    anywhere turns it): the model cannot tell a missed page from another screen there."""
     for p in cx.tree.nodes:
         if not p.window.reported or not p.visible or cx.rules.role(p) != R.ROLE_PAGER:
             continue
         if not p.supports(*_FORWARD_ACTIONS):
             continue  # nothing further to page to (or the app pages it some other way)
+        if _area(p.rect.intersect(p.window.bounds)) >= SCRIM_AREA * max(1, _area(p.window.bounds)):
+            continue  # a destination pager (see above)
         inside = {id(x) for x in p.iter()}
         if _page_controls(cx, p):
             continue  # tabs, page buttons or custom actions reach the other pages

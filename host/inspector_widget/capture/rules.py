@@ -219,8 +219,10 @@ ALIASES: dict[str, str] = {r.alias: r.id for r in _CATALOG if r.alias}
 ATF_NAMES: dict[str, str] = {r.atf: r.id for r in _CATALOG if r.atf}
 FAMILIES = ("a11y", "render", "tb")
 #: The tb.* rules the default lint reports with the a11y ones: no finding on any GOOD
-#: variant of the TalkBack corpus nor on the recorded real captures, and none that repeats
-#: an a11y rule (an unlabelled ghost stop is a11y.label.missing). The others are heuristic
+#: variant of the TalkBack corpus (tests/test_capture_tb_rules.py), and on the recorded
+#: real screens (every tests/data/realapps dump, test_realapp_accuracy.py) only what a real
+#: TalkBack walk confirmed; none repeats an a11y rule (an unlabelled ghost stop is
+#: a11y.label.missing). The others are heuristic
 #: (out_of_order, boundary_jump: a guessed visual order), inferred (custom_action_missing:
 #: slot links) or a design call on common layouts (double_stop: a row with inline buttons):
 #: lint(rules=["tb"]) lists every tb rule.

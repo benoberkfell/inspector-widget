@@ -301,3 +301,23 @@ def test_the_model_says_what_auto_scroll_reads_before_the_next_control():
     hint = next(h for h in eps.hints if h["kind"] == "autoscroll_ahead")
     assert hint["container"] == "view:2183" and hint["offscreen"] == 142
     assert "142 more item(s)" in hint["message"]
+
+
+# ------------------------------------------------------------- the default tb.* rules
+#: what the default tb.* rules (capture/rules.py DEFAULT_TB) report on each recorded real
+#: screen: only Thunderbird's counted empty header ("2 of 7"), which a real walk confirmed.
+#: AntennaPod's rows (speech_order), its show notes (past an edge) and Thunderbird's message
+#: pager were false positives the walks disproved.
+REAL_DEFAULT_TB = {"thunderbird_list_views": {"tb.wrong_announcement": 1}}
+
+
+@pytest.mark.parametrize("name", sorted(p.name.split(".")[0] for p in DATA.glob("*.a11y.json.gz")))
+def test_the_default_tb_rules_are_precise_on_every_recorded_real_screen(name):
+    from collections import Counter
+
+    from inspector_widget.capture.rules import DEFAULT_TB
+    from inspector_widget.talkback import static
+
+    fs = static.findings(tb.Navigator(tb.build(dump(name))), density=DENSITY, codes=DEFAULT_TB)
+    assert dict(Counter(f.code for f in fs)) == REAL_DEFAULT_TB.get(name, {}), \
+        [(f.code, f.node.key, f.evidence) for f in fs]
