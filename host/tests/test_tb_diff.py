@@ -445,3 +445,19 @@ def test_a_recycled_row_view_in_its_old_slot_is_another_stop_in_the_model():
     # outside a list a label that changes in place is the same node ("Play" -> "Pause")
     m.stops = [tbwalk.PStop("view:5", "Play", "Play", (0, 0, 100, 100), 1, "Button")]
     assert m.match("view:5", "Button|Pause", (0, 0, 100, 100)) is m.stops[0]
+
+
+def test_a_compose_key_is_one_node_whatever_its_list_item_shows_now():
+    # NiA: a card's other texts come and go as it scrolls (its context with them); its chips
+    # keep their semantics ids, so the same key and label is the same stop. A View key in
+    # another list item is a recycled View (RecyclerView rebinds it) and another stop.
+    m = tbwalk.Model()
+    chip = tbwalk.PStop("compose:8:2626", "HEADLINES", "HEADLINES", (120, 938, 231, 144), 1,
+                        "View", "Introducing Compose Camp")
+    archive = tbwalk.PStop("view:15", "Archive", "Archive", (900, 530, 120, 120), 1, "Button",
+                           "Mail 3")
+    m.stops = [chip, archive]
+    assert m.match("compose:8:2626", "View|HEADLINES", (120, 298, 231, 144),
+                   ctx="We launched Compose Camp") is chip
+    assert m.match("view:15", "Button|Archive", (900, 1530, 120, 120), ctx="Mail 31") is None
+    assert m.match("view:15", "Button|Archive", (900, 1530, 120, 120), ctx="Mail 3") is archive

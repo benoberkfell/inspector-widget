@@ -187,12 +187,14 @@ def _node_scrolls(n: "Node") -> bool:
 def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any], Any],
                  words: Callable[[Any], str], scrolls: Callable[[Any], bool]
                  ) -> Tuple[Optional[str], bool]:
-    """``(ctx, item_root)`` of a node inside a scrolling list: ``ctx`` the texts of the
-    innermost list item around it that has any outside the node itself ("" when none does;
-    None when it is in no list), ``item_root`` whether the node is itself a list item (a
-    child of the scrolling container). Two nodes alike in class, label and screen slot are
-    told apart by it: the HEADLINES chips of two news cards (NiA, after a scroll put the
-    second where the first was), a RecyclerView row View rebound to another item."""
+    """``(ctx, item_root)`` of a node inside a scrolling list: ``ctx`` the first text of
+    the innermost list item around it that has one outside the node itself (a card's title,
+    a row's sender: what stays put while the item scrolls and its other texts come and go;
+    "" when none has; None when it is in no list), ``item_root`` whether the node is itself
+    a list item (a child of the scrolling container). Two nodes alike in class, label and
+    screen slot are told apart by it: the HEADLINES chips of two news cards (NiA, after a
+    scroll put the second where the first was), a RecyclerView row View rebound to another
+    item."""
     own: set = set()
     stack = [n]
     while stack:
@@ -207,18 +209,15 @@ def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any],
             if first:
                 item_root = child is n
                 first = False
-            texts: List[str] = []
             stack = [child]
-            while stack and sum(len(t) for t in texts) < CTX_LEN:
+            while stack:
                 x = stack.pop()
                 if id(x) in own:
                     continue
                 w = words(x)
                 if w:
-                    texts.append(w)
+                    return w[:CTX_LEN], item_root
                 stack.extend(reversed(list(children(x) or ())))
-            if texts:
-                return " | ".join(texts)[:CTX_LEN], item_root
         child, a = a, parent(a)
     return ("" if not first else None), item_root
 
@@ -909,12 +908,15 @@ class Model:
         in place outside a list item, or went empty (clipped), is the same node."""
         key = self.aliases.get(key, key) if key else key
         if key:
+            # a View key can be a recycled View (another item: its list item tells); a
+            # Compose key names one node (its semantics id is not reused)
+            view = key.startswith("view:")
             same = [s for s in self.stops if s.key.split("#")[0] == key]
             for s in same:
-                if s.sig == sig and _ctx_ok(s.ctx, ctx):
+                if s.sig == sig and (not view or _ctx_ok(s.ctx, ctx)):
                     return s
             for s in same:
-                if s.key != key or not _ctx_ok(s.ctx, ctx):
+                if s.key != key or (view and not _ctx_ok(s.ctx, ctx)):
                     continue
                 if not (iou(s.bounds, box) >= 0.5 or _unlabelled(sig) or _unlabelled(s.sig)):
                     continue
