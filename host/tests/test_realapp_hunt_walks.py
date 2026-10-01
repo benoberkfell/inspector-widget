@@ -328,6 +328,54 @@ def test_g9_the_window_list_names_the_system_dialog_over_the_app():
                             NIA) is None
 
 
+def test_g9_a_window_beside_the_app_covers_nothing_of_it():
+    # Split screen on emulator-5554: Settings above NiA in the window list and with input
+    # focus, in the other half of the screen. It was taken for a cover: the capture had no
+    # stop of NiA and said "TalkBack reads it, not this app; BACK dismisses it".
+    from inspector_widget.talkback import windows
+
+    wins, focus = _win("nia_split_screen")
+    app = next(w for w in wins if w.package == NIA)
+    other = next(w for w in wins if w.package == "com.android.settings")
+    assert focus == other.title and wins.index(other) < wins.index(app)
+    assert (app.frame, other.frame) == ((0, 0, 1280, 1413), (0, 1443, 1280, 2856))
+    assert app.display == other.display == 0
+    assert windows.covering(wins, NIA, focus) is None
+    # the same window over the app's half covers it, and focused it needs no area
+    other.frame = (0, 600, 1280, 2856)
+    assert windows.covering(wins, NIA, focus) is other
+    other.frame = (0, 1300, 1280, 1500)  # 113 px of 1413 over the app, with input focus
+    assert windows.covering(wins, NIA, focus) is other
+    assert windows.covering(wins, NIA, None) is None  # unfocused: too little of the app
+    # another display is another screen
+    other.frame, other.display = (0, 0, 1280, 1413), 2
+    assert windows.covering(wins, NIA, focus) is None
+
+
+def test_g9_how_a_foreign_window_goes_away_depends_on_what_it_is():
+    from inspector_widget.talkback import windows
+
+    sys16k = {"package": "android", "type": "APPLICATION_OVERLAY", "window": "android",
+              "focused": True}
+    perm = {"package": "com.google.android.permissioncontroller", "type": "BASE_APPLICATION",
+            "window": "com.google.android.permissioncontroller/com.android.permissioncontroller"
+                      ".permission.ui.GrantPermissionsActivity", "focused": True}
+    # the 16 KB dialog is answered with its OK button; BACK goes to a focused activity;
+    # BACK with the focus elsewhere would reach another window
+    assert "OK" in windows.dismiss(sys16k) and "BACK" not in windows.hint(sys16k)
+    assert windows.dismiss(perm) == "BACK dismisses it" and "BACK" in windows.hint(perm)
+    perm["focused"] = False
+    assert "BACK" not in windows.dismiss(perm) and "BACK" not in windows.hint(perm)
+    # the stored token keeps the focus, so the tree's diagnostic words it the same way
+    assert windows.from_token(windows.token(perm))["focused"] is False
+    tree = tb.build(H.dump("nia_for_you"), diagnostics=windows.token(perm))
+    msg = next(d["message"] for d in tree.diagnostics if d["kind"] == "foreign_window")
+    assert "BACK" not in msg and msg.endswith("Close it on the device, then retry.")
+    # a token without the focus (an older capture) reads as before
+    assert windows.from_token("foreign-window pkg=a type=B title=a/.X") == {
+        "package": "a", "type": "B", "window": "a/.X"}
+
+
 def test_g9_a_capture_under_a_system_dialog_shows_no_stop_of_the_app():
     from inspector_widget.capture import fetch
     from inspector_widget.talkback import windows
@@ -339,9 +387,17 @@ def test_g9_a_capture_under_a_system_dialog_shows_no_stop_of_the_app():
     raw = T.raw_from_a11y(resp, cid="cforeign", dpi=480)
     fetch._mark_foreign(raw, dict(cover), NIA)
     assert raw.meta.device["foreign_window"]["package"] == cover["package"]
-    assert raw.meta.diagnostics[-1].startswith(
+    assert raw.meta.diagnostics[-1] == (
         "covered by another app's window: com.google.android.permissioncontroller/"
-        "…GrantPermissionsActivity; TalkBack reads it")
+        "…GrantPermissionsActivity; BACK dismisses it; TalkBack reads it, not this app")
+    # what covers it and how it goes fit the 120 characters a capture shows of it
+    from inspector_widget import ops
+
+    assert raw.meta.diagnostics[-1].index("BACK dismisses it") + 17 <= ops.DIAGNOSTIC_CHARS
+    sys16k = {"package": "android", "type": "APPLICATION_OVERLAY", "window": "android"}
+    fetch._mark_foreign(raw, sys16k, NIA)
+    assert raw.meta.diagnostics[-1].index("its OK button dismisses it") + 26 \
+        <= ops.DIAGNOSTIC_CHARS
     ix = T.build(raw)
     assert ix.reading == []  # "on screen" lists nothing: TalkBack reads the dialog
     stored = pb.DumpA11yResponse.FromString(raw.a11y).diagnostics
@@ -364,11 +420,38 @@ def test_g9_tb_walk_fails_fast_naming_the_dialog(monkeypatch):
         device.ensure_foreground("emulator-5554", NIA)
     assert e.value.code == "app_left_foreground"
     env = {"error": {"code": e.value.code, "message": str(e.value), "hint": e.value.hint}}
-    assert "android (APPLICATION_OVERLAY)" in str(e.value) and "BACK" in e.value.hint
+    # the 16 KB dialog: its OK button dismisses it for good
+    assert "android (APPLICATION_OVERLAY)" in str(e.value) and "OK" in e.value.hint
     assert len(js(env).encode()) <= 300
     # an activity of another app on top of the app's window (it is on top): no overlay
     cover["window"] = "com.example/.Other"
     assert device.ensure_foreground("emulator-5554", NIA) == {}
+
+
+def test_g9_tb_walk_fails_fast_when_talkback_was_already_on(monkeypatch):
+    # After `talkback on` or a leave_on walk, enable() returned before any foreground
+    # check, so a walk went on under the 16 KB dialog (no activity: the top is the app)
+    from inspector_widget.talkback import device, windows
+
+    on = {device.SERVICES: device.TALKBACK_COMPONENT, device.A11Y_ENABLED: "1",
+          device.TOUCH_EXPLORATION: "1"}
+    cover = {"package": "android", "type": "APPLICATION_OVERLAY", "window": "android",
+             "frame": [32, 789, 1216, 1361], "focused": True}
+    asked = []
+    monkeypatch.setattr(device, "read_settings", lambda serial: dict(on))
+    monkeypatch.setattr(device, "talkback_version", lambda serial: "17.0.0")
+    monkeypatch.setattr(windows, "foreign_cover",
+                        lambda serial, package: asked.append(package) or dict(cover))
+    monkeypatch.setattr(device, "put_setting", lambda *a: pytest.fail("changed a setting"))
+    with pytest.raises(device.TalkBackError) as e:
+        device.enable("emulator-x", NIA)
+    assert e.value.code == "app_left_foreground" and asked == [NIA]
+    assert "android (APPLICATION_OVERLAY)" in str(e.value)
+    # nothing over it: on as it was; no package (talkback on): no check
+    monkeypatch.setattr(windows, "foreign_cover", lambda serial, package: None)
+    assert device.enable("emulator-x", NIA)["changed"] is False
+    monkeypatch.setattr(windows, "foreign_cover", lambda serial, package: pytest.fail("asked"))
+    assert device.enable("emulator-x")["changed"] is False
 
 
 # ------------------------------------------------- the round's live walks (emulator-5554)

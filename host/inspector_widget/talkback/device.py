@@ -356,10 +356,12 @@ def enable(serial: str, package: Optional[str] = None,
 
     ``changed`` False means TalkBack was already on and nothing was touched.
     With ``package``, checks that app is still on top afterwards and brings it
-    back to the front (without recreating it) if TalkBack covered it. With
-    ``verbose_log``, TalkBack's log level is set to VERBOSE first (TalkBack
-    reads it when it binds); that needs TalkBack off, so an already-running
-    TalkBack keeps its level (``log_level`` says so).
+    back to the front (without recreating it) if TalkBack covered it; a window
+    of another app over it (a system dialog) raises ``app_left_foreground``
+    naming it, also when TalkBack was already on. With ``verbose_log``,
+    TalkBack's log level is set to VERBOSE first (TalkBack reads it when it
+    binds); that needs TalkBack off, so an already-running TalkBack keeps its
+    level (``log_level`` says so).
     """
     t0 = time.monotonic()
     before = read_settings(serial)
@@ -371,6 +373,10 @@ def enable(serial: str, package: Optional[str] = None,
                                  "Android Accessibility Suite.")
     out: Dict[str, Any] = {"serial": serial, "talkback": "on", "version": version}
     if _on(before):
+        if package:
+            # nothing was changed, so nothing to restore: a system dialog over the app (G9)
+            # still stops a walk before its first press, as when TalkBack is turned on here
+            _not_covered(serial, package)
         if verbose_log:
             out["log_level"] = "unchanged: TalkBack was already on (the level can only change while it is off)"
         out.update(changed=False, took_ms=_ms(t0))

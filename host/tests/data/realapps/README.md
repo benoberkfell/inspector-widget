@@ -46,4 +46,4 @@ They pin the app bugs and the tool gaps in `docs/realapp-findings.md`.
 timings), `talkback17_occlusion_walks.json.gz` (the occlusion-model round's live walks on
 emulator-5554, each with a `note`) and `windows_nia_*.txt` (the window manager's list, trimmed,
 with Now in Android under the 16 KB compatibility dialog and the notification permission
-request).
+request, and in split screen beside a focused Settings, which covers none of it).

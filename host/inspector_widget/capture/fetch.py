@@ -645,7 +645,9 @@ def _mark_foreign(raw: RawCapture, cover: dict[str, Any], package: str) -> None:
     from ..talkback import windows
 
     raw.meta.device["foreign_window"] = cover
-    raw.meta.diagnostics.append(f"{windows.message(cover, 'this app')}; BACK dismisses it")
+    # what covers it and how it goes, first: a capture shows 120 characters of a diagnostic
+    raw.meta.diagnostics.append(f"covered by another app's window: {windows.name(cover)}; "
+                                f"{windows.dismiss(cover)}; TalkBack reads it, not this app")
     if raw.a11y:
         from ..proto import view_inspection_pb2 as pb
 
