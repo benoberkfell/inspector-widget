@@ -161,7 +161,7 @@ internal object SafeString {
      * A function object: a Kotlin lambda or function reference, or a D8/javac lambda. Its toString
      * is never called (a Kotlin one renders through kotlin-reflect).
      */
-    private fun isFunction(cls: Class<*>): Boolean {
+    fun isFunction(cls: Class<*>): Boolean {
         val name = cls.name
         if (cls.isSynthetic || "\$\$Lambda" in name || "ExternalSyntheticLambda" in name) return true
         var k: Class<*>? = cls

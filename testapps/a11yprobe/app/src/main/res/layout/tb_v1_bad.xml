@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  V1 stripe_order BAD (TbViewActivity):
+  * the value "Ada Lovelace" sits a little higher than its label "Name", with no
+    vertical overlap, so ViewGroup's STRIPE sort (non-overlapping rows first)
+    reads the value before the label;
+  * "Save" asks to be read before @id/tb_v1_field, which <include> duplicated:
+    findViewInsideOutShouldExist resolves it to the nearest copy ("Phone"), not
+    the first one ("Email") the author meant.
+  The intended order: Name, Ada Lovelace, Save, Email, Phone.
+-->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:padding="16dp">
+
+    <TextView
+        android:id="@+id/tb_v1_name"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="28dp"
+        android:text="Name"
+        android:textSize="22sp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <TextView
+        android:id="@+id/tb_v1_value"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Ada Lovelace"
+        android:textSize="12sp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/tb_v1_fields"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:orientation="vertical"
+        app:layout_constraintTop_toBottomOf="@id/tb_v1_name">
+
+        <include layout="@layout/tb_v1_field" />
+
+        <FrameLayout
+            android:id="@+id/tb_v1_phone_box"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <include layout="@layout/tb_v1_field" />
+
+            <Button
+                android:id="@+id/tb_v1_save"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end"
+                android:accessibilityTraversalBefore="@id/tb_v1_field"
+                android:text="Save" />
+        </FrameLayout>
+    </LinearLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>

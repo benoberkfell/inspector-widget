@@ -7,7 +7,8 @@
 //
 //   adb shell am start -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S3
 //
-// Scenario ids (S1..S6, D1, D2) are listed in InteropFragment.kt.
+// Scenario ids (S1..S6, D1, D2) are listed in InteropFragment.kt; the TalkBack
+// corpus hybrids (tb_h1..tb_h6, with --es variant bad|good) in TbHybrid.kt.
 // ============================================================================
 package com.oberkfell.a11yprobe
 
@@ -26,7 +27,9 @@ class InteropActivity : AppCompatActivity() {
         title = scenario.title
         if (savedInstanceState == null) {
             supportFragmentManager.beginTransaction()
-                .replace(R.id.interop_container, InteropFragment.newInstance(scenario.id), "interop_${scenario.id}")
+                .replace(R.id.interop_container,
+                    InteropFragment.newInstance(scenario.id, intent.getStringExtra(MainActivity.EXTRA_VARIANT)),
+                    "interop_${scenario.id}")
                 .commit()
         }
     }

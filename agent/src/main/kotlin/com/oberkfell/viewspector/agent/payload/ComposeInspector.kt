@@ -62,7 +62,10 @@
  * node and slot-table group is guarded on its own, so one bad value costs that value, never the
  * ComposeView; the failures are counted in the diagnostics.
  *
- * PASSWORDS (Redaction.kt): a Password semantics node's EditableText / InputText go out masked.
+ * PASSWORDS (Redaction.kt): a password field's EditableText / InputText go out masked. A node is
+ * one by [isPasswordNode]: Password semantics, a password ContentType, or a text field whose
+ * modifiers hold a password keyboard (a visible-password field has no Password semantics). The
+ * a11y text ([SemanticsIndex.passwords]) and the event tap ask the same predicate.
  * The slot table is read in two passes per ComposeView: the first collects every password
  * field's text (a call with a PasswordVisualTransformation or a password keyboard, a
  * *SecureTextField, a Password semantics node's content, and the secret-named String
@@ -494,11 +497,14 @@ object ComposeInspector {
      * unmerged SemanticsNode id to the measured size of its LayoutNode (px, [packSize]): the space
      * the node reserves in layout, including Modifier.minimumInteractiveComponentSize() padding,
      * unlike its a11y boundsInScreen, which Compose widens to the 48dp touch size for any clickable.
+     * [passwords] holds the ids of unmerged SemanticsNodes that are password fields
+     * ([isPasswordNode]), whose a11y text is masked.
      */
     internal class SemanticsIndex(
         val rootSemanticsId: Int,
         val traversalGroups: Set<Int>,
         val layoutSizes: Map<Int, Long>,
+        val passwords: Set<Int>,
     )
 
     internal fun packSize(w: Int, h: Int): Long = (w.toLong() shl 32) or (h.toLong() and 0xFFFFFFFFL)
@@ -515,8 +521,9 @@ object ComposeInspector {
             val rootId = invoke(root, "getId") as? Int ?: return null
             val groups = HashSet<Int>()
             val sizes = HashMap<Int, Long>()
-            collectUnmerged(root, groups, sizes, 0)
-            SemanticsIndex(rootId, groups, sizes)
+            val passwords = HashSet<Int>()
+            collectUnmerged(root, groups, sizes, passwords, 0)
+            SemanticsIndex(rootId, groups, sizes, passwords)
         } catch (t: Throwable) {
             Log.w(TAG, "semantics index failed", t)
             null
@@ -525,11 +532,20 @@ object ComposeInspector {
 
     private var indexFailureLogged = false
 
-    private fun collectUnmerged(node: Any, groups: MutableSet<Int>, sizes: MutableMap<Int, Long>, depth: Int) {
+    private fun collectUnmerged(
+        node: Any,
+        groups: MutableSet<Int>,
+        sizes: MutableMap<Int, Long>,
+        passwords: MutableSet<Int>,
+        depth: Int,
+    ) {
         if (depth > MAX_DEPTH) return
         val id = invoke(node, "getId") as? Int
         if (id != null) {
-            if (configFlag(node, "IsTraversalGroup")) groups.add(id)
+            val entries = configEntries(node, INDEX_KEYS)
+            // Compared as a Boolean: never through the app value's equals().
+            if ((entries["IsTraversalGroup"] as? Boolean) == true) groups.add(id)
+            if (passwordOf(node, entries)) passwords.add(id)
             // SemanticsNode.layoutInfo is the node's LayoutNode (public LayoutInfo width/height).
             val info = invoke(node, "getLayoutInfo")
             val w = intOf(info, "getWidth")
@@ -540,7 +556,7 @@ object ComposeInspector {
             // Per node: one bad subtree must not cost the index of the whole ComposeView.
             if (child != null) {
                 try {
-                    collectUnmerged(child, groups, sizes, depth + 1)
+                    collectUnmerged(child, groups, sizes, passwords, depth + 1)
                 } catch (t: Throwable) {
                     if (!indexFailureLogged) {
                         indexFailureLogged = true
@@ -551,18 +567,89 @@ object ComposeInspector {
         }
     }
 
-    /** True when [node]'s SemanticsConfiguration maps the key named [keyName] to Boolean true. */
-    private fun configFlag(node: Any, keyName: String): Boolean {
-        val config = invoke(node, "getConfig") ?: return false
-        val iter = invoke(config, "iterator") as? Iterator<*> ?: return false
+    /**
+     * The entries of [node]'s SemanticsConfiguration whose key is named in [keys], raw values.
+     * Key names are compared as Strings: never through an app value's equals().
+     */
+    private fun configEntries(node: Any, keys: Set<String>): Map<String, Any?> {
+        val config = invoke(node, "getConfig") ?: return emptyMap()
+        val iter = invoke(config, "iterator") as? Iterator<*> ?: return emptyMap()
+        val out = HashMap<String, Any?>()
         var guard = 0
         while (guard++ < MAX_CONFIG_ENTRIES && iter.hasNext()) {
             val entry = iter.next() as? Map.Entry<*, *> ?: continue
-            val key = entry.key ?: continue
-            // Compared as a String / Boolean: never through the app value's equals().
-            if ((invoke(key, "getName") as? String) == keyName) return (entry.value as? Boolean) == true
+            val name = entry.key?.let { invoke(it, "getName") as? String } ?: continue
+            if (name in keys) out[name] = entry.value
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------- passwords
+    // The semantics keys [passwordOf] reads, and the index's (IsTraversalGroup) with them.
+    private val PASSWORD_KEYS = setOf("Password", "ContentType", "EditableText")
+    private val INDEX_KEYS = PASSWORD_KEYS + "IsTraversalGroup"
+
+    /**
+     * Whether SemanticsNode [node] (merged or unmerged) is a password field, whose text must go
+     * out masked. Any one signal is enough:
+     *  - Password semantics (a PasswordVisualTransformation, a *SecureTextField);
+     *  - a ContentType whose autofill hints name a password (Redaction.isPasswordContentType);
+     *  - for a text field (EditableText), a password keyboard or transformation held by a
+     *    modifier on its LayoutNode (Redaction.isComposePasswordModifier). A visible-password
+     *    field (KeyboardOptions(keyboardType = Password) without PasswordVisualTransformation)
+     *    has no Password semantics, and Compose sets no input type on its node, yet its text is
+     *    the plaintext; its ImeOptions are what give it away.
+     * The semantics dump, the a11y tree ([SemanticsIndex.passwords]) and the event tap all ask
+     * this, and the slot table goes by the same values (Redaction.isComposePasswordParam), so
+     * every path masks the same fields. Never throws.
+     */
+    internal fun isPasswordNode(node: Any): Boolean = try {
+        passwordOf(node, configEntries(node, PASSWORD_KEYS))
+    } catch (_: Throwable) {
+        false
+    }
+
+    /**
+     * [isPasswordNode] for the unmerged SemanticsNode [semanticsId] of [composeView] (an
+     * accessibility virtual id), found by walking its semantics tree. False when not found.
+     * Main thread.
+     */
+    internal fun isPasswordNode(composeView: View, semanticsId: Int): Boolean = try {
+        val owner = invoke(composeView, "getSemanticsOwner")
+        val root = invoke(owner, "getUnmergedRootSemanticsNode")
+        val node = root?.let { findSemanticsNode(it, semanticsId, 0) }
+        node != null && isPasswordNode(node)
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun passwordOf(node: Any, entries: Map<String, Any?>): Boolean {
+        if (entries.containsKey("Password")) return true
+        if (Redaction.isPasswordContentType(entries["ContentType"])) return true
+        return entries.containsKey("EditableText") && hasPasswordModifier(node)
+    }
+
+    /** A password keyboard or transformation held by a modifier element of [node]'s LayoutNode. */
+    private fun hasPasswordModifier(node: Any): Boolean {
+        // SemanticsNode.layoutInfo is its LayoutNode; LayoutInfo.getModifierInfo() lists the
+        // node's modifier elements (what the slot table's modifier strings are read from).
+        val infos = invoke(invoke(node, "getLayoutInfo"), "getModifierInfo") as? List<*> ?: return false
+        for (mi in infos) {
+            val element = invoke(mi, "getModifier") ?: continue
+            if (Redaction.isComposePasswordModifier(element)) return true
         }
         return false
+    }
+
+    private fun findSemanticsNode(node: Any, id: Int, depth: Int): Any? {
+        if (depth > MAX_DEPTH) return null
+        if ((invoke(node, "getId") as? Int) == id) return node
+        val children = invoke(node, "getChildren") as? List<*> ?: return null
+        for (c in children) {
+            if (c == null) continue
+            findSemanticsNode(c, id, depth + 1)?.let { return it }
+        }
+        return null
     }
 
     // ---------------------------------------------------------------- semantics (A)
@@ -623,12 +710,15 @@ object ComposeInspector {
             ctx.log("semantics config", t)
             LinkedHashMap()
         }
+        // A password field's content (Redaction.kt); its plaintext also masks the slot table.
+        // Only a node holding field content needs the full check ([isPasswordNode]).
+        val password = attrs.containsKey("Password") ||
+            ((attrs.containsKey("EditableText") || attrs.containsKey("InputText")) && isPasswordNode(node))
         try {
-            // A Password node's field content (Redaction.kt); its plaintext also masks the slot table.
-            Redaction.redactComposeAttrs(attrs, ctx.secrets)
+            Redaction.redactComposeAttrs(attrs, ctx.secrets, password)
         } catch (t: Throwable) {
-            // Never send a Password node's text unredacted: drop the field values instead.
-            if (attrs.containsKey("Password")) {
+            // Never send a password field's text unredacted: drop the field values instead.
+            if (password) {
                 attrs.remove("EditableText"); attrs.remove("InputText")
             }
             ctx.log("semantics redaction", t)

@@ -44,6 +44,23 @@
             android:label="View defaults"
             android:theme="@style/Theme.A11yProbe" />
 
+        <!--
+          TalkBack navigation corpus, classic Views (TbViewActivity.kt):
+          the extras scenario=tb_v1..tb_v14 and variant=bad|good. The detail
+          screen is V11's second Activity.
+        -->
+        <activity
+            android:name=".TbViewActivity"
+            android:exported="true"
+            android:label="A11yProbe TalkBack"
+            android:theme="@style/Theme.A11yProbe" />
+
+        <activity
+            android:name=".TbViewDetailActivity"
+            android:exported="false"
+            android:label="Folder"
+            android:theme="@style/Theme.A11yProbe" />
+
     </application>
 
 </manifest>

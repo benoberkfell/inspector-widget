@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -247,6 +248,39 @@ def test_focus_taken_between_presses_is_recorded_as_stolen(probe):
     assert any("via=stolen" in ln for ln in res["lines"])
 
 
+def test_focus_taken_back_before_a_press_settles_is_stolen_too(probe):
+    """TalkBack focuses the next item, then (inside the same wait) the app pulls
+    focus back up the list: the press's move is the first, then a steal."""
+    def press(tb, action):
+        if action != "next" or len(tb.presses) != 3:
+            return False
+        tb.set_focus(tb.order[tb.order.index(tb.focus) + 1])
+        tb.set_focus(tb_item(0))  # the app's timer takes focus back
+        return True
+
+    probe.talkback.on_press = press
+    rec = saved(walk(probe, until="edge"))
+    moves = [(s["via"], s["key"]) for s in rec["steps"][:6]]
+    assert moves[3] == ("next", "view:1021") and moves[4] == ("stolen", "view:1020"), moves
+    codes = [f["code"] for f in rec["findings"]]
+    assert "tb.trap" in codes and "tb.revisit" not in codes
+
+
+def test_focus_taken_back_just_before_a_press_is_stolen_then_the_press_moves_on(probe):
+    def press(tb, action):
+        if action != "next" or len(tb.presses) != 5:
+            return False
+        tb.set_focus(tb_item(0))  # the app's timer, a moment before the press lands
+        tb.set_focus(tb.order[tb.order.index(tb.focus) + 1])
+        return True
+
+    probe.talkback.on_press = press
+    rec = saved(walk(probe, until="edge"))
+    moves = [(s["via"], s["key"]) for s in rec["steps"][:7]]
+    assert moves[5:7] == [("stolen", "view:1020"), ("next", "view:1021")], moves
+    assert "model.mismatch" not in [f["code"] for f in rec["findings"]]
+
+
 def test_dump_reader_records_stolen_focus_too(probe, monkeypatch):
     # With a 30ms poll and a 20ms settle, a step's wait reads exactly twice after
     # its press, so the third read after press 3 is the next step's pre-check.
@@ -380,6 +414,36 @@ def test_unlabelled_sliver_is_a_ghost_stop(tb_env):
     assert any(ln.startswith("2. view:1040") and "!ghost_stop" in ln for ln in res["lines"])
 
 
+def test_text_that_no_stop_read_is_skipped_but_not_text_under_a_dialog(tb_env):
+    title = ViewSpec(1003, "TextView", "android.widget", (16, 24, 328, 64), text="Title",
+                     a11y={"class_name": "android.widget.TextView", "text": "Title"})
+    note = ViewSpec(1004, "TextView", "android.widget", (16, 200, 328, 40), text="Unsaved changes",
+                    a11y={"class_name": "android.widget.TextView", "text": "Unsaved changes"})
+    tb_env.scene_factory = lambda: _scene_with(title, _button(1041, (16, 120, 328, 64), "OK"), note)
+    tb_env.talkback.order = [TB_TITLE, (1041, -1)]
+    res = walk(tb_env)
+    skipped = [f for f in res["findings"] if f["code"] == "tb.skipped" and "on screen" in f["msg"]]
+    assert skipped and "Unsaved changes" in skipped[0]["msg"]
+
+    # Text in a window the lap never entered (the activity under a modal dialog) is not skipped.
+    class Idx:
+        order = [SimpleNamespace(text="Unsaved changes", cd="", flags={"visible_to_user"}, window=1,
+                                 bounds=(16, 200, 328, 40), key="view:1004"),
+                 SimpleNamespace(text="Discard", cd="", flags={"visible_to_user"}, window=9,
+                                 bounds=(56, 410, 120, 64), key="view:2002")]
+
+        def window_rect(self, win):
+            return (0, 0, 360, 640)
+
+        def obscured(self, win):
+            return []
+
+    lap = [{"window": 9, "speak": "Discard. Button", "label": "Discard"}]
+    assert tbwalk.orphan_text(Idx(), lap) == []
+    assert [o["text"] for o in tbwalk.orphan_text(Idx(), lap + [{"window": 1, "speak": "Title"}])] \
+        == ["Unsaved changes"]
+
+
 def test_container_and_child_with_the_same_words_are_a_double_stop(tb_env):
     switch = ViewSpec(1051, "Switch", "android.widget", (250, 140, 90, 60), text="Wi-Fi",
                       a11y={"class_name": "android.widget.Switch", "text": "Wi-Fi", "clickable": True,
@@ -409,6 +473,27 @@ def test_leaving_a_same_window_overlay_is_an_escape(tb_env):
     esc = [f for f in res["findings"] if f["code"] == "tb.escape"]
     assert esc and esc[0]["refs"] == ["view:1072", "view:1061"]
     assert "view:1070" in esc[0]["msg"]
+
+
+def test_a_compose_host_with_a_scrim_over_views_is_an_overlay(tb_env):
+    # Views report their drawing order; the Compose host reports 0 (Compose builds
+    # its node itself) and sorts first by position, though it is drawn last.
+    background = [_button(1060 + i, (20, 110 + 140 * i, 320, 60), f"Account {i}", drawing_order=2 + i)
+                  for i in range(2)]
+    scrim = ViewSpec(1071, "View", "android.view", (0, 0, 360, 640),
+                     a11y={"class_name": "android.view.View", "clickable": True},
+                     children=[_button(1072, (40, 300, 280, 60), "Stay")])
+    host = ViewSpec(1070, "AndroidComposeView", "androidx.compose.ui.platform", (0, 0, 360, 640),
+                    a11y={"class_name": "android.view.View"}, children=[scrim])
+    tb_env.scene_factory = lambda: _scene_with(host, *background)
+    tb_env.talkback.order = [(1072, -1), (1060, -1)]
+    res = walk(tb_env, until="edge")
+    esc = [f for f in res["findings"] if f["code"] == "tb.escape"]
+    assert esc and esc[0]["refs"] == ["view:1072", "view:1060"]
+    # Without the scrim the host is plain content drawn under the Views: no overlay.
+    scrim.a11y["clickable"] = False
+    res = walk(tb_env, until="edge")
+    assert "tb.escape" not in [f["code"] for f in res["findings"]]
 
 
 def test_compose_nodes_are_keyed_by_semantics_id(tb_env):
@@ -584,9 +669,31 @@ def test_survive_detects_a_rebound_row_as_drift(probe, monkeypatch):
     assert any("TB_PROBE" in b and "notify_all" in b for b in probe.broadcasts)
 
 
+def test_survive_sees_a_rebound_row_that_sent_no_event(probe):
+    def rebind(args):  # Compose rebinds a keyless lazy item without a content-change event
+        _views(probe.live_scene(PKG))[1022].a11y["text"] = "Item 9"
+
+    probe.on_broadcast = rebind
+    res = scenario(probe, "survive", target="Item 2", mutate="probe:insert_top")
+    assert res["verdict"] == "drifted" and res["finding"]["code"] == "tb.focus_drift"
+
+
 def test_survive_kept(probe):
     res = scenario(probe, "survive", target="Item 1", mutate="broadcast:-a com.example.NOOP")
     assert res["verdict"] == "kept" and "finding" not in res
+
+
+def test_survive_an_updated_row_is_kept_not_drift(probe):
+    def change_item(args):
+        _views(probe.live_scene(PKG))[1022].a11y["text"] = "Item 2 (played)"
+        probe.agent(PKG).a11y_tap.record(fakeagent.TYPE_WINDOW_CONTENT_CHANGED, 1001, 1022, -1,
+                                         content_change_types=1)
+
+    probe.on_broadcast = change_item
+    res = scenario(probe, "survive", target="Item 2", mutate="probe:change_item")
+    assert res["verdict"] == "kept" and "finding" not in res
+    assert tbscenarios._same_item("Track 8", "Track 8 (played)")
+    assert not tbscenarios._same_item("Message 1", "Message 10")
 
 
 # --------------------------------------------------------------------------- #
@@ -729,6 +836,42 @@ def test_remodel_matches_a_reminted_id_by_signature():
     m.stops = [tbwalk.PStop("compose:7:141", "Row 3", "Row 3", (0, 100, 300, 80), 1, "View")]
     assert m.match("compose:7:759", "View|Row 3", (0, 101, 300, 80)).key == "compose:7:141"
     assert m.match("compose:7:760", "View|Row 3", (0, 900, 300, 80)) is None
+
+
+def test_remodel_puts_what_a_scroll_revealed_after_what_it_scrolled_off(monkeypatch):
+    def stop(key, label, y):
+        return tbwalk.PStop(key, label, label, (0, y, 300, 80), 1, "View")
+    m = tbwalk.Model()
+    m.stops = [stop("h", "Heading", 0)] + [stop(f"r{i}", f"Row {i}", 100 * i) for i in (1, 2, 3)] \
+        + [stop("f", "Footer", 900)]
+    # Rows 1-2 scrolled off, 4-5 came in; the heading and footer stayed.
+    new = [stop("h", "Heading", 0), stop("r3", "Row 3", 100), stop("r4", "Row 4", 200),
+           stop("r5", "Row 5", 300), stop("f", "Footer", 900)]
+    monkeypatch.setattr(tbwalk, "predict", lambda resp, legacy: (new, "", {"covered_windows": {}}))
+    m.remodel(None, False)
+    assert [s.key for s in m.stops] == ["h", "r1", "r2", "r3", "r4", "r5", "f"]
+    # Everything under the heading scrolled: the new rows follow the ones that left.
+    new = [stop("h", "Heading", 0), stop("r6", "Row 6", 100), stop("r7", "Row 7", 200)]
+    m.remodel(None, False)
+    assert [s.key for s in m.stops] == ["h", "r1", "r2", "r3", "r4", "r5", "f", "r6", "r7"]
+
+
+def test_remodel_keeps_a_rebound_recyclerview_row_as_a_stop_of_its_own(monkeypatch):
+    def stop(key, label, y):
+        return tbwalk.PStop(key, label, label, (0, y, 300, 80), 1, "TextView")
+    m = tbwalk.Model()
+    m.stops = [stop("view:2", "Heading", 0), stop("view:13", "Mail 2", 100), stop("view:14", "Mail 3", 200)]
+    # A page scroll: view:13 now shows Mail 20 further down; view:14 was updated in place.
+    new = [stop("view:2", "Heading", 0), stop("view:14", "Mail 3 (read)", 200), stop("view:13", "Mail 20", 500)]
+    monkeypatch.setattr(tbwalk, "predict", lambda resp, legacy: (new, "", {"covered_windows": {}}))
+    m.remodel(None, False)
+    assert [s.key for s in m.stops] == ["view:2", "view:13", "view:14", "view:13#1"]
+    assert m.match("view:13", "TextView|Mail 20", (0, 500, 300, 80)).key == "view:13#1"
+    assert m.match("view:13", "TextView|Mail 2", (0, 100, 300, 80)).key == "view:13"
+    assert m.match("view:14", "TextView|Mail 3 (read)", (0, 200, 300, 80)).key == "view:14"
+    # A card scrolled half off the top loses its (clipped) text: still the same node.
+    m.stops.append(stop("compose:7:39", "News 5", 900))
+    assert m.match("compose:7:39", "TextView|", (0, 20, 300, 30)).key == "compose:7:39"
 
 
 def test_utterance_logcat_turns_verbose_logging_on_and_back_off(probe):
@@ -941,3 +1084,25 @@ def test_proving_the_keymap_on_the_last_stop_comes_back_to_it(probe, monkeypatch
     res = scenario(probe, "focus_after", target="Item 5", action="activate")
     assert probe.talkback.clicks == [tb_item(5)]
     assert res["target"]["ref"] == "view:1025"
+
+
+def test_recycled_views_showing_other_items_are_not_a_loop(probe):
+    """RecyclerView rebinds the same Views to other items as it scrolls: the same
+    pair of keys with other content is a new move, not a loop."""
+    succ = {None: TB_TITLE, TB_TITLE: tb_item(0), tb_item(0): tb_item(1), tb_item(1): tb_item(0)}
+    texts = iter([f"Item {i}" for i in range(2, 30)])
+
+    def recycle(tb, action):
+        if action != "next":
+            return False
+        target = succ[tb.focus]
+        if tb.focus in (tb_item(0), tb_item(1)):  # the next row reuses the other View
+            view = next(v for r in tb.device.live_scene(PKG).roots for v in r.walk() if v.id == target[0])
+            view.a11y["text"] = next(texts, None) or "Item x"
+            tb.device.agent(PKG).a11y_tap.record(fakeagent.TYPE_WINDOW_CONTENT_CHANGED, 1001, target[0], -1)
+        tb.set_focus(target)
+        return True
+
+    probe.talkback.on_press = recycle
+    res = walk(probe, max_steps=12)
+    assert res["ended"] == "max_steps", res["lines"]

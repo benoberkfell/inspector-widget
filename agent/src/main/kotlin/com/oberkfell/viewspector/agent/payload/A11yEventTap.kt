@@ -334,22 +334,20 @@ object A11yEventTap {
         var hostViewId = 0L
         var hostClass: String? = null
         var virtualId = A11yIds.HOST_VIEW_ID
-        var sourceView: View? = null
+        var hostView: View? = null
         val packed = A11yViews.sourceNodeId(event)
         if (packed != null && !A11yIds.isUndefined(packed)) {
             virtualId = A11yIds.virtualIdOf(packed)
             A11yViews.viewFor(root, A11yIds.accessibilityViewIdOf(packed))?.let {
+                hostView = it
                 hostViewId = ViewReflect.uniqueDrawingId(it)
                 hostClass = it.javaClass.name
-                // The View itself is the source; a virtual node's host View is not the field.
-                if (virtualId == A11yIds.HOST_VIEW_ID) sourceView = it
             }
         }
-        // A password field's event text is its content (TYPE_VIEW_TEXT_CHANGED): mask it like
-        // every other text path (Redaction.kt). The event says so for a masked field (and a
-        // Compose Password node); a visible-password field only by its View's input type.
-        val secret = event.isPassword || sourceView?.let { Redaction.isPasswordView(it) } == true
-        val text = textOf(event, secret)
+        // A password field's event text is its content (TYPE_VIEW_TEXT_CHANGED and
+        // TYPE_VIEW_TEXT_SELECTION_CHANGED carry the whole text): mask it like every other text
+        // path (Redaction.kt). Resolved only for an event that has text to record.
+        val text = textOf(event) { isPasswordSource(event, hostView, virtualId) }
         val changes = event.contentChangeTypes
         val pane = if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && (changes and PANE_CHANGES) != 0) {
             text
@@ -380,19 +378,52 @@ object A11yEventTap {
     }
 
     /**
-     * The event's text (else its content description), at most [MAX_TEXT] chars; the text of
-     * a [secret] (password) source masked. A masked field's own text is mostly dots already,
-     * but not the character just typed (PasswordTransformationMethod shows it briefly), and a
-     * visible-password field's is the plaintext.
+     * Whether the source of [event] ([host] and [virtualId], as [fields] resolved them) is a
+     * password field. Any one signal is enough:
+     *  - the event says so (AccessibilityEvent.isPassword): a masked View field, a Compose node
+     *    with Password semantics, a provider that copies its node's isPassword (ExploreByTouchHelper);
+     *  - the source View, or a virtual node's host View, is one ([Redaction.isPasswordView]):
+     *    a visible-password EditText has no isPassword, only its input type;
+     *  - a Compose node's SemanticsNode is one (ComposeInspector.isPasswordNode): a
+     *    visible-password Compose field (a password keyboard, no PasswordVisualTransformation)
+     *    has no Password semantics, so no isPassword, and Compose sets no input type. Asked of
+     *    the semantics tree, not of the provider, whose node would add nothing here and whose
+     *    lookup changes the delegate's state (ComposeTraversal);
+     *  - any other virtual node: its provider's node is isPassword or of a password input type.
+     * A check that fails counts as "no" for itself only. Main thread.
      */
-    private fun textOf(event: AccessibilityEvent, secret: Boolean): String? {
-        val joined = event.text?.filter { !it.isNullOrEmpty() }?.joinToString(" ")
-        val s = when {
-            !joined.isNullOrEmpty() -> if (secret) Redaction.mask(joined) else joined
-            else -> event.contentDescription?.toString()
+    private fun isPasswordSource(event: AccessibilityEvent, host: View?, virtualId: Int): Boolean {
+        if (guarded { event.isPassword }) return true
+        if (host == null) return false
+        if (Redaction.isPasswordView(host)) return true
+        if (virtualId == A11yIds.HOST_VIEW_ID) return false
+        if (ComposeInspector.isAndroidComposeView(host)) return ComposeInspector.isPasswordNode(host, virtualId)
+        return guarded {
+            val node = host.accessibilityNodeProvider?.createAccessibilityNodeInfo(virtualId)
+            node != null && (node.isPassword || Redaction.isPasswordInputType(node.inputType))
         }
+    }
+
+    private inline fun guarded(block: () -> Boolean): Boolean = try {
+        block()
+    } catch (_: Throwable) {
+        false
+    }
+
+    /**
+     * The event's text (else its content description), at most [MAX_TEXT] chars, masked whole
+     * when [secret] says the source is a password field (asked only when there is text). A
+     * masked field's own text is mostly dots already, but not the character just typed
+     * (PasswordTransformationMethod shows it briefly), and a visible-password field's is the
+     * plaintext. Nothing else of the event's text is read: not its beforeText (the text before
+     * a TEXT_CHANGED), and its added / removed counts are not recorded.
+     */
+    private fun textOf(event: AccessibilityEvent, secret: () -> Boolean): String? {
+        val joined = event.text?.filter { !it.isNullOrEmpty() }?.joinToString(" ")
+        val s = if (!joined.isNullOrEmpty()) joined else event.contentDescription?.toString()
         if (s.isNullOrEmpty()) return null
-        return if (s.length > MAX_TEXT) s.substring(0, MAX_TEXT) else s
+        val cut = if (s.length > MAX_TEXT) s.substring(0, MAX_TEXT) else s
+        return if (secret()) Redaction.mask(cut) else cut
     }
 
     // ------------------------------------------------------------------ reading (any thread)

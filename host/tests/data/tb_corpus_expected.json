@@ -1,0 +1,1421 @@
+{
+ "about": "The A11yProbe TalkBack corpus (docs/design/talkback-navigation.md part 5): what each scenario/variant must show, measured on TalkBack 17.0 / API 36 (emulator-5556) and pinned. calibration: true marks entries where TalkBack 17 differs from the design's prediction; the note says how. model_mismatch pins the model's measured delta (null: none).",
+ "talkback": "17.0.0",
+ "api": 36,
+ "entries": [
+  {
+   "scenario": "tb_c1",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.double_stop",
+    "tb.ghost_stop"
+   ],
+   "static_findings": [
+    "tb.double_stop",
+    "tb.ghost_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A clickable card with its own Checkbox: two stops per card, the Checkbox unlabelled."
+  },
+  {
+   "scenario": "tb_c1",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c2",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.out_of_order"
+   ],
+   "static_findings": [
+    "tb.out_of_order"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "Two columns without traversal groups read zig-zag."
+  },
+  {
+   "scenario": "tb_c2",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c3",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.out_of_order"
+   ],
+   "static_findings": [
+    "tb.out_of_order"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "traversalIndex sorted over the whole level: the title comes last."
+  },
+  {
+   "scenario": "tb_c3",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c4",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {
+    "start": "Delete draft?",
+    "max_steps": 24
+   },
+   "expected_findings": [
+    "tb.ghost_stop"
+   ],
+   "static_findings": [
+    "tb.ghost_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: Compose drops the Buttons the clickable scrim covers, so the walk never escapes the fake dialog on TalkBack 17; the defect it shows is the unlabelled full-screen scrim, a stop."
+  },
+  {
+   "scenario": "tb_c4",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {
+    "start": "Delete draft?",
+    "max_steps": 24
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c5",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {
+    "start": "Filters",
+    "max_steps": 24
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: an expanded BottomSheetScaffold is non-modal, and Compose drops what the sheet covers; the visible results are reachable by design. No escape on TalkBack 17."
+  },
+  {
+   "scenario": "tb_c5",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {
+    "start": "Filters",
+    "max_steps": 24
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c6",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list itself walks cleanly; the defect is what an update does to focus (survive)."
+  },
+  {
+   "scenario": "tb_c6",
+   "variant": "bad_b",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list itself walks cleanly; the defect is what an update does to focus (survive)."
+  },
+  {
+   "scenario": "tb_c6",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c7",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: rows moved off screen by offset are not in the a11y tree at all (Compose leaves nodes outside the view out), so TalkBack reads 10 of 30 and wraps, and nothing in the tree shows the rest; only the Compose facet has them."
+  },
+  {
+   "scenario": "tb_c7",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c8",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.edge_stuck"
+   ],
+   "static_findings": [
+    "tb.edge_stuck"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "TalkBack does not scroll a pager: focus leaves page 1."
+  },
+  {
+   "scenario": "tb_c8",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c9",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.wrong_announcement"
+   ],
+   "static_findings": [
+    "tb.wrong_announcement"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "expected_speech": [
+    "$5. Socks"
+   ],
+   "note": "A merged row reads its texts in composition order: \"$5. Socks\"."
+  },
+  {
+   "scenario": "tb_c9",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "expected_speech": [
+    "Socks, $5"
+   ]
+  },
+  {
+   "scenario": "tb_c10",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "expected_speech": [
+    "Weekly newsletter. Check box"
+   ],
+   "note": "Calibration: TalkBack 17 speaks no state for an unchecked Compose Checkbox without stateDescription, as the 16.2 port predicts (the model agrees)."
+  },
+  {
+   "scenario": "tb_c10",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "expected_speech": [
+    "Not subscribed. Weekly newsletter"
+   ]
+  },
+  {
+   "scenario": "tb_c11",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: a SwipeToDismissBox row has no custom action, which neither a walk nor the a11y tree shows (tb.custom_action_missing needs the Compose slot facet; not implemented)."
+  },
+  {
+   "scenario": "tb_c11",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c12",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {
+    "until": "steps",
+    "max_steps": 30
+   },
+   "expected_findings": [
+    "tb.trap"
+   ],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "max_steps"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The app puts accessibility focus back on Search every 2s. TalkBack 17 does not follow input focus (requestFocus) here, so the steal is the explicit kind."
+  },
+  {
+   "scenario": "tb_c12",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {
+    "until": "steps",
+    "max_steps": 30
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "max_steps"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c13",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The dialog opens only in focus_after."
+  },
+  {
+   "scenario": "tb_c13",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c14",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list walks cleanly; the defect is restore after back."
+  },
+  {
+   "scenario": "tb_c14",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c15",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.loop",
+    "tb.double_stop"
+   ],
+   "static_findings": [
+    "tb.double_stop"
+   ],
+   "walk_expect": {
+    "ended": "loop"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "Now in Android's For-you grid: a card scrolled half off the top is focused again, TalkBack scrolls back to show its bookmark and forward again: a loop."
+  },
+  {
+   "scenario": "tb_c15",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c16",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.edge_stuck"
+   ],
+   "static_findings": [
+    "tb.edge_stuck"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: Compose keeps the offscreen WebView page out of the tree, so AntennaPod's bug does not reproduce in Compose (V13 does); the swipe-only pager edge remains."
+  },
+  {
+   "scenario": "tb_c16",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v1",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.out_of_order"
+   ],
+   "static_findings": [
+    "tb.out_of_order"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "ConstraintLayout STRIPE order plus a traversal link to an id <include> duplicated."
+  },
+  {
+   "scenario": "tb_v1",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v2",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.out_of_order"
+   ],
+   "static_findings": [
+    "tb.out_of_order"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A traversalAfter cycle: TalkBack 17 breaks it and reads B before A."
+  },
+  {
+   "scenario": "tb_v2",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v3",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {
+    "expect": [
+     "Summary: read me first",
+     "Step 1: pick a plan",
+     "Step 2: pay"
+    ]
+   },
+   "expected_findings": [
+    "tb.out_of_order"
+   ],
+   "static_findings": [
+    "tb.out_of_order"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "traversalBefore to an unimportant View is dropped: the summary is read last (against the author's expected order)."
+  },
+  {
+   "scenario": "tb_v3",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {
+    "expect": [
+     "Summary: read me first",
+     "Step 1: pick a plan",
+     "Step 2: pay"
+    ]
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v4",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.double_stop",
+    "tb.ghost_stop"
+   ],
+   "static_findings": [
+    "tb.double_stop",
+    "tb.ghost_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A clickable row whose contentDescription hides its text, plus a clickable Switch: two stops."
+  },
+  {
+   "scenario": "tb_v4",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v5",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {
+    "start": "Choose an option",
+    "max_steps": 24
+   },
+   "expected_findings": [
+    "tb.escape",
+    "tb.ghost_stop"
+   ],
+   "static_findings": [
+    "tb.escape",
+    "tb.ghost_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A same-window scrim + card: focus walks out behind it, and the unlabelled scrim is a stop."
+  },
+  {
+   "scenario": "tb_v5",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {
+    "start": "Choose an option",
+    "max_steps": 24
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v6",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list walks cleanly; the defect is what an update does to focus (survive)."
+  },
+  {
+   "scenario": "tb_v6",
+   "variant": "bad_b",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list walks cleanly; the defect is what an update does to focus (survive)."
+  },
+  {
+   "scenario": "tb_v6",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v7",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.edge_stuck"
+   ],
+   "static_findings": [
+    "tb.edge_stuck"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "Rows moved by translationY with no scroll actions: the walk stops at a cut-off row."
+  },
+  {
+   "scenario": "tb_v7",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v8",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.edge_stuck"
+   ],
+   "static_findings": [
+    "tb.edge_stuck"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A scroll that moves children by translationY and sends no TYPE_VIEW_SCROLLED."
+  },
+  {
+   "scenario": "tb_v8",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v9",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.ghost_stop"
+   ],
+   "static_findings": [
+    "tb.ghost_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "Model baselines: an unlabelled ImageButton and a silent container."
+  },
+  {
+   "scenario": "tb_v9",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v10",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.window_order"
+   ],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A non-focusable PopupWindow is read after the whole main window."
+  },
+  {
+   "scenario": "tb_v10",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v11",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list walks cleanly; the defect is restore after back."
+  },
+  {
+   "scenario": "tb_v11",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v12",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.wrong_announcement"
+   ],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "expected_speech": [
+    "Message 1. 2 of 21"
+   ],
+   "note": "Thunderbird: an empty header item counts in the rows' collection positions, so the first message is \"2 of 21\"."
+  },
+  {
+   "scenario": "tb_v12",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "expected_speech": [
+    "Message 1. 1 of 20"
+   ]
+  },
+  {
+   "scenario": "tb_v13",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.ghost_stop",
+    "tb.edge_stuck",
+    "tb.out_of_order"
+   ],
+   "static_findings": [
+    "tb.edge_stuck"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": {
+    "differ": 5,
+    "note": "TalkBack 17 walks into the WebView's virtual nodes (the show notes); the model does not model web content beyond supportsWebActions (talkback/rules.py), so it predicts the Download button after the page and none of the web stops.",
+    "unpredicted": [
+     "virtual:17:4",
+     "virtual:17:8",
+     "virtual:17:7",
+     "virtual:17:2",
+     "virtual:17:12"
+    ],
+    "unvisited": []
+   },
+   "calibration": false,
+   "note": "AntennaPod: ViewPager2 keeps the offscreen WebView page in the tree; TalkBack walks into show notes nobody can see."
+  },
+  {
+   "scenario": "tb_v13",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v14",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The dialog opens only in focus_after."
+  },
+  {
+   "scenario": "tb_v14",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h1",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [
+    "tb.ghost_stop",
+    "tb.skipped"
+   ],
+   "static_findings": [
+    "tb.ghost_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "ComposeView cells with noHideDescendants: every cell is hidden, the list is one empty stop."
+  },
+  {
+   "scenario": "tb_h1",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h2",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "The list walks cleanly; the defect is what an update does to focus (survive)."
+  },
+  {
+   "scenario": "tb_h2",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h3",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: TalkBack 17 still reaches the TextViews of an AndroidView whose root is not important (as separate stops); the holder-link loss does not show."
+  },
+  {
+   "scenario": "tb_h3",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h4",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: TalkBack 17 reads the overlaid banner FIRST (the model predicts that too), not last as the STRIPE tie suggested."
+  },
+  {
+   "scenario": "tb_h4",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h5",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {
+    "start": "Stay",
+    "max_steps": 24
+   },
+   "expected_findings": [
+    "tb.escape",
+    "tb.double_stop"
+   ],
+   "static_findings": [
+    "tb.escape",
+    "tb.double_stop"
+   ],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false,
+   "note": "A ComposeView \"dialog\" (scrim + card) over the Fragment's Views: focus walks out to the accounts."
+  },
+  {
+   "scenario": "tb_h5",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {
+    "start": "Stay",
+    "max_steps": 24
+   },
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h6",
+   "variant": "bad",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": true,
+   "note": "Calibration: Compose > AndroidView > RecyclerView scrolls and focus leaves correctly on TalkBack 17."
+  },
+  {
+   "scenario": "tb_h6",
+   "variant": "good",
+   "kind": "walk",
+   "walk": {},
+   "expected_findings": [],
+   "static_findings": [],
+   "walk_expect": {
+    "ended": "wrap"
+   },
+   "model_mismatch": null,
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c6",
+   "variant": "bad",
+   "kind": "survive",
+   "args": {
+    "target": "Message 3",
+    "mutate": "probe:insert_top"
+   },
+   "expect_verdict": [
+    "drifted"
+   ],
+   "expected_findings": [
+    "tb.focus_drift"
+   ],
+   "calibration": false,
+   "note": "No keys: after an insert the focused row shows its predecessor."
+  },
+  {
+   "scenario": "tb_c6",
+   "variant": "bad_b",
+   "kind": "survive",
+   "args": {
+    "target": "Message 3",
+    "mutate": "probe:refresh"
+   },
+   "expect_verdict": [
+    "reset_top"
+   ],
+   "expected_findings": [
+    "tb.focus_reset"
+   ],
+   "calibration": true,
+   "note": "Keys minted per refresh: every row is re-created, TalkBack starts over at the top."
+  },
+  {
+   "scenario": "tb_c6",
+   "variant": "good",
+   "kind": "survive",
+   "args": {
+    "target": "Message 3",
+    "mutate": "probe:insert_top"
+   },
+   "expect_verdict": [
+    "kept"
+   ],
+   "expected_findings": [],
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v6",
+   "variant": "bad",
+   "kind": "survive",
+   "args": {
+    "target": "Mail 3",
+    "mutate": "probe:insert_top"
+   },
+   "expect_verdict": [
+    "reset_top"
+   ],
+   "expected_findings": [
+    "tb.focus_reset"
+   ],
+   "calibration": true,
+   "note": "Calibration: the design expected drift; on API 36 notifyDataSetChanged sends TalkBack to the top."
+  },
+  {
+   "scenario": "tb_v6",
+   "variant": "bad_b",
+   "kind": "survive",
+   "args": {
+    "target": "Mail 8",
+    "mutate": "probe:change_item"
+   },
+   "expect_verdict": [
+    "reset_top"
+   ],
+   "expected_findings": [
+    "tb.focus_reset"
+   ],
+   "calibration": true,
+   "note": "change_item with the default change animation: a new holder, focus to the top."
+  },
+  {
+   "scenario": "tb_v6",
+   "variant": "good",
+   "kind": "survive",
+   "args": {
+    "target": "Mail 3",
+    "mutate": "probe:insert_top"
+   },
+   "expect_verdict": [
+    "kept"
+   ],
+   "expected_findings": [],
+   "calibration": false
+  },
+  {
+   "scenario": "tb_h2",
+   "variant": "bad",
+   "kind": "survive",
+   "args": {
+    "target": "Track 8",
+    "mutate": "probe:change_item"
+   },
+   "expect_verdict": [
+    "reset_top"
+   ],
+   "expected_findings": [
+    "tb.focus_reset"
+   ],
+   "calibration": true,
+   "note": "ComposeView cells re-created on a change: focus to the top."
+  },
+  {
+   "scenario": "tb_h2",
+   "variant": "good",
+   "kind": "survive",
+   "args": {
+    "target": "Track 8",
+    "mutate": "probe:change_item"
+   },
+   "expect_verdict": [
+    "kept"
+   ],
+   "expected_findings": [],
+   "calibration": false,
+   "note": "The row is updated in place (\"Track 8 (played)\")."
+  },
+  {
+   "scenario": "tb_c13",
+   "variant": "bad",
+   "kind": "focus_after",
+   "args": {
+    "target": "Rename file",
+    "action": "activate"
+   },
+   "expect_verdict": [
+    "on_close_or_unlabeled"
+   ],
+   "expected_findings": [
+    "tb.initial_focus"
+   ],
+   "calibration": false,
+   "note": "The dialog's first focus is its unlabelled close button."
+  },
+  {
+   "scenario": "tb_c13",
+   "variant": "good",
+   "kind": "focus_after",
+   "args": {
+    "target": "Rename file",
+    "action": "activate"
+   },
+   "expect_verdict": [
+    "initial_ok"
+   ],
+   "expected_findings": [],
+   "calibration": false
+  },
+  {
+   "scenario": "tb_v14",
+   "variant": "bad",
+   "kind": "focus_after",
+   "args": {
+    "target": "Share item",
+    "action": "activate"
+   },
+   "expect_verdict": [
+    "on_close_or_unlabeled"
+   ],
+   "expected_findings": [
+    "tb.initial_focus"
+   ],
+   "calibration": false,
+   "note": "D1: a DialogFragment with no window title: TalkBack starts on an unlabelled button."
+  },
+  {
+   "scenario": "tb_v14",
+   "variant": "good",
+   "kind": "focus_after",
+   "args": {
+    "target": "Share item",
+    "action": "activate"
+   },
+   "expect_verdict": [
+    "initial_ok"
+   ],
+   "expected_findings": [],
+   "calibration": false
+  },
+  {
+   "scenario": "tb_c14",
+   "variant": "bad",
+   "kind": "restore",
+   "args": {
+    "target": "Topic 3"
+   },
+   "expect_verdict": [
+    "top"
+   ],
+   "expected_findings": [
+    "tb.restore_failed"
+   ],
+   "calibration": false,
+   "note": "Now in Android: single-activity navigation, the row is disposed; back starts over at the top."
+  },
+  {
+   "scenario": "tb_c14",
+   "variant": "good",
+   "kind": "restore",
+   "args": {
+    "target": "Topic 3"
+   },
+   "expect_verdict": [
+    "restored"
+   ],
+   "expected_findings": [],
+   "calibration": true,
+   "note": "Calibration: a pane title per destination does not restore on TalkBack 17; GOOD restores accessibility focus itself."
+  },
+  {
+   "scenario": "tb_v11",
+   "variant": "bad",
+   "kind": "restore",
+   "args": {
+    "target": "Folder 3"
+   },
+   "expect_verdict": [
+    "top"
+   ],
+   "expected_findings": [
+    "tb.restore_failed"
+   ],
+   "calibration": false,
+   "note": "The list activity is re-created on the way back."
+  },
+  {
+   "scenario": "tb_v11",
+   "variant": "good",
+   "kind": "restore",
+   "args": {
+    "target": "Folder 3"
+   },
+   "expect_verdict": [
+    "restored"
+   ],
+   "expected_findings": [],
+   "calibration": false
+  }
+ ]
+}
