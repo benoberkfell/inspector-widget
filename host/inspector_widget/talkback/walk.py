@@ -667,7 +667,8 @@ def _ordered_nodes(windows: List[Dict[str, Any]], d: Dict[str, Any]) -> Tuple[Li
     try:
         # T1's literal port of TalkBack's traversal, when it is merged.
         tborder = importlib.import_module("inspector_widget.talkback.order")
-        res = tborder.reading_order(d)  # the whole dump: windows, modality, importance
+        # The whole dump (windows, modality, importance), spoken as for a key-driven walk.
+        res = tborder.reading_order(d, keyboard=True)
         return list(res["_nodes"]), [e.get("speak") for e in res["focus_order"]], "talkback.order"
     except Exception:  # noqa: BLE001 - not merged yet, or it could not model this dump
         pass
@@ -1530,6 +1531,12 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
     if ended == "wrap" and start_idx is not None:
         last_idx = next((s.index for s in reversed(steps) if s.index is not None), start_idx)
         walk["orphans"] = orphan_text(last_idx, records, legacy)
+    if start_resp is not None:
+        # What the model knows lies ahead (auto-scrolled content, a WebView that swallows
+        # "next"): diff names a stuck walk at such a WebView a tb.trap.
+        known = model_hints(start_resp)
+        walk["hints"] = known["hints"]
+        walk["web_traps"] = known["web_traps"]
     analysis = diff.analyze(walk, expect=expect)
     walk["findings"] = analysis["findings"]
     walk["vs_model"] = analysis["vs_model"]
@@ -1699,20 +1706,25 @@ def static_walk(resp: Any, *, direction: str = "next", until: str = "wrap",
     talkback.order predicts. No device needed; ``resp`` is a DumpA11yResponse.
 
     The model does not scroll: the walk ends (``ended`` "autoscroll") where
-    TalkBack would auto-scroll a list, so what it would scroll in is not judged.
-    A pager is not auto-scrolled, so leaving one is still reported."""
+    TalkBack would auto-scroll a list, so what it would scroll in is not judged;
+    ``hints`` says what lies there (talkback.order's ``autoscroll_ahead``). A
+    pager is not auto-scrolled, so leaving one is still reported. A WebView that
+    swallows "next" ends it as ``ended`` "trap" with a tb.trap finding."""
     from .. import a11y
     from .order import simulate
     from .tree import build
     idx = DumpIndex(resp)
     model = Model()
     model.build(resp, bool(idx.legacy))
-    order = simulate(build(a11y.a11y_to_dict(resp)), start=None, direction=direction, until=until)
+    order = simulate(build(a11y.a11y_to_dict(resp)), start=None, direction=direction, until=until,
+                     keyboard=True)
     ended = order.ended
     steps: List[Step] = []
     for st in order.steps:
         key = st.get("key")
         node = idx.nodes.get(key) if key else None
+        if st.get("swallowed"):
+            break
         if st.get("autoscroll"):
             ended = "autoscroll"
             break
@@ -1742,8 +1754,27 @@ def static_walk(resp: Any, *, direction: str = "next", until: str = "wrap",
     analysis = diff.analyze(walk, expect=expect)
     findings = [dict(f, basis="model" if f.get("basis") == "walk" else f.get("basis"))
                 for f in analysis["findings"] if f["code"] != "model.mismatch"]
-    walk["findings"] = findings
+    traps = [d for d in order.diagnostics if d.get("kind") == "web_trap"]
+    walk["findings"] = [diff.web_trap_finding(t, basis="model") for t in traps] + findings
+    walk["hints"] = [h["message"] for h in order.hints]
     return walk
+
+
+def model_hints(resp: Any) -> Dict[str, Any]:
+    """What the model knows about a screen that a walk over it runs into: ``hints`` (the
+    autoscroll_ahead and web_trap messages of a forward lap) and ``web_traps`` (every WebView
+    that swallows "next", :meth:`.order.Navigator.web_traps`). Empty when the model cannot
+    read the dump."""
+    try:
+        from .. import a11y
+        from .order import Navigator, simulate
+        from .tree import build
+        tb = build(a11y.a11y_to_dict(resp))
+        order = simulate(tb, start=None, until="wrap", keyboard=True)
+        return {"hints": [h["message"] for h in order.hints],
+                "web_traps": Navigator(tb).web_traps()}
+    except Exception:  # noqa: BLE001 - the walk reports without them
+        return {"hints": [], "web_traps": []}
 
 
 def _restore_state(drv: Driver) -> str:
@@ -1802,6 +1833,8 @@ def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) ->
         head["cycle"] = walk["cycle"]
     if walk.get("notes"):
         head["notes"] = walk["notes"]
+    if walk.get("hints"):
+        head["hints"] = [h if len(h) <= 240 else h[:239] + "…" for h in walk["hints"][:3]]
     findings = [{k: f[k] for k in ("code", "sev", "refs", "basis", "msg", "fix") if f.get(k) is not None}
                 for f in walk.get("findings") or []]
     hints = next_hints(walk)

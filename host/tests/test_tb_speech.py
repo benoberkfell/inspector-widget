@@ -270,7 +270,7 @@ def test_tb17_d1_utterances_apart_from_the_carried_over_list_exit():
     assert walk.speech()[: len(expected)] == expected
 
 
-def test_versions_differ_only_in_the_separator_so_far():
+def test_versions_differ_in_the_separator_and_the_pager_words():
     node = n(2, cls="android.widget.CheckBox", text="Done", flags=FOCUS + ("checkable", "checked"))
     tree = tb.build([root(node)])
     target = tree.node("view:2")
@@ -337,3 +337,105 @@ def test_tb17_p6_utterances_are_exact(name):
         assert walk_model.stops[11].get("speak_conf") == "pre_scroll"
     else:
         assert pre_scroll == []
+
+
+# ------------------------------------------------------------- TalkBack 17.0, real-app walks (B10)
+def _rows(host0, n_rows, text, y0=0, **kw):
+    return [n(host0 + i, cls="android.widget.TextView", text=f"{text} {i}", flags=FOCUS,
+              b=(0, y0 + 100 * i, 1080, 100), **kw) for i in range(n_rows)]
+
+
+def test_a_flat_list_holding_another_flat_list_is_not_announced():
+    # CollectionState.shouldEnter (UT/monitor/CollectionState.java:966): "the innermost
+    # collection" only. Now in Android's For-you feed (a LazyColumn) holds the topic grid:
+    # TalkBack 17 said "What are you interested in?" with no "In list", then "Not selected.
+    # Headlines. In list" in the grid.
+    chips = n(30, cls="android.view.View", b=(0, 200, 1080, 300),
+              collection_info={"row_count": -1, "column_count": -1},
+              children=_rows(40, 2, "Topic", 200))
+    header = n(20, cls="android.widget.TextView", text="What are you interested in?",
+               flags=FOCUS, b=(0, 0, 1080, 100))
+    feed = n(10, cls="android.view.View", b=(0, 0, 1080, 1000),
+             collection_info={"row_count": -1, "column_count": -1}, children=[header, chips])
+    assert tb.simulate(tb.build([root(feed)])).speech()[:3] == [
+        "What are you interested in?", "Topic 0. In list", "Topic 1"]
+    # A hierarchical outer collection is still announced.
+    feed["collection_info"]["hierarchical"] = True
+    assert tb.simulate(tb.build([root(feed)])).speech()[0] == \
+        "What are you interested in?. In list"
+
+
+def _pager(rows, cols):
+    page = n(11, cls="android.widget.FrameLayout", b=(0, 100, 1080, 800),
+             collection_item_info={"row_index": 0, "column_index": 0}, children=[
+                 n(12, cls="android.widget.TextView", text="Subject", flags=FOCUS,
+                   b=(0, 100, 1080, 100))])
+    pager = n(10, cls="androidx.viewpager.widget.ViewPager", b=(0, 100, 1080, 800),
+              collection_info={"row_count": rows, "column_count": cols},
+              actions=({"id": 0x01020047},), children=[page])
+    up = n(9, cls="android.widget.ImageButton", cd="Navigate up", flags=FOCUS, b=(0, 0, 120, 100))
+    return [root(up, pager)]
+
+
+def test_talkback_17_words_a_pager_by_its_orientation():
+    # Measured: "Inline image attachment. In horizontal pager" (Thunderbird's message pager,
+    # rows 1 x 6), "In vertical pager" (AntennaPod's player), and "Navigate up. Button. Out of
+    # grid pager" on the way out (Thunderbird, A11yProbe V13 and C16). 16.2 says "In pager".
+    h = tb.simulate(tb.build(_pager(1, 6)), start="view:9")
+    assert h.speech()[:2] == ["Subject. In horizontal pager", "Navigate up. Button. Out of grid pager"]
+    v = tb.simulate(tb.build(_pager(2, 1)), start="view:9")
+    assert v.speech()[0] == "Subject. In vertical pager"
+    old = tb.simulate(tb.build(_pager(1, 6)), start="view:9", version="16.2")
+    assert old.speech()[:2] == ["Subject, In pager", "Navigate up, Button, Out of pager"]
+
+
+def test_an_edit_box_reached_by_keyboard_says_editing():
+    # EditTextDescription.stateDescription (TB/compositor/roledescription/EditTextDescription
+    # .java:126): "Editing" when the box has input focus and a keyboard is up. TalkBack 17 on
+    # Thunderbird's onboarding, walked with a hardware keyboard: "Editing. Every 15 minutes.
+    # Edit box. Check frequency. Drop down list. read only".
+    box = n(2, cls="android.widget.EditText", text="Every 15 minutes",
+            flags=FOCUS, b=(0, 0, 1080, 150))
+    tree = tb.build([root(box)])
+    nav, node = tb.Navigator(tree), tree.node("view:2")
+    assert S.announce(nav, node, transitions=False).text == "Every 15 minutes. Edit box. read only"
+    assert S.announce(nav, node, transitions=False, keyboard=True).text == \
+        "Editing. Every 15 minutes. Edit box. read only"
+    box["flags"] = list(box["flags"]) + ["focused", "editable"]
+    tree = tb.build([root(box)])
+    assert S.announce(tb.Navigator(tree), tree.node("view:2"), transitions=False).text == \
+        "Editing. Every 15 minutes. Edit box"
+
+
+def test_a_walk_from_a_focused_node_starts_inside_its_collection():
+    # The focus was already on a list row when the walk started: TalkBack had said "In list"
+    # there, so the next row says only its position (Thunderbird's onboarding walk:
+    # "Thunderbird. In list. 6 items" on the wrap, then "Sync options").
+    rows = [n(10 + i, cls="android.widget.TextView", text=f"Row {i}", flags=FOCUS,
+              b=(0, 100 * i, 1080, 100), collection_item_info={"row_index": i, "column_index": 0})
+            for i in range(3)]
+    lst = n(2, cls="android.view.View", b=(0, 0, 1080, 300),
+            collection_info={"row_count": 3, "column_count": 1}, children=rows)
+    walk = tb.simulate(tb.build([root(lst)]), start="view:10", until="steps", max_steps=1)
+    assert walk.speech() == ["Row 1. 2 of 3"]
+
+
+def test_clickable_image_unlabelled_control_and_single_choice_radio():
+    # B10 on TalkBack 17: a clickable ImageView is "Search. Button" (Role IMAGE_BUTTON), an
+    # unlabelled control says only its role ("Button"), a single-choice CheckedTextView says
+    # "not checked. Light. Radio button. 1 of 3. In list. 3 items".
+    search = n(2, cls="android.widget.ImageView", cd="Search", flags=FOCUS, b=(0, 0, 120, 120))
+    blank = n(3, cls="android.widget.ImageView", flags=FOCUS, b=(200, 0, 120, 120))
+    assert say(search).text == "Search. Button"
+    assert say(blank).text == "Button" and say(blank).unlabelled
+    opts = [n(10 + i, cls="android.widget.CheckedTextView", text=t,
+              flags=FOCUS + ("checkable",) + (("checked",) if t == "System" else ()),
+              b=(0, 200 + 100 * i, 1080, 100),
+              collection_item_info={"row_index": i, "column_index": 0})
+            for i, t in enumerate(("Light", "Dark", "System"))]
+    lst = n(4, cls="android.widget.ListView", b=(0, 200, 1080, 300),
+            collection_info={"row_count": 3, "column_count": 1, "selection_mode": 1},
+            children=opts)
+    assert tb.simulate(tb.build([root(lst)])).speech()[:3] == [
+        "not checked. Light. Radio button. 1 of 3. In list. 3 items",
+        "not checked. Dark. Radio button. 2 of 3", "checked. System. Radio button. 3 of 3"]

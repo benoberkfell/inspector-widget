@@ -5,7 +5,7 @@ Pure: it works on the walk record :mod:`.walk` saves (steps, predicted stops,
 how the walk ended), so a stored walk can be re-analysed offline.
 
 Codes: ``tb.out_of_order``, ``tb.loop``, ``tb.trap`` (the app took focus
-between presses), ``tb.revisit`` (a stop read twice in one lap),
+between presses, or a WebView swallows "next"), ``tb.revisit`` (a stop read twice in one lap),
 ``tb.edge_stuck``, ``tb.skipped`` (predicted stops never reached, or text on
 screen nobody read), ``tb.ghost_stop``, ``tb.double_stop``, ``tb.escape``,
 ``tb.focus_lost``, ``tb.wrong_announcement`` ("N of M" that counts an item
@@ -55,8 +55,10 @@ FIXES = {
     "tb.focus_lost": "Keep the focused item alive while it scrolls (stable keys / "
                      "LazyListState, no key churn); TalkBack re-focuses only after a scroll "
                      "event from the container.",
-    "tb.trap": "Request input focus once (LaunchedEffect(Unit) / a one-off requestFocus), not "
-               "on every recomposition or timer tick: each request pulls TalkBack's focus back.",
+    "tb.trap": "Move accessibility focus once (on arrival: LaunchedEffect(Unit)), not on every "
+               "recomposition or timer tick: each ACTION_ACCESSIBILITY_FOCUS (or "
+               "TYPE_VIEW_ACCESSIBILITY_FOCUSED) the app sends pulls TalkBack back. (TalkBack 17 "
+               "does not follow requestFocus() input focus, so the steal is an explicit one.)",
     "tb.revisit": "Give lazy items stable keys and one stop each (a traversal group per card); "
                   "avoid content that re-lays out while TalkBack scrolls it.",
     "tb.wrong_announcement": "Keep empty header/footer items out of the adapter (or mark them "
@@ -69,6 +71,12 @@ FIXES = {
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
 }
+# tb.trap for a WebView that swallows "next" (FIXES has the focus-stealing one).
+FIX_WEB_TRAP = ("Keep pages that are not on screen out of the accessibility tree: "
+                "importantForAccessibility=noHideDescendants on the pager pages that are not "
+                "current (AUTO on the current one), or keep the WebView GONE/INVISIBLE until its "
+                "page is shown. TalkBack never scrolls a pager, so it cannot bring that page into "
+                "view itself.")
 # tb.wrong_announcement for a merged row read out of order (FIXES has the "N of M" one).
 _FIX_SPEECH_ORDER = ("Compose the texts in reading order (a merged row reads its children in "
                      "composition order, not placement), or give the row one label in reading "
@@ -84,6 +92,16 @@ def _finding(code: str, sev: str, msg: str, steps: Sequence[Dict[str, Any]] = ()
     f["steps"] = [s["i"] for s in steps][:MAX_REFS * 2]
     if code in FIXES:
         f["fix"] = FIXES[code]
+    return f
+
+
+def web_trap_finding(trap: Dict[str, Any], steps: Sequence[Dict[str, Any]] = (),
+                     basis: str = "walk") -> Dict[str, Any]:
+    """tb.trap for talkback.order's ``web_trap`` diagnostic: a WebView swallows "next"."""
+    keys = _uniq([trap.get("at"), trap.get("web_root")])
+    f = _finding("tb.trap", "error", trap["message"], steps, basis=basis,
+                 refs=[s.get("ref") for s in steps] or keys, keys=keys)
+    f["fix"] = FIX_WEB_TRAP
     return f
 
 
@@ -446,9 +464,15 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                             [s for s in steps if s.get("ref") in cyc][:MAX_REFS], refs=cyc))
     last = next((s for s in reversed(steps) if s.get("moved") and s.get("key")), None)
     if walk.get("ended") == "stuck" and last is not None:
-        out.append(_finding("tb.edge_stuck", "error",
-                            f"TalkBack stopped at {_name(last)}: two presses in a row moved nothing "
-                            f"(no edge wrap)", [last]))
+        # Stuck right before (or on) a WebView the model says swallows "next": that is why.
+        trap = next((t for t in walk.get("web_traps") or ()
+                     if last.get("key") in (t.get("before"), t.get("at"), t.get("web_root"))), None)
+        if trap is not None:
+            out.append(web_trap_finding(trap, [last]))
+        else:
+            out.append(_finding("tb.edge_stuck", "error",
+                                f"TalkBack stopped at {_name(last)}: two presses in a row moved "
+                                f"nothing (no edge wrap)", [last]))
     for s in steps:
         if s.get("via") == "lost":
             prev = next((p for p in reversed(steps[:s["i"]]) if p.get("key")), None)

@@ -654,6 +654,12 @@ def test_restore_after_back_that_goes_to_the_top_fails(probe, monkeypatch):
     res = scenario(probe, "restore", target="Item 3")
     assert res["verdict"] == "top" and res["finding"]["code"] == "tb.restore_failed"
     assert res["opened"]["top"] == f"{PKG}/.DetailActivity"
+    # Measured on TalkBack 17 (A11yProbe C14, Now in Android): neither a paneTitle per
+    # destination nor requestFocus restores focus; an explicit ACTION_ACCESSIBILITY_FOCUS does.
+    fix = res["finding"]["fix"]
+    assert "ACTION_ACCESSIBILITY_FOCUS" in fix and "performAccessibilityAction" in fix
+    assert "paneTitle per destination does not restore" in fix
+    assert not fix.startswith("Give each destination a paneTitle")
 
 
 def test_survive_detects_a_rebound_row_as_drift(probe, monkeypatch):

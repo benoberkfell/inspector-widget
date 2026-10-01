@@ -10,8 +10,11 @@ not-important Views hoisted through.
 
 Where the port deliberately differs from the Java it says so:
 
-* Web content (``WebInterfaceUtils``) is modelled only as far as ``supportsWebActions``
-  (NEXT/PREVIOUS_HTML_ELEMENT) and the WebView container's visibility.
+* Web content (``WebInterfaceUtils``): TalkBack hands navigation inside a WebView to the
+  WebView (ACTION_NEXT/PREVIOUS_HTML_ELEMENT), and Chromium picks the next element. The
+  elements it moves through are approximated by :meth:`Rules.web_elements`, calibrated on
+  TalkBack 17.0 walks (Thunderbird's message body, A11yProbe V13): document order, elements
+  with words or an action, never one of zero size.
 * ``ClassLoadingCache.checkInstanceOf`` loads classes in TalkBack's own process: framework
   classes and the androidx/material classes TalkBack bundles. :data:`_SUPERCLASS` stands in for
   that class loader; any other class name matches only itself.
@@ -20,7 +23,7 @@ Where the port deliberately differs from the Java it says so:
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .tree import TbNode, TbTree
 
@@ -195,6 +198,7 @@ class Rules:
         self.cache: Dict[int, bool] = {}
         self._role: Dict[int, int] = {}
         self._focus: Dict[int, Tuple[bool, str]] = {}
+        self._flat_inside: Dict[int, bool] = {}
 
     # ---- primitives (UT/AccessibilityNodeInfoUtils.java) -----------------------------------
     def is_visible(self, n: Optional[TbNode]) -> bool:
@@ -471,8 +475,10 @@ class Rules:
     def focus_decision(self, n: TbNode, check_children: bool = True) -> Tuple[bool, str]:
         """shouldFocusNode with the branch that decided it:
 
-        ``web``, ``not_visible``, ``window_wrapper`` (bounds equal to the window's, has
-        children, neither focusable nor clickable), ``leaf`` (accessibility-focusable with no
+        ``web`` (a WebView's root or an element its WebView moves focus to), ``web_part`` (web
+        content read as part of an element, or a container with nothing to say), ``web_empty``
+        (a web element of zero size), ``not_visible``, ``window_wrapper`` (bounds equal to the
+        window's, has children, neither focusable nor clickable), ``leaf`` (accessibility-focusable with no
         children: always focused, the unlabeled-button path), ``speaking`` (focusable with
         something to speak), ``silent_container`` (focusable, has children, nothing to speak),
         ``text_orphan`` (not focusable, has text or a state, no focusable ancestor),
@@ -490,9 +496,20 @@ class Rules:
 
     def _focus_decision(self, n: TbNode, check_children: bool) -> Tuple[bool, str]:
         if self.supports_web_actions(n):
-            container = next((a for a in [n, *n.ancestors()]
-                              if self.role(a) == ROLE_WEB_VIEW), None)
-            return (container is not None and container.visible), "web"
+            # Inside a WebView, the WebView picks the stops (see web_elements); the root is
+            # reached through nodeFilterOrWebView, with no visibility check.
+            root = self.web_root_of(n)
+            if root is None:  # HTML actions outside any WebView: 16.2's container check
+                return n.visible, "web"
+            if n is root:
+                return self.is_web_root(n), "web"
+            if not self.is_web_element(n) or any(
+                    self.is_web_element(a) for a in n.ancestors() if a is not root
+                    and root in a.ancestors()):
+                return False, "web_part"
+            if n.rect.is_empty():
+                return False, "web_empty"
+            return True, "web"
         if not self.is_visible(n):
             return False, "not_visible"
         if self.are_bounds_identical_to_window(n) and n.children \
@@ -519,6 +536,51 @@ class Rules:
             if self.focus_decision(a, check_children=False)[0]:
                 return a
         return None
+
+    # ---- web content ----------------------------------------------------------------------------
+    def is_web_root(self, n: Optional[TbNode]) -> bool:
+        """The node TalkBack stops on before it hands navigation to a WebView: Role WEB_VIEW with
+        the HTML navigation actions. findTargetFromNativeElement searches with
+        ``nodeFilterOrWebView`` (TB/focusmanagement/FocusProcessorForLogicalNavigation.java:1357),
+        which accepts it without shouldFocusNode, so no visibility check: TalkBack 17 walked into
+        a WebView on an offscreen pager page (A11yProbe V13)."""
+        return n is not None and self.role(n) == ROLE_WEB_VIEW and self.supports_web_actions(n)
+
+    def web_root_of(self, n: Optional[TbNode]) -> Optional[TbNode]:
+        """WebInterfaceUtils.ascendToWebView (UT/WebInterfaceUtils.java:344): the nearest
+        self-or-ancestor with Role WEB_VIEW, for a node with the HTML actions."""
+        if not self.supports_web_actions(n):
+            return None
+        return next((a for a in [n, *n.ancestors()] if self.role(a) == ROLE_WEB_VIEW), None)
+
+    def is_web_element(self, n: TbNode) -> bool:
+        """An element ACTION_NEXT_HTML_ELEMENT moves to (Chromium decides; this is the
+        approximation measured on TalkBack 17.0): it has words of its own, an action, or is a
+        heading. The texts inside a link or button are part of it, see :meth:`web_elements`."""
+        if not self.supports_web_actions(n) or self.role(n) == ROLE_WEB_VIEW:
+            return False
+        words = (n.content_description or n.text or "").strip()
+        return bool(words) or self.is_heading(n) or n.has("checkable") or n.has("focusable") \
+            or self.is_clickable(n) or self.is_long_clickable(n)
+
+    def web_elements(self, root: TbNode, include_empty: bool = False) -> List[TbNode]:
+        """The elements TalkBack reaches inside the web root ``root``, in document (pre-)order.
+
+        Measured on TalkBack 17.0: Thunderbird's message body (the root "Webview", a paragraph,
+        an image) and A11yProbe V13 (a heading, a paragraph, two links: not the containers
+        around the links, nor the texts inside them). An element of zero size is never a stop
+        (AntennaPod's show notes, clipped to nothing below the screen, were never read);
+        ``include_empty`` lists those too. An element's descendants are read as part of it."""
+        out: List[TbNode] = []
+        stack = list(reversed(root.children))
+        while stack:
+            n = stack.pop()
+            if self.is_web_element(n):
+                if include_empty or not n.rect.is_empty():
+                    out.append(n)
+                continue
+            stack.extend(reversed(n.children))
+        return out
 
     # ---- filters ------------------------------------------------------------------------------
     def filter_auto_scroll(self, n: Optional[TbNode]) -> bool:
@@ -585,6 +647,20 @@ class Rules:
         """FILTER_COLLECTION (:477)."""
         return n is not None and (self.role(n) in (ROLE_LIST, ROLE_GRID, ROLE_PAGER)
                                   or bool(n.get("collection_info")))
+
+    def filter_flat_collection(self, n: TbNode) -> bool:
+        """FILTER_FLAT_COLLECTION (UT/monitor/CollectionState.java:129): a collection that is
+        not marked hierarchical."""
+        ci = n.get("collection_info")
+        return self.filter_collection(n) and not (ci and ci.get("hierarchical"))
+
+    def holds_flat_collection(self, n: TbNode) -> bool:
+        """hasMatchingDescendant(n, FILTER_FLAT_COLLECTION), memoised."""
+        hit = self._flat_inside.get(id(n))
+        if hit is None:
+            hit = self._flat_inside[id(n)] = any(
+                self.filter_flat_collection(d) for d in list(n.iter())[1:])
+        return hit
 
     def node_filter(self, granularity: str = "default",
                     pivot: Optional[TbNode] = None) -> Callable[[TbNode], bool]:
