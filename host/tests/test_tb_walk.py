@@ -1176,3 +1176,76 @@ def test_orphan_text_reads_descriptions_and_abbreviations_as_the_static_rule_doe
 
     lap = [{"window": 1, "speak": "Android AI Tools. August 5, 2026. Position: 4 minutes"}]
     assert [o["text"] for o in tbwalk.orphan_text(Idx(), lap)] == ["Unsaved changes"]
+
+
+def test_a_move_that_lands_after_the_step_timeout_is_the_press_s_not_a_steal(probe):
+    """NiA's topic screen: TalkBack's auto-scroll took 900-1200ms, so a press timed out
+    (an "edge"), and focus landed before the next press. That is the press's own move
+    (late), not the app taking focus: no tb.trap, and the press after it is no wrap."""
+    state = {"armed": False}
+
+    def press(tb, action):
+        if action == "next" and len(tb.presses) == 3:
+            state["armed"] = True
+            return True  # TalkBack is still scrolling: nothing lands inside the wait
+        return False
+
+    def behaviour(req):
+        agent = probe.agent(PKG)
+        if req.WhichOneof("command") == "a11y_focus" and state["armed"] \
+                and req.a11y_focus.wait_ms == 0:
+            state["armed"] = False
+            probe.talkback.set_focus(tb_item(1))  # the slow move lands
+        return 0, agent.dispatch(req)
+
+    probe.behaviour = behaviour
+    probe.talkback.on_press = press
+    res = walk(probe)
+    rec = saved(res)
+    moves = [(s["i"], s["via"], s["key"]) for s in rec["steps"][:5]]
+    assert moves[3] == (3, "late", "view:1021") and moves[4] == (4, "next", "view:1022"), moves
+    assert rec["steps"][3]["late"] is True and not rec["steps"][3].get("edge")
+    assert not [s for s in rec["steps"] if s["via"] in ("stolen", "initial")]
+    codes = [f["code"] for f in rec["findings"]]
+    assert "tb.trap" not in codes and "tb.edge_stuck" not in codes and "tb.revisit" not in codes
+    assert res["ended"] == "wrap"
+
+
+def test_item_context_tells_the_chips_of_two_cards_apart():
+    # a LazyColumn (scrollable) of two cards, each with a HEADLINES chip in a scrolling row
+    def node(cls, text="", flags=(), kids=()):
+        n = tbwalk.Node()
+        n.cls, n.text, n.cd, n.flags, n.actions, n.key = cls, text, "", set(flags), set(), cls + text
+        n.label, n.bounds = text, (0, 0, 10, 10)
+        for k in kids:
+            k.parent = n
+            n.children.append(k)
+        return n
+
+    chips = [node("View", "HEADLINES"), node("View", "HEADLINES")]
+    rows = [node("Row", flags=("scrollable",), kids=[c]) for c in chips]
+    cards = [node("Card", kids=[node("Text", t), r])
+             for t, r in zip(("Introducing Compose Camp", "Android 16 beta"), rows)]
+    node("LazyColumn", flags=("scrollable",), kids=cards)
+    assert chips[0].ctx == "Introducing Compose Camp" and chips[1].ctx == "Android 16 beta"
+    assert chips[0].item_root  # an item of its own scrolling row (with no other text)
+    assert cards[0].item_root and cards[0].ctx == ""  # a card has nothing around it
+
+
+def test_a_wrap_needs_the_node_read_before_not_an_alike_one_still_on_screen():
+    # NiA wioch6k: the HEADLINES chip of another card, scrolled into the first chip's slot,
+    # ended the walk as a "wrap" (and raised a false edge_stuck and skipped)
+    def node(key):
+        n = tbwalk.Node()
+        n.key, n.cls, n.label, n.text, n.cd = key, "View", "HEADLINES", "HEADLINES", ""
+        n.bounds, n.flags, n.actions = (120, 2352, 231, 144), set(), set()
+        return n
+
+    old, new = node("compose:8:552"), node("compose:8:646")
+    s = tbwalk.Step(6, old.key, node=old)
+    idx = SimpleNamespace(nodes={old.key: old, new.key: new})
+    snap = tbwalk.Snapshot(idx, 0.0, focus_node=new)
+    assert not tbwalk._seen_again(s, snap)  # the old chip is still in the dump: another node
+    del idx.nodes[old.key]
+    assert tbwalk._seen_again(s, snap)  # gone: a re-minted id of the same chip
+    assert tbwalk._seen_again(tbwalk.Step(6, new.key, node=new), snap)

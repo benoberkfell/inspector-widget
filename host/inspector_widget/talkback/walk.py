@@ -85,11 +85,29 @@ _ROLE_WORDS = {
 
 class Node:
     __slots__ = ("key", "window", "host", "virtual", "cls", "label", "text", "cd", "bounds",
-                 "flags", "actions", "parent", "children", "drawing_order", "pane_title")
+                 "flags", "actions", "parent", "children", "drawing_order", "pane_title", "_item")
 
     def __init__(self) -> None:
         self.parent: Optional["Node"] = None
         self.children: List["Node"] = []
+
+    @property
+    def item(self) -> Tuple[Optional[str], bool]:
+        """``(ctx, item_root)``: the list item the node sits in (:func:`item_context`)."""
+        try:
+            return self._item
+        except AttributeError:
+            self._item = item_context(self, lambda x: x.parent, lambda x: x.children,
+                                      lambda x: x.cd or x.text, _node_scrolls)
+            return self._item
+
+    @property
+    def ctx(self) -> Optional[str]:
+        return self.item[0]
+
+    @property
+    def item_root(self) -> bool:
+        return self.item[1]
 
     @property
     def simple_cls(self) -> str:
@@ -159,14 +177,67 @@ def _unlabelled(sig: str) -> bool:
     return not sig or sig.endswith("|")
 
 
+CTX_LEN = 80
+
+
+def _node_scrolls(n: "Node") -> bool:
+    return n.cls != _WEBVIEW and ("scrollable" in n.flags or bool(n.actions & set(_SCROLL_ACTIONS)))
+
+
+def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any], Any],
+                 words: Callable[[Any], str], scrolls: Callable[[Any], bool]
+                 ) -> Tuple[Optional[str], bool]:
+    """``(ctx, item_root)`` of a node inside a scrolling list: ``ctx`` the texts of the
+    innermost list item around it that has any outside the node itself ("" when none does;
+    None when it is in no list), ``item_root`` whether the node is itself a list item (a
+    child of the scrolling container). Two nodes alike in class, label and screen slot are
+    told apart by it: the HEADLINES chips of two news cards (NiA, after a scroll put the
+    second where the first was), a RecyclerView row View rebound to another item."""
+    own: set = set()
+    stack = [n]
+    while stack:
+        x = stack.pop()
+        own.add(id(x))
+        stack.extend(children(x) or ())
+    item_root = False
+    child, a = n, parent(n)
+    first = True
+    while a is not None:
+        if scrolls(a):
+            if first:
+                item_root = child is n
+                first = False
+            texts: List[str] = []
+            stack = [child]
+            while stack and sum(len(t) for t in texts) < CTX_LEN:
+                x = stack.pop()
+                if id(x) in own:
+                    continue
+                w = words(x)
+                if w:
+                    texts.append(w)
+                stack.extend(reversed(list(children(x) or ())))
+            if texts:
+                return " | ".join(texts)[:CTX_LEN], item_root
+        child, a = a, parent(a)
+    return ("" if not first else None), item_root
+
+
+def _ctx_ok(a: Optional[str], b: Optional[str]) -> bool:
+    """Contexts that do not tell two nodes apart: one unknown, or the same."""
+    return a is None or b is None or a == b
+
+
 def same_node(key_a: Optional[str], sig_a: str, box_a: Rect,
-              key_b: Optional[str], sig_b: str, box_b: Rect, min_iou: float = 0.8) -> bool:
+              key_b: Optional[str], sig_b: str, box_b: Rect, min_iou: float = 0.8,
+              ctx_a: Optional[str] = None, ctx_b: Optional[str] = None) -> bool:
     """The same node: the same key, or (a re-minted Compose id) the same
-    signature where the boxes overlap."""
+    signature where the boxes overlap, in the same list item (``ctx``, when both
+    are known: :func:`item_context`)."""
     if key_a is not None and key_a == key_b:
         return True
     labelled = bool(sig_a) and not sig_a.endswith("|")  # unlabelled nodes all look alike
-    return labelled and sig_a == sig_b and iou(box_a, box_b) >= min_iou
+    return labelled and sig_a == sig_b and iou(box_a, box_b) >= min_iou and _ctx_ok(ctx_a, ctx_b)
 
 
 def node_key(window: int, host: int, virtual: int, cls: str, label: str,
@@ -651,6 +722,8 @@ class PStop:
     bounds: Rect
     window: int
     cls: str
+    ctx: Optional[str] = None  # item_context: the list item it sits in
+    item_root: bool = False
 
     @property
     def sig(self) -> str:
@@ -703,6 +776,10 @@ def predict(resp: Any, legacy: bool) -> Tuple[List[PStop], str, Dict[str, Any]]:
                      if int(n.get("virtual_id", HOST_VIEW_ID)) == HOST_VIEW_ID
                      and "compose" in ((n.get("provider_class") or "") + (n.get("class_name") or "")).lower()}
     nodes, speaks, source = _ordered_nodes(windows, d)
+    parent_of: Dict[int, Dict[str, Any]] = {}
+    for m in _iter_dicts(windows):
+        for c in m.get("children") or []:
+            parent_of[id(c)] = m
     stops: List[PStop] = []
     for n, sp in zip(nodes, speaks, strict=False):
         kids = [(c.get("text") or "", c.get("content_description") or "") for c in n.get("children") or []]
@@ -712,9 +789,12 @@ def predict(resp: Any, legacy: bool) -> Tuple[List[PStop], str, Dict[str, Any]]:
         win = win_of.get(id(n), 0)
         key = node_key(win, int(n.get("host_view_id") or 0), int(n.get("virtual_id", HOST_VIEW_ID)),
                        cls, label, legacy, compose_hosts)
+        ctx, item_root = item_context(
+            n, lambda x: parent_of.get(id(x)), lambda x: x.get("children") or [],
+            lambda x: x.get("content_description") or x.get("text") or "", _dict_scrolls)
         stops.append(PStop(key, label, sp or _dict_speech(n), (b.get("x", 0), b.get("y", 0),
                                                               b.get("w", 0), b.get("h", 0)),
-                           win, cls.rsplit(".", 1)[-1]))
+                           win, cls.rsplit(".", 1)[-1], ctx, item_root))
     covered = {w["root_view_id"]: w["covered_by"] for w in windows if w.get("covered_by") is not None}
     return stops, source, {"covered_windows": covered, "dump": d}
 
@@ -737,6 +817,13 @@ def predict_initial(resp: Any, window: Optional[int] = None) -> Optional[Dict[st
     except Exception:  # noqa: BLE001 - the walk reports without it
         return None
     return {k: init.get(k) for k in ("key", "how", "title", "title_source", "skipped")}
+
+
+def _dict_scrolls(n: Dict[str, Any]) -> bool:
+    if (n.get("class_name") or "") == _WEBVIEW:
+        return False
+    return "scrollable" in (n.get("flags") or ()) or any(
+        isinstance(a, dict) and a.get("id") in _SCROLL_ACTIONS for a in n.get("actions") or ())
 
 
 def _iter_dicts(windows: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
@@ -790,7 +877,8 @@ class Model:
         new, _source, meta = predict(resp, legacy)
         self.remodels += 1
         self.covered_windows.update(meta["covered_windows"])
-        known_of = [self.match(s.key, s.sig, s.bounds) for s in new]
+        known_of = [self.match(s.key, s.sig, s.bounds, ctx=s.ctx, item_root=s.item_root)
+                    for s in new]
         present = {k.key for k in known_of if k is not None}
         keys = [s.key for s in self.stops]
         prev: Optional[str] = None
@@ -809,25 +897,35 @@ class Model:
             self.stops.insert(at, s)
             prev = s.key
 
-    def match(self, key: Optional[str], sig: str, box: Rect) -> Optional[PStop]:
+    def match(self, key: Optional[str], sig: str, box: Rect, *, ctx: Optional[str] = None,
+              item_root: bool = False) -> Optional[PStop]:
         """The model's stop for a node: by key (or alias), else by signature +
         overlap. A RecyclerView rebinds a View (a ComposeView cell too) to other
         items as it scrolls: the same key with another label elsewhere is another
-        stop (``<key>#<n>``, made by :meth:`remodel`); a label that changed in
-        place, or went empty (clipped), is the same node."""
+        stop (``<key>#<n>``, made by :meth:`remodel`), and so is a list item View
+        that shows another label in the very slot it had (V6: the row View that
+        showed "Mail 3" scrolled back into that slot showing "Mail 31"), or the same
+        key in another list item (``ctx``, :func:`item_context`). A label that changed
+        in place outside a list item, or went empty (clipped), is the same node."""
         key = self.aliases.get(key, key) if key else key
         if key:
             same = [s for s in self.stops if s.key.split("#")[0] == key]
             for s in same:
-                if s.sig == sig:
+                if s.sig == sig and _ctx_ok(s.ctx, ctx):
                     return s
             for s in same:
-                if s.key == key and (iou(s.bounds, box) >= 0.5 or _unlabelled(sig) or _unlabelled(s.sig)):
-                    return s
+                if s.key != key or not _ctx_ok(s.ctx, ctx):
+                    continue
+                if not (iou(s.bounds, box) >= 0.5 or _unlabelled(sig) or _unlabelled(s.sig)):
+                    continue
+                if (item_root or s.item_root) and key.startswith("view:") and s.sig != sig \
+                        and not _unlabelled(sig) and not _unlabelled(s.sig):
+                    continue  # a recycled item View showing another item
+                return s
             if same:
                 return None
         for s in self.stops:
-            if same_node(None, sig, box, None, s.sig, s.bounds):
+            if same_node(None, sig, box, None, s.sig, s.bounds, ctx_a=ctx, ctx_b=s.ctx):
                 return s
         return None
 
@@ -1118,6 +1216,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
         prev_idx = cur.index
         transitions: Dict[Tuple[Optional[str], ...], int] = {}
         last_edge_at = -1
+        edge_at: Optional[int] = None  # the step edge_info was taken at
         no_moves = 0
         lost = 0
         last_lost_at = -1
@@ -1142,13 +1241,43 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                                           extra={"top": device.top_activity(drv.serial)}))
                         break
                 else:
-                    # None -> focus: TalkBack's own initial focus; else the app took it.
-                    via = "stolen" if cur.key is not None else "initial"
-                    steps.append(Step(len(steps), pre.key, via=via, node=pre.focus, t=pre.t,
-                                      index=pre.index))
+                    last = steps[-1] if steps else None
+                    if last is not None and last.i > 0 and (last.edge or last.via == "lost"):
+                        # The last press timed out (no move, or no focus) and its move came
+                        # after the wait: TalkBack's own (a slow auto-scroll: NiA's took
+                        # 900-1200ms), not the app's. The press moved after all.
+                        scrolled = _scrolled_key(drv, last.index or prev_idx, pre, last.t)
+                        st = Step(last.i, pre.key, via="autoscroll" if scrolled else "late",
+                                  node=pre.focus, t=last.t, index=pre.index, scrolled=scrolled,
+                                  extra={"late": True, "wall_ms": _ms(pre.t - last.t)})
+                        steps[-1] = st
+                        no_moves = lost = 0
+                        last_edge_at = max((j for j, x in enumerate(steps) if x.edge), default=-1)
+                        last_lost_at = max((j for j, x in enumerate(steps) if x.via == "lost"),
+                                           default=-1)
+                        if edge_at is not None and not steps[edge_at].edge:
+                            edge_info, edge_at = None, None  # it was no edge
+                        if hook is not None:
+                            hook.step(st, pre)
+                        if recapture == "on_unknown" and pre.focus is not None and model.match(
+                                pre.key, pre.focus.sig, pre.focus.bounds, ctx=pre.focus.ctx,
+                                item_root=pre.focus.item_root) is None:
+                            model.remodel(pre.resp, legacy)
+                            st.extra["remodel"] = True
+                    else:
+                        # None -> focus: TalkBack's own initial focus; else the app took it.
+                        via = "stolen" if cur.key is not None else "initial"
+                        steps.append(Step(len(steps), pre.key, via=via, node=pre.focus, t=pre.t,
+                                          index=pre.index))
+                        no_moves = 0  # the next press moves on from where the app put focus
                 cur, prev_idx = pre, pre.index
             t_sent, _send_ms = drv.press(direction)
             w = drv.wait(cur.key, t_sent)
+            if not w.moved and not w.aborted and _scroll_in_flight(drv, w.snap, t_sent):
+                # TalkBack is still auto-scrolling: its move lands once the scroll settles
+                events = list(w.snap.events)
+                w = drv.wait(cur.key, t_sent)
+                w.snap.events = events + list(w.snap.events)
             stolen, new = _press_target(w.snap, cur.key, direction)
             if stolen is not None:
                 steps.append(Step(len(steps), stolen.key, via="stolen", node=stolen.focus, t=t_sent,
@@ -1186,6 +1315,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                     continue
                 if edge_info is None and cur.focus is not None:
                     edge_info = _edge_info(cur.index, cur.focus, direction)
+                    edge_at = len(steps) - 1
                 last_edge_at = len(steps) - 1
                 if until == "edge":
                     ended = "edge"
@@ -1211,7 +1341,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                 hook.step(st, new)
             if recapture == "on_unknown" and (
                     new.key not in model.keys() if new.focus is None
-                    else model.match(new.key, new.focus.sig, new.focus.bounds) is None):
+                    else model.match(new.key, new.focus.sig, new.focus.bounds, ctx=new.focus.ctx,
+                                     item_root=new.focus.item_root) is None):
                 model.remodel(new.resp, legacy)
                 st.extra["remodel"] = True
             # A move is the same move only with the same content: RecyclerView rebinds
@@ -1222,9 +1353,7 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             transitions[tr] = len(steps) - 1
             cur, prev_idx = new, new.index
             if until == "wrap" and last_edge_at >= 0 and new.focus is not None and any(
-                    s.node is not None and same_node(s.key, s.node.sig, s.node.bounds, new.key,
-                                                     new.focus.sig, new.focus.bounds)
-                    for s in steps[:last_edge_at]):
+                    _seen_again(s, new) for s in steps[:last_edge_at]):
                 # Past the edge and back on a stop this walk already read: a full lap.
                 ended = "wrap"
                 break
@@ -1246,6 +1375,23 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                    initial=initial, start_resp=start_resp, start_idx=start_idx,
                    direction=direction, until=until, expect=expect, tts=tts, t_start=t_start,
                    max_lines=max_lines, max_bytes=max_bytes, save=save, full=full)
+
+
+def _seen_again(s: "Step", new: Snapshot) -> bool:
+    """Whether ``new``'s focus is the node step ``s`` read: the same key, or a re-minted
+    Compose id (the same signature where the boxes overlap, in the same list item) whose
+    old key is gone from the dump. A node still in the dump under its own key is another
+    node, however alike (NiA: the HEADLINES chip of the card a scroll put in the slot of the
+    one read before)."""
+    f = new.focus
+    if s.node is None or f is None:
+        return False
+    if s.key is not None and s.key == new.key:
+        return True
+    if s.key is not None and s.key in new.index.nodes:
+        return False
+    return same_node(s.key, s.node.sig, s.node.bounds, new.key, f.sig, f.bounds,
+                     ctx_a=s.node.ctx, ctx_b=f.ctx)
 
 
 def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_presses: int) -> Snapshot:
@@ -1286,6 +1432,14 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
 
 def _key_of(n: Optional[Node]) -> Optional[str]:
     return n.key if n is not None else None
+
+
+def _scroll_in_flight(drv: Driver, snap: Snapshot, t_sent: float) -> bool:
+    """Whether a container scrolled since the press (a VIEW_SCROLLED event, or TalkBack's
+    AutoScrollActor in its log) while focus has not landed yet."""
+    if any(e.get("type") == "VIEW_SCROLLED" for e in snap.events):
+        return True
+    return drv.log is not None and bool(drv.log.since(t_sent, "scroll"))
 
 
 def _scrolled_key(drv: Driver, prev_idx: DumpIndex, new: Snapshot, t_sent: float) -> Optional[str]:
@@ -1625,7 +1779,8 @@ def _build_records(steps: List[Step], model: Model, tts: Dict[int, str],
         elif s.extra.get("speak") is not None:
             speak = s.extra.pop("speak")
         elif s.key is not None:
-            p = model.match(s.key, s.node.sig, s.node.bounds) if s.node else model.get(s.key)
+            p = model.match(s.key, s.node.sig, s.node.bounds, ctx=s.node.ctx,
+                            item_root=s.node.item_root) if s.node else model.get(s.key)
             speak = (p.speak if p is not None else "") or (s.node.speech() if s.node else "")
         rect = None
         if s.node is not None:
@@ -1662,7 +1817,8 @@ def _build_records(steps: List[Step], model: Model, tts: Dict[int, str],
             rec["ancestors"] = [ref_of(a.key) for a in s.node.ancestors()][:16]
             if s.node.parent is not None:
                 rec["parent_rect"] = list(s.node.parent.bounds)
-            known = model.match(s.key, s.node.sig, s.node.bounds)
+            known = model.match(s.key, s.node.sig, s.node.bounds, ctx=s.node.ctx,
+                                item_root=s.node.item_root)
             if known is not None and known.key != s.key:
                 rec["pkey"] = known.key  # the model's key for this node (a re-minted id)
         if rec.get("covered_by"):

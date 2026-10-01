@@ -347,3 +347,28 @@ def test_a_model_stop_talkback_scrolls_into_view_first_is_not_judged_a_ghost():
     assert "tb.ghost_stop" in codes(diff.analyze(record([head, clipped], ended="autoscroll")))
     clipped["show_on_screen"] = True  # static_walk: TalkBack shows it (and its clipped text) first
     assert "tb.ghost_stop" not in codes(diff.analyze(record([head, clipped], ended="autoscroll")))
+
+
+def test_alike_nodes_of_different_list_items_are_not_the_same_node():
+    from inspector_widget.talkback import walk as w
+    # NiA: the HEADLINES chips of two news cards, the second scrolled into the first's slot
+    a = ("compose:8:552", "View|HEADLINES", (120, 2352, 231, 144))
+    b = ("compose:8:646", "View|HEADLINES", (120, 2352, 231, 144))
+    assert w.same_node(*a, *b)  # no item context known: alike is the same (a re-minted id)
+    assert not w.same_node(*a, *b, ctx_a="Introducing Compose Camp", ctx_b="Android 16 beta")
+    assert w.same_node(*a, *b, ctx_a="Introducing Compose Camp", ctx_b="Introducing Compose Camp")
+
+
+def test_a_recycled_row_view_in_its_old_slot_is_another_stop_in_the_model():
+    # V6 BAD_B: RecyclerView rebinds the View that showed "Mail 3" to "Mail 31" and lays it
+    # out in the very slot it had; it is another stop, not a label changed in place
+    m = tbwalk.Model()
+    m.stops = [tbwalk.PStop("view:14", "Mail 3", "Mail 3", (0, 530, 2076, 137), 1, "TextView",
+                            "", True)]
+    assert m.match("view:14", "TextView|Mail 31", (0, 530, 2076, 137), ctx="",
+                   item_root=True) is None
+    assert m.match("view:14", "TextView|Mail 3", (0, 530, 2076, 137), ctx="",
+                   item_root=True) is m.stops[0]
+    # outside a list a label that changes in place is the same node ("Play" -> "Pause")
+    m.stops = [tbwalk.PStop("view:5", "Play", "Play", (0, 0, 100, 100), 1, "Button")]
+    assert m.match("view:5", "Button|Pause", (0, 0, 100, 100)) is m.stops[0]
