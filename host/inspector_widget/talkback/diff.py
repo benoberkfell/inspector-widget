@@ -694,7 +694,8 @@ def _check_window_order(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
             if below:
                 out.append(_finding(
                     "tb.window_order", "warn",
-                    f"step {s['i']}: window {s.get('window')} (from y={top}) is read only after "
+                    f"step {s['i']}: window {s.get('window_ref') or s.get('window')} (from "
+                    f"y={top}) is read only after "
                     f"{len(below)} stop(s) of the window under it that sit lower on screen, e.g. "
                     f"{_name(below[0])}", [below[0], s]))
                 break

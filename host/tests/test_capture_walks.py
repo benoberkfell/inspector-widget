@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import pytest
 
@@ -341,3 +342,21 @@ def test_a_screen_replaced_mid_walk_is_not_read_as_talkback_navigation():
     assert rec["vs_model"]["differ"] == 0
     assert any("the screen changed under the walk" in n for n in rec["notes"])
     assert W.step_line(rec["steps"][5]).endswith('"C2 BAD: products" via=screen')
+
+
+def test_a_popup_read_last_is_named_by_ref():
+    """V10 BAD (live: "window 21 (from y=925) is read only after ..."): the window's root
+    id is not something the agent can query; its ref is."""
+    import copy
+
+    import tb_capture_fixtures as F
+    from inspector_widget.capture.index import apply_refs
+
+    rec, _ = F.load_walk("tb_v10-bad-walk")
+    ix, raw = F.corpus_capture("tb_v10-bad-walk")
+    rx = apply_refs(ix, {n.key: f"n{i + 1}" for i, n in enumerate(ix.nodes.values())})
+    rec = W.bind_walk(copy.deepcopy(rec), W.Binding([(0, _Loaded(rx, raw))]))
+    wo = [f for f in rec["findings"] if f["code"] == "tb.window_order"]
+    assert len(wo) == 1
+    assert re.match(r"step \d+: window n\d+ \(from y=\d+\) is read only after", wo[0]["msg"]), \
+        wo[0]["msg"]

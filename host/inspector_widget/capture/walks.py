@@ -503,6 +503,9 @@ def bind_walk(record: dict[str, Any], binding: Binding,
         wcov = s.get("window_covered_by")
         if wcov is not None and binding.window_ref(wcov):
             s["window_covered_by"] = binding.window_ref(wcov)
+        if s.get("via") == "window" and s.get("window") is not None \
+                and binding.window_ref(s["window"]):
+            s["window_ref"] = binding.window_ref(s["window"])  # findings name it by ref
     for p in record.get("predicted") or []:
         ref, _cid = binding.ref(p.get("key"), at=0, sig=signature(p.get("cls"), p.get("label")),
                                 bounds=p.get("bounds"))
