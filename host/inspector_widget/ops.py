@@ -1216,7 +1216,7 @@ def _walk_action(ctx: OpContext, act: str, wid: str | None, serial: Any, package
         out["hint"] = ("JSON: steps (key, ref, cap, speak, via, bounds ...), predicted, findings "
                        "(talkback/diff.py); read with jq.")
         return out
-    return walks.stored_result(rec, budget)
+    return walks.stored_result(rec, budget, listed=ctx.listed)
 
 
 def _captures_list(ctx: OpContext, limit: int, every: bool, serial: Any, package: Any,

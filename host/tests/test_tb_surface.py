@@ -533,8 +533,10 @@ def test_the_talkback_toolset_hints_only_its_own_tools(tb, monkeypatch):
     monkeypatch.setenv(surface.ENV_TOOLSET, "talkback")
     _out_of_order(tb)
     res = ok("tb_walk", serial=SERIAL, package=PKG, **FAST)
-    assert res["next"] == ['tb_walk(direction="prev",start="n11")'] and res["keys"]
-    assert "Loop:" not in mcp_server._listed_tools()["tb_walk"]["description"]
+    # no inspect_node in this listing: node keys would be bytes nothing can use
+    assert res["next"] == ['tb_walk(direction="prev",start="n11")'] and "keys" not in res
+    desc = mcp_server._listed_tools()["tb_walk"]["description"]
+    assert "Loop:" not in desc and "selector" not in desc and "w3f9ak1" not in desc
 
 
 def test_a_backward_walk_from_the_first_stop_compares_the_lap_after_the_wrap(tb):

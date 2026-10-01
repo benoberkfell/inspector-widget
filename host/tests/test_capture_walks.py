@@ -391,3 +391,55 @@ def test_a_navigation_rail_is_in_order_as_the_capture_reads_it():
     assert bound["vs_model"]["agree"] == 9
     assert [s["vrank"][3] for s in bound["steps"][:4]] == [0, 1, 2, 3]
 
+
+# --------------------------------------------------------------------------- #
+# What a caller with only some tools listed can follow
+# --------------------------------------------------------------------------- #
+TALKBACK_ONLY = frozenset({"list_devices", "list_processes", "attach", "detach", "talkback",
+                           "tb_walk", "tb_scenario"})
+
+
+def _named_tools(doc) -> set:
+    return set(re.findall(r"\b([a-z_]+)\(", dumps(doc)))
+
+
+def test_a_cut_walk_names_no_tool_the_caller_does_not_list():
+    rec = _record(n_steps=40, ref_keys={f"n{3 + i}": f"view:{1000 + i}" for i in range(40)})
+    out = W.walk_result(rec, max_lines=5, listed=TALKBACK_ONLY)
+    cut = next(ln for ln in out["lines"] if "omitted" in ln)
+    assert cut == "… 35 steps omitted: raise max_lines / max_bytes …"
+    assert _named_tools(out) <= TALKBACK_ONLY, _named_tools(out)
+    assert "keys" not in out  # no inspect_node to take them
+    # every tool listed: the stored walk holds every line
+    full = W.walk_result(rec, max_lines=5)
+    assert any('captures(action="show",id="w3f9ak1")' in ln for ln in full["lines"])
+    # the stored walk's own result hints only listed tools too
+    shown = W.stored_result(dict(rec, findings=[
+        {"code": "tb.double_stop", "sev": "warn", "refs": ["n5", "n6"], "steps": [2, 3],
+         "msg": "x"}]), listed=TALKBACK_ONLY)
+    assert _named_tools(shown) <= TALKBACK_ONLY, _named_tools(shown)
+
+
+def test_a_long_walk_keeps_every_finding_its_bytes_allow():
+    # nine findings in about 3 KB: no count cap hides the ninth
+    findings = [{"code": "tb.out_of_order", "sev": "warn", "refs": [f"n{i}"], "basis": "walk",
+                 "msg": f"stop n{i} is out of order", "steps": [i - 3]} for i in range(4, 13)]
+    res = W.walk_result(_record(findings=findings))
+    assert len(res["findings"]) == 9 and "findings_omitted" not in res
+
+
+def test_the_escape_hint_inspects_the_overlay_and_scrolled_refs_get_keys():
+    rec = _record(findings=[{"code": "tb.escape", "sev": "error", "refs": ["n6", "n7"],
+                             "steps": [3, 4], "overlay": "n88", "from": "n5", "msg": "x"}])
+    assert W.walk_hints(rec)[0] == 'node("n88",facets="tb")'
+
+    class _B:
+        def key_of(self, ref):
+            return {"n30": "compose:7:30", "n88": "compose:7:88"}.get(ref)
+
+    rec["steps"][2]["scrolled"] = "n30"
+    keys = W._ref_keys(rec, _B())
+    assert keys["n30"] == "compose:7:30" and keys["n88"] == "compose:7:88"
+    listed = TALKBACK_ONLY | {"inspect_node"}
+    out = W.walk_result(dict(rec, ref_keys=keys), listed=listed)
+    assert out["next"][0] == 'inspect_node(node_key="compose:7:88")'

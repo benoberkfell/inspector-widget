@@ -602,12 +602,23 @@ def _ref_keys(record: Mapping[str, Any], binding: Binding) -> dict[str, str]:
         ref, key = s.get("ref"), s.get("key")
         if ref and key and ref != key and not s.get("unbound"):
             out.setdefault(str(ref), str(key))
+    # refs the lines and findings name besides the stops: what a step scrolled
+    # (via=autoscroll(n30)), the overlay it was behind, the window it was in
+    named: list[Any] = []
+    for s in record.get("steps") or []:
+        named += [s.get("scrolled"), s.get("container"), s.get("window_ref"),
+                  (s.get("covered_by") or {}).get("ref") if isinstance(s.get("covered_by"), dict)
+                  else None]
     for f in record.get("findings") or []:
-        for r in f.get("refs") or []:
-            if r and r not in out:
-                k = binding.key_of(r)
-                if k:
-                    out[str(r)] = k
+        named += list(f.get("refs") or []) + [f.get("overlay"), f.get("from")]
+    edge = record.get("edge")
+    if isinstance(edge, Mapping):
+        named.append(edge.get("container_ref"))
+    for r in named:
+        if r and isinstance(r, str) and r not in out:
+            k = binding.key_of(r)
+            if k:
+                out[r] = k
     return out
 
 
@@ -731,7 +742,10 @@ def walk_hints(record: Mapping[str, Any], listed: Any = None) -> list[str]:
     for f in record.get("findings") or []:
         if f.get("code") == "model.mismatch":
             continue
-        ref = next((r for r in f.get("refs") or [] if re.match(r"^n\d+$", str(r))), None)
+        cand = list(f.get("refs") or [])
+        if f.get("code") == "tb.escape" and f.get("overlay"):
+            cand = [f["overlay"]] + cand  # the overlay to fix, not a stop behind it
+        ref = next((r for r in cand if re.match(r"^n\d+$", str(r))), None)
         if ref:
             hints.append(call("node", ref, facets="tb"))
             break
@@ -807,16 +821,20 @@ def walk_result(record: Mapping[str, Any], *, max_lines: int = WALK_MAX_LINES,
         tail["notes"] = list(record["notes"])
     tail["restore"] = record.get("restore")
     hints = walk_hints(record, listed)
-    keys = record.get("ref_keys") or {} if listed is not None and "node" not in listed else {}
+    # inspect_node takes node keys: map the refs shown when it is the way to a node
+    keys = record.get("ref_keys") or {} if listed is not None and "node" not in listed \
+        and "inspect_node" in listed else {}
+    # the stored walk holds every line: say how to read it only to a caller who can
+    show = (f'captures(action="show",id="{record.get("id")}")'
+            if listed is None or "captures" in listed else "raise max_lines / max_bytes")
     # max_lines counts the steps; the start line (step 0) comes on top
-    speak_len, n_findings, n_lines = SPEAK_LEN, 8, max(5, int(max_lines)) + 1
+    speak_len, n_findings, n_lines = SPEAK_LEN, len(findings), max(5, int(max_lines)) + 1
     while True:
         lines = [step_line(s, speak_len) for s in steps]
         if len(lines) > n_lines:
             keep = n_lines - 1
             half = keep // 2
-            lines = lines[:half] + [f"… {len(lines) - keep} steps omitted: captures("
-                                    f"action=\"show\",id=\"{record.get('id')}\") …"] \
+            lines = lines[:half] + [f"… {len(lines) - keep} steps omitted: {show} …"] \
                 + lines[len(lines) - (keep - half):]
         out = dict(head, lines=lines, diff=diff, findings=findings[:n_findings])
         if len(findings) > n_findings:
@@ -1049,14 +1067,16 @@ def _trim_text(d: Any, key: str, n: int) -> bool:
     return False
 
 
-def stored_result(rec: Mapping[str, Any], max_bytes: int | None = None) -> dict[str, Any]:
+def stored_result(rec: Mapping[str, Any], max_bytes: int | None = None,
+                  listed: Any = None) -> dict[str, Any]:
     """``captures(action="show", id=<walk id>)``: the stored record as its tool
-    returned it (a walk's lines are not cut by count, only by ``max_bytes``)."""
+    returned it (a walk's lines are not cut by count, only by ``max_bytes``); ``listed``:
+    as :func:`walk_result` (hints to listed tools only)."""
     if str(rec.get("id") or "").startswith("t"):
-        return scenario_result(rec, max_bytes=max_bytes or 2000)
+        return scenario_result(rec, max_bytes=max_bytes or 2000, listed=listed)
     n = sum(1 for _ in rec.get("steps") or [])
     return walk_result(rec, max_lines=max(WALK_MAX_LINES, n + 1),
-                       max_bytes=max_bytes or 16000)
+                       max_bytes=max_bytes or 16000, listed=listed)
 
 
 __all__ = [
