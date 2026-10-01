@@ -397,6 +397,7 @@ def test_labels_are_unique_per_lineage(tmp_path):
     assert store.load(a).meta.label == "base" and store.load(o).meta.label == "base"
     assert store.resolve("base", (SERIAL, APP)) == a
     assert store.resolve("@base", (SERIAL, OTHER)) == o
+    assert store.resolve("@Base", (SERIAL, OTHER)) == o  # labels are lowercase (G27)
     with pytest.raises(OpError) as e:
         store.resolve("base")
     assert e.value.code == "ambiguous"
