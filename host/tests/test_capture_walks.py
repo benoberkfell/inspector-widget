@@ -1,0 +1,219 @@
+"""capture/walks.py, device-free: the stored TalkBack walks and scenarios, their
+classification by ref, and the compact tool results within their budgets
+(talkback-navigation.md part 4 B: a walk at most 5 KB at 60 steps, a scenario at
+most 1 KB). The device path (tb_walk / tb_scenario through both surfaces against
+the fake TalkBack) is tests/test_tb_surface.py.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+from inspector_widget.capture import walks as W
+from inspector_widget.capture.model import OpError
+from inspector_widget.output import dumps, utf8_len
+
+
+class _Store:
+    def __init__(self, root):
+        self.root = str(root)
+
+
+def _size(doc) -> int:
+    return utf8_len(dumps(doc))
+
+
+def _step(i, ref, speak="Item", via="next", **kw):
+    return {"i": i, "key": f"view:{1000 + i}", "ref": ref, "via": via, "moved": True,
+            "label": speak, "speak": speak, "cls": "Button", "bounds": [0, i * 80, 360, 64],
+            "window": 1, **kw}
+
+
+def _record(n_steps=9, findings=(), ended="wrap", **kw):
+    steps = [_step(0, "n3", "Title", via="start")]
+    steps += [_step(i, f"n{3 + i}", f"Item {i}, Button") for i in range(1, n_steps)]
+    rec = {"id": "w3f9ak1", "serial": "emulator-5554", "package": "com.example",
+           "talkback": "17.0.0 uinput/enhanced", "direction": "next", "until": "wrap",
+           "ended": ended, "steps": steps, "predicted": [{"key": s["key"], "ref": s["ref"]}
+                                                         for s in steps],
+           "findings": list(findings), "vs_model": {"agree": n_steps - 1, "differ": 0},
+           "ms": {"p50": 210, "p95": 470, "total": 4300}, "restore": "restored",
+           "captures": ["c7h2kq"]}
+    rec.update(kw)
+    return rec
+
+
+FIX = "Group each column: Modifier.semantics { isTraversalGroup = true } " * 3
+
+
+# --------------------------------------------------------------------------- #
+# classify and the walk result
+# --------------------------------------------------------------------------- #
+def test_classify_sorts_findings_by_class_and_ref():
+    rec = _record(findings=[
+        {"code": "tb.skipped", "sev": "warn", "refs": ["n31", "n32"], "steps": []},
+        {"code": "tb.double_stop", "sev": "warn", "refs": ["n20", "n21"], "steps": [4, 5]},
+        {"code": "tb.escape", "sev": "error", "refs": ["n9"], "steps": [6]},
+        {"code": "tb.loop", "sev": "error", "refs": ["n4", "n5"], "steps": [2]},
+        {"code": "model.mismatch", "sev": "info", "refs": ["n99"], "steps": [3]},
+    ], vs_model={"agree": 6, "differ": 1, "first": "step 3: model n5, actual n6",
+                 "unvisited": ["n31"]})
+    rec["steps"].append({"i": 9, "key": None, "via": "left_app", "moved": False,
+                         "top": "com.android.launcher/.Home"})
+    d = W.classify(rec)
+    assert d == {"ended": "wrap", "model": "6 agree, 1 differ: step 3: model n5, actual n6",
+                 "unvisited": ["n31"], "skip": ["n31", "n32"], "double": ["n20", "n21"],
+                 "escape": ["n9"], "loop": ["n4", "n5"],
+                 "left_app": "com.android.launcher/.Home"}
+
+
+@pytest.mark.parametrize("step,line", [
+    ({"i": 0, "key": None, "via": "start"}, "0. (no accessibility focus)"),
+    ({"i": 8, "key": "view:1", "edge": True, "moved": False}, "8. — edge"),
+    ({"i": 4, "key": None, "via": "left_app", "top": "x/.Y"}, "4. — left the app (top: x/.Y)"),
+    ({"i": 5, "key": None, "via": "lost", "scrolled": "n10"}, "5. — focus lost after n10 scrolled"),
+    (_step(7, "n30", "Socks, $5", via="autoscroll", scrolled="n10"),
+     '7. n30 "Socks, $5" via=autoscroll(n10)'),
+    (_step(9, "n3", "Title", via="wrap"), '9. n3 "Title" via=wrap'),
+    (dict(_step(3, "view:1003", "Gone"), unbound=True), '3. ?view:1003 Button "Gone"'),
+    (dict(_step(2, "n5", "OK"), tags=["double_stop"]), '2. n5 "OK" !double_stop'),
+])
+def test_step_lines(step, line):
+    assert W.step_line(step) == line
+
+
+def test_walk_result_names_refs_and_gives_each_fix_once():
+    findings = [{"code": "tb.out_of_order", "sev": "warn", "refs": [f"n{i}"], "basis": "walk",
+                 "msg": f"stop n{i} is out of order", "fix": FIX, "steps": [i - 3],
+                 "keys": [f"view:{i}"]} for i in (5, 6)]
+    res = W.walk_result(_record(findings=findings))
+    assert res["capture"] == "c7h2kq" and res["walk"] == "w3f9ak1" and res["start"] == "n3"
+    assert res["steps"] == 8 and res["ended"] == "wrap"
+    assert res["lines"][2] == '2. n5 "Item 2, Button" !out_of_order'
+    assert [f.get("fix") is not None for f in res["findings"]] == [True, False]
+    assert "keys" not in res["findings"][0] and "steps" not in res["findings"][0]
+    assert res["diff"]["out_of_order"] == ["n5", "n6"]
+    assert res["next"][:2] == ['node("n5",facets="tb")', 'image(overlay="walk",walk="w3f9ak1")']
+    assert utf8_len(dumps(res["next"])) <= 200
+
+
+def test_sixty_steps_with_findings_fit_five_kilobytes():
+    findings = [{"code": c, "sev": "warn", "refs": ["n10", "n11"], "basis": "walk",
+                 "msg": "x" * 180, "fix": FIX, "steps": [10, 11]}
+                for c in ("tb.out_of_order", "tb.double_stop", "tb.ghost_stop", "tb.skipped",
+                          "tb.escape", "tb.edge_stuck", "tb.revisit", "tb.wrong_announcement")]
+    rec = _record(n_steps=61, findings=findings, notes=["a note " * 10],
+                  vs_model={"agree": 50, "differ": 10, "first": "step 7: model n9, actual n10"})
+    for s in rec["steps"][1:]:
+        s["speak"] = "A rather long announcement for this list item, Button, double tap"
+    res = W.walk_result(rec)
+    assert _size(res) <= W.WALK_MAX_BYTES, _size(res)
+    assert res["steps"] == 60 and res["findings"] and res["diff"]["model"].startswith("50 agree")
+    rec2 = _record(n_steps=61)
+    res2 = W.walk_result(rec2)
+    assert len(res2["lines"]) == 61 and _size(res2) <= W.WALK_MAX_BYTES  # all 60 steps fit
+    short = W.walk_result(rec2, max_lines=20)
+    assert len(short["lines"]) == 21 and any("steps omitted" in ln for ln in short["lines"])
+
+
+def test_a_walk_left_on_hints_the_restore():
+    res = W.walk_result(_record(restore="left on (talkback restore to undo)"))
+    assert 'talkback(action="restore")' in res["next"]
+
+
+# --------------------------------------------------------------------------- #
+# scenarios
+# --------------------------------------------------------------------------- #
+def _scenario(**kw):
+    rec = {"id": "t3f9ak1", "kind": "survive", "serial": "e", "package": "p",
+           "captures": ["c1aaaa", "c2bbbb"],
+           "target": {"ref": "n47", "cls": "Button", "speak": "Item 7, Button"},
+           "mutate": "tap Button 'Favourite' (injected: bypasses TalkBack)",
+           "timeline": [{"t": 0, "focus": "n47"}, {"t": 35, "windows": 2},
+                        {"t": 140, "focus": None}, {"t": 310, "focus": "n12"}] * 3,
+           "focus": {"ref": "n12", "cls": "TextView", "speak": "Products, Heading"},
+           "verdict": "reset_top", "lost_midway": True,
+           "finding": {"code": "tb.focus_reset", "sev": "warn", "basis": "walk",
+                       "msg": "after tap, focus reset top to n12 (was n47; 12 nodes removed, "
+                              "12 added) " * 2, "fix": FIX * 2},
+           "cause_text": "n47 rebound as n103 (a recycled cell or a re-created item); "
+                         "12 removed, 12 added, 1 rebound",
+           "restore": "restored", "notes": ["a long note " * 10]}
+    rec.update(kw)
+    return rec
+
+
+def test_scenario_result_fits_one_kilobyte_and_keeps_the_verdict():
+    res = W.scenario_result(_scenario())
+    assert _size(res) <= W.SCENARIO_MAX_BYTES, _size(res)
+    assert res["verdict"] == "reset_top" and res["finding"]["code"] == "tb.focus_reset"
+    assert res["target"] == 'n47 "Item 7, Button"' and res["focus"] == 'n12 "Products, Heading"'
+    assert res["capture"] == "c1aaaa" and res["after"] == "c2bbbb"
+    assert res["cause"].startswith("n47 rebound as n103")
+    small = W.scenario_result(_scenario(timeline=[{"t": 0, "focus": "n47"}], notes=[]))
+    assert small["timeline"] == ["0 n47"] and small["finding"]["fix"].startswith("Group each")
+    assert small["next"][0] == 'diff(a="c1aaaa",b="c2bbbb")'
+
+
+def test_focus_after_result_says_what_the_window_did():
+    rec = _scenario(kind="focus_after", action="activate (TalkBack click, Meta+Space)",
+                    before={"windows": 1, "panes": []}, after={"windows": 2, "panes": ["Filters"]},
+                    new_screen=True, model={"initial": "n50"}, verdict="initial_ok",
+                    finding=None, cause_text=None, timeline=[], notes=[])
+    res = W.scenario_result(rec)
+    assert res["windows"] == "1->2" and res["panes"] == ["Filters"]
+    assert res["model_initial"] == "n50" and res["did"].startswith("activate")
+
+
+# --------------------------------------------------------------------------- #
+# storage
+# --------------------------------------------------------------------------- #
+def test_save_list_resolve_drop_and_wipe(tmp_path):
+    store = _Store(tmp_path)
+    a = W.save(store, _record(id="waaaaa1"))
+    b = W.save(store, _record(id="wbbbbb1", package="com.other"))
+    os.utime(a, (1, os.path.getmtime(b) - 10))
+    W.save(store, _scenario(id="tccccc1", package="com.example", serial="emulator-5554"))
+    assert W.load(store, "waaaaa1")["id"] == "waaaaa1"
+    assert W.resolve(store, None, ("emulator-5554", "com.example")) == "waaaaa1"
+    assert W.resolve(store, "latest", ("emulator-5554", "com.other")) == "wbbbbb1"
+    assert W.resolve(store, None, None, kind=None) == "tccccc1"
+    rows, total = W.listing(store, ("emulator-5554", "com.example"), 10)
+    assert total == 2 and rows[0].startswith("tccccc1 tb_scenario survive verdict=")
+    assert "tb_walk 8 steps ended=wrap 0 findings" in rows[1]
+    with pytest.raises(OpError) as e:
+        W.resolve(store, "wzzzzz9")
+    assert e.value.code == "walk_not_found"
+    with pytest.raises(OpError) as e:
+        W.resolve(store, "c7h2kq")
+    assert e.value.code == "bad_args"
+    with pytest.raises(OpError) as e:
+        W.resolve(store, None, ("x", "y"))
+    assert e.value.code == "walk_not_found" and "tb_walk()" in e.value.hint
+    W.drop(store, "waaaaa1")
+    with pytest.raises(OpError):
+        W.load(store, "waaaaa1")
+    assert W.wipe(store) == 2 and W.listing(store, None, 10) == ([], 0)
+
+
+def test_old_walks_are_pruned(tmp_path, monkeypatch):
+    store = _Store(tmp_path)
+    monkeypatch.setattr(W, "KEEP", 3)
+    now = __import__("time").time()
+    for i in range(5):
+        path = W.save(store, _record(id=f"w{i:06d}"))
+        os.utime(path, (now - 100 + i, now - 100 + i))
+    W.save(store, _record(id="wnewest"))
+    left = sorted(os.listdir(W.walks_dir(store)))
+    assert len(left) == 3 and "wnewest.json" in left
+
+
+def test_a_stored_walk_shows_every_step(tmp_path):
+    rec = _record(n_steps=80)
+    out = W.stored_result(rec)
+    assert len(out["lines"]) == 80 and _size(out) <= 16000
+    assert W.stored_result(_scenario())["verdict"] == "reset_top"
+    assert json.loads(dumps(out)) == out

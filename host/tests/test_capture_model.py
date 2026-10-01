@@ -83,7 +83,11 @@ def test_op_error_codes_and_shape():
         m.OpError("nope", "x")
     assert set(m.ERROR_CODES) == {
         "no_session", "device_lost", "agent_error", "capture_not_found", "ref_not_in_capture",
-        "not_found", "ambiguous", "bad_selector", "bad_args", "facet_unavailable", "unsupported"}
+        "not_found", "ambiguous", "bad_selector", "bad_args", "facet_unavailable", "unsupported",
+        # the TalkBack tools (talkback-navigation.md part 4 B)
+        "walk_not_found", "talkback_unavailable", "enable_failed", "restore_failed", "busy",
+        "app_left_foreground", "injector_failed", "keymap_unknown", "focus_unreadable",
+        "start_not_found"}
 
 
 # --------------------------------------------------------------------------- options, meta, raw
