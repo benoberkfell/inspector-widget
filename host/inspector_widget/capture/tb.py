@@ -55,6 +55,10 @@ DIRECTIONS = ("next", "prev")
 SPEAK_SRC_MODEL = "tb"
 SPEAK_SRC_FALLBACK = "ro1"
 
+#: Model diagnostics a capture reports (``tb: ...``): why the model's "N of M" for RecyclerView
+#: items is missing or differs from a walk's (talkback/recycler.py).
+SURFACED_DIAGNOSTICS = frozenset({"recycler_bound_before_service", "recycler_positions_unknown"})
+
 #: The attribute an Index carries its binding under (Index is unhashable, so no weak map).
 _CACHE_ATTR = "_tb_capture"
 
@@ -736,6 +740,8 @@ def issues(ix: Index, loaded: Any, *, density: int | None = None,
                                "inferred" if f.conf == "heuristic" else "exact")))
     out.extend(_custom_actions_missing(ix, tbc))
     diags = [f"tb: {unmapped} TalkBack findings not mapped to nodes"] if unmapped else []
+    diags.extend(f"tb: {d['message']}" for d in tbc.tree.diagnostics
+                 if d.get("kind") in SURFACED_DIAGNOSTICS)
     return out, diags
 
 

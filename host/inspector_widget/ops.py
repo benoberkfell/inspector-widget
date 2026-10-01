@@ -1578,6 +1578,9 @@ class _TbCaptures:
         self.taken.append((at, lc))
         self.ctx.store.held.add(lc.id)  # until release(): a full lineage evicts unlabeled first
         self._last_at, self._pending = at, False
+        for d in lc.index().diagnostics:  # the model's warnings (talkback/recycler.py)
+            if d.startswith("tb: ") and "not mapped" not in d and d[4:] not in self.notes:
+                self.notes.append(d[4:])
         return lc
 
     # ---- the engine's hook (talkback.walk.run_walk / scenarios.run_scenario)
