@@ -44,8 +44,8 @@ def _defaults(sub: argparse.ArgumentParser) -> dict:
 
 # --------------------------------------------------------------------------- params
 def test_every_mcp_tool_maps_to_a_subcommand():
-    """The legacy and TalkBack tools map through output.CLI_SUBCOMMANDS; the
-    capture-and-walk tools come from inspector_widget.surface, whose registry
+    """The legacy tools map through output.CLI_SUBCOMMANDS; the capture-and-walk
+    and TalkBack tools come from inspector_widget.surface, whose registry
     generates both (test_surface.py checks their parameters)."""
     from inspector_widget import surface
 
@@ -201,7 +201,7 @@ def test_talkback_status_is_the_same_document(tmp_path):
     [(text, is_error)] = _run_mcp("default", str(tmp_path / "m"),
                                   [("talkback", {"action": "status"}, None)])
     [(cli_text, rc)] = _run_cli("default", str(tmp_path / "c"),
-                                [(None, None, ["talkback", "status"])], extra=())
+                                [(None, None, ["talkback", "status"])], extra=("--json",))
     assert not is_error and rc == 0 and cli_text == text
 
 

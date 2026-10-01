@@ -33,6 +33,8 @@ TRANSPORT_ONLY = {
     ("image", "inline"): "mcp",       # the pixels ride in the MCP reply (ImageContent)
     ("image", "out"): "cli",          # the CLI copies the PNG to a path instead
     ("capture", "build_out"): "cli",  # the MCP server takes $INSPECTOR_WIDGET_ARTIFACTS
+    ("tb_walk", "build_out"): "cli",  # ... and so do the TalkBack tools that attach
+    ("tb_scenario", "build_out"): "cli",
 }
 
 
@@ -53,7 +55,7 @@ def _size(obj) -> int:
 def test_every_spec_is_one_mcp_tool_and_one_cli_subcommand():
     subs = _subparsers()
     names = [s.name for s in surface.SPECS]
-    assert names == list(surface.CAPTURE_TOOLS)
+    assert names == list(surface.CAPTURE_TOOLS) + list(surface.TALKBACK_TOOLS)
     for ts in surface.SPECS:
         assert ts.name in mcp_server.TOOLS, ts.name
         assert mcp_server.TOOLS[ts.name]["surface"] is ts
@@ -68,7 +70,9 @@ def test_every_spec_is_one_mcp_tool_and_one_cli_subcommand():
 def test_parameters_have_the_same_names_and_defaults(ts):
     schema = mcp_server.TOOLS[ts.name]["schema"]["properties"]
     sub = _subparsers()[ts.cli_name]
-    by_dest = {a.dest: a for a in sub._actions}
+    by_dest: dict = {}
+    for a in sub._actions:  # the canonical flag first; aliases (--prev) share its dest
+        by_dest.setdefault(a.dest, a)
     for p in ts.params:
         only = TRANSPORT_ONLY.get((ts.name, p.name))
         if only is not None:
@@ -241,14 +245,23 @@ def test_the_default_listing_is_unchanged(monkeypatch):
     assert _size(listing) == 18_337
 
 
+#: tools/list budgets, compact bytes: the default stays at most 20,000 (it is the
+#: pre-capture listing byte for byte), the capture toolset at most 12,000 (spec
+#: section 7), and no listing averages more than 1,300 B per tool.
+LISTING_AVG_MAX = 1300
+
+
 @pytest.mark.parametrize("toolset,count,limit", [
-    ("legacy", 15, 18_500), ("capture", 12, 12_000), ("talkback", 7, 18_500),
-    ("capture,talkback", 15, 20_000), ("all", 26, 32_000)])
+    (None, 18, 20_000), ("legacy,talkback", 18, 20_000), ("legacy", 15, 18_500),
+    ("capture", 12, 12_000), ("talkback", 7, 7 * LISTING_AVG_MAX),
+    ("capture,talkback", 15, 15 * LISTING_AVG_MAX), ("all", 26, 32_000)])
 def test_toolset_listings(monkeypatch, toolset, count, limit):
     listing = _listing(monkeypatch, toolset)
     names = [t["name"] for t in listing["tools"]]
-    assert len(names) == count and set(names) == set(surface.toolset_names(toolset))
+    want = surface.toolset_names(toolset) if toolset else surface.toolset_names()
+    assert len(names) == count and set(names) == set(want)
     assert _size(listing) <= limit, _size(listing)
+    assert _size(listing) / count <= LISTING_AVG_MAX, _size(listing) / count
     for t in listing["tools"]:  # the capture tools say whether they only read
         if t["name"] in surface.CAPTURE_TOOLS:
             ro = t["annotations"]["readOnlyHint"]
@@ -418,7 +431,13 @@ def test_cli_takes_dash_leading_values():
     ('captures(action="show",id="c1")', "inspector-widget captures show c1"),
     ('find(in="all",text="Delete me")', "inspector-widget find --in all --text 'Delete me'"),
     ('find(count_only=true)', "inspector-widget find --count-only"),
-    ('tb_walk(start="first")', 'tb_walk(start="first")'),  # no generated subcommand
+    ('tb_walk(start="first")', "inspector-widget tb-walk --start first"),
+    ('tb_walk(direction="prev")', "inspector-widget tb-walk --direction prev"),
+    ('talkback(action="restore")', "inspector-widget talkback restore"),
+    ('image(overlay="walk",walk="w3f9ak1")',
+     "inspector-widget image --overlay walk --walk w3f9ak1"),
+    ('captures(action="show",id="w3f9ak1")', "inspector-widget captures show w3f9ak1"),
+    ('dump_tree(max_depth=2)', 'dump_tree(max_depth=2)'),  # no generated subcommand
 ])
 def test_cli_hints_are_cli_commands(hint, want):
     assert surface.cli_hint(hint) == want

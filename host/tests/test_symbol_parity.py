@@ -230,6 +230,7 @@ _SIG_SOURCES = (
     "inspector_widget/capture/analyzers.py",
     "inspector_widget/capture/diff.py",
     "inspector_widget/capture/images.py",
+    "inspector_widget/capture/walks.py",
 )
 
 _NAMED_RECEIVERS = {
@@ -633,9 +634,11 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("skia_client", "per_component_images"),
         ("overlay", "render_a11y_overlay"),
         ("a11y_lint", "run_lint"),          # cli / mcp_server -> the unified lint
-        ("device", "action"),               # talkback tool / subcommand
-        ("walk", "run_walk"),               # tb_walk
-        ("scenarios", "run_scenario"),      # tb_scenario
+        ("device", "action"),               # ops.talkback (both surfaces)
+        ("walk", "run_walk"),               # ops.tb_walk
+        ("scenarios", "run_scenario"),      # ops.tb_scenario
+        ("walks", "bind_walk"),             # ops.tb_walk -> the walk store / ref binding
+        ("images", "walk_overlay"),         # image(overlay="walk")
         ("Session", "dump_a11y"),           # the walk's focus reader
         ("adb", "shell"),                   # talkback/device.py
         ("diff", "analyze"),

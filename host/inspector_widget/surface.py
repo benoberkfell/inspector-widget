@@ -44,7 +44,7 @@ LEGACY_TOOLS = SESSION_TOOLS + (
     "dump_accessibility", "a11y_lint", "a11y_overlay", "inspect", "inspect_node",
     "component_image")
 #: The TalkBack tools (docs/design/talkback-navigation.md part 4).
-TALKBACK_TOOLS = ("talkback", "tb_walk", "tb_scenario")
+TALKBACK_TOOLS = ops.TB_TOOL_NAMES
 CAPTURE_TOOLS = ops.TOOL_NAMES
 
 TOOLSETS: dict[str, tuple[str, ...]] = {
@@ -56,6 +56,15 @@ TOOLSETS: dict[str, tuple[str, ...]] = {
 #: Until the deliberate flip (WP S4) the MCP server lists what it listed before
 #: the capture tools existed: the 15 legacy tools and the TalkBack tools.
 DEFAULT_TOOLSET = "legacy,talkback"
+
+
+def legacy_talkback(listed: Iterable[str]) -> bool:
+    """Whether a listing shows the TalkBack tools in their pre-capture shape: the
+    legacy inspection tools are listed and the capture tools are not (the default
+    toolset, byte for byte as before). The calls run the same implementation
+    (ops.talkback / tb_walk / tb_scenario) either way."""
+    names = set(listed)
+    return "dump_accessibility" in names and "capture" not in names
 
 
 def toolset_names(value: str | None = None, env: Mapping[str, str] | None = None
@@ -117,6 +126,10 @@ class Param:
     cli_choices: Mapping[str, str] | None = None
     keep_words: tuple[str, ...] = ()   # string|array: words that stay a string on the CLI
     check: Callable[[Any], Any] | None = None
+    #: CLI flags that set this parameter to a value (``{"--prev": "prev"}``).
+    cli_set: Mapping[str, Any] | None = None
+    #: An array the CLI flag takes repeatedly as well as comma-separated.
+    repeat: bool = False
 
     @property
     def flag(self) -> str:
@@ -144,6 +157,10 @@ class ToolSpec:
 
     def params_for(self, surface: str) -> list[Param]:
         return [p for p in self.params if surface in p.surfaces]
+
+    @property
+    def device_wide(self) -> bool:
+        return self.name in TALKBACK_TOOLS
 
 
 def _rules_check(v: Any) -> Any:
@@ -185,6 +202,13 @@ def _fields(doc: bool = False) -> Param:
                  if doc else "")
 
 
+def _build_out() -> Param:
+    """CLI only: the MCP server takes $INSPECTOR_WIDGET_ARTIFACTS."""
+    return Param("build_out", "string", surfaces=("cli",), cli=(),
+                 help="directory with the on-device artifacts (default: "
+                      "$INSPECTOR_WIDGET_ARTIFACTS, else the checkout's build-out/)")
+
+
 def _format() -> Param:
     return Param("format", "string", "lines", enum=("lines", "json"))
 
@@ -195,44 +219,58 @@ GRAMMAR = ('Line: ref Type #rid @tag "label" flags [x,y wxh] !issue +N(hidden) t
 
 D_CAPTURE = (
     "Snapshot the app ONCE (views, properties, Compose, accessibility, screenshots, lint) "
-    "into the store; returns its id (c7h2kq), lint and issue lines, a preview outline. Query "
+    "into the store; returns its id (c7h2kq), lint, issues, an outline preview. Query "
     "it with outline, find, node, image, lint, diff (no device I/O); refs (n23) carry across "
-    "captures. After the UI changes capture again; diff_from=\"prev\" adds what changed.")
-D_CAPTURES = ("List and manage stored captures; label takes id+label; export writes files "
-              "and returns paths; gc all=true wipes the store.")
-D_OUTLINE = ("Tree of a capture, one line per node. view: ui (Views + Compose + a11y merged), "
+    "captures. Recapture after the UI changes; diff_from=\"prev\" adds what changed.")
+D_CAPTURES = ("Manage stored captures (what=\"walks\": TalkBack walks, ids w...); label "
+              "takes id+label; export writes files, returns paths; gc all=true wipes all.")
+D_OUTLINE = ("Tree of a capture, one line per node. view: ui (Views+Compose+a11y merged), "
              "views, compose, slots (composables, src=File.kt:line), a11y, reading (TalkBack's "
              "stops; explain=true: its words, why=, via=; include_skipped: - lines "
              "merged_into=/hidden_by=/why=). Semantic detail collapses wrappers. " + GRAMMAR)
 D_FIND = ("Find nodes in a capture; filters are ANDed. text: substring of label/text/desc/"
           "state/hint; type/rid/tag/src: globs; flags: all of; issue: rule, code or severity; "
           "within: a selector; at: [x,y]; min_dp/max_dp: touch (a11y) size.")
-D_NODE = ("Everything about one node (or refs, up to 10): ids, bounds, tap_xy, layout/clip, "
-          "a11y, compose (slots with file:line), issues, props, parent; facets=\"tb\": "
+D_NODE = ("Everything about one node (refs: up to 10): ids, bounds, tap_xy, layout/clip, "
+          "a11y, compose (slots, file:line), issues, props, parent; facets=\"tb\": "
           "TalkBack (why, speech, prev/next). ref: n23, a key (view:12), a point x,y, or "
           "#rid, @tag, Type\"label\" joined by ' > ' (direct child).")
-D_IMAGE = ("PNG of a node (a crop of its own window's screenshot) or an overlay (marks: "
-           "boxes labelled by ref). Returns the path.")
+D_IMAGE = ("PNG: a node's crop of its window's screenshot, or an overlay (marks: boxes by "
+           "ref; walk: a tb_walk's steps). Returns the path.")
 D_LINT = ("Accessibility lint (R1..R18) of a capture grouped by rule, with fixes; "
           "rules=[\"tb\"]: TalkBack navigation; [\"render.\"]: clipped, hidden, offscreen. "
-          "contrast=true samples the stored screenshot (~4s, cached).")
+          "contrast=true samples the screenshot (~4s, cached).")
 D_DIFF = ("Compare two captures of one app by ref: changed, moved, added, removed, "
           "rebound; issue deltas; \"new screen\" when little is shared.")
+
+#: The TalkBack debugging loop, in the instructions and tb_walk's description.
+TB_LOOP = ('capture -> lint(rules=["tb"]) -> outline(view="reading",explain=true) -> '
+           'node(ref,facets="tb") -> tb_walk(start=ref) -> image(overlay="walk")')
+_DEVICE_WIDE = "DEVICE-WIDE: "
+D_TALKBACK = (_DEVICE_WIDE + "TalkBack status (read-only) | on | off | restore. on snapshots "
+              "the accessibility settings first; restore (also at exit) writes them back.")
+D_TB_WALK = (_DEVICE_WIDE + "drives the REAL TalkBack (on, then restored) with next/prev from "
+             "start (current, first, a ref or selector). Each step is a capture ref + what it "
+             "says; diff: actual vs model (skip, double, out_of_order, loop, trap, escape, "
+             "stuck, left_app) by ref; findings with fixes. Stored as a walk (w3f9ak). "
+             "Loop: " + TB_LOOP + ".")
+D_TB_SCENARIO = (_DEVICE_WIDE + "where real TalkBack focus goes, by ref. focus_after: do "
+                 "action (activate|back|tap:<ref>|key:<combo>); restore: activate target, go "
+                 "back; survive: focus target, apply mutate (tap:<ref>|activate|key:|broadcast:"
+                 "|probe:), watch wait_ms. Verdict, timeline, cause (capture diff).")
 
 INSTRUCTIONS = (
     "Inspector Widget reads the live UI of a debuggable Android app. Workflow: capture() takes "
     "one snapshot (views + properties, Compose, accessibility, screenshots, lint) and returns "
-    "an id like c7h2kq with a short outline. Then query that snapshot with outline, find, "
+    "an id like c7h2kq with a short outline. Query it with outline, find, "
     "node, image, lint and diff; they never touch the device. Every node has a short ref "
-    "(n23) that stays the same across later captures of the same app; a ref that is gone "
+    "(n23) that stays the same in later captures of the app; a ref that is gone "
     "returns an error instead of pointing elsewhere. Outline lines read: ref Type #resourceId "
     "@testTag \"label\" flags [x,y wxh] !issue +N (N hidden descendants); coordinates are "
     "screen pixels. After the UI changes, capture again (capture(diff_from=\"prev\") also "
     "reports what changed). serial and package are optional once a session exists.")
 #: Added when the TalkBack tools are listed with the capture tools.
-INSTRUCTIONS_TALKBACK = (" TalkBack: outline(view=\"reading\",explain=true) and "
-                         "lint(rules=[\"tb\"]) predict it; tb_walk drives the real one and "
-                         "diffs.")
+INSTRUCTIONS_TALKBACK = " TalkBack: " + TB_LOOP + "."
 #: ... with the legacy tools (no outline): dump_accessibility's focus_order predicts it.
 INSTRUCTIONS_TALKBACK_LEGACY = (" TalkBack: dump_accessibility's focus_order predicts its "
                                 "order; tb_walk drives the real screen reader and compares.")
@@ -281,8 +319,8 @@ def instructions(listed: Iterable[str]) -> str:
     return text
 
 
-_FLAGS_HELP = "click longclick focus focused scroll checkable checked selected disabled " \
-              "heading edit password hidden ..."
+_FLAGS_HELP = "click longclick focus scroll checkable checked selected disabled heading " \
+              "edit hidden ..."
 
 
 def _specs() -> list[ToolSpec]:
@@ -304,21 +342,19 @@ def _specs() -> list[ToolSpec]:
             Param("settle_ms", "integer", 0, minimum=0, maximum=3000),
             Param("diff_from", "string", help="prev or a label"),
             Param("if_changed_since", "string",
-                  help="Return {unchanged:true} if the UI still matches it"),
+                  help="{unchanged:true} if the UI still matches it"),
             Param("outline_lines", "integer", ops.OUTLINE_LINES, minimum=0, maximum=80),
             Param("on_screen", "boolean", True),
             Param("pin", "boolean", False),
             _max_bytes(ops.CAPTURE_MAX_BYTES),
-            Param("build_out", "string", surfaces=("cli",), cli=(),
-                  help="directory with the on-device artifacts (default: "
-                       "$INSPECTOR_WIDGET_ARTIFACTS, else the checkout's build-out/)"),
+            _build_out(),
         ], ops.capture, False, {"capture"}, D_CAPTURE, _render_capture),
         ToolSpec("captures", "captures", "list and manage stored captures", [
             Param("action", "string", "list", enum=ops.CAPTURE_ACTIONS, positional=True,
                   nargs="?", cli_choices={"ls": "list", "rm": "drop"}),
             Param("id", "string", positional=True, nargs="?"),
             Param("label", "string", positional=True, nargs="?", help="empty removes"),
-            Param("what", "string", "nodes", enum=ops.EXPORT_WHAT),
+            Param("what", "string", "nodes", enum=ops.CAPTURES_WHAT),
             Param("format", "string", "jsonl", enum=ops.EXPORT_FORMATS),
             Param("all", "boolean", False, help="list: every app; gc: wipe the store"),
             Param("limit", "integer", ops.CAPTURES_LIMIT, minimum=1, maximum=200),
@@ -357,7 +393,7 @@ def _specs() -> list[ToolSpec]:
             Param("min_dp", "number"), Param("max_dp", "number"),
             Param("kind", "string", enum=("view", "compose", "slot", "a11y")),
             Param("window", "string|integer",
-                  help="A window selector, or its z index (0 = the bottom window)"),
+                  help="Window selector or z index (0 = bottom)"),
             Param("in", "string", "ui", enum=("ui", "slots", "all")),
             Param("sort", "string", "tree", enum=("tree", "reading", "top", "area")),
             Param("limit", "integer", 20, minimum=1, maximum=200),
@@ -383,7 +419,7 @@ def _specs() -> list[ToolSpec]:
             Param("ref", "string", positional=True, nargs="?"),
             _capture(), Param("window", "string"),
             Param("overlay", "string", "none", enum=("none", "marks", "lint", "reading",
-                                                     "bounds", "compose")),
+                                                     "bounds", "compose", "walk")),
             Param("marks", "string|array", "auto", items="string", keep_words=("auto", "all")),
             Param("pad", "integer", 16, minimum=0, maximum=2000),
             Param("source", "string", "auto", enum=ops.IMAGE_SOURCES),
@@ -392,6 +428,7 @@ def _specs() -> list[ToolSpec]:
                   help="Also return the image (~w*h/750 tokens)"),
             Param("out", "string", surfaces=("cli",), help="copy the PNG to this path"),
             _max_bytes(ops.IMAGE_MAX_BYTES), _serial(), _package(),
+            Param("walk", "string"),
         ], ops.image, True, {"capture"}, D_IMAGE, _render_image),
         ToolSpec("lint", "lint", "accessibility lint of a capture, grouped", [
             _capture(),
@@ -416,6 +453,53 @@ def _specs() -> list[ToolSpec]:
             Param("image", "boolean", False), _cursor(),
             _max_bytes(4000), _serial(), _package(),
         ], ops.diff, True, {"capture"}, D_DIFF, _render_lines),
+        # TalkBack (docs/design/talkback-navigation.md part 4 B): DEVICE-WIDE
+        ToolSpec("talkback", "talkback", "TalkBack status/on/off/restore (DEVICE-WIDE: the "
+                 "accessibility settings are snapshotted and restored)", [
+            Param("action", "string", "status", enum=ops.TALKBACK_ACTIONS, positional=True,
+                  nargs="?"),
+            _serial(), _package(),
+            Param("verbose_log", "boolean", False,
+                  help="on: TalkBack log level VERBOSE (walks read its exact words)"),
+        ], ops.talkback, False, {"talkback"}, D_TALKBACK, _render_json),
+        ToolSpec("tb_walk", "tb-walk", "drive the real TalkBack (DEVICE-WIDE) through the app "
+                 "and diff its order with the model's, by capture ref", [
+            _serial(), _package(),
+            Param("start", "string", "current", help="current, first, a ref/selector or a label"),
+            Param("direction", "string", "next", enum=ops.TB_DIRECTIONS,
+                  cli_set={"--prev": "prev"}),
+            Param("max_steps", "integer", ops.TB_MAX_STEPS, minimum=1, maximum=300),
+            Param("until", "string", "wrap", enum=ops.TB_UNTIL),
+            Param("expect", "array", items="string", repeat=True,
+                  help="Expected order: refs, selectors or labels"),
+            Param("step_timeout_ms", "integer", ops.TB_STEP_TIMEOUT_MS, minimum=100,
+                  maximum=10000),
+            Param("settle_ms", "integer", ops.TB_SETTLE_MS, minimum=10, maximum=2000),
+            Param("recapture", "string", "on_unknown", enum=ops.TB_RECAPTURE),
+            Param("utterance", "string", "auto", enum=ops.TB_UTTERANCE),
+            Param("injector", "string", "auto", enum=ops.TB_INJECTORS),
+            Param("leave_on", "boolean", False),
+            Param("max_lines", "integer", 60, minimum=5, maximum=300),
+            Param("max_bytes", "integer", ops.TB_WALK_MAX_BYTES, maximum=ops.TB_WALK_HARD_MAX),
+            _build_out(),
+        ], ops.tb_walk, False, {"talkback"}, D_TB_WALK, _render_tb),
+        ToolSpec("tb_scenario", "tb-scenario", "where real TalkBack focus goes after an action, "
+                 "after back, or after the list updates (DEVICE-WIDE)", [
+            Param("kind", "string", enum=ops.TB_KINDS, positional=True, nargs="?",
+                  cli_choices={"focus-after": "focus_after"}),
+            _serial(), _package(),
+            Param("target", "string", help="A ref, selector or label; default: current focus"),
+            Param("action", "string", "activate"),
+            Param("mutate", "string"),
+            Param("wait_ms", "integer", ops.TB_WAIT_MS, minimum=300, maximum=20000),
+            Param("injector", "string", "auto", enum=ops.TB_INJECTORS),
+            Param("leave_on", "boolean", False),
+            Param("step_timeout_ms", "integer", ops.TB_STEP_TIMEOUT_MS, minimum=100,
+                  maximum=10000),
+            Param("settle_ms", "integer", ops.TB_SETTLE_MS, minimum=10, maximum=2000),
+            _max_bytes(ops.TB_SCENARIO_MAX_BYTES),
+            _build_out(),
+        ], ops.tb_scenario, False, {"talkback"}, D_TB_SCENARIO, _render_tb),
     ]
 
 
@@ -631,13 +715,16 @@ def run(name: str, args: Any, ctx: ops.OpContext, surface: str = "mcp"
 #: Tools with a destructive mode: capture(slots="enable") hot-reloads the app
 #: (resetting remember{} state) and captures drop/gc(all=true) delete captures
 #: of every agent sharing the store. MCP clients ask before running them.
-DESTRUCTIVE_TOOLS = frozenset({"capture", "captures"})
+DESTRUCTIVE_TOOLS = frozenset({"capture", "captures", *TALKBACK_TOOLS})
 
 
 def annotations(ts: ToolSpec) -> dict[str, Any]:
     if ts.read_only:
         return {"readOnlyHint": True}
-    return {"readOnlyHint": False, "destructiveHint": ts.name in DESTRUCTIVE_TOOLS}
+    out: dict[str, Any] = {"readOnlyHint": False, "destructiveHint": ts.name in DESTRUCTIVE_TOOLS}
+    if ts.device_wide:  # TalkBack runs for every app: never run twice by accident
+        out["idempotentHint"] = False
+    return out
 
 
 def mcp_entries(toolset: str = "all", *, context: Callable[[], ops.OpContext] | None = None,
@@ -716,9 +803,14 @@ def add_cli(subparsers: Any, *, context: Callable[[argparse.Namespace], ops.OpCo
                     sp.add_argument(*p.cli, dest=p.name + "_one", action="append",
                                     default=None, metavar="RULE", help=argparse.SUPPRESS)
                     names = [p.flag]
+                elif p.repeat:  # --expect a --expect b, or --expect a,b
+                    kw["action"] = "append"
             else:
                 kw["type"] = _cli_value(p)
             sp.add_argument(*names, **kw)
+            for flag, value in (p.cli_set or {}).items():
+                sp.add_argument(flag, dest=p.name, action="store_const", const=value,
+                                default=argparse.SUPPRESS, help=f"same as {p.flag} {value}")
         sp.add_argument("--json", action="store_true",
                         help="print the JSON the MCP tool returns")
         sp.add_argument("--pretty", action="store_true", help="indent the JSON")
@@ -751,6 +843,8 @@ def cli_args(ts: ToolSpec, ns: argparse.Namespace) -> dict[str, Any]:
                 v = v[0] if v else None
         if p.cli_choices and v in p.cli_choices:
             v = p.cli_choices[v]
+        if p.repeat and isinstance(v, list):
+            v = [x for item in v for x in _split(str(item))] or None
         if isinstance(v, str) and p.type == "array":
             v = _split(v)
             if p.items == "number":
@@ -793,6 +887,10 @@ def cli_main(ts: ToolSpec, ns: argparse.Namespace,
     out_path = getattr(ns, "out", None)
     if ts.name == "image" and out_path and isinstance(res.get("path"), str):
         shutil.copyfile(res["path"], out_path)
+    if ts.device_wide and (res.get("restore_pending") is True
+                           or str(res.get("restore") or "").startswith("left on")):
+        print(f"note: TalkBack stays on (device-wide) until `{CLI_PROG} talkback restore`",
+              file=sys.stderr)
     if ns.json or ns.pretty:
         print(res.text(pretty=ns.pretty))
     elif getattr(ns, "quiet", False):
@@ -942,6 +1040,32 @@ def _render_image(doc: Mapping[str, Any]) -> list[str]:
     return out
 
 
+def _render_tb(doc: Mapping[str, Any]) -> list[str]:
+    """tb_walk / tb_scenario for humans: a header, the steps (or the timeline), the
+    classified diff, each finding with its fix, then the next commands."""
+    out = [_header(doc)]
+    for line in doc.get("lines") or []:
+        out.append(f"  {line}")
+    for ev in doc.get("timeline") or []:
+        out.append(f"  +{ev}")
+    for key in ("diff", "expect"):
+        if isinstance(doc.get(key), dict):
+            out.append(f"{key}: {dumps(doc[key])}")
+    findings = list(doc.get("findings") or [])
+    if isinstance(doc.get("finding"), dict):
+        findings.append(doc["finding"])
+    for f in findings:
+        refs = f" ({' '.join(f['refs'])})" if f.get("refs") else ""
+        out.append(f"{f.get('code')} [{f.get('sev')}{'/' + f['basis'] if f.get('basis') else ''}]"
+                   f"{refs} {f.get('msg')}")
+        if f.get("fix"):
+            out.append(f"  fix: {f['fix']}")
+    for key in ("notes", "recaptured", "panes"):
+        if doc.get(key):
+            out.append(f"{key}: {dumps(doc[key])}")
+    return out + _next_lines(doc)
+
+
 def _render_capture(doc: Mapping[str, Any]) -> list[str]:
     if doc.get("unchanged"):
         return [str(doc.get("capture")), f"unchanged (age {doc.get('age_s')}s)"]
@@ -989,6 +1113,7 @@ def _cli_option_strings(ts: ToolSpec) -> tuple[set[str], set[str]]:
         if p.positional:
             continue
         opts = {p.flag, *p.cli}
+        every |= set(p.cli_set or ())
         if p.type == "boolean":
             if p.default is True:
                 opts.add("--no-" + p.flag[2:])
@@ -1046,6 +1171,7 @@ __all__ = [
     "INSTRUCTIONS_LEGACY",
     "INSTRUCTIONS_TALKBACK",
     "LEGACY_TOOLS",
+    "TB_LOOP",
     "Param",
     "Result",
     "SESSION_TOOLS",
@@ -1063,6 +1189,7 @@ __all__ = [
     "execute",
     "instructions",
     "json_schema",
+    "legacy_talkback",
     "mcp_entries",
     "run",
     "spec",
