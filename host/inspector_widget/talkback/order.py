@@ -589,7 +589,8 @@ class Navigator:
     # ---- web content (FocusProcessorForLogicalNavigation :1146-1560) --------------------------
     # Forward: native elements -> the WebView's root ("Webview") -> web elements -> native
     # elements. Backward: native elements -> web elements -> native elements (the root is
-    # skipped). Inside, the WebView moves focus itself (ACTION_NEXT/PREVIOUS_HTML_ELEMENT).
+    # skipped; measured on TalkBack 17.0, Thunderbird's message body). Inside, the WebView
+    # moves focus itself (ACTION_NEXT/PREVIOUS_HTML_ELEMENT).
     def _html_target(self, pivot: TbNode, forward: bool) -> Optional[TbNode]:
         """navigateToHtmlTarget: the element the WebView moves to from ``pivot``, or None when
         it reports none (the end of the page that way)."""

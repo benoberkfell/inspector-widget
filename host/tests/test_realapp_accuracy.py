@@ -214,6 +214,21 @@ def test_zero_size_web_content_is_read_like_talkback_17_does():
     assert hint["trap"] is False and hint["web_root"] == "virtual:695:23"
 
 
+def test_going_back_into_a_webview_lands_on_its_last_element_and_skips_its_root():
+    # Live, Thunderbird's message body walked backwards (Meta+Left) on TalkBack 17.0: the wrap
+    # lands on the image (the page's last element), then the paragraph, then the native button
+    # before the WebView: the root "Webview" is never a stop going back.
+    walk = WALKS["thunderbird_message_backward"]
+    tree = tb.build(dump(walk["dump"]))
+    order = tb.simulate(tree, start=walk["start"]["key"], direction="prev", until="steps",
+                        max_steps=len(walk["steps"]), keyboard=True)
+    for (moved, key, _label, said), m in zip(walk["steps"], order.steps, strict=True):
+        assert (m["key"] if not m.get("edge") else None) == (key if moved else None), (key, m)
+        if moved:
+            assert m["speak"] == said
+    assert "virtual:314:4" not in order.keys()
+
+
 def test_the_antennapod_player_trap_is_named_and_explained():
     # Live on TalkBack 17.0: after "Shownotes" every press stayed put. The next stop is the show
     # notes WebView on the vertical pager's off-screen page: the model flags it, and a walk stuck

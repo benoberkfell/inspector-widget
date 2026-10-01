@@ -72,7 +72,9 @@ def test_forward_reads_the_webview_root_then_its_elements_then_leaves():
 
 def test_backward_goes_to_the_last_element_and_skips_the_root():
     # findTargetFromMiddlePivot (:1459): going back into a WebView, PREVIOUS_HTML_ELEMENT on
-    # its root lands on the last element; going back from the root (:1524) leaves it.
+    # its root lands on the last element; going back from the root (:1524) leaves it. Measured
+    # live on Thunderbird's message body (test_realapp_accuracy): the root is never a stop
+    # going back, though FocusProcessorForLogicalNavigation's comment (:1146) says otherwise.
     walk = tb.simulate(tb.build(message_screen()), start="view:11", direction="prev",
                        until="steps", max_steps=3)
     assert walk.keys() == ["virtual:30:2", "virtual:30:7", "view:10"]
