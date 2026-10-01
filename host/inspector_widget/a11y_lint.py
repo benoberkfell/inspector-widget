@@ -1269,6 +1269,15 @@ def _scroll_axes(c: _Node) -> Set[str]:
 
 _SCROLL_NAMES = {"SCROLL_UP", "SCROLL_DOWN", "SCROLL_LEFT", "SCROLL_RIGHT", "SCROLL_FORWARD",
                  "SCROLL_BACKWARD"}
+_PAGE_NAMES = {"PAGE_UP", "PAGE_DOWN", "PAGE_LEFT", "PAGE_RIGHT"}
+
+
+def _is_pager(c: _Node) -> bool:
+    """A pager: ViewPager / ViewPager2 (reported as androidx ViewPager), PAGE_* actions, or
+    the RecyclerView inside a ViewPager2 (the pager's own bounds)."""
+    def pager(m: _Node) -> bool:
+        return m.simple_class in ("ViewPager", "ViewPager2") or bool(m.actions & _PAGE_NAMES)
+    return pager(c) or (c.parent is not None and pager(c.parent) and c.rect == c.parent.rect)
 
 
 def _scroll_edges(c: _Node) -> Optional[Set[str]]:
@@ -1303,13 +1312,15 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
         can = _scroll_axes(c)
         edges = _scroll_edges(c)
         more = (lambda e: True) if edges is None else (lambda e: e in edges)  # noqa: E731
-        # The item of ``c`` that holds ``n``: one that exactly fills ``c`` along an axis (a
-        # pager's page at rest) is wholly shown that way, whatever lies beyond the edge.
-        item = n
-        while item.parent is not None and item.parent is not c:
-            item = item.parent
-        fills_h = item.y == c.y and item.h == c.h
-        fills_w = item.x == c.x and item.w == c.w
+        # A pager's page at rest exactly fills it: wholly shown, whatever lies beyond the edge.
+        # (A ScrollView's one content child fills it too, but only as far as it shows.)
+        fills_h = fills_w = False
+        if _is_pager(c):
+            item = n
+            while item.parent is not None and item.parent is not c:
+                item = item.parent
+            fills_h = item.y == c.y and item.h == c.h
+            fills_w = item.x == c.x and item.w == c.w
         if "h" in can and not fills_h and (
                 (n.y <= c.y + _EDGE_TOL and more("top"))
                 or (n.y + n.h >= c.y + c.h - _EDGE_TOL and more("bottom"))):

@@ -1447,3 +1447,19 @@ def test_a_webview_without_web_content_is_not_unlabelled_and_is_diagnosed():
     assert of(rep, "a11y.label.missing") == [] and of(rep, "a11y.node.empty_focusable") == []
     diag = next(d for d in rep.diagnostics if d["code"] == "web.not_exposed")
     assert diag["keys"] == ["view:50"] and "TalkBack" in diag["message"]
+
+
+def test_r2_a_sliver_at_the_bottom_of_a_scroll_view_is_clipped():
+    # AntennaPod's home (live): a horizontal list of podcast covers shows a 32px sliver at the
+    # bottom of the screen's ScrollView. The ScrollView's one content child fills it (as far as
+    # it shows), which is not a pager page at rest: the covers are clipped.
+    cover = view(404, "android.widget.ImageView", flags=CLICK, cd="Planet Money", b=(48, 2380, 288, 20))
+    covers = view(261, "androidx.recyclerview.widget.RecyclerView", flags=("long_clickable",),
+                  b=(0, 2368, 1280, 32), kids=[cover], collection_info={"row_count": 1, "column_count": 2})
+    content = view(221, "android.widget.LinearLayout", b=(0, 348, 1280, 2052), kids=[covers],
+                   important_for_accessibility="NO")
+    scroll = view(220, "android.widget.ScrollView", flags=("scrollable", "focusable"),
+                  b=(0, 348, 1280, 2052), kids=[content], actions=["SCROLL_FORWARD", "SCROLL_DOWN"])
+    f = of(lint(screen(decor(1, scroll, b=(0, 0, 1280, 2856))), density=480),
+           "a11y.touch_target.small")
+    assert sorted((x.node_key, x.severity) for x in f) == [("view:261", "info"), ("view:404", "info")]
