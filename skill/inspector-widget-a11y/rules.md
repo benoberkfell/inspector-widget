@@ -106,10 +106,14 @@ description on another; both are folded into the node.
   alone cannot tell a stock M3 control from a `Modifier.size(24.dp).clickable`. The
   agent also reports each Compose node's layout size (its LayoutNode, `layout_size`
   in the a11y dump). Stock M3 Checkbox/IconButton/Switch reserve 48dp there
-  (`minimumInteractiveComponentSize`) and pass; a clickable laid out smaller is a
-  `warn` with `bounds_source` "Compose layout size" and `touch_w_dp`/`touch_h_dp`
-  in the evidence: the extra touch area is not reserved, so a neighbour or a clip
-  can take it and the visible control stays small.
+  (`minimumInteractiveComponentSize`) and pass. A clickable laid out smaller is
+  reported with `bounds_source` "Compose layout size" and `touch_w_dp`/`touch_h_dp`
+  in the evidence. It is a `warn` when another clickable (not its own row or
+  child) lies inside its widened touch area (`touch_rivals`): the extra area is not
+  reserved, so the neighbour can take a touch meant for it. With nothing there
+  (`touch_area_clear`) every touch in the area reaches it, so it works as a 48dp
+  target and the finding is `info` (Thunderbird's message-row stars, laid out
+  48x24dp).
 - **Clipping (on evidence only):** a dimension is clipped where the node touches
   an edge of a scroll container that can still scroll past that edge (its scroll
   actions say so; a container with none counts for every edge; a pager's page at
@@ -128,8 +132,12 @@ description on another; both are folded into the node.
   reflected in accessibility bounds, so this rule still reports it. Web content
   (a WebView's page): CSS `min-width`/`min-height` or padding on the link/button.
   Every rule gives web content HTML/CSS advice, never Compose's.
+- **Capture lint:** `lint()` over a capture does not judge R2 on a node that
+  `render.clipped` flags (its visible part is not its size: a 9dp sliver of a row at
+  a scroll edge, a toggle half under a bar); the `render.clipped` issue says so.
 - **Evidence:** `w_dp`, `h_dp`, `min_dp`, `floor_dp`, `standard`, `clipped_axes`,
-  `bounds_source` (and `touch_w_dp`/`touch_h_dp` for the Compose layout case).
+  `bounds_source` (and `touch_w_dp`/`touch_h_dp` plus `touch_rivals` or
+  `touch_area_clear` for the Compose layout case).
 
 ### R3 `a11y.contrast.low` — text contrast below WCAG 1.4.3  (ATF TextContrast; the one pixel rule)
 - **Flags:** a visible, enabled, non-password node with its own text whose

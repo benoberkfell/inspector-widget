@@ -376,12 +376,11 @@ def test_launcher_walk(world: dict[str, Captured]) -> None:
     summary = p.summary(lc)
     assert nbytes(summary) <= 2500
     # The recording's heading row is clipped at the list's edge, and its Text is not
-    # in the (pre-ID1) a11y tree. Both lint findings on it are info: an unnamed row
-    # clipped at a scroll edge may have its label in the part scrolled away (R1; on
-    # Now in Android's feed such chips read fine once TalkBack scrolls them in), and
-    # its 33dp-tall sliver is a small target only as far as it shows (R2).
-    assert summary["lint"] == ("2 info: 1 label_missing, 1 touch_target "
-                               "(contrast not run)")
+    # in the (pre-ID1) a11y tree. Its lint finding is info: an unnamed row clipped at a
+    # scroll edge may have its label in the part scrolled away (R1; on Now in Android's
+    # feed such chips read fine once TalkBack scrolls them in). Its 33dp-tall sliver is
+    # not judged as a touch target: render.clipped says it is cut (G18).
+    assert summary["lint"] == "1 info: 1 label_missing (contrast not run)"
     heading = c.ref("@launch_heading")
     assert summary["issues"] == f"1 clipped: {heading}"
 
@@ -422,12 +421,12 @@ def test_launcher_walk(world: dict[str, Captured]) -> None:
     assert node["layout"]["declared"] == [0, 2757, 1280, 216]
     assert node["layout"]["visible"] == 0.125
     assert node["tap_xy"] == [640, 2770]
-    assert any("likely false positive" in i for i in node["issues"])
+    assert not any("touch_target" in i for i in node["issues"])  # clipped: not judged
     assert [s.split(" src=")[1].split()[0] for s in node["compose"]["slots"]] == [
         "MainActivity.kt:150", "MainActivity.kt:151", "MainActivity.kt:152"]
 
-    lint = p.lint(lc)  # both on the clipped heading row: info (see the summary above)
-    assert nbytes(lint) <= 1200 and lint["counts"] == {"error": 0, "warn": 0, "info": 2}
+    lint = p.lint(lc)  # on the clipped heading row: info (see the summary above)
+    assert nbytes(lint) <= 1200 and lint["counts"] == {"error": 0, "warn": 0, "info": 1}
 
     crop = p.image(lc, heading)
     assert nbytes(crop) <= 400 and crop["px"][1] > 0 and os.path.exists(crop["path"])

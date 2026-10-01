@@ -43,7 +43,7 @@ def test_launcher_reading_with_explain_fits_2500_bytes():
     # the sliver at the list's edge: TalkBack scrolls it in first, then says what it shows
     assert out["lines"][12] == (
         '13. sem:7:141 @launch_heading "Section heading, MissingHeading" click tgroup '
-        '[0,2757 1280x27] !clipped !touch_target why=leaf show_on_screen=sem:7:18 '
+        '[0,2757 1280x27] !clipped why=leaf show_on_screen=sem:7:18 '
         'speak=after_scroll')
 
 

@@ -801,21 +801,22 @@ def _cached_lint(src: _Src, ix: Index, kind: str, *, density: int, font_scale: f
 
 
 def _annotate_touch_fp(pairs: Iterable[tuple[str, Issue]],
-                       render: Mapping[str, Iterable[Issue]]) -> None:
-    """Findings on a node clipped at a scroll edge measure the visible sliver, not
-    the node: a touch target there is a likely false positive (L2), and a contrast
-    sample is low confidence."""
+                       render: Mapping[str, Iterable[Issue]]) -> list[tuple[str, Issue]]:
+    """``pairs`` without the touch-target findings on a node ``render.clipped`` flags: its
+    visible part is not its size (a 9dp sliver of a 72dp row at a scroll edge, Now in
+    Android's Unbookmark half under the bottom bar), so R2 is not judged there (G18; it
+    used to be kept as a likely false positive). A contrast sample on a node clipped at a
+    scroll edge is kept, low confidence: the sliver may not show the text."""
+    out: list[tuple[str, Issue]] = []
     for nid, iss in pairs:
-        if iss.id not in (TOUCH_RULE, CONTRAST_RULE):
+        clipped = [r for r in render.get(nid, ()) if r.id == CLIPPED]
+        if iss.id == TOUCH_RULE and clipped:
             continue
-        for r in render.get(nid, ()):
-            if r.id == CLIPPED and r.evidence.get("scroll"):
-                if iss.id == TOUCH_RULE:
-                    iss.evidence["note"] = LIKELY_FP
-                else:
-                    iss.evidence["note"] = SLIVER_NOTE
-                    iss.conf = "inferred"
-                break
+        if iss.id == CONTRAST_RULE and any(r.evidence.get("scroll") for r in clipped):
+            iss.evidence["note"] = SLIVER_NOTE
+            iss.conf = "inferred"
+        out.append((nid, iss))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -943,7 +944,7 @@ def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None =
         if unmapped:
             diags.append(f"lint: {len(unmapped)} findings not mapped to nodes: "
                          + ", ".join(unmapped[:3]) + (" …" if len(unmapped) > 3 else ""))
-        _annotate_touch_fp(lint_pairs, render)
+        lint_pairs = _annotate_touch_fp(lint_pairs, render)
         tb_pairs, tb_diags = _tb_issues(ix, src, density)
         lint_pairs.extend(tb_pairs)
         diags.extend(tb_diags)
@@ -1256,7 +1257,7 @@ def _effective(ix: Index, src: _Src, *, contrast: bool, wcag: bool, density: int
     if wcag:
         res = _cached_lint(src, ix, "tree", density=density, font_scale=font_scale, wcag=True)
         pairs = [(nid, Issue(i.id, i.sev, dict(i.evidence), i.conf)) for nid, i in res.issues]
-        _annotate_touch_fp(pairs, render)
+        pairs = _annotate_touch_fp(pairs, render)
         out = [(nid, i) for nid, i in out
                if not i.id.startswith("a11y.") or i.id == CONTRAST_RULE] + pairs
         unmapped.extend(res.unmapped)
@@ -1264,7 +1265,7 @@ def _effective(ix: Index, src: _Src, *, contrast: bool, wcag: bool, density: int
         res = _cached_lint(src, ix, "contrast", density=density, font_scale=font_scale,
                            wcag=False)
         pairs = [(nid, Issue(i.id, i.sev, dict(i.evidence), i.conf)) for nid, i in res.issues]
-        _annotate_touch_fp(pairs, render)
+        pairs = _annotate_touch_fp(pairs, render)
         out = [(nid, i) for nid, i in out if i.id != CONTRAST_RULE] + pairs
         unmapped.extend(res.unmapped)
         status = "sampled" if res.status.startswith("sampled") else res.status

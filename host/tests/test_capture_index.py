@@ -935,3 +935,24 @@ def test_outline_reading_on_the_nia_onboarding_grid_is_column_major_like_talkbac
                                      "8:124", "8:134", "8:144")]
     assert grid == ["8:94", "8:100", "8:104", "8:110", "8:114", "8:120",  # column 0
                     "8:124", "8:134", "8:144"]                            # column 1
+
+
+def test_the_outline_says_scroll_only_for_a_node_that_can_scroll():
+    # G18: the outline's ``scroll`` came from AccessibilityNodeInfo.scrollable, which a
+    # Compose card reports with only CLICK (Now in Android's feed, n2839), and a list that
+    # fits reports with no scroll action. It now follows the scroll actions.
+    import tb_capture_fixtures as F
+
+    from inspector_widget.capture import lines
+
+    ix, _raw = F.fixture_capture("nia_settings")
+    fits = ix.get("sem:80:166")  # the dialog's ScrollView: everything fits, no action
+    grid = ix.get("sem:8:85")  # the topic grid: SCROLL_FORWARD, SCROLL_RIGHT
+    assert "scroll" in fits.flags and "scroll" not in lines.display_flags(fits)
+    assert "scroll" in lines.display_flags(grid)
+    # no a11y node to ask: the flag stands
+    bare = type(grid)(key="sem:1:2", kind="compose", flags=["scroll"], facets={})
+    assert lines.display_flags(bare) == ["scroll"]
+    card = type(grid)(key="sem:1:3", kind="compose", flags=["click", "scroll"],
+                      facets={"a11y": {"actions": ["CLICK"]}})
+    assert lines.display_flags(card) == ["click"]

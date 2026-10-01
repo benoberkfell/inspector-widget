@@ -330,8 +330,9 @@ def test_launcher_lint_maps_every_finding_to_its_node():
     """The capture's lint is ``a11y_lint.run_lint`` over the stored unified a11y tree,
     so it finds what the live a11y_lint tool finds on the same dump, and every
     finding lands on its node. The launcher's rows sit in a collection, so the
-    lint no longer asks them for a role (R5); the screen has no heading (R9), and
-    the last row, clipped at the list's edge, is a small touch target."""
+    lint no longer asks them for a role (R5); the screen has no heading (R9). The last
+    row is clipped at the list's edge: the live lint measures its 9dp sliver as a small
+    touch target, which the capture does not judge on a render.clipped node (G18)."""
     from inspector_widget import a11y
 
     ix, loaded = _launcher_loaded()
@@ -339,13 +340,14 @@ def test_launcher_lint_maps_every_finding_to_its_node():
     an.analyze(ix, loaded, lint="tree", density=480, font_scale=1.0)
     assert not any(d.startswith("lint:") for d in ix.diagnostics), ix.diagnostics
     assert _issues(ix) == {"n1": [("a11y.heading.structure", "info")],
-                           "n22": [(TOUCH, "info"), ("render.clipped", "info")]}
+                           "n22": [("render.clipped", "info")]}
     live = a11y_lint.run_lint(
         None, density=480, include_contrast=False,
         a11y_data=a11y.a11y_to_dict(pb.DumpA11yResponse.FromString(loaded.raw("a11y"))),
         compose_data=an._Src(loaded).compose_dict())
     assert sorted((f.rule, f.severity) for f in live.findings) == sorted(
-        (i.id, i.sev) for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y."))
+        [(i.id, i.sev) for n in ix.nodes.values() for i in n.issues
+         if i.id.startswith("a11y.")] + [(TOUCH, "info")])
 
 
 def test_view_screens_are_linted_too():
@@ -368,13 +370,14 @@ def test_view_screens_are_linted_too():
                and all(x in ix.nodes for x in i.evidence["node_ids"]) for n, i in groups)
 
 
-def test_touch_target_on_scroll_clipped_node_is_a_likely_false_positive():
+def test_touch_target_on_a_clipped_node_is_not_judged():
+    # G18: R2 measured the 9dp sliver of a 72dp row clipped at the list's edge; it was kept
+    # as a "likely false positive". A render.clipped node's visible part is not its size,
+    # so R2 is not judged there; render.clipped says what is going on.
     ix, loaded = _launcher_loaded()
     _clear(ix)
     an.analyze(ix, loaded)
-    touch = [i for i in ix.get("n22").issues if i.id == TOUCH]
-    assert touch[0].evidence["note"] == "likely false positive: clipped at scroll edge"
-    assert touch[0].evidence["w_dp"] == 426.7 and touch[0].evidence["h_dp"] == 9.0
+    assert [i.id for i in ix.get("n22").issues] == ["render.clipped"]
 
 
 def test_analyze_is_idempotent_and_keeps_foreign_issues():
@@ -402,7 +405,7 @@ def test_analyze_accepts_a_raw_capture_before_publish():
     raw = RawCapture(meta=ix.meta, compose_sem=_real_compose(),
                      a11y=a11y_pb_from_index(cb.launcher_index()).SerializeToString())
     an.analyze(ix, raw, lint="tree")
-    assert sorted(_issues(ix, "a11y.")) == ["n1", "n22"]
+    assert sorted(_issues(ix, "a11y.")) == ["n1"]  # n22: clipped, R2 not judged
 
 
 def test_no_a11y_tree_means_no_lint_and_says_so():
@@ -726,7 +729,7 @@ def test_cursors_page_through_every_finding_once():
 def test_lint_summary_for_capture():
     ix, _ = _analyzed_launcher()
     assert an.lint_summary(ix) == {
-        "lint": "2 info: 1 heading, 1 touch_target (contrast not run)",
+        "lint": "1 info: 1 heading (contrast not run)",
         "issues": "1 clipped: n22"}
     ix, _ = _spec_launcher()
     assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state, 1 touch_target "
@@ -866,9 +869,10 @@ def test_contrast_on_a_scroll_clipped_sliver_is_low_confidence():
     pairs = [("n22", Issue(an.CONTRAST_RULE, "error", {"ratio": 1.25})),
              ("n22", Issue(TOUCH, "warn", {"w_dp": 426.7, "h_dp": 9.0})),
              ("n11", Issue(an.CONTRAST_RULE, "error", {"ratio": 2.0}))]
-    an._annotate_touch_fp(pairs, {"n22": [clipped]})
+    kept = an._annotate_touch_fp(pairs, {"n22": [clipped]})
+    assert [(nid, i.id) for nid, i in kept] == [("n22", an.CONTRAST_RULE),
+                                                ("n11", an.CONTRAST_RULE)]  # R2: not judged
     assert pairs[0][1].conf == "inferred" and "sliver" in pairs[0][1].evidence["note"]
-    assert pairs[1][1].evidence["note"] == an.LIKELY_FP and pairs[1][1].conf == "exact"
     assert "note" not in pairs[2][1].evidence and pairs[2][1].conf == "exact"
 
 

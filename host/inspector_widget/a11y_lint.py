@@ -1388,6 +1388,31 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
     return axes
 
 
+def _touch_rivals(n: _Node, run: _Run) -> List[str]:
+    """Keys of the other clickable nodes inside ``n``'s touch bounds (its a11y bounds, which
+    Compose widens to 48dp): neither an ancestor (the row a star sits in) nor a descendant,
+    on screen, in the same window."""
+    mine: Set[int] = set()
+    stack = [n]
+    while stack:
+        m = stack.pop()
+        mine.add(id(m))
+        stack.extend(m.children)
+    p = n.parent
+    while p is not None:
+        mine.add(id(p))
+        p = p.parent
+    out: List[str] = []
+    for m in run.nodes:
+        if id(m) in mine or m.win is not n.win or not _visible(m) or not _actionable(m):
+            continue
+        ix = min(n.x + n.w, m.x + m.w) - max(n.x, m.x)
+        iy = min(n.y + n.h, m.y + m.h) - max(n.y, m.y)
+        if ix > 0 and iy > 0:
+            out.append(m.key)
+    return out
+
+
 def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
     if not _visible(n) or not _actionable(n) or not _enabled(n):
         return []
@@ -1422,14 +1447,29 @@ def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
         w_dp, h_dp = run.dp(lay["w"]), run.dp(lay["h"])
         ev.update({"w_dp": w_dp, "h_dp": h_dp, "touch_w_dp": bdp["w"], "touch_h_dp": bdp["h"],
                    "bounds_source": "Compose layout size (touch bounds are widened to 48dp)"})
+        reserve = (f"Reserve {min_dp}dp: Modifier.minimumInteractiveComponentSize() or "
+                   f"Modifier.sizeIn(minWidth = {min_dp}.dp, minHeight = {min_dp}.dp) on the "
+                   f"clickable element.")
+        rivals = _touch_rivals(n, run)
+        if not rivals:
+            # Nothing else clickable lies in the widened area, so every touch in it reaches
+            # this control: a 48dp target in practice (Thunderbird's message-row stars, laid
+            # out 48x24dp, one per row with nothing beside them).
+            ev["touch_area_clear"] = True
+            return [run.finding(
+                "a11y.touch_target.small", "info", n,
+                f"Laid out at {w_dp}x{h_dp}dp; Compose widens its touch area to "
+                f"{bdp['w']}x{bdp['h']}dp and no other clickable lies in it, so it works as a "
+                f"{min_dp}dp target, as long as nothing clickable moves into that area. "
+                f"{reserve}", ev)]
+        ev["touch_rivals"] = rivals[:5]
         return [run.finding(
             "a11y.touch_target.small", "warn", n,
             f"Laid out at {w_dp}x{h_dp}dp. Compose widens its touch bounds to "
             f"{bdp['w']}x{bdp['h']}dp for hit-testing, but the layout does not reserve that "
-            f"area, so a neighbouring target or a clip can take it and the visible control "
-            f"stays small. Reserve {min_dp}dp: Modifier.minimumInteractiveComponentSize() or "
-            f"Modifier.sizeIn(minWidth = {min_dp}.dp, minHeight = {min_dp}.dp) on the "
-            f"clickable element.", ev)]
+            f"area and {rivals[0]}{' and others' if len(rivals) > 1 else ''} lie in it, so a "
+            f"touch there can reach the other target and the visible control stays small. "
+            f"{reserve}", ev)]
     if not small:
         return []
     clipped = _clipped_axes(n, run)
