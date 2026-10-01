@@ -1311,7 +1311,10 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
                             for i in n.issues):
         nxt.append('find(issue="render.")')
     if covered and scope is None and out["covered"]["windows"]:
-        nxt.append(f'lint(within="{out["covered"]["windows"][0]}")')
+        # ahead of find(issue="render."): what a dialog hides matters more (3 hints at most)
+        render = 'find(issue="render.")'
+        nxt.insert(nxt.index(render) if render in nxt else len(nxt),
+                   f'lint(within="{out["covered"]["windows"][0]}")')
     nxt = next_hints(nxt)
     if nxt:
         out["next"] = nxt

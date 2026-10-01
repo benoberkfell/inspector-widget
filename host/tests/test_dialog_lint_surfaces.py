@@ -117,9 +117,9 @@ def test_the_capture_lint_counts_findings_under_the_dialog_apart(nia):
         assert lint["covered"] == {"n": COVERED, "windows": [win.ref], "by": [dialog.ref],
                                    "listed": False}
         assert not (lint.get("rules") or lint.get("lines"))
-        # no node( hint to a node behind the dialog; one to lint that window instead
-        assert lint["next"][-1] == f'lint(within="{win.ref}")'
-        assert not any(h.startswith("node(") for h in lint["next"])
+        # no node( hint to a node behind the dialog; one to lint that window instead, ahead
+        # of find(issue="render.") (at most 3 hints are kept)
+        assert lint["next"] == [f'lint(within="{win.ref}")', 'find(issue="render.")']
     inside = run(nia.ctx, "lint", within=win.ref, group="none")
     assert inside["counts"]["info"] == COVERED and len(inside["lines"]) == COVERED
     assert inside["covered"]["listed"] is True
