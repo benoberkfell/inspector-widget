@@ -665,7 +665,7 @@ def _capture_diff(base: LoadedCapture, lc: LoadedCapture) -> tuple[dict[str, Any
     d = _diff(base, lc, limit=DIFF_LINES, max_bytes=DIFF_MAX_BYTES)
     keep = ("a", "verdict", "shared", "summary", "notes", "lines", "issues", "truncated")
     doc = {k: d[k] for k in keep if k in d}
-    if doc.get("issues") == {"resolved": [], "new": []}:
+    if doc.get("issues") == {"resolved": [], "new": []}:  # nothing else to say either
         del doc["issues"]
     nxt = [h for h in d.get("next") or [] if h.startswith("diff(")]
     return doc, nxt

@@ -213,13 +213,16 @@ def test_long_and_odd_labels_are_escaped_and_cut():
 
 
 # --------------------------------------------------------------------------- collections
-def feed(cells, *, cid, dy=0):
+def feed(cells, *, cid, dy=0, issues=None):
+    """A RecyclerView of cells (title + delete button); ``issues``: cell id -> the
+    delete button's issues."""
     rows = []
     for i, (u, label) in enumerate(cells):
         y = 50 + 100 * i + dy
         rows.append(V("LinearLayout", u,
                       V("TextView", u + 1, rid="title", label=label, b=(0, y, 300, 50)),
-                      V("ImageButton", u + 2, rid="delete", label="Delete", b=(300, y, 100, 50)),
+                      V("ImageButton", u + 2, rid="delete", label="Delete", b=(300, y, 100, 50),
+                        issues=(issues or {}).get(u, ())),
                       b=(0, y, 400, 100)))
     return scene(V("DecorView", 1,
                    V("TextView", 2, rid="header", label="Inbox", b=(0, 0, 400, 50)),
@@ -364,6 +367,47 @@ def test_issue_deltas_by_ref_and_rule():
     c = chain.publish(screen("c00003", {}, lint="none"))
     out2 = d.diff(b, c)
     assert "issues" not in out2 and "issues not compared: lint=none in b" in out2["notes"]
+
+
+def test_an_issue_that_left_with_its_node_is_not_resolved():
+    """W5: after a scroll or a closed dialog, the issues of nodes that left the
+    screen are counted apart (gone_with_node), never "resolved"; those of new
+    nodes are on_new_nodes, never "new" (they were not introduced by a change);
+    a recycled cell's issue is the same issue on its rebound ref."""
+    role, touch = "a11y.role.missing_on_clickable", "a11y.touch_target.small"
+
+    def screen(cid, units, issues):
+        return scene(V("DecorView", 1,
+                       *[V("Button", u, rid=f"b{u}", label=f"B{u}", b=(0, 50 * u, 100, 40),
+                           issues=issues.get(u, ())) for u in units],
+                       b=(0, 0, 400, 800)), cid=cid)
+
+    chain = Chain()
+    a = chain.publish(screen("c00001", [2, 3, 4, 5], {2: [role], 4: [touch], 5: [role]}))
+    # 4 and 5 leave, 6 arrives with an issue, 2 keeps its issue, 3 gains one
+    b = chain.publish(screen("c00002", [2, 3, 6], {2: [role], 3: [touch], 6: [role]}))
+    out = d.diff(a, b)
+    assert out["issues"]["resolved"] == []
+    assert out["issues"]["new"] == [f"{touch} ×1: {b.by_key['view:3']}"]
+    assert out["issues"]["gone_with_node"] == 2 and out["issues"]["on_new_nodes"] == 1
+    # the node stays and the finding goes: that is resolved
+    c = chain.publish(screen("c00003", [2, 3, 6], {6: [role]}))
+    out2 = d.diff(b, c)
+    assert out2["issues"]["resolved"] == [f"{role} ×1: {b.by_key['view:2']}",
+                                          f"{touch} ×1: {b.by_key['view:3']}"]
+    assert "gone_with_node" not in out2["issues"] and out2["issues"]["new"] == []
+
+
+def test_a_rebound_cells_issue_is_not_new():
+    chain = Chain()
+    role = "a11y.role.missing_on_clickable"
+    rows_a = [(100, "Item 0"), (200, "Item 1"), (300, "Item 2")]
+    rows_b = [(200, "Item 1"), (300, "Item 2"), (100, "Item 3")]
+    a = chain.publish(feed(rows_a, cid="c00001", issues={100: [role], 200: [role]}))
+    b = chain.publish(feed(rows_b, cid="c00002", dy=-100, issues={100: [role], 200: [role]}))
+    out = d.diff(a, b, max_bytes=0)
+    assert out["summary"]["rebound"] == 3
+    assert out["issues"] == {"resolved": [], "new": []}
 
 
 def test_params_are_compared_when_both_captures_have_slots():

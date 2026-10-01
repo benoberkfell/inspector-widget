@@ -931,7 +931,12 @@ with every consumer.
   - Order: b's pre-order for changed, moved, added and rebound nodes, then the
     removals in a's pre-order.
   - `issues`: `{resolved, new}`, each `"<rule> ×N: n1 n2 n3 +k"` (at most 6
-    rules). An issue change alone does not make a node "changed". When only one
+    rules), compared on the nodes both captures hold (a rebound pair is one
+    node, shown by its new ref): `resolved` means the node is still there and
+    the finding is gone. The issues of removed nodes are counted as
+    `gone_with_node`, those of added nodes as `on_new_nodes` (when non-zero);
+    a scroll or a closed dialog resolves nothing. An issue change alone does
+    not make a node "changed". When only one
     capture ran `lint=full`, `a11y.contrast*` rules are not compared (noted);
     when one ran `lint=none`, issues are not compared at all (noted).
   - Slot nodes are compared only when both captures have a slot table.
