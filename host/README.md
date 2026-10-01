@@ -8,7 +8,9 @@
   abstract socket, and speaks the framed protobuf protocol from
   `proto/view_inspection.proto`. (Built by the host-driver module.)
 - **`mcp_server.py`** — an [MCP](https://modelcontextprotocol.io) server that
-  exposes Inspector Widget to an LLM agent as 18 tools, built on top of
+  exposes Inspector Widget to an LLM agent as 26 tools (18 listed by default:
+  the 15 inspection tools and the 3 TalkBack tools; the 8 capture-and-walk
+  tools with `INSPECTOR_WIDGET_TOOLSET=capture` or `all`), built on top of
   `inspector_widget`.
 
 The wire protocol, packages, socket names, and screenshot encoding are fixed by
@@ -71,7 +73,9 @@ device artifacts are looked up (a missing artifact is a warning, not a failure).
 
 ```
 Inspector Widget MCP server — self check
+  toolset: legacy,talkback (18 listed; set INSPECTOR_WIDGET_TOOLSET = legacy, capture, talkback, all or a comma list)
   tools (18): list_devices, list_processes, attach, dump_tree, get_properties, screenshot, dump_compose, compose_overlay, dump_accessibility, a11y_lint, a11y_overlay, detach, inspect, inspect_node, component_image, talkback, tb_walk, tb_scenario
+  not listed, callable by name (8): capture, captures, outline, find, node, image, lint, diff
   inspector_widget: OK
   view_inspection_pb2: OK
   mcp SDK: 1.30.0 OK (real MCP transport)
@@ -223,6 +227,10 @@ Every result leaves through `inspector_widget.output` (Phase 0 of
   `<store>/spill/` (1 h TTL) and the response is a spill envelope of at most
   3,000 bytes: `{truncated, tool, bytes, max_bytes, summary, preview, spill_path,
   hint}`. `detail="full"` with `max_bytes=0` is the rollback to the legacy output.
+  Tools without a `max_bytes` argument (`inspect_node`, the overlays,
+  `component_image`, ...) are budgeted at the environment default; their hint
+  names the spill file and `INSPECTOR_WIDGET_MAX_BYTES`, never an argument the
+  tool would reject.
 
 The CLI takes the same parameters as kebab-case flags with the same defaults
 (`--detail`, `--max-bytes`, `--max-depth`, `--root`, `--user-code-only` /
@@ -236,18 +244,66 @@ The CLI takes the same parameters as kebab-case flags with the same defaults
 | `list_devices` | — | `{devices:[{serial, api, abi, model, state}], count}` |
 | `list_processes` | `serial?` | `{serial, processes:[{package, pid, running}], count}` — debuggable packages only; running apps first |
 | `attach` | `serial?`, `package`, `force=false` | `{attached, pid, warm, reused, api_level, abi, agent_version, build_id, window_count, root_ids, session, note?}` — injects if needed (idempotent); app must be running. `warm`: the agent was already running; `reused`: this server's cached session was reused; `note` when that session runs an older build. `force=true` stops any running agent and injects a fresh one |
-| `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0`, `root_id=0` | `{serial, package, roots:[ViewNode…], root_count, properties?, screenshot?}` — auto-attaches; brief: `properties` is `{view_id: {name: value}}` (non-default values) plus `omitted_defaults` |
+| `dump_tree` | `serial`, `package`, `include_properties=false`, `include_resolution_stack=false`, `include_screenshot=false`, `scale=1.0`, `root_id=0` | `{serial, package, roots:[ViewNode…], root_count, properties?, diagnostics?, screenshot?}` — auto-attaches; brief: `properties` is `{view_id: {name: value}}` (non-default values) plus `omitted_defaults`; `diagnostics` is what the agent cut or could not read (`depth-truncated=N`, `properties-failed=N`), beside each cut node's `CHILDREN_TRUNCATED` flag |
 | `get_properties` | `serial`, `package`, `view_id`, `include_resolution_stack=false`, `filter=all` | brief: `{serial, package, view_id, properties:{name: value}}`; full: `{…, group:{view_id, properties:[{name,type,is_layout,value,source?,resolution_stack?}]}}` |
 | `screenshot` | `serial`, `package`, `scale=1.0` | `{path, width, height, bytes, scale}` — PNG saved on host |
-| `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{roots:[…]}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see) |
+| `dump_compose` | `serial`, `package`, `include_semantics=true`, `include_slot_table=true`, `enable_inspection=false` (opt-in: hot-reload resets `remember{}` state) | `{windows:[…], diagnostics, note?}` — Compose semantics tree + slot-table composables with `file:line` (the layer `dump_tree` cannot see). An empty slot table gets a `note`: how to populate it (`enable_inspection=true`, with its warning) only on a readable Compose UI; with no ComposeView, or an obfuscated / unreadable Compose (`compose_obfuscated`, `semantics_failed`), the note says why there is no slot table instead (the CLI prints the same) |
 | `compose_overlay` | `serial`, `package`, `scale=1.0`, `all_boxes=false` | `{path, boxes, …}` — screenshot with every on-screen Compose element boxed (text/role + bounds) + a flat on-screen text list |
 | `dump_accessibility` | `serial`, `package`, `include_extras=true`, `include_rendering_info=false` | unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes): text/contentDescription/stateDescription/role, state flags, bounds, decoded actions, collection/range info, plus host-computed TalkBack `focus_order` and a `generation`; nodes TalkBack never sees carry `ignored`, windows under a modal dialog `covered_by` |
 | `a11y_lint` | `serial`, `package`, `include_contrast=true`, `scale=1.0`, `wcag_mode=false`, `rules=[…]`, `include_rendering_info=true`, `group_by=rule` | brief: `{summary, by_rule:{rule:{sev, n, msg, nodes:[≤3 node keys], more?}}, diagnostics (warn/error), density, font_scale, generation, contrast_sampled, omitted}`; `group_by=none` / full: `{summary, findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window, collection, message, evidence}], diagnostics, stats, …}` — the detect/verify engine (R1..R18) over the unified a11y tree (Views + Compose), judging what TalkBack reads; `rules` takes ids, `R#` aliases or ATF names; `wcag_mode` uses 44dp targets; `include_contrast=false` skips the pixel rule |
 | `a11y_overlay` | `serial`, `package`, `scale=1.0`, `include_contrast=true`, `wcag_mode=false` | `{path, boxes, labels, flagged, summary, …}` — every window composited (a dialog over its activity), every a11y node boxed + what TalkBack says + reading-order number; red error, amber warn, blue info, green clean, dashed = a finding with no a11y node, drawn at its bounds |
 | `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation and `summary.generation`; can render the integrated overlay (all windows; green exact, amber overlap, grey none) |
 | `inspect_node` | `serial`, `package`, one of `node_key` (`view:<id>` \| `compose:<acvId>:<semanticsId>` \| `composeview:<acvId>`) \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, generation, where, context, view?, compose?, a11y?, list_item?, a11y_only?, a11y_parent?, resolved_from?, key_note?, component_image{path}, lint[], lint_summary, lint_diagnostics}` — `compose` carries the semantics attrs (`source` is null: `file:line` needs `dump_compose` with the slot table), `view` typed properties, `lint` exactly the `a11y_lint` findings for the element and the nodes merged into it |
-| `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source, window?}` — cropped PNG of one element, cut from its own window (`source`: `skp` \| `bitmap_crop`) |
+| `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source, window?, serial, package, node_key}` — cropped PNG of one element, cut from its own window (`source`: `skp` \| `bitmap_crop`); `component-image` prints the same document |
+| `talkback` | `serial?`, `action` (`status` \| `on` \| `off` \| `restore`), `package?`, `verbose_log=false` | TalkBack state, or what `on`/`off`/`restore` changed — **device-wide**: the accessibility settings are snapshotted and restored afterwards, at exit, or by `restore` |
+| `tb_walk` | `serial?`, `package`, `start=current`, `direction=next`, `max_steps=60`, `until=wrap`, `expect?`, `step_timeout_ms=1500`, `settle_ms=120`, `recapture=on_unknown`, `utterance=auto`, `injector=auto`, `leave_on=false`, `max_lines=60`, `max_bytes=5000` | presses the real TalkBack's next/previous (uinput keyboard, touch fallback), records where focus lands and diffs that order with the model's (`dump_accessibility`'s `focus_order`) and a visual order: `{lines, findings, next, ...}`; device-wide, never retried |
+| `tb_scenario` | `serial?`, `package`, `kind` (`focus_after` \| `restore` \| `survive`), `target?`, `action=activate`, `mutate?`, `wait_ms=2000`, `injector=auto`, `leave_on=false`, `step_timeout_ms=1500`, `settle_ms=120` | where the real TalkBack focus goes after an action, after back, or after a list update, classified (`tb.initial_focus`, `tb.restore_failed`, ...); device-wide, never retried |
 | `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped, note?}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach, or one in the app's new process after a restart; never injects one to stop it); `agent_stopped` is true only once nothing listens on the agent's socket; `shutdown=false` only drops this server's cached connection |
+
+### Capture and walk (toolset `capture`)
+
+`INSPECTOR_WIDGET_TOOLSET` picks what `tools/list` shows: `legacy` (the 15
+inspection tools), `talkback` (the 4 session tools and the 3 TalkBack tools),
+`capture` (the 4 session tools and the 8 below), `all`, or a comma list. The
+default is `legacy,talkback` (18) until the deliberate flip; every tool stays
+callable by name. The MCP `instructions` name only listed tools. The same 8
+tools are CLI subcommands generated from one registry
+(`inspector_widget/surface.py`: same names, kebab-case flags, same defaults;
+`--json` prints the MCP text, the human output prints `next` hints as
+`inspector-widget ...` commands; a flag value starting with `-`, as in
+`--fields -bounds`, is accepted).
+
+`capture` snapshots the app once (views and properties, Compose semantics and
+slot table, the unified a11y tree, a screenshot per window, lint and render
+signals) into the on-disk store both surfaces share
+(`$INSPECTOR_WIDGET_CAPTURE_DIR`); the others query a stored capture with no
+device I/O. Every node has a short ref (`n23`) that carries across captures of
+one app; a ref that left the screen answers `ref_not_in_capture` with where it
+was last seen and its `sel` (a durable selector such as `@cell_1 > @delete`).
+
+| Tool | Arguments (defaults) | Returns |
+|------|-----------|---------|
+| `capture` | `serial?`, `package?`, `label?`, `props=true`, `resolution_stack=false`, `slots=if_available` (`enable` hot-reloads the app first: destructive), `screenshot=true`, `screenshot_scale=1.0`, `skp=false`, `a11y_rendering=false`, `lint=tree` (`full` adds contrast), `settle_ms=0`, `diff_from?`, `if_changed_since?`, `outline_lines=20`, `on_screen=true`, `pin=false`, `max_bytes=3000` | `{capture, session, pid, device, took_ms, consistency, facets, windows, lint, issues, diagnostics?, note?, diff?, outline, on_screen, next}`; `facets.compose` says `obfuscated: ...` (or the `semantics_failed` reason) instead of a count when Compose cannot be read; `diagnostics` leads with the agent's own cuts (`views: depth-truncated=N`, `compose: semantics_failed: ...`) |
+| `captures` | `action=list` (`show`, `pin`, `unpin`, `label`, `drop`, `export`, `gc`), `id?`, `label?`, `what=nodes`, `format=jsonl`, `all=false`, `limit=20`, `max_bytes=2000`, `serial?`, `package?` | list lines, one capture's details, or the paths `export` wrote; `gc(all=true)` wipes the store |
+| `outline` | `capture=latest`, `root?`, `view=ui` (`views`, `compose`, `slots`, `a11y`, `reading`), `depth=3`, `detail=semantic`, `origin=app`, `max_children=12`, `max_lines=80`, `fields?`, `cursor?`, `format=lines`, `max_bytes=6000` | one grammar-v1 line per node, `+N` hidden counts, a cursor; the expand hint follows the biggest cut |
+| `find` | `capture=latest`, `text`, `text_re`, `type`, `rid`, `tag`, `src`, `role` (globs), `flags`, `any_flags`, `has`, `missing`, `issue`, `within`, `at`, `overlaps`, `min_dp`/`max_dp` (on the touch (a11y) bounds), `kind`, `window` (selector or z index), `in=ui`, `sort=tree`, `limit=20`, `fields?`, `cursor?`, `count_only=false`, `format=lines`, `max_bytes=3000` | matching lines (filters ANDed), `total`; flags include `truncated` (children the agent did not send) and `redacted` (masked password text) |
+| `node` | `ref` or `refs` (≤10), `capture=latest`, `facets?`, `props=none`, `params=brief`, `ancestors=false`, `children=false`, `image=false`, `max_bytes?` | everything about one node: ids, bounds, `tap_xy`, layout/clip, a11y, compose (slots with `file:line`), issues, props |
+| `image` | `ref?`, `capture=latest`, `window?`, `overlay=none` (`marks`, `lint`, `reading`, `bounds`, `compose`), `marks=auto`, `pad=16`, `source=auto`, `max_side=1024`, `inline=false` (MCP only), `max_bytes=600` | `{path, ...}` of a crop from the node's own window, or an overlay |
+| `lint` | `capture=latest`, `rules?`, `severity=info`, `within?`, `contrast=false`, `wcag=false`, `group=rule`, `per_rule=3`, `limit=30`, `cursor?`, `max_bytes=4000` | findings grouped by rule with fixes; one bug repeated in list cells collapses to `×N in <list> cells (...)`; `+N more` hints keep the call's scope |
+| `diff` | `a=prev`, `b=latest`, `within?`, `include?`, `min_move_px=4`, `limit=40`, `image=false`, `cursor?`, `max_bytes=4000` | changed / moved / added / removed / rebound lines; `issues: {resolved, new, gone_with_node?, on_new_nodes?}` compared on the nodes both captures hold (a scroll resolves nothing) |
+
+Arguments are validated once for both surfaces (`bad_args` with the expected
+type). `serial` and `package` are optional: explicit ones win, then the
+lineage of a named capture, then the **caller's own** default session (the MCP
+server's last attach or capture, kept in memory; `$INSPECTOR_WIDGET_SESSION`
+= `serial/package` for a CLI), then the store's shared default (the last
+attach or capture of any caller), then, for `capture`, the single running
+debuggable app (also when the default session's app is no longer running; the
+capture says so in `note`). A query the shared default resolved, while the
+store holds other apps, carries `session` naming the app it read. Each capture
+reads the device's dpi and font scale at that moment. `capture` and `captures`
+carry `destructiveHint` (a hot reload, deleting captures); a
+`capture(slots="enable")` that loses its session is never retried.
 
 ### Node keys and reading order
 
@@ -333,7 +389,8 @@ DRAWABLE, ANIM, ANIMATOR, INTERPOLATOR, DIMENSION`. Decoding:
 7. `detach(serial, package)` when done.
 
 Sessions are cached per `(serial, package)`; repeated calls reuse the live
-agent. A cached session is checked before each use (the connection is still
+agent. The density and font scale the lint uses are re-read after 2 s, so a
+`settings put system font_scale` or `wm density` change shows in the next call. A cached session is checked before each use (the connection is still
 open and the app still has the same pid); a dead one (the agent idled out, the
 app restarted, another client sent SHUTDOWN) is dropped and re-attached, and a
 read-only call whose connection drops mid-way is retried once on a fresh attach.
@@ -341,7 +398,8 @@ Not retried: a timeout (it would only wait again), `attach`/`detach` (they
 manage the session themselves), the TalkBack tools (a retry would repeat
 device-wide key presses), `dump_compose` with `enable_inspection=true`
 unless the request provably never left the host (the hot reload must not run
-twice), a call whose app a concurrent `detach` stopped (the retry would inject
+twice), `capture(slots="enable")` at all (its hot reload is one of several
+requests), a call whose app a concurrent `detach` stopped (the retry would inject
 the agent again), and anything once the server is exiting. Every tool that
 used a session carries that session's warning as `note` (e.g. its agent runs
 another build than the local payload.jar), as the CLI prints it for every

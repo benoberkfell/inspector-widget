@@ -114,21 +114,38 @@ Run two tools:
 - **`a11y_lint(serial, package)`** — the rule engine (R1..R18). It lints the
   same unified tree as `dump_accessibility`, so classic View screens, Compose,
   RecyclerView cells, AndroidView-in-Compose and dialogs are all covered in one
-  call. Returns `findings[]`, each with a `rule` id and `alias` (`R1`..),
-  `severity` (`error` | `warn` | `info`), a typed `node_key`
-  (`view:<id>` / `compose:<acvId>:<semId>`), the `node` (label, role, class,
-  testTag, source), `bounds` (px) and `bounds_dp` (dp), `window`, `collection`
-  (list/row position; `window.covered_by` when the window is under an open
-  dialog), a remediation `message`, and `evidence`. Also a `summary` (counts by
-  severity and by rule), the dump's `generation` and `diagnostics`: read them
-  before trusting a clean result. Rules judge what TalkBack reads: Views TalkBack
-  never sees are skipped, and focus stops come from the reading order. By default
-  it screenshots each window to run the one contrast rule; pass
-  `include_contrast=false` to skip it (tree-only rules still run).
+  call. **By default it answers grouped by rule** (brief):
+  `by_rule: {"<rule id>": {sev, n, msg, nodes: [first 3 node keys], more?}}`,
+  plus a `summary` (`error`, `warn`, `info`, `total`), the dump's `generation`,
+  the warn/error `diagnostics`, `density`, `font_scale`, `contrast_sampled` and
+  `omitted` (what the brief form left out). Pass **`group_by="none"`** (or
+  `detail="full"`) for the per-finding list `findings[]`, each with a `rule` id
+  and `alias` (`R1`..), `severity` (`error` | `warn` | `info`), a typed
+  `node_key` (`view:<id>` / `compose:<acvId>:<semId>`), the `node` (label, role,
+  class, testTag, source), `bounds` (px) and `bounds_dp` (dp), `window`,
+  `collection` (list/row position; `window.covered_by` when the window is under
+  an open dialog), a remediation `message`, and `evidence` (§2). Read the
+  `diagnostics` before trusting a clean result. Rules judge what TalkBack
+  reads: Views TalkBack never sees are skipped, and focus stops come from the
+  reading order. By default it screenshots each window to run the one contrast
+  rule; pass `include_contrast=false` to skip it (tree-only rules still run).
+
+**Results are compact, brief and budgeted** on every tool (MCP and CLI alike):
+`detail="brief"` (default) drops what you rarely need and counts every omission
+(`omitted`, `hidden`, `omitted_defaults`); `detail="full"` returns everything.
+The tree tools (`dump_accessibility`, `inspect`, `dump_compose`, `dump_tree`)
+take `max_depth` (1 = the roots) and `root` (a node key from an earlier result)
+to read one subtree. A result over `max_bytes` (default 32,000 bytes;
+`$INSPECTOR_WIDGET_MAX_BYTES`; `0` = no cap) comes back as a **spill
+envelope**: `{truncated: true, tool, bytes, summary, preview, spill_path,
+hint}` with the whole result in the `spill_path` file. Narrow the call
+(`root`, `max_depth`, `rules`), raise `max_bytes` where the tool takes it, or
+read the file with jq; never ask for megabytes.
 
 Read the lint `summary` first to triage: fix **errors** before **warns** before
-**info**. Group findings by `rule` so you apply one canonical fix pattern across
-all instances. The full catalogue of rules, what each detects, and the canonical
+**info**. The default `by_rule` grouping is already the right unit of work: one
+canonical fix pattern per rule across all its nodes (`group_by="none"` when you
+need each finding's `message` and `evidence`). The full catalogue of rules, what each detects, and the canonical
 remediation is in **[rules.md](rules.md)** — keep it open while you work.
 
 Useful `a11y_lint` arguments:
@@ -274,8 +291,11 @@ lint **scoped to the rule(s) you addressed** and confirm the finding is gone:
 a11y_lint(serial, package, rules=["a11y.label.missing"])
 ```
 
-Check the `summary.by_rule` count for that rule dropped (ideally to 0 for the
-elements you fixed) and that no element you touched still appears in `findings`.
+Check that the rule's `by_rule["<rule id>"].n` dropped (the rule is gone from
+`by_rule` when it reaches 0) and that no `node_key` you touched is still in its
+`nodes` list. `nodes` shows the first three keys only: when `n` is larger (a
+`more` count), re-run with `group_by="none"` and check `findings[].node_key`
+before you call it fixed.
 For a visual gut-check, re-run `a11y_overlay` and confirm the previously-red box
 is now green. If the finding persists, re-open `inspect_node` on it: the dossier
 will show whether the new semantics actually landed (e.g. the
@@ -290,7 +310,17 @@ the session re-attaches automatically on the next call.)
 
 ## 2. Reading the lint findings
 
-Every finding has the same shape:
+The default (brief) answer groups the findings by rule:
+
+```json
+"by_rule": {
+  "a11y.touch_target.small": {"sev": "warn", "n": 4, "msg": "Touch target …",
+                              "nodes": ["compose:1234:42", "compose:1234:43",
+                                        "view:88"], "more": 1}
+}
+```
+
+With `group_by="none"` (or `detail="full"`) every finding has the same shape:
 
 ```json
 {
@@ -352,11 +382,14 @@ already loaded in the app, else injecting it) and disconnects when it is done.
 Only the Compose key registry outlives it (a small file per app process), so a
 `compose:` key from `a11y-lint` still resolves in a later `inspect-node`. That
 makes it slower for iterative work but perfect for a single deterministic
-command. The 16 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a11y`
+command. The subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a11y`
 (dump + `--overlay`/`--lint` ≈ `dump_accessibility` + `a11y_overlay`),
 `inspect-node`, `component-image`, `inspect`, `compose`, `dump`,
 `get-properties`, `screenshot`, `devices`, `packages`, `attach`, `detach`,
-`talkback`, `tb-walk`, `tb-scenario`. See
+`talkback`, `tb-walk`, `tb-scenario`, and the capture-and-walk tools under the
+same names (`capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`,
+`diff`). `--json -` prints exactly what the MCP tool returns, with the same
+`--detail`, `--max-bytes`, `--max-depth`, `--root` and `--group-by` flags. See
 **[tools.md](tools.md)** for the full MCP↔CLI mapping and exact invocations.
 
 ---
@@ -379,7 +412,8 @@ command. The 16 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a1
 8.  PROPOSE: in Player.kt:88, add contentDescription = if (playing) "Pause" else "Play"
       to the IconButton's Icon (or Modifier.semantics { contentDescription = … }).
    (developer rebuilds + redeploys)
-9.  a11y_lint(serial, package, rules=["a11y.label.missing"]) → 0 findings ✓
+9.  a11y_lint(serial, package, rules=["a11y.label.missing"]) → summary.total 0,
+      the rule gone from by_rule ✓
 10. a11y_overlay(serial, package)                   → that box is now GREEN ✓
 11. detach(serial, package)                         → free the device session
 ```
@@ -411,8 +445,15 @@ command. The 16 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a1
   `compose --enable-inspection`). That hot-reloads every composition and **resets
   `remember{}` state** (open dialogs, typed text, scroll, toggles) and re-mints
   Compose node ids, so enable it before reproducing a state-dependent bug, then
-  re-dump. If the slot table is still empty after that, the app may be a
-  minified/release build.
+  re-dump. When there is no ComposeView on screen, or the app's Compose is
+  obfuscated or unreadable (`compose_obfuscated` / `semantics_failed` in the
+  diagnostics), the `note` says there is no slot table to get and the hot reload
+  would only reset state: do not run it there.
+- **A cut tree says so.** The agent caps very deep trees and masks password
+  text: `dump_tree`'s `diagnostics` (`depth-truncated=N`) and a node's
+  `CHILDREN_TRUNCATED` / `TEXT_REDACTED` flags, `inspect`'s
+  `summary.incomplete`. Do not conclude "no such element" from a truncated
+  tree; read the subtree with `root`.
 - **Compose keys go stale.** Recomposition, list recycling and navigation re-mint
   semantics ids; the `generation` of each dump says when. `inspect_node`
   re-resolves a key it (or `dump_accessibility` / `a11y_lint`) saw before, and
@@ -428,6 +469,11 @@ command. The 16 subcommands mirror the tools: `a11y-lint` (≈ `a11y_lint`), `a1
   `window.covered_by` (still real defects, reachable once the dialog closes).
 - **Material 48dp vs WCAG 44dp.** Default touch-target floor is Material 48dp;
   pass `wcag_mode=true` for the WCAG 2.5.8 44dp target (24dp is the hard floor).
+- **Big screens: capture once, then walk.** With `INSPECTOR_WIDGET_TOOLSET=capture`
+  (or `all`) the server lists the capture-and-walk tools: `capture()` snapshots
+  the app once (views, Compose, a11y, screenshots, lint) and `outline`, `find`,
+  `node`, `lint`, `image` and `diff` query that snapshot in small, budgeted
+  calls with stable refs (`n23`), no device I/O. See [tools.md](tools.md).
 - **`detach` when done** to free device resources. It is safe to call even if
   not attached.
 

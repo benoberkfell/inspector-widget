@@ -1,8 +1,11 @@
 # Inspector Widget — tools (MCP) and CLI reference
 
 The Inspector Widget MCP server (codename `viewspector`, at `host/mcp_server.py`)
-exposes 18 tools. The host CLI (`host/cli.py`) mirrors them in 16 subcommands
-for scripting. This is the reference for the accessibility workflow plus the
+has 26 tools and lists 18 by default: the 15 inspection tools below and the 3
+TalkBack tools. The 8 capture-and-walk tools are listed with
+`INSPECTOR_WIDGET_TOOLSET=capture` (or `all`; every tool stays callable by
+name). The host CLI (`host/cli.py`) mirrors all of them in 24 subcommands for
+scripting. This is the reference for the accessibility workflow plus the
 View/Compose tools you may reach for, and the MCP↔CLI mapping.
 
 ---
@@ -18,6 +21,20 @@ that used a session (not `list_*`, `talkback` or `detach`) adds the session's
 `note`, if it has one, to its result or error, as the CLI prints it as a
 warning: e.g. the agent runs another build than the local one;
 `attach(force=true)` replaces it.
+
+**Output (every tool, MCP and CLI alike).** Compact JSON, brief by default:
+`detail="brief"` drops what is rarely needed and counts each omission
+(`omitted`, `hidden`, `omitted_defaults`, `hidden_descendants`); `detail="full"`
+returns the whole result. Tree tools (`dump_tree`, `dump_compose`,
+`dump_accessibility`, `inspect`) take `max_depth` (1 = the roots) and `root`
+(a node id or key from the result). `max_bytes` (default
+`$INSPECTOR_WIDGET_MAX_BYTES`, else 32,000; `0` = no cap; 1,000..200,000) caps
+the reply: a larger result becomes a **spill envelope** `{truncated, tool,
+bytes, max_bytes, summary, preview, spill_path, hint}` of at most 3,000 bytes,
+with the whole brief result in the `spill_path` file (read it with jq). The
+hint says what to narrow; `max_bytes` exists on `dump_tree`, `get_properties`,
+`dump_compose`, `dump_accessibility`, `a11y_lint`, `inspect` and `tb_walk`
+(for the others, only `INSPECTOR_WIDGET_MAX_BYTES` raises it).
 
 ### Discovery / session
 - **`list_devices()`** → `{devices:[{serial, api, abi, model, state}], count}`.
@@ -35,21 +52,25 @@ warning: e.g. the agent runs another build than the local one;
 
 ### Accessibility (the core of this skill)
 - **`dump_accessibility(serial, package, include_extras=true,
-  include_rendering_info=false)`** → unified `AccessibilityNodeInfo` tree (Views +
-  Compose virtual nodes) with text/contentDescription/stateDescription/role,
-  state flags, bounds, decoded actions, collection/range info, a `node_key` per
-  node, plus the host-computed TalkBack `focus_order` (`[{order, key, speak}]`:
-  each focus stop and what TalkBack announces there), `reading_order_diagnostics`
-  and a `generation`. The order is over the tree TalkBack sees: Views not
+  include_rendering_info=false, focus_order="stops", max_depth?, root?)`** →
+  unified `AccessibilityNodeInfo` tree (Views + Compose virtual nodes) with
+  text/contentDescription/stateDescription/role, state flags, bounds, decoded
+  actions, collection/range info, a `node_key` per node, plus the host-computed
+  TalkBack `focus_order` (`[{order, key, speak}]`: each focus stop and what
+  TalkBack announces there; `focus_order="none"` leaves it out, `"full"` adds
+  the a11y ids), `reading_order_diagnostics` and a `generation`. The order is over the tree TalkBack sees: Views not
   important for accessibility carry `ignored` (`not_important`: their children are
   read in their place; `hidden`: a noHideDescendants subtree) and are no stops;
   each window carries `window_type` / `window_flags` / `modal`, and a window under
   an open modal dialog carries `covered_by` and has no stops.
 - **`a11y_lint(serial, package, include_contrast=true, scale=1.0,
-  wcag_mode=false, rules=[...], include_rendering_info=true)`** → `{summary,
-  findings:[{rule, alias, severity, node_key, node, bounds, bounds_dp, window,
-  collection, message, evidence}], diagnostics, stats, density, font_scale,
-  generation, ...}`. The DETECT and VERIFY engine, run over the unified a11y tree
+  wcag_mode=false, rules=[...], include_rendering_info=true, group_by="rule")`**
+  → brief (default): `{summary, by_rule:{"<rule>":{sev, n, msg, nodes:[first 3
+  node keys], more?}}, diagnostics (warn/error), density, font_scale,
+  generation, contrast_sampled, omitted}`. `group_by="none"` (or
+  `detail="full"`): `{summary, findings:[{rule, alias, severity, node_key, node,
+  bounds, bounds_dp, window, collection, message, evidence}], diagnostics,
+  stats, ...}`. The DETECT and VERIFY engine, run over the unified a11y tree
   (Views + Compose). `window.covered_by` marks a finding under an open dialog.
   `rules` runs a subset (ids, `R1`..`R18` aliases or ATF names; unknown ids are a
   tool error); `wcag_mode` uses 44dp targets; `include_contrast=false` skips the
@@ -80,7 +101,7 @@ warning: e.g. the agent runs another build than the local one;
   resolves; a stale Compose key is re-resolved (`resolved_from`) when unambiguous,
   and a recycled cell's key gets a `key_note`.
 - **`component_image(serial, package, node_key|view_id|semantics_id|bounds)`** →
-  `{path, source, window?}` — a cropped PNG of one element (`source`: `skp` |
+  `{path, source, window?, serial, package, node_key}` — a cropped PNG of one element (`source`: `skp` |
   `bitmap_crop`, cut from the element's own window, e.g. a dialog). Use when you
   only need the picture.
 
@@ -91,12 +112,17 @@ warning: e.g. the agent runs another build than the local one;
   `enable_inspection=true`. That hot-reloads and **resets `remember{}` state** (open
   dialogs, typed text, scroll, toggles) and re-mints Compose node ids, so do it before
   reproducing a state-dependent bug, not after. The layer `dump_tree` cannot see.
+  An empty slot table comes with a `note`: it suggests `enable_inspection` only
+  when a readable Compose UI is on screen, and otherwise says why there is no slot
+  table (no ComposeView; `compose_obfuscated`; `semantics_failed`).
 - **`compose_overlay(serial, package, scale=1.0, all_boxes=false)`** → screenshot
   with every on-screen Compose element boxed (text/role + bounds) + a flat
   on-screen text list.
 - **`dump_tree(serial, package, include_properties=false,
   include_resolution_stack=false, include_screenshot=false, scale=1.0)`** → the
-  classic Android View hierarchy.
+  classic Android View hierarchy, with `diagnostics` when the agent cut or could
+  not read part of it (`depth-truncated=N`; the cut nodes carry
+  `CHILDREN_TRUNCATED`, masked password fields `TEXT_REDACTED`).
 - **`get_properties(serial, package, view_id, include_resolution_stack=false)`** →
   one View's typed attributes (colors `#AARRGGBB`, resources resolved,
   `is_layout` marked).
@@ -106,6 +132,39 @@ warning: e.g. the agent runs another build than the local one;
   `summary.generation`; can render the integrated overlay (every window
   composited; box colour = correlation: green `exact`, amber `overlap` (label
   `a11y~IoU`), grey `none`).
+
+### TalkBack (device-wide: TalkBack runs for every app; settings are restored)
+- **`talkback(serial, action=status|on|off|restore, package?)`** → TalkBack state,
+  or what changed.
+- **`tb_walk(serial, package, start="current", direction="next", max_steps=60,
+  until="wrap", expect=[...], ...)`** → presses the real TalkBack's next/previous,
+  records where focus lands and diffs that order with the predicted one
+  (`dump_accessibility`'s `focus_order`) and a visual order.
+- **`tb_scenario(serial, package, kind=focus_after|restore|survive, target?,
+  action="activate", ...)`** → where real TalkBack focus goes after an action,
+  after back, or after a list update.
+
+### Capture and walk (`INSPECTOR_WIDGET_TOOLSET=capture` or `all`)
+Capture once, keep it by id, walk it with small budgeted queries (no device
+I/O after the capture). Refs (`n23`) carry across captures of one app.
+- **`capture(serial?, package?, label?, slots="if_available", lint="tree",
+  diff_from?, ...)`** → `{capture, session, device, facets, windows, lint,
+  issues, diagnostics?, outline, on_screen, next}`. `slots="enable"` hot-reloads
+  the app (destructive; never retried). `diagnostics` leads with what the agent
+  could not send (`views: depth-truncated=N`, `compose: compose_obfuscated...`).
+- **`outline(view=ui|views|compose|slots|a11y|reading, root?, depth=3, ...)`**,
+  **`find(text, type, rid, tag, src, role, flags, issue, within, at, min_dp,
+  max_dp, window, ...)`** (filters ANDed; `max_dp` on the touch bounds;
+  `flags=["truncated"]` lists nodes with cut children), **`node(ref|refs)`**,
+  **`image(ref|overlay)`**, **`lint(rules, within, severity, contrast, ...)`**
+  (one bug repeated in list cells is one `×N in <list> cells` line),
+  **`diff(a="prev", b="latest")`** (issue deltas only on nodes both captures
+  hold: `resolved`, `new`, plus `gone_with_node` / `on_new_nodes` counts), and
+  **`captures(action=list|show|pin|unpin|label|drop|export|gc)`**.
+- `serial`/`package` default to this caller's own last attach or capture (the
+  MCP server's; `INSPECTOR_WIDGET_SESSION=serial/package` for a CLI), then the
+  store's shared default; a query resolved by the shared default while the
+  store holds other apps carries `session`.
 
 ---
 
@@ -132,7 +191,24 @@ python host/cli.py a11y-lint  --serial SERIAL --package PKG [--json -] [--rule R
 python host/cli.py inspect    --serial SERIAL --package PKG [--json -] [--properties] [--overlay out.png]
 python host/cli.py inspect-node    --serial SERIAL --package PKG (--node-key KEY | --view-id ID | --semantics-id ID | --bounds x,y,w,h) [--json -] [--no-image]
 python host/cli.py component-image --serial SERIAL --package PKG (--node-key KEY | ...) --out out.png
+python host/cli.py talkback   status|on|off|restore --serial SERIAL
+python host/cli.py tb-walk    --serial SERIAL --package PKG [--expect A,B,...] [--json -]
+python host/cli.py tb-scenario focus-after|restore|survive --serial SERIAL --package PKG [--json -]
+python host/cli.py capture    [-s SERIAL] [-p PKG] [--label L] [--json]      # prints the summary (-q: the id)
+python host/cli.py outline    [-c CAPTURE] [--view reading] [--root SEL] [--fields -bounds] [--json]
+python host/cli.py find       [-c CAPTURE] [--type T] [--tag T] [--flags click] [--max-dp 47] [--count] [--json]
+python host/cli.py node       REF [REF...] [--props nondefault] [--json]
+python host/cli.py lint       [-c CAPTURE] [--rule R1] [--within SEL] [--json]
+python host/cli.py diff       [A] [B] [--json]
+python host/cli.py captures   [ls|show|pin|unpin|label|rm|export|gc] [ID] [LABEL]
 ```
+
+The tree and lint subcommands take the MCP output parameters as flags with the
+same defaults (`--detail`, `--max-bytes`, `--max-depth`, `--root`,
+`--group-by`, `--focus-order`, `--filter`), and `--json -` prints exactly what
+the MCP tool returns. The capture-and-walk subcommands print a human rendering
+by default (their `next` hints as `inspector-widget ...` commands) and the MCP
+text with `--json`.
 
 ### MCP ↔ CLI mapping
 
@@ -152,6 +228,10 @@ python host/cli.py component-image --serial SERIAL --package PKG (--node-key KEY
 | `inspect` | `inspect --json -` (`--overlay out.png`) |
 | `inspect_node` | `inspect-node --node-key KEY` (or `--view-id` / `--semantics-id` / `--bounds x,y,w,h`) |
 | `component_image` | `component-image --node-key KEY --out out.png` |
+| `talkback` | `talkback status\|on\|off\|restore` |
+| `tb_walk` | `tb-walk` |
+| `tb_scenario` | `tb-scenario focus-after\|restore\|survive` |
+| `capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`, `diff` | the same names (`--kebab-case` flags) |
 | `detach` | `detach` |
 
 `inspect-node` / `component-image` take the same keys and raise the same errors

@@ -973,4 +973,4 @@ Library modules read only the public Session surface: `dump_tree`, `get_windows`
 - **improve/a11y-agent-identity** (ID1, ID2, CO4 agent fixes) is not a build gate. The "exact" acceptance in L1 requires fixtures recorded after it merges.
 - **a11y-host-model / a11y-lint-unified** (L1/L2/RO1/OV1/A2-A5): consumed only through the C7 adapter. No capture WP edits `a11y.py`, `a11y_lint.py`, `overlay.py`, `correlate.py` or `strings.py`.
 - **agent-hardening stream** (Dispatcher.kt, TreeBuilder.kt, ComposeInspector.kt): R1 and R3 coordinate with it and start after session-lifecycle.
-- Naming (AGENTS.md §1): every new user-facing name is `inspector-widget`/`INSPECTOR_WIDGET_*`. No codename identifier is renamed. The project is local-only: commit locally, never push.
+- Naming (AGENTS.md §1): every new user-facing name is `inspector-widget`/`INSPECTOR_WIDGET_*`. No codename identifier is renamed. Where work is committed and pushed follows the repository's contributor guide (AGENTS.md, CLAUDE.md), not this design.

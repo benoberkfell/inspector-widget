@@ -208,7 +208,16 @@ schemas and the CLI flags, same names and defaults), over `inspector_widget/ops.
 snapshots the app once into the on-disk store both surfaces share; the others query a stored
 capture without device I/O. `INSPECTOR_WIDGET_TOOLSET` (`legacy`, `capture`, `talkback`, `all`,
 or a comma list) picks what the MCP server lists; the default is `legacy,talkback` until the
-deliberate flip (WP S4), and every tool stays callable by name.
+deliberate flip (WP S4), and every tool stays callable by name. The MCP `instructions` name only
+listed tools (with the default listing, `dump_accessibility`'s `focus_order` is the predicted
+TalkBack order, not `outline(view="reading")`). `capture` and `captures` carry `destructiveHint`.
+
+Session defaulting for the capture tools: explicit `serial`/`package`, then a named capture's
+lineage, then the **caller's own** default session (the MCP server's last attach or capture, in
+memory; `INSPECTOR_WIDGET_SESSION=serial/package` for a CLI), then the store's shared default
+(`session.json`, rewritten by every caller), then the single running debuggable app. Concurrent
+agents on one store therefore stay on their own apps; a query resolved by the shared default
+while the store holds other apps carries `session`. Captures read dpi and font scale each time.
 
 Every subcommand routes through `inspector_widget.attach() -> Session` (the same facade the MCP
 uses); the older ones then drive `session.client` directly (works; their bodies are not yet shared
