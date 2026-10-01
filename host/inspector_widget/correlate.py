@@ -1388,16 +1388,32 @@ _INCOMPLETE_TOKENS = (
 )
 
 
-def incomplete_tokens(diagnostics: Dict[str, str]) -> Dict[str, List[str]]:
-    """``{facet: [token, ...]}``: the tokens of each dump's diagnostics string that say the
-    dump is incomplete (:data:`_INCOMPLETE_TOKENS`), for facets that have any."""
+# Diagnostics tokens (by prefix) about password redaction failing closed (CONTRACT §5): the
+# editable values the agent masked because their password status could not be determined,
+# and the ComposeViews whose password fields it cannot identify at all (an R8-obfuscated app),
+# so an agent can tell why a field it expected to read shows only dots.
+_REDACTION_TOKENS = ("redaction_unverified", "redaction_masked")
+
+
+def _tokens(diagnostics: Dict[str, str], prefixes: Tuple[str, ...]) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     for facet, text in diagnostics.items():
-        hits = [t.strip() for t in (text or "").split(";")
-                if t.strip().startswith(_INCOMPLETE_TOKENS)]
+        hits = [t.strip() for t in (text or "").split(";") if t.strip().startswith(prefixes)]
         if hits:
             out[facet] = hits
     return out
+
+
+def incomplete_tokens(diagnostics: Dict[str, str]) -> Dict[str, List[str]]:
+    """``{facet: [token, ...]}``: the tokens of each dump's diagnostics string that say the
+    dump is incomplete (:data:`_INCOMPLETE_TOKENS`), for facets that have any."""
+    return _tokens(diagnostics, _INCOMPLETE_TOKENS)
+
+
+def redaction_tokens(diagnostics: Dict[str, str]) -> Dict[str, List[str]]:
+    """``{facet: [token, ...]}``: the tokens of each dump's diagnostics string about text
+    masked for want of a password status (:data:`_REDACTION_TOKENS`), for facets that have any."""
+    return _tokens(diagnostics, _REDACTION_TOKENS)
 
 
 def _merge_session(session: Any, props: bool, rendering: bool = False
@@ -1406,8 +1422,10 @@ def _merge_session(session: Any, props: bool, rendering: bool = False
     as ``a11y.a11y_to_dict`` shaped it, or a bare list of roots from a fake).
 
     ``merged["diagnostics"]`` keeps each dump's agent diagnostics (``view`` / ``compose`` /
-    ``a11y``), and ``summary["incomplete"]`` the tokens among them that say a tree was cut
-    or partly unreadable, so a caller never takes a truncated tree for a complete one."""
+    ``a11y``), ``summary["incomplete"]`` the tokens among them that say a tree was cut
+    or partly unreadable, so a caller never takes a truncated tree for a complete one, and
+    ``summary["redaction"]`` those that say editable text was masked because its password
+    status could not be determined."""
     diagnostics: Dict[str, str] = {}
     view_roots, prop_map = _shaped_view_tree(session, props, diagnostics)
     compose_windows = _shaped_compose(session, diagnostics)
@@ -1427,6 +1445,9 @@ def _merge_session(session: Any, props: bool, rendering: bool = False
     incomplete = incomplete_tokens(diagnostics)
     if incomplete:
         merged["summary"]["incomplete"] = incomplete
+    redaction = redaction_tokens(diagnostics)
+    if redaction:
+        merged["summary"]["redaction"] = redaction
     merged.registry = registry_for(session)
     return merged, compose_windows, a11y_data
 
@@ -1666,8 +1687,9 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
         "correlation_confidence": node.get("correlation_confidence"),
         "generation": merged.get("generation"),
     }
-    if (merged.get("summary") or {}).get("incomplete"):
-        dossier["incomplete"] = merged["summary"]["incomplete"]
+    for key in ("incomplete", "redaction"):
+        if (merged.get("summary") or {}).get(key):
+            dossier[key] = merged["summary"][key]
     for facet in ("view", "compose", "a11y", "render_quad", "a11y_iou", "list_item",
                   "interop", "a11y_only", "a11y_parent", "compose_synthetic",
                   "resolved_from", "key_note"):

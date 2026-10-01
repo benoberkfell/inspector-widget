@@ -374,6 +374,10 @@ class Dispatcher(private val deviceLock: Any = Any()) {
         if (cmd.waitMs > 0) diag.append("; waited=${wait.waitedMs}ms")
         wait.note?.let { diag.append("; ").append(it) }
         if (snap.dropped > 0) diag.append("; events-dropped=${snap.dropped}")
+        // Text masked for want of a password status (Redaction.kt): the focus read's, then the
+        // events' (by seq).
+        for (r in snap.events) if (r.textUnverified) read.redaction.masked("event:${r.seq}")
+        read.redaction.appendTo(diag)
         resp.setSeq(read.seq)
             .setDropped(snap.dropped)
             .setFocusEvent(wait.focusEvent)

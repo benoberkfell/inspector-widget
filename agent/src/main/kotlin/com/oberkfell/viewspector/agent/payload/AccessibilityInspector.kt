@@ -50,6 +50,12 @@
  * and ComposeNode.bounds. In query mode the connection returns them relative to the window,
  * so a window away from the screen origin (dialog, popup) is shifted back by the offset
  * connectionOffset measures (diagnostics: window-offset=dx,dy).
+ *
+ * Passwords (Redaction.kt): a password field's text is masked, and so is the text of an
+ * EDITABLE node whose password status cannot be determined (fail closed: its source is
+ * unresolved, or it is a Compose node whose semantics are out of reach or unreadable). The
+ * diagnostics list those (redaction_masked) and the AndroidComposeViews whose password fields
+ * cannot be identified at all (redaction_unverified).
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -163,6 +169,8 @@ object AccessibilityInspector {
          * layout_size of Compose nodes): the focus reader maps a node or two and must stay fast.
          */
         val lite: Boolean = false,
+        /** What was masked for want of a password status, for the diagnostics. */
+        val redaction: Redaction.Unverified = Redaction.Unverified(),
     ) {
         var count = 0
         val byA11yId = HashMap<Int, View>()
@@ -326,6 +334,10 @@ object AccessibilityInspector {
             )
         }
         if (ctx.count >= ctx.maxNodes) diag.append("; node-cap=${ctx.maxNodes} reached (later nodes not sent)")
+        for ((view, index) in ctx.composeIndex) {
+            if (index == null || ComposeInspector.isRenamed(view)) ctx.redaction.composeView(idOf(view))
+        }
+        ctx.redaction.appendTo(diag)
         return windows to diag.toString()
     }
 
@@ -423,9 +435,10 @@ object AccessibilityInspector {
         strings: StringTable,
         maxDepth: Int,
         maxNodes: Int,
+        redaction: Redaction.Unverified,
     ): ViewInspection.A11yNode {
         val ctx = Ctx(roots, strings, includeExtras = true, includeRenderingInfo = false,
-            maxDepth = maxDepth, maxNodes = maxNodes, lite = true)
+            maxDepth = maxDepth, maxNodes = maxNodes, lite = true, redaction = redaction)
         ctx.currentRoot = root
         return walk(node, Ident(view, virtualId), ctx, 0, local = true)
     }
@@ -1093,36 +1106,72 @@ object AccessibilityInspector {
         if (Build.VERSION.SDK_INT >= 33) node.getChild(i, 0) else node.getChild(i)
 
     /**
-     * The node's text, masked (Redaction.kt) for a password field: the node says so
-     * (isPassword), its input type is a password variation (a visible-password field is
-     * not isPassword, yet its text is the plaintext), or it is a Compose password field
-     * ([composePassword]). A node showing its hint keeps it.
+     * The node's text, masked (Redaction.kt) for a password field ([passwordState]), and for
+     * an editable node whose status is UNKNOWN (fail closed; listed in ctx.redaction). A node
+     * showing its hint keeps it.
      */
     private fun a11yText(node: AccessibilityNodeInfo, ident: Ident, ctx: Ctx): CharSequence? {
         val text = node.text
-        if (text.isNullOrEmpty()) return text
-        val secret = bool { node.isPassword } ||
-            Redaction.isPasswordInputType(safeInt { node.inputType }) ||
-            composePassword(ident, ctx)
-        if (!secret || bool { node.isShowingHintText }) return text
+        if (text.isNullOrEmpty() || bool { node.isShowingHintText }) return text
+        val state = passwordState(node, ident, ctx)
+        if (!Redaction.mustMask(state, isEditable(node))) return text
+        if (state == Redaction.PasswordState.UNKNOWN) ctx.redaction.masked(keyOf(ident))
         return Redaction.mask(text)
     }
 
     /**
-     * A Compose virtual node whose SemanticsNode is a password field
-     * (ComposeInspector.isPasswordNode). Compose sets no input type, so a visible-password
+     * Whether [node] is a password field: it says so (isPassword), its input type is a
+     * password variation (a visible-password field is not isPassword, yet its text is the
+     * plaintext), its View is one (Redaction.passwordStateOf: a password transformation or
+     * autofill hint), or it is a Compose password field ([composePassword]). UNKNOWN when its
+     * View is unresolved, or for a Compose node whose status cannot be determined. Another
+     * provider's virtual node is taken at its word (isPassword / input type).
+     */
+    private fun passwordState(node: AccessibilityNodeInfo, ident: Ident, ctx: Ctx): Redaction.PasswordState {
+        if (bool { node.isPassword } || Redaction.isPasswordInputType(safeInt { node.inputType })) {
+            return Redaction.PasswordState.PASSWORD
+        }
+        val view = ident.view ?: return Redaction.PasswordState.UNKNOWN
+        if (ident.virtualId == HOST_VIEW_ID) return Redaction.passwordStateOf(view)
+        if (ComposeInspector.isAndroidComposeView(view)) return composePassword(view, ident.virtualId, ctx)
+        return Redaction.PasswordState.NOT_PASSWORD
+    }
+
+    /** An editable text node: isEditable, an EditText class name, or a SET_TEXT action. */
+    private fun isEditable(node: AccessibilityNodeInfo): Boolean =
+        bool { node.isEditable } ||
+            Redaction.isEditableClassName(safe { node.className }) ||
+            safe { node.actionList }?.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT } == true
+
+    /** The node key of [ident] in the host's form (view:, compose:, virtual:), for diagnostics. */
+    private fun keyOf(ident: Ident): String {
+        val view = ident.view
+        val host = view?.let { idOf(it) } ?: 0L
+        if (ident.virtualId == HOST_VIEW_ID) return "view:$host"
+        val compose = view != null && ComposeInspector.isAndroidComposeView(view)
+        return "${if (compose) "compose" else "virtual"}:$host:${ident.virtualId}"
+    }
+
+    /**
+     * The password status of Compose virtual node [virtualId] of [view]
+     * (ComposeInspector.passwordState). Compose sets no input type, so a visible-password
      * field's node is neither isPassword nor a password input type. From the dump's semantics
      * index; the lite snapshot (a node or two) looks up its one node instead, and builds the
      * index after [LITE_COMPOSE_LOOKUPS] lookups (a deep subtree would walk the tree per node).
+     * UNKNOWN when the semantics tree is out of reach (R8 renamed Compose), and a renamed
+     * AndroidComposeView is noted as one whose password fields cannot be identified.
      */
-    private fun composePassword(ident: Ident, ctx: Ctx): Boolean {
-        if (ident.virtualId == HOST_VIEW_ID) return false
-        val view = ident.view ?: return false
-        if (!ComposeInspector.isAndroidComposeView(view)) return false
+    private fun composePassword(view: View, virtualId: Int, ctx: Ctx): Redaction.PasswordState {
+        if (ComposeInspector.isRenamed(view)) ctx.redaction.composeView(idOf(view))
         if (ctx.lite && ctx.composeLookups++ < LITE_COMPOSE_LOOKUPS) {
-            return ComposeInspector.isPasswordNode(view, ident.virtualId)
+            return ComposeInspector.passwordState(view, virtualId)
         }
-        return composeIndexOf(ident, ctx)?.passwords?.contains(ident.virtualId) == true
+        val index = composeIndexOf(Ident(view, virtualId), ctx)
+        if (index == null) {
+            ctx.redaction.composeView(idOf(view))
+            return Redaction.PasswordState.UNKNOWN
+        }
+        return index.passwordState(virtualId)
     }
 
     private inline fun <T> safe(block: () -> T): T? = try {

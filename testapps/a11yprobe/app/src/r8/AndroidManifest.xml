@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The r8 build type only (app/build.gradle.kts): R8-minified and obfuscated like a release
+  build, yet debuggable, so Inspector Widget can attach to it.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application
+        android:debuggable="true"
+        tools:ignore="HardcodedDebugMode"
+        tools:replace="android:debuggable" />
+</manifest>
