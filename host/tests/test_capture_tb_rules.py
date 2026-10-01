@@ -164,6 +164,7 @@ def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():
     assert by["tb.ghost_stop"]["nodes"] == [
         "×6 in #message_list cells (@MessageItem_FavouriteButtonIcon): sem:785:855 "
         "sem:795:880 sem:805:903 +3"]
+    assert out["next"][-1] == 'node("sem:785:838",facets="tb,issues")'
     assert R.resolve(["tb"]) == [r.id for r in R.RULES.values() if r.family == "tb"]
     assert R.resolve("double_stop") == ["tb.double_stop"]
 

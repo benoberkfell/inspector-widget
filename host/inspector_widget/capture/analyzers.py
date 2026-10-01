@@ -1303,7 +1303,13 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
         nxt.append('image(overlay="lint")')
         focus = _focus_node(ix, kept)
         if focus:
-            nxt.append(f'node("{focus}")')
+            fn = ix.get(focus)
+            tb_only = fn is not None and any(i.id.startswith("tb.") for nid, i in kept
+                                             if nid == fn.id) and all(
+                i.id.startswith("tb.") for _nid, i in kept)
+            # a TalkBack finding: the node's TalkBack account (why, speech, neighbours)
+            nxt.append(f'node("{focus}",facets="tb,issues")' if tb_only
+                       else f'node("{focus}")')
     if not explicit and any(i.id.startswith("render.") for n in ix.nodes.values()
                             for i in n.issues):
         nxt.append('find(issue="render.")')
