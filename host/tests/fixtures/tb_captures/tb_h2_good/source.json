@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "am start -S -n com.oberkfell.a11yprobe/.InteropActivity --es scenario tb_h2 --es variant good; capture(props=false)",
+ "screen": "TalkBack corpus tb_h2 good"
+}

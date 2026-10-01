@@ -164,9 +164,25 @@ def corpus_capture(eid: str) -> tuple[Index, RawCapture]:
     return build(raw), raw
 
 
+#: Live captures of the corpus screens (TalkBack off, props off, no screenshots), recorded on
+#: emulator-5556 by the live stage: ``tb_<scenario>_<variant>[_slots]``.
+LIVE = Path(__file__).parent / "fixtures" / "tb_captures"
+
+
+def live_names() -> list[str]:
+    return sorted(p.name for p in LIVE.iterdir() if (p / "meta.json").is_file())
+
+
+@lru_cache(maxsize=None)
+def live_capture(name: str) -> tuple[Index, RawCapture]:
+    """``(index, raw)`` of a live corpus capture (``tests/fixtures/tb_captures/<name>``)."""
+    return fixture_capture(str(LIVE / name))
+
+
 @lru_cache(maxsize=None)
 def fixture_capture(name: str) -> tuple[Index, RawCapture]:
-    """``(index, raw)`` of a recorded live capture (``tests/fixtures/captures/<name>``)."""
+    """``(index, raw)`` of a recorded live capture (``tests/fixtures/captures/<name>``, or
+    a fixture directory)."""
     import capture_replay as cr
 
     rec = cr.load(name)
