@@ -639,6 +639,7 @@ def _prune(node: "pb.A11yNode", depth: int) -> None:
 
 # AccessibilityEvent types / AccessibilityNodeInfo action ids the fake emits.
 TYPE_VIEW_CLICKED = 0x00000001
+TYPE_VIEW_LONG_CLICKED = 0x00000002
 TYPE_VIEW_SCROLLED = 0x00001000
 TYPE_WINDOW_CONTENT_CHANGED = 0x00000800
 TYPE_VIEW_ACCESSIBILITY_FOCUSED = 0x00008000
@@ -768,6 +769,10 @@ class FakeAgent:
         # A11yFocus.kt / A11yEventTap.kt state (see set_a11y_focus).
         self.a11y_tap = FakeA11yTap()
         self.a11y_focus: Optional[Tuple[int, int]] = None  # (host_view_id, virtual_id)
+        # A11yAct actions performed: (host_view_id, virtual_id, action id); on_a11y_action
+        # (host_view_id, virtual_id, action id), when set, is the app reacting to one.
+        self.a11y_actions: List[Tuple[int, int, int]] = []
+        self.on_a11y_action: Optional[Callable[[int, int, int], None]] = None
         self.touch_exploration = False  # TalkBack off: accessibility focus actions refused
         self.services_enabled = False
         self.running = True
@@ -1196,6 +1201,10 @@ class FakeAgent:
         elif cmd.virtual_id != HOST_VIEW_ID and self._virtual(host, cmd.virtual_id) is None:
             error = (f"virtual id {cmd.virtual_id} no longer resolves under View "
                      f"{cmd.host_view_id} (the node is gone; take a fresh dump)")
+        elif cmd.action == pb.NODE_ACTION_RAW and action_id not in self._offered(
+                host, cmd.virtual_id):
+            # performAccessibilityAction(id) on an action the node does not offer: false
+            error = f"action {action_id:#x} is not offered by the node (performAccessibilityAction returned false)"
         if error is None:
             out.performed = True
             root = self._root_of(cmd.host_view_id)
@@ -1207,10 +1216,17 @@ class FakeAgent:
             elif action_id == 0x10:
                 self.a11y_tap.record(TYPE_VIEW_CLICKED, root.id if root else 0,
                                      cmd.host_view_id, cmd.virtual_id)
+            elif action_id == 0x20:
+                self.a11y_tap.record(TYPE_VIEW_LONG_CLICKED, root.id if root else 0,
+                                     cmd.host_view_id, cmd.virtual_id)
             elif action_id in (0x1000, 0x2000):
                 self.a11y_tap.record(TYPE_VIEW_SCROLLED, root.id if root else 0,
                                      cmd.host_view_id, cmd.virtual_id,
                                      scroll_delta_y=120 if action_id == 0x1000 else -120)
+            self.a11y_actions.append((cmd.host_view_id, cmd.virtual_id, action_id))
+            hook = getattr(self, "on_a11y_action", None)
+            if hook is not None:  # the app reacting (a long press opens an action mode ...)
+                hook(cmd.host_view_id, cmd.virtual_id, action_id)
         else:
             out.error = error
         if self.a11y_focus is not None:
@@ -1219,6 +1235,12 @@ class FakeAgent:
         out.diagnostics = f"roots={len(self.scene.roots)}; via=query-connection"
         st.fill(out.strings)
         return resp
+
+    def _offered(self, host: ViewSpec, virtual_id: int) -> set:
+        """The action ids a node offers (its a11y ``actions``)."""
+        spec = host.a11y if virtual_id == HOST_VIEW_ID else (
+            (self._virtual(host, virtual_id) or ComposeNodeSpec(0, 0, (0, 0, 0, 0))).a11y or {})
+        return {a[0] if isinstance(a, (tuple, list)) else a for a in spec.get("actions") or []}
 
     def _h_capture_skp(self, req_id, cmd):
         resp = self._ok(req_id)
