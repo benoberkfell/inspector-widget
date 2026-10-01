@@ -217,3 +217,66 @@ def test_a_stored_walk_shows_every_step(tmp_path):
     assert len(out["lines"]) == 80 and _size(out) <= 16000
     assert W.stored_result(_scenario())["verdict"] == "reset_top"
     assert json.loads(dumps(out)) == out
+
+
+# --------------------------------------------------------------------------- #
+# What an overlay covers: the capture decides (live V5, emulator-5556)
+# --------------------------------------------------------------------------- #
+class _Loaded:
+    """A capture as the store serves it, from an index and its raw facets."""
+
+    def __init__(self, ix, raw):
+        self.id, self.meta, self._ix, self._raw = raw.meta.id, raw.meta, ix, raw
+
+    def index(self):
+        return self._ix
+
+    def raw(self, name):
+        return getattr(self._raw, name)
+
+
+def _escapes(rec):
+    return [(f["msg"].split(":")[0], f["steps"]) for f in rec["findings"]
+            if f["code"] == "tb.escape"]
+
+
+def test_consecutive_steps_behind_an_overlay_are_one_escape():
+    """H5 BAD: TalkBack walks out of the Compose "dialog" and reads all nine Views behind
+    it; one finding names every step (the walk overlay marks them all)."""
+    import copy
+
+    import tb_capture_fixtures as F
+
+    from inspector_widget.talkback import diff
+
+    rec, _ = F.load_walk("tb_h5-bad-walk")
+    found = diff.analyze(copy.deepcopy(rec))["findings"]
+    esc = [f for f in found if f["code"] == "tb.escape"]
+    assert len(esc) == 1 and esc[0]["msg"].startswith("steps 2-10: focus left the overlay")
+    assert "read 9 stops behind it" in esc[0]["msg"]
+    assert esc[0]["steps"] == list(range(1, 11))
+
+
+def test_a_bound_walk_takes_what_an_overlay_covers_from_its_capture():
+    """V5 BAD: the walk's own guess compares drawing orders across Views the a11y dump
+    hoists, so it put the card's heading "behind" the scrim drawn under it and missed the
+    eight buttons the scrim covers. Bound to a capture with the View tree, the walk reads
+    what tb.escape reads: the title and the eight buttons, not the card."""
+    import copy
+
+    import tb_capture_fixtures as F
+
+    rec, _ = F.load_walk("tb_v5-bad-walk")
+    ix, raw = F.corpus_capture("tb_v5-bad-walk")
+    unbound = copy.deepcopy(rec)
+    from inspector_widget.talkback import diff
+
+    unbound["findings"] = diff.analyze(unbound)["findings"]
+    assert _escapes(unbound) == [("step 5", [4, 5]), ("step 14", [13, 14])]
+    bound = W.bind_walk(copy.deepcopy(rec), W.Binding([(0, _Loaded(ix, raw))]))
+    assert _escapes(bound) == [("steps 5-13", [4, 5, 6, 7, 8, 9, 10, 11, 12, 13])]
+    covered = [s["i"] for s in bound["steps"] if s.get("covered_by")]
+    assert covered == list(range(5, 14))
+    assert all(s["covered_by"]["overlay"] == "view:12" for s in bound["steps"]
+               if s.get("covered_by"))
+

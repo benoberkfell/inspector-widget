@@ -370,27 +370,46 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
+    """tb.escape: a step in a window under a modal one, or behind a same-window overlay the
+    walk was inside before. Consecutive escaped steps out of the same overlay are one finding
+    (every step named, so a drawing marks them all)."""
+    runs: List[Tuple[Any, Dict[str, Any], List[Dict[str, Any]]]] = []  # (why, cover, steps)
     moves = _moves(walk["steps"])
     for j, s in enumerate(moves):
+        why: Any = None
         if s.get("window_covered_by") is not None:
-            s["_escape"] = True
-            out.append(_finding("tb.escape", "error",
-                                f"step {s['i']}: focus reached {_name(s)} in a window under the modal "
-                                f"window {s['window_covered_by']}", [s]))
+            why, first = ("window", s["window_covered_by"]), s
+        else:
+            cov = s.get("covered_by")
+            if not cov or not cov.get("rect"):
+                continue
+            orect = tuple(cov["rect"])
+            inside = [m for m in moves[:j] if not m.get("covered_by") and _rect(m)
+                      and _contains(orect, _rect(m))]  # type: ignore[arg-type]
+            if not inside:
+                continue
+            why, first = ("overlay", orect), inside[-1]
+        s["_escape"] = True
+        prev = moves[j - 1] if j else None
+        if runs and runs[-1][0] == why and prev is not None and prev is runs[-1][2][-1]:
+            runs[-1][2].append(s)
+        else:
+            runs.append((why, first, [s]))
+    out = []
+    for why, first, steps in runs:
+        a, b = steps[0], steps[-1]
+        at = f"step {a['i']}" if a is b else f"steps {a['i']}-{b['i']}"
+        n = f"{len(steps)} stops" if len(steps) > 1 else "1 stop"
+        if why[0] == "window":
+            msg = (f"{at}: focus read {n} in a window under the modal window {why[1]}, "
+                   f"first {_name(a)}")
+            out.append(_finding("tb.escape", "error", msg, steps))
             continue
-        cov = s.get("covered_by")
-        if not cov or not cov.get("rect"):
-            continue
-        orect = tuple(cov["rect"])
-        inside = [m for m in moves[:j] if not m.get("covered_by") and _rect(m)
-                  and _contains(orect, _rect(m))]  # type: ignore[arg-type]
-        if inside:
-            s["_escape"] = True
-            out.append(_finding("tb.escape", "error",
-                                f"step {s['i']}: focus left the overlay {cov.get('ref') or cov.get('overlay')} "
-                                f"({cov.get('cls')}, {int(100 * cov.get('area', 0))}% of the window) and "
-                                f"landed on {_name(s)} behind it", [inside[-1], s]))
+        cov = a["covered_by"]
+        msg = (f"{at}: focus left the overlay {cov.get('ref') or cov.get('overlay')} "
+               f"({cov.get('cls')}, {int(100 * cov.get('area', 0))}% of the window) and read "
+               f"{n} behind it, first {_name(a)}")
+        out.append(_finding("tb.escape", "error", msg, [first, *steps]))
     return out[:5]
 
 

@@ -271,9 +271,10 @@ class _CaptureKeys:
         self.keys: dict[str, str] = {}
         self.sigs: list[tuple[str, Rect, str]] = []
         self.windows: dict[int, str] = {}
+        self._covered: dict[str, dict[str, Any]] | None | bool = False
         from .tb import TbCapture, _iter_paths
 
-        tbc = TbCapture.of(self.ix, lc)
+        tbc = self._tbc = TbCapture.of(self.ix, lc)
         if tbc is None:
             return
         for w in tbc.dump.data.get("windows") or []:
@@ -295,6 +296,32 @@ class _CaptureKeys:
             wref = tbc.window_ref(rv)
             if rv is not None and wref:
                 self.windows[int(rv)] = wref
+
+    def covered(self) -> dict[str, dict[str, Any]] | None:
+        """``{stop ref: covered_by}`` for the stops drawn under a same-window overlay, as
+        the capture's tb.escape sees them (its View tree knows what is drawn above what);
+        None when the capture cannot tell."""
+        if self._covered is False:
+            self._covered = None
+            if self._tbc is not None:
+                from ..talkback import static
+                from .tb import drawn_above
+
+                found = static.covered(self._tbc.nav, drawn_above(self.ix))
+                if found is not None:
+                    out: dict[str, dict[str, Any]] = {}
+                    for key, (ov, pct) in found.items():
+                        nid = self.keys.get(key)
+                        if nid is None:
+                            continue
+                        r = ov.rect if hasattr(ov, "rect") else None
+                        out[nid] = {"overlay": getattr(ov, "key", None),
+                                    "ref": self._tbc.nid(ov),
+                                    "cls": str(ov.raw.get("class_name") or "").rsplit(".", 1)[-1],
+                                    "area": round(pct / 100, 2),
+                                    "rect": [r.left, r.top, r.width, r.height] if r else None}
+                    self._covered = out
+        return self._covered  # type: ignore[return-value]
 
     def ref(self, key: str | None, sig: str | None = None, bounds: Any = None) -> str | None:
         if key:
@@ -360,6 +387,13 @@ class Binding:
     def has(self, key: str | None) -> bool:
         return bool(key) and any(key in c.keys for _a, c in self._caps)
 
+    def covered(self, cid: str | None) -> dict[str, dict[str, Any]] | None:
+        """What capture ``cid`` says is drawn under an overlay (None: it cannot tell)."""
+        for _a, c in self._caps:
+            if c.id == cid:
+                return c.covered()
+        return None
+
     def speakable(self, ref: str | None, cid: str | None) -> str | None:
         """What the capture's TalkBack model says at ``ref`` (its a11y facet)."""
         for _a, c in self._caps:
@@ -422,6 +456,16 @@ def bind_walk(record: dict[str, Any], binding: Binding,
         cov = s.get("covered_by")
         if isinstance(cov, dict) and cov.get("overlay"):
             cov["ref"] = _bind_key(binding, cov["overlay"], at)
+        # What the step's capture knows is drawn above what decides (the walk's own guess
+        # compares drawing orders across Views the dump hoists: V5 live, the card's heading
+        # "behind" the scrim drawn under it, the buttons the scrim covers not)
+        known = binding.covered(s.get("cap")) if s.get("cap") and not s.get("unbound") \
+            else None
+        if known is not None:
+            if s.get("ref") in known:
+                s["covered_by"] = dict(known[s["ref"]])
+            else:
+                s.pop("covered_by", None)
         wcov = s.get("window_covered_by")
         if wcov is not None and binding.window_ref(wcov):
             s["window_covered_by"] = binding.window_ref(wcov)

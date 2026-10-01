@@ -521,7 +521,9 @@ def _under(cx: _Ctx, scrim: Dict[str, Any], raws: Sequence[Dict[str, Any]]) -> L
     return out
 
 
-def _escapes(cx: _Ctx) -> Iterator[Finding]:
+def _overlays(cx: _Ctx) -> Iterator[Tuple[Any, List[TbNode], int]]:
+    """``(overlay node, the stops drawn under it, its % of the window)`` for every scrim
+    with a dialog or sheet over it (tb.escape's overlays)."""
     for w in cx.nav.windows:
         if not w.reported:
             continue
@@ -538,11 +540,30 @@ def _escapes(cx: _Ctx) -> Iterator[Finding]:
             node = cx.tree.by_raw.get(id(scrim)) or cx.tree.excluded_by_raw.get(id(scrim))
             if node is None:
                 continue
-            others = [cx.tree.by_raw[id(r)] for r in under]
             pct = round(100 * _area(_rect_of(scrim).intersect(w.bounds))
                         / max(1, _area(w.bounds)))
-            yield Finding("tb.escape", "error", node, others[:MAX_OTHERS],
-                          {"under": len(others), "area_pct": pct})
+            yield node, [cx.tree.by_raw[id(r)] for r in under], pct
+
+
+def _escapes(cx: _Ctx) -> Iterator[Finding]:
+    for node, others, pct in _overlays(cx):
+        yield Finding("tb.escape", "error", node, others[:MAX_OTHERS],
+                      {"under": len(others), "area_pct": pct})
+
+
+def covered(nav: Navigator, drawn_above: Optional[DrawnAbove]) -> Optional[Dict[str, Any]]:
+    """The stops drawn under a same-window overlay, by node key: ``{key: (overlay node,
+    its % of the window)}``, as tb.escape sees them; None when what is drawn above what is
+    unknown (no View tree). A walk bound to captures takes its "behind the overlay" from
+    here, so the lint and the walk agree on what an overlay covers."""
+    if drawn_above is None:
+        return None
+    cx = _Ctx(nav, 420, drawn_above)
+    out: Dict[str, Any] = {}
+    for node, under, pct in _overlays(cx):
+        for n in under:
+            out.setdefault(n.key, (node, pct))
+    return out
 
 
 def _skipped(cx: _Ctx) -> Iterator[Finding]:
@@ -734,4 +755,4 @@ def findings(nav: Navigator, *, density: int = 420,
     return out
 
 
-__all__ = ["CODES", "Finding", "findings", "ghost", "show_on_screen"]
+__all__ = ["CODES", "Finding", "covered", "findings", "ghost", "show_on_screen"]
