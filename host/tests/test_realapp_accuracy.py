@@ -260,19 +260,27 @@ def test_the_antennapod_player_trap_is_named_and_explained():
     assert codes[0] == "tb.trap"
 
 
-def test_going_back_into_a_page_nobody_can_see_says_so():
-    # Going back, a WebView's root is never a stop, so the walk enters an off-screen page through
-    # its last element and reads it. It now says so, as the forward walk does: a web_hidden_page
-    # (not a trap: nothing measured says TalkBack traps going back), so the model's walk is a
-    # tb.ghost_stop. AntennaPod's expanded player: forward, the show notes trap.
+def test_going_back_into_a_page_nobody_can_see_reads_it_and_says_so():
+    # Live, AntennaPod's expanded player walked backwards (Meta+Left) on TalkBack 17.0 from the
+    # position slider: TalkBack goes into the show notes on the vertical pager's off-screen page
+    # through its last element and reads on, 6/6 presses as the model has it. No trap going back
+    # (forward, the same page traps). The model's walk says so: a web_hidden_page without a trap,
+    # so the walk's lint is a tb.ghost_stop; it used to say nothing going back.
     from inspector_widget.talkback import diff
 
-    tree = tb.build(dump("antennapod_player_expanded"))
-    back = tb.simulate(tree, direction="prev", keyboard=True)
-    read = [k for k in back.keys() if k.startswith("virtual:359:")]
-    assert read and "virtual:359:23" not in read
+    walk = WALKS["antennapod_player_expanded_backward"]
+    tree = tb.build(dump(walk["dump"]))
+    back = tb.simulate(tree, start=walk["start"]["key"], direction="prev", until="steps",
+                       max_steps=len(walk["steps"]), keyboard=True)
+    assert [m.get("key") for m in back.steps] == [key for moved, key, _l, _s in walk["steps"]
+                                                  if moved]
+    said = [s for _m, _k, _l, s in walk["steps"]]
+    model = [m["speak"] for m in back.steps]
+    assert model[:-1] == said[:-1]
+    assert (model[-1], said[-1]) == (".", "Period")  # a lone "." is spoken by its name
     hidden = [h for h in back.hints if h["kind"] == "web_hidden_page"]
-    assert [(h["web_root"], h["trap"]) for h in hidden] == [("virtual:359:23", False)]
+    assert [(h["web_root"], h["trap"], h["before"]) for h in hidden] == [
+        ("virtual:695:23", False, "view:289")]
     assert diff.web_trap_finding(hidden[0], basis="model")["code"] == "tb.ghost_stop"
     fwd = tb.simulate(tree, keyboard=True)
     assert fwd.ended == "trap"

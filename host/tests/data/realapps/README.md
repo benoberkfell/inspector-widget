@@ -5,9 +5,10 @@ walks from three open-source debuggable apps on emulator-5554 (API 37, 1280x2856
 Thunderbird for Android (fossDebug, a demo account), Now in Android (demoDebug) and
 AntennaPod (freeDebug, two subscriptions). Taken by the real-app validation run with the
 host at e992335; the walks pressed Meta+Right through a uinput keyboard and read TalkBack's
-verbose ttsOutput. `antennapod_player_expanded`, `antennapod_home_player_collapsed` and
-`thunderbird_message_tb_on` (with its backward walk) came
-later, from live `tb-walk` runs (the dump each walk started from, and the walk).
+verbose ttsOutput. `antennapod_player_expanded`, `antennapod_home_player_collapsed`,
+`thunderbird_message_tb_on` and `antennapod_player_expanded_tb_on` (each of the last two with
+a backward walk) came later, from live `tb-walk` runs (the dump each walk started from, and
+the walk).
 
 `talkback17_walks.json.gz` holds, per screen, the focus before the walk (`start`) and each
 press as `[moved, focused node key, its label, what TalkBack said]`. A walk and its dump were
