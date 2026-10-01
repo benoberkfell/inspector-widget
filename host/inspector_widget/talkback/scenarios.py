@@ -185,7 +185,8 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
                  action: str = "activate", mutate: Optional[str] = None, wait_ms: int = 2000,
                  injector: str = "auto", leave_on: bool = False,
                  step_timeout_ms: int = STEP_TIMEOUT_MS, settle_ms: int = SETTLE_MS,
-                 save: bool = True, hook: Optional[Any] = None) -> Dict[str, Any]:
+                 save: bool = True, hook: Optional[Any] = None, relaunch: bool = False,
+                 attach: Optional[Any] = None) -> Dict[str, Any]:
     """Run one scenario (see the module docstring) and return a compact verdict.
 
     ``hook`` (the capture surface's) is told when TalkBack has settled
@@ -200,8 +201,9 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
         raise ValueError("survive needs mutate (tap:<selector> | activate | key:<combo> | "
                          "broadcast:<args> | probe:<action>)")
     wait_s = max(0.3, wait_ms / 1000)
-    drv = Driver(session, injector=injector, utterance="model", leave_on=leave_on,
-                 step_timeout_ms=step_timeout_ms, settle_ms=settle_ms, what="tb_scenario")
+    drv = Driver(session, injector=injector, utterance="auto", leave_on=leave_on,
+                 step_timeout_ms=step_timeout_ms, settle_ms=settle_ms, what="tb_scenario",
+                 relaunch=relaunch, attach=attach)
     out: Dict[str, Any] = {"kind": kind, "serial": session.serial, "package": session.package}
     with drv:
         # TalkBack that just started puts its own initial focus on the window ~550ms
@@ -225,6 +227,7 @@ def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
             out.update(_survive(drv, cur, mutate or "", wait_s, legacy))
         if hook is not None:
             hook.finish(None)  # still with TalkBack on: the screen the scenario left
+    out["talkback_started"] = drv.talkback_started
     out["talkback"] = f"{drv.enabled.get('version', '?')} {drv.inj.describe() if drv.inj else '?'}"
     out["restore"] = ("FAILED: " + drv.restore_error + " (run talkback restore)") if drv.restore_error \
         else "restored" if drv.restored is not None \

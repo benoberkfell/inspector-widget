@@ -61,6 +61,9 @@ UNTIL = ("wrap", "edge", "loop", "steps")
 DIRECTIONS = ("next", "prev")
 UTTERANCE = ("auto", "model", "logcat")
 RECAPTURE = ("on_unknown", "never")
+#: A move that repeats with its nodes elsewhere (TalkBack auto-scrolled) is a loop only
+#: when the presses after it repeat too, this many (G10).
+LOOP_CONFIRM = 2
 
 Rect = Tuple[int, int, int, int]
 
@@ -641,10 +644,33 @@ _RE_EDGE = re.compile(r"FocusProcessor-LogicalNav: Reach edge")
 # Only the actor's own lines: node dumps and pipeline lines list SHOW_ON_SCREEN too.
 _RE_SCROLL = re.compile(r"AutoScrollActor: (?:ScrollAction=ACTION_SCROLL|Perform ACTION_SHOW_ON_SCREEN"
                         r"|Perform scroll action)")
+# Every spoken feedback: ``TalkBackFeedbackProvider:  <EVENT>:  ttsOutput= <words>  queueMode=...``.
+_RE_FEEDBACK = re.compile(r"(TalkBackFeedbackProvider:)\s+([A-Z_]+):\s+ttsOutput=\s?(.*?)"
+                          r"(\s{2,}queueMode.*)?$")
+# The focus rule's line names why TalkBack focused a node (G11's focus reason).
+_RE_REASON = re.compile(r"EventTypeViewAccessibilityFocusedFeedbackRule:.*?ttsOutput=\{.*\},"
+                        r"((?:\s*is\w+=(?:true|false),?)+)")
+# ``<epoch>  <pid>  <tid> <level> <tag>: `` (logcat -v epoch), the header of every line
+_RE_HEADER = re.compile(r"^\s*\d+\.\d+\s+\d+\s+\d+\s+[VDIWEFS]\s+[^:]*:\s?")
+#: Feedback events whose words are announcements, not a focus move's (kind "announce").
+ANNOUNCE_EVENTS = frozenset({"TYPE_ANNOUNCEMENT", "TYPE_WINDOW_STATE_CHANGED",
+                             "TYPE_WINDOW_CONTENT_CHANGED", "TYPE_VIEW_TEXT_CHANGED",
+                             "TYPE_WINDOWS_CHANGED", "TYPE_VIEW_SELECTED", "TYPE_VIEW_CLICKED",
+                             "TYPE_VIEW_SCROLLED"})
+#: The longest multi-line utterance kept (lines joined).
+MAX_CONTINUATION = 40
 
 
 class TalkBackLog:
-    """``adb logcat --pid=<TalkBack>`` parsed into (t, kind, value) events."""
+    """``adb logcat --pid=<TalkBack>`` parsed into (t, kind, value) events.
+
+    Kinds: ``tts`` (what TalkBack said on a focus move), ``announce`` (what it said for
+    an announcement, a window or pane change, a click ...: ``EVENT: words``), ``hint``
+    (the usage hint), ``reason`` (why it focused a node: the focus rule's true flags,
+    ``isInitialFocus`` / ``isRestoreFocusOrEnsureOnScreen`` / ``isEventNavigateByUser``),
+    ``edge`` and ``scroll``. An utterance that spans several lines (text with newlines)
+    is one event: logcat prints its continuation lines with the same header and
+    TalkBack's ``Class:`` prefix (or none), up to the line that ends in ``queueMode``."""
 
     def __init__(self, serial: str) -> None:
         self.serial = serial
@@ -652,6 +678,7 @@ class TalkBackLog:
         self.events: List[Tuple[float, str, str]] = []
         self._lock = threading.Lock()
         self.lines = 0
+        self._pending: Optional[List[Any]] = None  # [t, kind, event, header, prefix, parts]
 
     def start(self) -> bool:
         pid = device.talkback_pid(self.serial)
@@ -670,25 +697,79 @@ class TalkBackLog:
             try:
                 raw = out.readline()
             except (OSError, ValueError):
-                return
+                break
             if not raw:
-                return
-            line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-            now = time.monotonic()
-            ev = None
-            m = _RE_TTS.search(line)
-            if m:
-                ev = ("tts", m.group(1).strip())
-            elif _RE_EDGE.search(line):
-                ev = ("edge", "")
-            elif _RE_SCROLL.search(line):
-                ev = ("scroll", "")
+                break
+            self.feed(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
+        self._flush()
+
+    def feed(self, line: str, now: Optional[float] = None) -> None:
+        """Parse one logcat line (the reader's; tests feed lines directly)."""
+        now = time.monotonic() if now is None else now
+        line = line.rstrip("\r\n")
+        with self._lock:
+            self.lines += 1
+        if self._pending is not None and self._continue(line):
+            return
+        self._flush()
+        m = _RE_FEEDBACK.search(line)
+        if m:
+            event, words, done = m.group(2), m.group(3), m.group(4) is not None
+            kind = ("tts" if event == "TYPE_VIEW_ACCESSIBILITY_FOCUSED" else
+                    "hint" if event == "EVENT_SPEAK_HINT" else
+                    "announce" if event in ANNOUNCE_EVENTS else "speak")
+            hm = _RE_HEADER.match(line)
+            self._pending = [now, kind, event, hm.group(0) if hm else "", m.group(1), [words]]
+            if done:
+                self._flush()
+            return
+        ev = None
+        r = _RE_REASON.search(line)
+        if r:
+            flags = [f.split("=")[0].strip() for f in r.group(1).split(",")
+                     if f.strip().endswith("=true")]
+            ev = ("reason", ",".join(flags))
+        elif _RE_EDGE.search(line):
+            ev = ("edge", "")
+        elif _RE_SCROLL.search(line):
+            ev = ("scroll", "")
+        if ev:
             with self._lock:
-                self.lines += 1
-                if ev:
-                    self.events.append((now, ev[0], ev[1]))
+                self.events.append((now, ev[0], ev[1]))
+
+    def _continue(self, line: str) -> bool:
+        """Add ``line`` to the utterance being read when it is its continuation."""
+        p = self._pending
+        assert p is not None
+        hm = _RE_HEADER.match(line)
+        if hm is not None:
+            if hm.group(0) != p[3]:
+                return False  # another line of the log: the utterance ended
+            body = line[hm.end():]
+            if body.startswith(p[4]):
+                body = body[len(p[4]):].lstrip(" ")
+            elif _RE_FEEDBACK.search(line) or ":" in body.split(" ", 1)[0]:
+                return False  # a new message of another class, same millisecond
+        else:
+            body = line
+        end = re.search(r"\s{2,}queueMode", body)
+        p[5].append(body[:end.start()] if end else body)
+        if end or len(p[5]) >= MAX_CONTINUATION:
+            self._flush()
+        return True
+
+    def _flush(self) -> None:
+        with self._lock:  # the reader and stop() may both end an utterance
+            p, self._pending = self._pending, None
+            if p is None:
+                return
+            words = "\n".join(x.rstrip() for x in p[5]).strip()
+            value = words if p[1] in ("tts", "hint", "speak") else f"{p[2]}: {words}"
+            self.events.append((p[0], p[1], value))
 
     def since(self, t: float, kind: Optional[str] = None) -> List[Tuple[float, str, str]]:
+        """Events at or after ``t`` (time.monotonic()), of ``kind`` when given. A pending
+        multi-line utterance counts once it ended."""
         with self._lock:
             return [e for e in self.events if e[0] >= t and (kind is None or e[1] == kind)]
 
@@ -705,9 +786,10 @@ class TalkBackLog:
             try:
                 getattr(proc, fn)()
                 proc.wait(timeout=2)
-                return
+                break
             except Exception:  # noqa: BLE001
                 continue
+        self._flush()
 
 
 # --------------------------------------------------------------------------- #
@@ -957,11 +1039,26 @@ class WalkError(RuntimeError):
 
 class Driver:
     """TalkBack on (restored on exit unless ``leave_on``), a key injector and a
-    focus reader, under the per-device lock. Use as a context manager."""
+    focus reader, under the per-device lock. Use as a context manager.
+
+    ``utterance`` auto or logcat sets TalkBack's log level to VERBOSE when this driver
+    turns TalkBack on (restore puts it back), so the walk reads TalkBack's own words;
+    auto goes on without it when that fails (``utterance_why`` says why).
+
+    ``relaunch``: TalkBack first, as its users have it. TalkBack is turned on, then the
+    app is force-stopped and started from its launcher (:func:`.device.relaunch`), and
+    the session re-attached to the new process (``attach(serial, package)``; default
+    :func:`inspector_widget.attach`), so RecyclerView rows are bound with TalkBack
+    running ("N of M", page stops) as a TalkBack user gets them. ``session`` then only
+    needs ``serial`` and ``package``.
+
+    ``started`` says when TalkBack started relative to the app's process
+    (:func:`.device.talkback_started`): before_app, after_app or before_walk."""
 
     def __init__(self, session: Any, *, injector: str = "auto", utterance: str = "auto",
                  leave_on: bool = False, step_timeout_ms: int = STEP_TIMEOUT_MS,
-                 settle_ms: int = SETTLE_MS, what: str = "tb_walk") -> None:
+                 settle_ms: int = SETTLE_MS, what: str = "tb_walk", relaunch: bool = False,
+                 attach: Optional[Callable[[str, str], Any]] = None) -> None:
         self.session = session
         self.serial = session.serial
         self.package = session.package
@@ -971,8 +1068,14 @@ class Driver:
         self.timeout_s = step_timeout_ms / 1000
         self.quiet_s = settle_ms / 1000
         self.what = what
+        self.relaunch = bool(relaunch)
+        self._attach = attach
+        self._own_session = False
+        self.relaunched: Optional[Dict[str, Any]] = None
         self.inj: Optional[inject.Injector] = None
-        self.reader: FocusReader = make_reader(session)
+        # a relaunch replaces the process (and its agent): the reader comes after it
+        self.reader: FocusReader = DumpFocusReader(session) if self.relaunch \
+            else make_reader(session)
         self.log: Optional[TalkBackLog] = None
         self.enabled: Dict[str, Any] = {}
         self.turned_on = False
@@ -981,27 +1084,56 @@ class Driver:
         self.notes: List[str] = []
         self.seek_presses = 0
         self.start_via = "keys"
+        self.started: Dict[str, Any] = {}
+        #: why TalkBack's words are not in its log (utterance auto falls back to the model)
+        self.utterance_why: Optional[str] = None
+        self.proof: Optional[str] = None  # how an unproven keyboard was proven in place
         self._keymaps_tried: List[str] = []
         self._lock_cm: Any = None
+
+    @property
+    def talkback_started(self) -> Optional[str]:
+        return self.started.get("talkback_started")
+
+    @property
+    def injector_proven(self) -> bool:
+        return bool(self.inj is not None and self.inj.proven)
 
     # ---- lifecycle ------------------------------------------------------- #
     def __enter__(self) -> "Driver":
         self._lock_cm = device.device_lock(self.serial, self.what)
         self._lock_cm.__enter__()
         try:
-            self.enabled = device.enable(self.serial, self.package,
-                                         verbose_log=self.utterance == "logcat")
+            self.enabled = device.enable(
+                self.serial, None if self.relaunch else self.package,
+                verbose_log=self.utterance in ("auto", "logcat"),
+                verbose_required=self.utterance == "logcat")
             self.turned_on = bool(self.enabled.get("changed"))
-            if isinstance(self.enabled.get("log_level"), str):
-                self.notes.append(f"log level {self.enabled['log_level']}")
+            level = self.enabled.get("log_level")
+            if isinstance(level, dict) and ("unchanged" in level or "failed" in level):
+                self.utterance_why = (
+                    "TalkBack was already on, so its log level could not be set"
+                    if "unchanged" in level else f"its log level was not set ({level['failed']})")
+                if self.utterance == "logcat":
+                    self.notes.append(f"logcat: {self.utterance_why}")
             if self.enabled.get("warning_foreground"):
                 self.notes.append(self.enabled["warning_foreground"])
+            on_uptime = self.enabled.get("on_uptime")
+            if self.relaunch:
+                if on_uptime is None:  # on before this walk, at the latest now
+                    on_uptime = device.uptime(self.serial)
+                self.relaunched = device.relaunch(self.serial, self.package)
+                self._reattach()
             self._wait_services_on()
+            self.started = device.talkback_started(
+                self.serial, self.package, on_uptime,
+                pid=(self.relaunched or {}).get("pid") or getattr(self.session, "pid", None))
             self.inj = inject.open_injector(self.serial, self.injector_kind)
             if self.utterance in ("auto", "logcat"):
                 self.log = TalkBackLog(self.serial)
                 if not self.log.start():
                     self.log = None
+                    self.utterance_why = "TalkBack's process was not found"
                     if self.utterance == "logcat":
                         self.notes.append("logcat: TalkBack's process was not found; "
                                           "utterances come from the model")
@@ -1009,6 +1141,23 @@ class Driver:
             self.__exit__(None, None, None)
             raise
         return self
+
+    def _reattach(self) -> None:
+        """A session on the relaunched process (the old one died with its agent)."""
+        old = self.session
+        if self._attach is not None:
+            self.session = self._attach(self.serial, self.package)
+        else:
+            import inspector_widget as iw
+            close = getattr(old, "disconnect", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - the process is gone already
+                    pass
+            self.session = iw.attach(self.serial, self.package)
+            self._own_session = True
+        self.reader = make_reader(self.session)
 
     def __exit__(self, *exc: Any) -> None:
         try:
@@ -1022,6 +1171,12 @@ class Driver:
                 except Exception as err:  # noqa: BLE001 - reported in the result
                     self.restore_error = f"{type(err).__name__}: {err}"
         finally:
+            if self._own_session:
+                self._own_session = False
+                try:
+                    self.session.disconnect()
+                except Exception:  # noqa: BLE001 - best-effort teardown
+                    pass
             if self._lock_cm is not None:
                 self._lock_cm.__exit__(None, None, None)
                 self._lock_cm = None
@@ -1031,7 +1186,7 @@ class Driver:
         the window change); wait for that, then for it to stay put, so a walk
         starts where a user would."""
         snap = self.reader.snapshot()
-        if not self.turned_on or snap.key is not None:
+        if not (self.turned_on or self.relaunched) or snap.key is not None:
             return snap
         return self.reader.wait_change(None, INITIAL_FOCUS_S if timeout_s is None else timeout_s,
                                        0.3).snap
@@ -1067,13 +1222,19 @@ class Driver:
         assert self.inj is not None
         while True:
             self._keymaps_tried.append(self.inj.keymap)
+            t_first: Optional[float] = None
             for _ in range(2):
                 t, _ms_ = self.press("next")
+                t_first = t if t_first is None else t_first
                 self.seek_presses += 1
                 w = self.wait(cur_key, t)
                 if w.moved:
                     self.inj.mark_proven()
                     return w
+            if not self.inj.proven and t_first is not None:
+                back = self.prove_in_place(cur_key, t_first)
+                if back is not None:  # TalkBack takes these keys: not the keymap's fault
+                    return WaitResult(back, False, None, None, 0)
             if not self.try_other_keymap():
                 break
         raise WalkError("keymap_unknown", "TalkBack did not move accessibility focus on Meta+Right "
@@ -1100,6 +1261,76 @@ class Driver:
             if d.get("performed"):
                 snap = self.reader.wait_change(snap.key, self.timeout_s, self.quiet_s).snap
         return snap
+
+    def prove_in_place(self, cur_key: Optional[str], since: float,
+                       stops: Optional[Sequence[str]] = None) -> Optional[Snapshot]:
+        """Two presses of "next" moved nothing on a keyboard never seen to move focus:
+        an edge TalkBack does not wrap, TalkBack ignoring keys (it can right after the
+        agent placed focus), or a keymap TalkBack does not bind. Tell them apart before
+        switching keymaps (G15): "Reach edge" in TalkBack's log for those presses means
+        it took them; else focus another stop through the agent (A11yAct, the stop the
+        model reads before ``cur_key``: ``stops``, else the dump's own) and press "next"
+        there: focus moving proves the keymap. Focus goes back to ``cur_key`` either
+        way. Returns the snapshot back there once proven, else None."""
+        kb = self.inj
+        if kb is None:
+            return None
+        if kb.proven:
+            return self.reader.snapshot()
+        if self.log is not None and self.log.since(since, "edge"):
+            kb.mark_proven()
+            self.proof = "TalkBack logged an edge"
+            return self.reader.snapshot()
+        if not isinstance(self.reader, A11yFocusReader):
+            return None
+        other = self._other_stop(cur_key, stops)
+        if other is None or not self._a11y_focus(other):
+            return None
+        snap = self.reader.wait_change(cur_key, self.timeout_s, self.quiet_s).snap
+        t, _ = self.press("next")
+        self.seek_presses += 1
+        w = self.wait(snap.key, t)
+        if w.moved:
+            kb.mark_proven()
+            self.proof = f"next moved focus from {other}"
+        snap = w.snap
+        if snap.key != cur_key:
+            if cur_key is None:
+                self._a11y_focus(snap.key, clear=True)
+            elif self._a11y_focus(cur_key):
+                snap = self.reader.wait_change(snap.key, self.timeout_s, self.quiet_s).snap
+        return snap if kb.proven else None
+
+    def _a11y_focus(self, key: Optional[str], clear: bool = False) -> bool:
+        if key is None:
+            return False
+        from .. import a11y
+        try:
+            d = a11y.a11y_act_to_dict(self.session.a11y_act(
+                node_key=key,
+                action="clear_accessibility_focus" if clear else "accessibility_focus"))
+        except Exception:  # noqa: BLE001 - a key the agent cannot act on
+            return False
+        return bool(d.get("performed"))
+
+    def _other_stop(self, cur_key: Optional[str], stops: Optional[Sequence[str]]
+                    ) -> Optional[str]:
+        """A stop "next" can leave: the one read before ``cur_key`` (so "next" from it
+        lands back on it), else the first stop that is not ``cur_key``."""
+        snap = self.reader.snapshot()
+        keys = [k for k in (stops or []) if k in snap.index.nodes]
+        if not keys and snap.resp is not None:
+            try:
+                keys = [p.key for p in predict(snap.resp, bool(snap.index.legacy))[0]
+                        if p.key in snap.index.nodes]
+            except Exception:  # noqa: BLE001 - no model: no proof
+                keys = []
+        if len(keys) < 2:
+            return None
+        if cur_key in keys:
+            i = keys.index(cur_key)
+            return keys[i - 1] if i > 0 else (keys[i + 1] if i + 2 < len(keys) else None)
+        return keys[0]
 
     def try_other_keymap(self) -> bool:
         """Switch an unproven keyboard to the classic (Alt) keymap once."""
@@ -1151,7 +1382,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
              settle_ms: int = SETTLE_MS, recapture: str = "on_unknown", utterance: str = "auto",
              injector: str = "auto", leave_on: bool = False, max_lines: int = 60,
              max_bytes: int = 5000, timeout_s: float = 300.0, save: bool = True,
-             hook: Optional[Any] = None, full: bool = False) -> Dict[str, Any]:
+             hook: Optional[Any] = None, full: bool = False, relaunch: bool = False,
+             attach: Optional[Callable[[str, str], Any]] = None) -> Dict[str, Any]:
     """Walk TalkBack through the app on ``session`` and return the compact result.
 
     ``start``: ``current`` (where focus is now), ``first`` (TalkBack's "first"
@@ -1163,9 +1395,16 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
     the wrap may be new: TalkBack's initial focus skips a title that repeats the
     window title). A walk also ends on ``stuck`` (two
     presses in a row that move nothing), ``loop`` (a move repeats with no edge in
-    between: TalkBack would never reach the end), ``left_app``, ``lost`` (no node held
-    focus after a press twice in a row, or again at the same place after
+    between, with the same boxes, or for two more presses: TalkBack would never reach
+    the end), ``left_app``, ``ime`` (focus left the app into the soft keyboard), ``lost``
+    (no node held focus after a press twice in a row, or again at the same place after
     starting over) and ``timeout``.
+
+    ``relaunch``: turn TalkBack on, then restart the app from its launcher (the session
+    is re-attached with ``attach``), as a TalkBack user opens it (:class:`Driver`).
+    The record says when TalkBack started (``talkback_started``) and whether the
+    keyboard was ever seen to move focus (``injector_proven``); a stuck or trapped
+    walk that has neither is marked unverified (:func:`mark_unverified`).
 
     The full record (every step, the predicted order, findings) is saved under
     ``<store>/walks/<walk id>.json``; the returned dict is at most ``max_bytes``
@@ -1190,7 +1429,8 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
     t_start = time.monotonic()
     deadline = t_start + timeout_s
     drv = Driver(session, injector=injector, utterance=utterance, leave_on=leave_on,
-                 step_timeout_ms=step_timeout_ms, settle_ms=settle_ms)
+                 step_timeout_ms=step_timeout_ms, settle_ms=settle_ms, relaunch=relaunch,
+                 attach=attach)
     steps: List[Step] = []
     model = Model()
     ended = "max_steps"
@@ -1213,10 +1453,14 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
         if hook is not None:
             hook.start(cur)
             start = hook.resolve(start)
+        t_seek = time.monotonic()
         cur = _seek_start(drv, cur, start, direction, max_steps)
-        steps.append(Step(0, cur.key, via="start", node=cur.focus, t=cur.t, index=cur.index))
+        steps.append(Step(0, cur.key, via="start", node=cur.focus, t=cur.t, index=cur.index,
+                          extra={"_seek_t": t_seek} if drv.seek_presses else {}))
         prev_idx = cur.index
-        transitions: Dict[Tuple[Optional[str], ...], int] = {}
+        transitions: Dict[Tuple[Any, ...], int] = {}
+        boxed: Dict[Tuple[Any, ...], int] = {}  # the same moves with the nodes' boxes
+        repeat: Optional[Tuple[int, int]] = None  # (seen_at, first repeat): a loop to confirm
         last_edge_at = -1
         edge_at: Optional[int] = None  # the step edge_info was taken at
         no_moves = 0
@@ -1296,6 +1540,15 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                     ended = "left_app"
                     steps.append(Step(len(steps), None, via="left_app", t=new.t, extra={"top": top}))
                     break
+                ime = _ime_focus(drv)
+                if ime is not None:
+                    # TalkBack went on into the soft keyboard's window, which the agent
+                    # cannot see: not a lost focus, and the presses after it are no edges.
+                    # The press moved TalkBack's focus: the keyboard works.
+                    drv.inj.mark_proven()  # type: ignore[union-attr]
+                    ended = "ime"
+                    steps.append(Step(len(steps), None, via="ime", t=t_sent, extra=ime))
+                    break
                 # Still in the app, but no node holds focus (cleared and not restored):
                 # the next press starts again from the top of the window.
                 steps.append(Step(len(steps), None, via="lost", t=t_sent,
@@ -1308,13 +1561,30 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
                     break
                 continue
             if not w.moved:
+                if cur.key is None and no_moves == 0 and steps[-1].via == "lost":
+                    ime = _ime_focus(drv)
+                    if ime is not None:
+                        drv.inj.mark_proven()  # type: ignore[union-attr]
+                        ended = "ime"
+                        steps[-1] = Step(steps[-1].i, None, via="ime", t=steps[-1].t, extra=ime)
+                        break
                 no_moves += 1
                 steps.append(Step(len(steps), cur.key, moved=False, edge=True, via="edge",
                                   node=cur.focus, t=t_sent, index=cur.index))
-                if no_moves >= 2 and not drv.inj.proven and drv.try_other_keymap():  # type: ignore[union-attr]
-                    del steps[-2:]  # those presses were not edges: the keymap was wrong
-                    no_moves = 0
-                    continue
+                if no_moves >= 2 and not drv.inj.proven:  # type: ignore[union-attr]
+                    # G15: prove the keyboard before blaming the keymap
+                    back = drv.prove_in_place(cur.key, steps[-2].t, model.keys())
+                    if back is not None:
+                        steps[-1].extra["proof"] = drv.proof
+                        if drv.proof != "TalkBack logged an edge":
+                            # TalkBack takes the keys from elsewhere: press again from here
+                            no_moves = 0
+                            cur, prev_idx = back, back.index
+                            continue
+                    elif drv.try_other_keymap():
+                        del steps[-2:]  # those presses were not edges: the keymap was wrong
+                        no_moves = 0
+                        continue
                 if edge_info is None and cur.focus is not None:
                     edge_info = _edge_info(cur.index, cur.focus, direction)
                     edge_at = len(steps) - 1
@@ -1351,22 +1621,34 @@ def run_walk(session: Any, *, start: str = "current", direction: str = "next",
             # the same Views to other items as it scrolls.
             tr = (cur.key, cur.focus.sig if cur.focus is not None else None,
                   new.key, new.focus.sig if new.focus is not None else None)
+            # ... and with the same scroll state (G10): a node re-read after TalkBack
+            # auto-scrolled its list sits elsewhere, and the walk goes on from there
+            trb = tr + (cur.focus.bounds if cur.focus is not None else None,
+                        new.focus.bounds if new.focus is not None else None)
             seen_at = transitions.get(tr)
-            transitions[tr] = len(steps) - 1
+            same_box = boxed.get(trb) is not None
+            transitions[tr] = boxed[trb] = len(steps) - 1
             cur, prev_idx = new, new.index
             if until == "wrap" and last_edge_at >= 0 and new.focus is not None and any(
                     _seen_again(s, new) for s in steps[:last_edge_at]):
                 # Past the edge and back on a stop this walk already read: a full lap.
                 ended = "wrap"
                 break
-            if seen_at is not None and until != "steps":
-                if last_lost_at > seen_at:
-                    ended = "lost"  # focus is lost at the same place every lap
-                elif last_edge_at > seen_at:
-                    ended = "wrap"
-                else:
-                    ended = "loop"
-                    cycle = [s.key for s in steps[seen_at - 1:len(steps) - 2] if s.key]
+            if seen_at is None or until == "steps":
+                repeat = None
+                continue
+            if last_lost_at > seen_at:
+                ended = "lost"  # focus is lost at the same place every lap
+                break
+            if last_edge_at > seen_at:
+                ended = "wrap"
+                break
+            if repeat is None:
+                repeat = (seen_at, len(steps) - 1)
+            if same_box or len(steps) - 1 - repeat[1] >= LOOP_CONFIRM:
+                ended = "loop"
+                first_seen, at = repeat
+                cycle = [s.key for s in steps[first_seen - 1:at - 1] if s.key]
                 break
         if drv.log is not None and drv.log.verbose:
             time.sleep(0.3)  # the last announcement lands ~100ms after its press
@@ -1434,6 +1716,18 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
 
 def _key_of(n: Optional[Node]) -> Optional[str]:
     return n.key if n is not None else None
+
+
+def _ime_focus(drv: Driver) -> Optional[Dict[str, Any]]:
+    """``{"ime_window": title}`` when accessibility focus sits in the input method's window
+    (the soft keyboard: another process, so the agent sees focus vanish), else None."""
+    try:
+        w = device.a11y_focus_window(drv.serial)
+    except Exception:  # noqa: BLE001 - unknown: the walk reads it as lost
+        return None
+    if w is not None and w.get("type") == "TYPE_INPUT_METHOD":
+        return {"ime_window": w.get("title") or "the keyboard"}
+    return None
 
 
 def _scroll_in_flight(drv: Driver, snap: Snapshot, t_sent: float) -> bool:
@@ -1559,17 +1853,43 @@ def _descendants(n: Node) -> List[Node]:
 
 
 def _attribute_tts(steps: List[Step], log: TalkBackLog) -> Dict[int, str]:
-    """ttsOutput lines -> the step whose press window [t_i, t_{i+1}) holds them."""
-    out: Dict[int, str] = {}
+    """ttsOutput lines -> the step whose press window [t_i, t_{i+1}) holds them (the
+    start's from its seek's first press on: TalkBack announced where the seek left
+    focus). A move that landed late (after its press's wait, or a slow auto-scroll) is
+    announced only once the next press was sent: when a step's window holds two
+    announcements and the step before, a move, holds none, the first goes back to it if
+    its words fit that step at least as well (else the walk would print stale model
+    speech for the auto-scrolled step). The last announcement left in a window wins."""
     events = log.since(0.0, "tts")
     bounds = [s.t for s in steps] + [float("inf")]
+    seek_t = steps[0].extra.get("_seek_t") if steps else None
+    per: Dict[int, List[str]] = {}
     for t, _k, text in events:
         for j in range(len(steps)):
-            if bounds[j] <= t < bounds[j + 1]:
-                if steps[j].moved and not steps[j].edge:
-                    out[j] = text  # the last announcement in the window wins
+            lo = seek_t if j == 0 and seek_t is not None else bounds[j]
+            if lo <= t < bounds[j + 1]:
+                per.setdefault(j, []).append(text)
                 break
-    return out
+
+    def speaks(j: int) -> bool:
+        st = steps[j]
+        return st.moved and not st.edge and st.key is not None
+
+    for j in sorted(per):
+        if j > 0 and len(per[j]) >= 2 and speaks(j - 1) and not per.get(j - 1):
+            first = per[j][0]
+            if _fit(first, steps[j - 1]) >= _fit(first, steps[j]):
+                per[j - 1] = [per[j].pop(0)]
+    return {j: v[-1] for j, v in per.items() if v and speaks(j)}
+
+
+def _fit(text: str, st: Step) -> float:
+    """How much of ``text`` is the words of the node step ``st`` focused (0..1)."""
+    words = diff._tokens(text)
+    if not words or st.node is None:
+        return 0.0
+    own = diff._tokens(f"{st.node.label} {st.node.speech()}")
+    return len(words & own) / len(words)
 
 
 # --------------------------------------------------------------------------- #
@@ -1614,7 +1934,7 @@ def _step_record(s: Step, ref: str, speak: str, utt: str, idx_rect: Optional[Rec
         rec["ms"] = s.ms
     if s.scrolled:
         rec["scrolled"] = s.scrolled
-    rec.update(s.extra)
+    rec.update({k: v for k, v in s.extra.items() if not k.startswith("_")})
     return rec
 
 
@@ -1709,14 +2029,17 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
     if ended == "wrap" and start_idx is not None:
         last_idx = next((s.index for s in reversed(steps) if s.index is not None), start_idx)
         walk["orphans"] = orphan_text(last_idx, records, legacy)
+    known: Dict[str, Any] = {}
     if start_resp is not None:
         # What the model knows lies ahead (auto-scrolled content, a WebView on an off-screen
         # page): diff names a walk stuck at such a WebView a tb.trap.
         known = model_hints(start_resp)
         walk["hints"] = known["hints"]
         walk["web_traps"] = known["web_traps"]
+    walk.update(start_order(drv))
     analysis = diff.analyze(walk, expect=expect)
     walk["findings"] = analysis["findings"]
+    mark_unverified(walk)
     walk["vs_model"] = analysis["vs_model"]
     if initial is not None and initial.get("key"):
         # TalkBack just started and put focus here itself: the model's initial-focus rule.
@@ -1740,12 +2063,21 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
     walk["remodels"] = model.remodels
     walk["recapture"] = "model only (no capture store on this branch)" if model.remodels else None
     n_logcat = sum(1 for r in records if r.get("utt") == "logcat")
-    walk["utterance"] = (f"logcat {n_logcat}/{sum(1 for r in records if r.get('speak') is not None)}"
-                         if n_logcat else "model")
+    n_moves = sum(1 for r in records if r.get("i", 0) > 0 and r.get("moved")
+                  and not r.get("edge") and r.get("key"))
+    walk["utterance"] = f"logcat {n_logcat}/{max(n_moves, n_logcat)}" if n_logcat else "model"
     walk["notes"] = list(drv.notes)
     if drv.log is not None and not drv.log.verbose and drv.utterance == "logcat":
         walk["notes"].append("logcat: no TalkBack verbose lines; set TalkBack Settings > Advanced "
                              "> Developer settings > Log output level: Verbose")
+    note = utterance_note(drv, n_logcat, n_moves)
+    if note:
+        walk["notes"].append(note)
+    if ended == "ime":
+        win = next((r.get("ime_window") for r in records if r.get("via") == "ime"), None)
+        walk["notes"].append(f"focus left the app into the keyboard ({win or 'IME'}): hide it "
+                             f"(BACK) or start past the text field, then walk again")
+    walk["notes"] += start_notes(walk.get("talkback_started"), known.get("diagnostics") or ())
     walk["restore"] = _restore_state(drv)
     walk["refs"] = {v: k for k, v in refs.items()}
     wid = _walk_id()
@@ -1949,8 +2281,9 @@ def model_hints(resp: Any) -> Dict[str, Any]:
     """What the model knows about a screen that a walk over it runs into: ``hints`` (the
     autoscroll_ahead and web_hidden_page messages of a forward lap) and ``web_traps`` (the
     WebViews on an off-screen page that TalkBack cannot focus,
-    :meth:`.order.Navigator.hidden_web_pages` with ``trap``). Empty when the model cannot read
-    the dump."""
+    :meth:`.order.Navigator.hidden_web_pages` with ``trap``) and the model's ``diagnostics``
+    kinds (``recycler_bound_before_service``: rows bound before TalkBack started). Empty when
+    the model cannot read the dump."""
     try:
         from .. import a11y
         from .order import Navigator, simulate
@@ -1958,9 +2291,89 @@ def model_hints(resp: Any) -> Dict[str, Any]:
         tb = build(a11y.a11y_to_dict(resp))
         order = simulate(tb, start=None, until="wrap", keyboard=True)
         return {"hints": [h["message"] for h in order.hints],
-                "web_traps": [d for d in Navigator(tb).hidden_web_pages() if d["trap"]]}
+                "web_traps": [d for d in Navigator(tb).hidden_web_pages() if d["trap"]],
+                "diagnostics": [d.get("kind") for d in tb.diagnostics]}
     except Exception:  # noqa: BLE001 - the walk reports without them
-        return {"hints": [], "web_traps": []}
+        return {"hints": [], "web_traps": [], "diagnostics": []}
+
+
+# --------------------------------------------------------------------------- #
+# When TalkBack started, and findings a walk cannot vouch for (G1, G15)
+# --------------------------------------------------------------------------- #
+#: The note on a walk TalkBack started after the app, over rows bound before it.
+BOUND_BEFORE_NOTE = ("rows were bound before TalkBack started: positions and page stops differ "
+                     "for a real user; rerun with relaunch=true")
+#: Findings about TalkBack getting stuck, which an after-app start or a keyboard never
+#: seen to move focus can fabricate.
+UNVERIFIED_CODES = ("tb.trap", "tb.edge_stuck", "tb.webview_block")
+_SEV_RANK = {"error": 0, "warn": 1, "info": 2}
+
+
+def start_order(drv: Driver) -> Dict[str, Any]:
+    """The record fields that say how the walk's TalkBack relates to a real user's:
+    ``talkback_started`` (and its times), ``injector_proven``, ``relaunch``."""
+    out: Dict[str, Any] = {"talkback_started": drv.talkback_started,
+                           "injector_proven": drv.injector_proven}
+    if drv.started.get("app_start_s") is not None:
+        out["app_start_s"] = drv.started["app_start_s"]
+    if drv.started.get("talkback_on_s") is not None:
+        out["talkback_on_s"] = drv.started["talkback_on_s"]
+    if drv.relaunched is not None:
+        out["relaunch"] = dict(drv.relaunched)
+    if drv.proof:
+        out["proof"] = drv.proof
+    return out
+
+
+def start_notes(started: Optional[str], diagnostics: Sequence[Any]) -> List[str]:
+    """The note a walk TalkBack started after the app gets when the model saw rows bound
+    before it (``recycler_bound_before_service`` among the start dump's diagnostics): their
+    positions and page stops are not what a TalkBack user hears."""
+    if started == "after_app" and "recycler_bound_before_service" in diagnostics:
+        return [BOUND_BEFORE_NOTE]
+    return []
+
+
+def mark_unverified(walk: Dict[str, Any]) -> None:
+    """tb.trap / tb.edge_stuck / tb.webview_block from a walk that cannot vouch for them
+    become info, basis ``unverified: injector`` (the keyboard never moved focus: the
+    presses may not have reached TalkBack) or ``unverified: after_app`` (TalkBack started
+    after the app: a TalkBack user's app may not get stuck there; rerun with relaunch).
+    The app pulling focus (a tb.trap on stolen steps) is the app's either way. Idempotent:
+    run again after the walk is re-analysed (capture binding)."""
+    proven = walk.get("injector_proven")
+    why = ("injector" if proven is False else
+           "after_app" if walk.get("talkback_started") == "after_app" else None)
+    if why is None:
+        return
+    vias = {s.get("i"): s.get("via") for s in walk.get("steps") or []}
+    hint = (" (unverified: the keyboard never moved focus; walk from a stop that moves first)"
+            if why == "injector" else
+            " (unverified: TalkBack started after the app; rerun with relaunch=true)")
+    for f in walk.get("findings") or []:
+        if f.get("code") not in UNVERIFIED_CODES or str(f.get("basis") or "").startswith(
+                "unverified"):
+            continue
+        st = f.get("steps") or []
+        if f["code"] == "tb.trap" and st and all(vias.get(i) == "stolen" for i in st):
+            continue
+        f["sev"], f["basis"] = "info", f"unverified: {why}"
+        f["msg"] = str(f.get("msg") or "") + hint
+    (walk.get("findings") or []).sort(key=lambda f: _SEV_RANK.get(f.get("sev"), 3))
+
+
+def utterance_note(drv: Driver, n_logcat: int, n_moves: int) -> Optional[str]:
+    """Why TalkBack's own words are missing (utterance auto fell back to the model), with
+    the way to get them; None when they are there or were not asked for."""
+    if drv.utterance != "auto" or n_logcat or not n_moves:
+        return None
+    why = drv.utterance_why
+    if why is None:
+        why = ("TalkBack's log had no ttsOutput lines (its log level is not VERBOSE)"
+               if drv.log is not None else "TalkBack's log was not read")
+    fix = ("talkback(action='off'), then rerun (it comes on with VERBOSE)"
+           if not drv.turned_on and drv.utterance_why else "rerun with utterance='logcat'")
+    return f"speech is the model's: {why}; {fix}"[:160]
 
 
 def _restore_state(drv: Driver) -> str:
@@ -1987,12 +2400,13 @@ def _line(r: Dict[str, Any], speak_len: int) -> str:
         return f"{r['i']}. — edge"
     if r.get("via") == "left_app":
         return f"{r['i']}. — left the app (top: {r.get('top') or '?'})"
+    if r.get("via") == "ime":
+        return f"{r['i']}. — focus left the app into the keyboard ({r.get('ime_window') or 'IME'})"
     if r.get("via") == "lost":
         return f"{r['i']}. — focus lost (no node holds it)" + (
             f" after scrolling {r['scrolled']}" if r.get("scrolled") else "")
-    sp = (r.get("speak") or "").replace("\n", " ")
-    if len(sp) > speak_len:
-        sp = sp[:speak_len - 1] + "…"
+    from ..capture.walks import cut_speech
+    sp = cut_speech(r.get("speak") or "", speak_len)  # head and tail (G2)
     out = f"{r['i']}. {r['ref']} {r.get('cls') or '?'} \"{sp}\""
     if r.get("via") not in ("next", "start", None):
         out += f" via={r['via']}"
@@ -2002,7 +2416,9 @@ def _line(r: Dict[str, Any], speak_len: int) -> str:
 
 
 def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) -> Dict[str, Any]:
-    """The tool result: header + one line per step + findings, within ``max_bytes``."""
+    """The tool result: header + one line per step + findings, within ``max_bytes``.
+    Under byte pressure the findings of one code merge into one before any line is cut,
+    and no distinct code is dropped (G3)."""
     tags: Dict[int, List[str]] = {}
     for f in walk.get("findings") or []:
         for i in f.get("steps") or []:
@@ -2012,6 +2428,10 @@ def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) ->
     head = {k: walk.get(k) for k in ("walk", "serial", "package", "talkback", "reader", "start",
                                       "direction", "until", "ended", "ms", "utterance", "vs_model",
                                       "restore")}
+    if walk.get("talkback_started"):
+        head["talkback_started"] = walk["talkback_started"]
+    if walk.get("injector_proven") is False:
+        head["injector_proven"] = False
     head["steps"] = sum(1 for r in walk["steps"] if r["i"] > 0)
     if walk.get("expect") is not None:
         head["expect"] = walk["expect"]
@@ -2024,7 +2444,7 @@ def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) ->
     findings = [{k: f[k] for k in ("code", "sev", "refs", "basis", "msg", "fix") if f.get(k) is not None}
                 for f in walk.get("findings") or []]
     hints = next_hints(walk)
-    speak_len, n_findings = 48, 8
+    speak_len, merged, msg_len = 48, False, None
     lines_all = walk["steps"]
     while True:
         lines = [_line(r, speak_len) for r in lines_all]
@@ -2033,9 +2453,19 @@ def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) ->
             half = keep // 2
             lines = lines[:half] + [f"… {len(lines) - keep} lines omitted (full walk in 'saved') …"] \
                 + lines[len(lines) - (keep - half):]
-        out = dict(head, lines=lines, findings=findings[:n_findings])
-        if len(findings) > n_findings:
-            out["findings_omitted"] = len(findings) - n_findings
+        fs = findings
+        if merged:  # one per code: the first, with how many there are
+            by: Dict[str, Dict[str, Any]] = {}
+            for f in findings:
+                if f["code"] in by:
+                    by[f["code"]]["n"] = by[f["code"]].get("n", 1) + 1
+                else:
+                    by[f["code"]] = dict(f)
+            fs = list(by.values())
+        if msg_len is not None:
+            fs = [dict(f, msg=f["msg"][:msg_len], **({"fix": f["fix"][:msg_len]}
+                                                     if f.get("fix") else {})) for f in fs]
+        out = dict(head, lines=lines, findings=fs)
         if hints:
             out["next"] = hints
         if walk.get("saved"):
@@ -2043,14 +2473,18 @@ def compact(walk: Dict[str, Any], max_lines: int = 60, max_bytes: int = 5000) ->
         size = len(json.dumps(out, ensure_ascii=False).encode())
         if size <= max_bytes:
             return out
-        if speak_len > 24:
+        if not merged:
+            merged = True
+        elif msg_len is None:
+            msg_len = 120
+        elif speak_len > 24:
             speak_len -= 8
-        elif n_findings > 3:
-            n_findings -= 1
         elif hints:
             hints = hints[:-1]
         elif max_lines > 12:
             max_lines = max(12, max_lines - 8)
+        elif msg_len > 40:
+            msg_len = 40
         else:
             return out
 
@@ -2059,6 +2493,11 @@ def next_hints(walk: Dict[str, Any]) -> List[str]:
     hints: List[str] = []
     codes = {f["code"] for f in walk.get("findings") or []}
     legacy = walk.get("legacy_ids")
+    if walk.get("talkback_started") == "after_app" and not walk.get("relaunch") and (
+            BOUND_BEFORE_NOTE in (walk.get("notes") or [])
+            or any(str(f.get("basis")) == "unverified: after_app"
+                   for f in walk.get("findings") or [])):
+        hints.append("tb_walk(relaunch=true): TalkBack on before the app, as its users have it")
     for f in walk.get("findings") or []:
         ref = (f.get("keys") or [None])[0]
         if ref and not legacy and f["code"] != "model.mismatch":

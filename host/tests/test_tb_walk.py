@@ -203,7 +203,9 @@ def test_two_presses_that_move_nothing_are_stuck(probe):
     res = walk(probe)
     assert res["ended"] == "stuck"
     assert res["lines"][-2:] == ["4. — edge", "5. — edge"]
-    assert [f["code"] for f in res["findings"]][:1] == ["tb.edge_stuck"]
+    stuck_f = [f for f in res["findings"] if f["code"] == "tb.edge_stuck"]
+    # TalkBack came on after the app (no relaunch): a user's app may not stick there
+    assert stuck_f and stuck_f[0]["basis"] == "unverified: after_app"
 
 
 def test_leaving_the_app_ends_the_walk(probe):
@@ -1269,3 +1271,300 @@ def test_cli_tb_walk_json_to_a_file_as_the_legacy_cli_did(probe, run_cli, tmp_pa
                 "--json", str(out))
     assert r.rc == 0, r
     assert json.loads(out.read_text())["ended"] == "wrap" and r.out == ""
+
+
+# --------------------------------------------------------------------------- #
+# G15: an unproven keyboard is proven in place before any keymap switch
+# --------------------------------------------------------------------------- #
+def _no_error(res, codes=("tb.trap", "tb.edge_stuck")):
+    return not [f for f in res["findings"] if f["code"] in codes and f["sev"] == "error"]
+
+
+def test_a_keyboard_ignored_after_an_a11y_act_start_is_proven_not_switched(probe):
+    """Hunt wvlytwx: the walk started on a node the agent focused (A11yAct), so the
+    keyboard had never moved focus; two presses that did nothing switched it to the
+    classic keymap TalkBack 17 does not bind, and every later press fabricated a trap.
+    Here TalkBack ignores the first two keys: the keyboard is proven from the stop before
+    (focused through the agent), the walk stays on the enhanced keymap and finishes."""
+    ignored = []
+
+    def deaf(tb, action):
+        if action == "next" and tb.focus == tb_item(5) and len(ignored) < 2:
+            ignored.append(action)
+            return True
+        return False
+
+    probe.talkback.on_press = deaf
+    res = walk(probe, start="view:1025", max_steps=16)
+    rec = saved(res)
+    assert rec["start_via"] == "a11y_act" and len(ignored) == 2
+    assert res["talkback"].endswith("uinput/enhanced"), res["talkback"]
+    assert not any("classic" in n for n in res.get("notes") or [])
+    assert rec["injector_proven"] is True
+    assert rec["proof"] == "next moved focus from view:1024"
+    assert res["ended"] == "wrap" and _no_error(res), res["findings"]
+    assert probe.system_backs == 0 and fakeagent.key_safety_violations(probe) == []
+
+
+def test_an_edge_talkback_logged_proves_the_keyboard(probe):
+    """TalkBack said "Reach edge" for the presses: it took them; no switch, no proof press."""
+    def stuck(tb, action):
+        if action == "next" and tb.focus == tb_item(5):
+            tb.log("FocusProcessor-LogicalNav: Reach edge before wrap")
+            return True
+        return False
+
+    probe.talkback.on_press = stuck
+    res = walk(probe, start="view:1025", max_steps=8)
+    rec = saved(res)
+    assert rec["proof"] == "TalkBack logged an edge" and rec["injector_proven"] is True
+    assert res["ended"] == "stuck" and res["talkback"].endswith("uinput/enhanced")
+    # a proven keyboard stuck for real: only the start order (TalkBack after the app) is
+    # left to doubt, not the keyboard
+    assert [f["basis"] for f in res["findings"] if f["code"] == "tb.edge_stuck"] == \
+        ["unverified: after_app"]
+
+
+def test_a_keyboard_that_never_moves_focus_makes_stuck_unverified(probe):
+    def deaf(tb, action):
+        return action == "next"  # TalkBack takes no key from this keyboard at all
+
+    probe.talkback.on_press = deaf
+    res = walk(probe, start="view:1025", max_steps=8)
+    rec = saved(res)
+    assert rec["injector_proven"] is False and res["ended"] == "stuck"
+    stuck = [f for f in res["findings"] if f["code"] == "tb.edge_stuck"]
+    assert stuck and stuck[0]["sev"] == "info" and stuck[0]["basis"] == "unverified: injector"
+    assert _no_error(res)
+    assert fakeagent.key_safety_violations(probe) == [] and probe.system_backs == 0
+
+
+def test_the_classic_keymap_is_still_found_when_proof_fails(tb_env):
+    tb_env.scene_factory = fakeagent.talkback_scene
+    tb_env.talkback.order = list(ORDER)
+    tb_env.talkback.keymap = "classic"
+    res = walk(tb_env, start="view:1022", max_steps=12)
+    assert res["talkback"].endswith("uinput/classic")
+    assert saved(res)["injector_proven"] is True and tb_env.system_backs == 0
+
+
+# --------------------------------------------------------------------------- #
+# G10: a move repeated after TalkBack scrolled is not yet a loop
+# --------------------------------------------------------------------------- #
+def _shift_rows(dev, dy):
+    views = _views(dev.live_scene(PKG))
+    for v in views[1011].children:  # the list moved: every row sits dy px higher
+        x, y, w, h = v.bounds
+        v.bounds = (x, y - dy, w, h)
+    dev.agent(PKG).a11y_tap.record(fakeagent.TYPE_VIEW_SCROLLED, 1001, 1010, -1,
+                                   scroll_delta_y=dy)
+
+
+def test_a_re_read_after_an_auto_scroll_is_not_a_loop(probe):
+    """Hunt wc8drkq: after an auto-scroll TalkBack read a row again and went on from it;
+    the walk ended 'loop' on the repeated move. With the rows elsewhere (the list
+    scrolled) it is no loop: the walk goes on to the edge and wraps."""
+    state = {"scrolled": False}
+
+    def scroll_back(tb, action):
+        if action == "next" and tb.focus == tb_item(1) and not state["scrolled"]:
+            state["scrolled"] = True
+            _shift_rows(tb.device, 40)
+            tb.set_focus(tb_item(0))  # TalkBack re-reads the row it scrolled to
+            return True
+        return False
+
+    probe.talkback.on_press = scroll_back
+    res = walk(probe, max_steps=20)
+    assert res["ended"] == "wrap", res["lines"]
+    assert not [f for f in res["findings"] if f["code"] == "tb.loop"]
+
+
+def test_a_cycle_whose_boxes_drift_is_a_loop_after_two_confirming_presses(probe):
+    succ = {None: TB_TITLE, TB_TITLE: tb_item(0), tb_item(0): tb_item(1),
+            tb_item(1): tb_item(2), tb_item(2): tb_item(0)}
+
+    def cycle(tb, action):
+        if action != "next":
+            return False
+        _shift_rows(tb.device, 1)  # a scroll offset that never comes back
+        tb.set_focus(succ[tb.focus])
+        return True
+
+    probe.talkback.on_press = cycle
+    res = walk(probe, max_steps=20)
+    assert res["ended"] == "loop"
+    assert saved(res)["cycle"] == ["view:1020", "view:1021", "view:1022"]
+    # the first repeat (step 6: Item 0 -> Item 1 again) plus two presses that repeat too
+    assert res["steps"] == 8
+    assert [f["sev"] for f in res["findings"] if f["code"] == "tb.loop"] == ["error"]
+
+
+# --------------------------------------------------------------------------- #
+# G21: focus that moves on into the soft keyboard
+# --------------------------------------------------------------------------- #
+def test_focus_moving_into_the_keyboard_ends_the_walk_as_ime(probe):
+    """Hunt whf4las / wiuvqit: after "Message text. Edit box" TalkBack moved on into the
+    keyboard's window, which the agent cannot see; the walk said stuck + focus lost."""
+    def into_ime(tb, action):
+        if action == "next" and tb.focus == tb_item(2):
+            tb.set_focus(None)  # the app's node loses accessibility focus
+            tb.device.ime_focus = "English (US) (QWERTY)"
+            return True
+        return tb.device.ime_focus is not None  # moves inside the keyboard: unseen
+
+    probe.talkback.on_press = into_ime
+    try:
+        res = walk(probe, max_steps=12)
+    finally:
+        probe.ime_focus = None
+    assert res["ended"] == "ime", res["lines"]
+    assert res["lines"][-1] == "5. — focus left the app into the keyboard (English (US) (QWERTY))"
+    assert not [f for f in res["findings"] if f["code"] in ("tb.edge_stuck", "tb.focus_lost")]
+    assert any("hide it (BACK)" in n for n in res["notes"])
+    rec = saved(res)
+    assert rec["steps"][-1]["via"] == "ime" and rec["injector_proven"] is True
+
+
+def test_the_ime_window_is_read_from_dumpsys_accessibility(tb_env):
+    tb_env.talkback.permission_on_start = False
+    tbdevice.enable(SERIAL, PKG)
+    try:
+        assert tbdevice.a11y_focus_window(SERIAL) is None  # nothing focused yet
+        tb_env.ime_focus = "Gboard"
+        w = tbdevice.a11y_focus_window(SERIAL)
+        assert w == {"id": 9001, "type": "TYPE_INPUT_METHOD", "title": "Gboard"}
+    finally:
+        tb_env.ime_focus = None
+        tbdevice.restore(SERIAL)
+
+
+# --------------------------------------------------------------------------- #
+# G24 / G2: TalkBack's words, whole and on the right step
+# --------------------------------------------------------------------------- #
+#: How logcat prints TalkBack's multi-line ttsOutput (emulator-5558, TalkBack 17: a
+#: Thunderbird message body "First line\nSecond line\nThird"): every line carries the
+#: header and TalkBack's class prefix; the last one ends in queueMode.
+_H = "         1790846314.872 22875 22875 V talkback: "
+MULTILINE = [
+    _H + "EventTypeViewAccessibilityFocusedFeedbackRule:  viewAccessibilityFocused: (606558) , "
+         "ttsOutput={Editing. First line Second line Third. Edit box}, isInitialFocus=false, "
+         "isRestoreFocusOrEnsureOnScreen=false, isEventNavigateByUser=true, "
+         "isDeviceScreenNoTouch=false,",
+    _H + "TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:  ttsOutput= Editing. First line",
+    _H + "TalkBackFeedbackProvider: Second line",
+    _H + "TalkBackFeedbackProvider: Third. Edit box    queueMode=9  ttsAddToHistory  "
+         "forceFeedbackEvenIfAudioPlaybackActive",
+    _H.replace(" V ", " D ") + "Pipeline: execute() feedback=Feedback{eventId=type:...}",
+    "         1790846315.002 22875 22875 V talkback: TalkBackFeedbackProvider:  TYPE_ANNOUNCEMENT:  "
+    "ttsOutput= 1 selected    queueMode=0",
+    "         1790846315.010 22875 22875 V talkback: TalkBackFeedbackProvider:  EVENT_SPEAK_HINT:  "
+    "ttsOutput= Press select to activate    queueMode=0",
+]
+
+
+def test_a_multi_line_utterance_is_one_event():
+    """Hunt wtvdjj3 step 10: the line reader kept only the first line of a multi-line
+    utterance."""
+    log = tbwalk.TalkBackLog(SERIAL)
+    for i, ln in enumerate(MULTILINE):
+        log.feed(ln, now=float(i))
+    log._flush()
+    assert log.since(0, "tts") == [(1.0, "tts", "Editing. First line\nSecond line\nThird. Edit box")]
+    assert log.since(0, "reason") == [(0.0, "reason", "isEventNavigateByUser")]
+    assert log.since(0, "announce") == [(5.0, "announce", "TYPE_ANNOUNCEMENT: 1 selected")]
+    assert log.since(0, "hint") == [(6.0, "hint", "Press select to activate")]
+
+
+def test_continuation_lines_without_a_header_are_joined_too():
+    log = tbwalk.TalkBackLog(SERIAL)
+    for ln in ["I talkback: TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:  "
+               "ttsOutput= Show notes", "If your fridge can be bricked",
+               "it is not yours    queueMode=0",
+               "V talkback: FocusProcessor-LogicalNav: Reach edge before wrap"]:
+        log.feed(ln, now=1.0)
+    assert [e[1:] for e in log.since(0)] == [
+        ("tts", "Show notes\nIf your fridge can be bricked\nit is not yours"), ("edge", "")]
+
+
+def _stp(i, t, key, label, moved=True, edge=False):
+    n = tbwalk.Node()
+    n.key, n.label, n.text, n.cd, n.cls, n.flags, n.children, n.parent = (
+        key, label, label, "", "android.widget.Button", set(), [], None)
+    n.virtual, n.actions = -1, set()
+    return tbwalk.Step(i, key, moved=moved, edge=edge, t=t, node=n if key else None)
+
+
+def test_a_late_move_keeps_its_own_words(monkeypatch):
+    """wyymb0o step 17: TalkBack auto-scrolled and announced the row only after the next
+    press was sent; the walk printed the model's stale words for it."""
+    steps = [_stp(0, 0.0, "view:1", "Compose"), _stp(1, 1.0, "view:2", "Testing"),
+             _stp(2, 3.0, "view:3", "Data Storage")]
+    log = tbwalk.TalkBackLog(SERIAL)
+    log.events = [(1.01, "tts", "Not selected. Testing.")]  # hmm: step 1's own, in time
+    assert tbwalk._attribute_tts(steps, log) == {1: "Not selected. Testing."}
+    log.events = [(3.01, "tts", "Not selected. Testing."),  # step 1's, late
+                  (3.05, "tts", "Not selected. Data Storage.")]
+    assert tbwalk._attribute_tts(steps, log) == {1: "Not selected. Testing.",
+                                                 2: "Not selected. Data Storage."}
+    # a re-announcement of the same stop is not moved back
+    log.events = [(3.01, "tts", "Data Storage"), (3.05, "tts", "Not selected. Data Storage.")]
+    assert tbwalk._attribute_tts(steps, log) == {2: "Not selected. Data Storage."}
+
+
+def test_the_start_reached_by_a_press_has_talkbacks_words(probe):
+    probe.talkback.focus = tb_item(3)
+    res = walk(probe, start="first", until="edge")
+    rec = saved(res)
+    assert rec["steps"][0]["utt"] == "logcat" and rec["steps"][0]["speak"] == "Title"
+    assert res["utterance"] == "logcat 7/7"
+
+
+def test_utterance_auto_turning_talkback_on_reads_its_log(probe):
+    """G2: auto sets VERBOSE while it turns TalkBack on (restore puts it back): 'logcat n/n'."""
+    res = walk(probe)
+    assert res["utterance"] == "logcat 8/8"
+    assert probe.talkback.log_level == "ERROR" and probe.uiautomator_while_on == 0
+
+
+def test_chained_walks_after_talkback_on_keep_reading_its_log(probe):
+    """Hunt wu79mcx: talkback on, then walks with leave_on lost logcat ("log level
+    unchanged"). talkback on sets VERBOSE by default and it stays until restore."""
+    on = tbdevice.action(SERIAL, "on", package=PKG, verbose_log=True)
+    assert on["log_level"] == {"before": "ERROR", "after": "VERBOSE"}
+    try:
+        for _ in range(2):  # the second starts where the first ended (Title): 7 moves
+            res = walk(probe, leave_on=True)
+            n = res["steps"] - 1  # the edge moves nothing
+            assert res["utterance"] == f"logcat {n}/{n}", res
+            assert not res.get("notes")
+    finally:
+        tbdevice.action(SERIAL, "restore")
+    assert probe.talkback.log_level == "ERROR"
+
+
+def test_a_model_fallback_says_why_in_a_short_note(probe, monkeypatch):
+    """TalkBack already on at its own (non-verbose) level: the words are the model's,
+    and the note says how to get TalkBack's."""
+    probe.talkback.permission_on_start = False
+    tbdevice.enable(SERIAL, PKG)  # on, without VERBOSE
+    try:
+        res = walk(probe, leave_on=True)
+    finally:
+        tbdevice.restore(SERIAL)
+    assert res["utterance"] == "model"
+    note = next(n for n in res["notes"] if n.startswith("speech is the model's"))
+    assert "already on" in note and "talkback(action='off')" in note
+    assert len(note.encode()) <= 160
+
+
+def test_a_log_level_that_cannot_be_set_is_no_failure_for_auto(probe, monkeypatch):
+    def broken(serial, level, record=False):
+        raise tbdevice.TalkBackError("log_level_failed", "no Log output level row")
+
+    monkeypatch.setattr(tbdevice, "set_log_level", broken)
+    res = walk(probe)
+    assert res["ended"] == "wrap" and res["utterance"] == "model"
+    assert any("log level was not set" in n for n in res["notes"])
+    with pytest.raises(tbdevice.TalkBackError):
+        walk(probe, utterance="logcat")  # asked for TalkBack's words: a failure
