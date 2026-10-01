@@ -53,6 +53,35 @@ def slot_table_note(flag: str, warning: str) -> str:
             f"names/params/file:line. WARNING: " + warning % flag)
 
 
+#: Diagnostics tokens that say Compose cannot be read in this app, so a hot
+#: reload (enable_inspection) cannot populate a slot table either.
+COMPOSE_UNREADABLE_TOKENS = ("compose_obfuscated", "semantics_failed")
+NO_COMPOSE_NOTE = ("no slot table: no AndroidComposeView on screen (this UI has no Compose); "
+                   "enable_inspection would only hot-reload the app")
+UNREADABLE_COMPOSE_NOTE = ("no slot table: Compose in this build cannot be read ({tokens} in "
+                           "diagnostics); enable_inspection cannot populate it and would "
+                           "only hot-reload the app")
+
+
+def compose_note(data: Mapping[str, Any], flag: str, warning: str) -> str | None:
+    """dump_compose's ``note`` when the slot table came back empty (``data`` is
+    ``strings.dump_compose_to_dict``'s, fetched without enable_inspection), for
+    both surfaces: how to populate it, or why it cannot be (no ComposeView, or
+    Compose obfuscated / unreadable), so the destructive ``flag`` is only
+    suggested when it can help. None when the slot table is populated."""
+    from . import strings
+
+    if strings.compose_slot_table_populated(dict(data)):
+        return None
+    if not data.get("windows"):
+        return NO_COMPOSE_NOTE
+    diag = str(data.get("diagnostics") or "")
+    hits = [t for t in COMPOSE_UNREADABLE_TOKENS if t in diag]
+    if hits:
+        return UNREADABLE_COMPOSE_NOTE.format(tokens=", ".join(hits))
+    return slot_table_note(flag, warning)
+
+
 def a11y_lint(report: Mapping[str, Any], serial: str, package: str) -> dict[str, Any]:
     """``a11y_lint``: ``LintReport.to_dict()`` plus whether contrast was sampled."""
     stats = report.get("stats") or {}
@@ -66,5 +95,5 @@ def inspect(merged: Mapping[str, Any], serial: str, package: str) -> dict[str, A
             "summary": merged.get("summary", {}), "sources": merged.get("sources", {})}
 
 
-__all__ = ["a11y_lint", "dump_tree", "get_properties", "inspect", "slot_table_note",
-           "with_target"]
+__all__ = ["a11y_lint", "compose_note", "dump_tree", "get_properties", "inspect",
+           "slot_table_note", "with_target"]

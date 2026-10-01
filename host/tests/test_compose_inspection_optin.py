@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 import cli
 import mcp_server
 from inspector_widget import Session, strings
@@ -62,3 +64,49 @@ def test_mcp_semantics_only_dump_adds_note(monkeypatch):
     assert "error" not in result, result
     assert "enable_inspection=true hot-reloads" in result["note"]
     assert "--enable-inspection hot-reloads" in strings.ENABLE_INSPECTION_WARNING % "--enable-inspection"
+
+
+def _compose_resp(windows: int, diagnostics: str):
+    resp = pb.DumpComposeResponse()
+    for i in range(windows):
+        window = resp.windows.add()
+        window.root.id = 100 + i
+        window.root.kind = pb.ComposeNode.COMPOSABLE
+    resp.diagnostics = diagnostics
+    return resp
+
+
+@pytest.mark.parametrize("windows,diag,suggests", [
+    (0, "found 0 AndroidComposeView(s); bounds=screen", False),
+    (1, "found 1 AndroidComposeView(s); bounds=screen; compose_obfuscated: Compose present "
+        "but classes are renamed (AndroidComposeView is a.b), semantics/slot table "
+        "unavailable, a11y still works; view#100 produced no compose nodes", False),
+    (1, "found 1 AndroidComposeView(s); bounds=screen; semantics_failed: view#100 "
+        "owner_unreachable", False),
+    (1, "found 1 AndroidComposeView(s); bounds=screen; slot table empty "
+        "(inspection_slot_table_set not populated) for 1/1 view(s)", True),
+])
+def test_the_hot_reload_is_suggested_only_where_it_can_help(monkeypatch, windows, diag,
+                                                            suggests):
+    """No ComposeView, an obfuscated Compose or a failed semantics read: the slot
+    table cannot be populated, so neither surface recommends the destructive
+    enable_inspection; both say why instead (backlog: agent-hardening)."""
+    resp = _compose_resp(windows, diag)
+
+    class FakeSession:
+        def dump_compose(self, **kwargs):
+            return resp
+
+    monkeypatch.setattr(mcp_server.SESSIONS, "get_or_attach", lambda serial, package: FakeSession())
+    note = mcp_server._run_tool("dump_compose", {"serial": "s", "package": "p"})["note"]
+    assert ("enable_inspection=true hot-reloads" in note) is suggests, note
+    assert ("Pass enable_inspection" in note) is suggests
+    if not suggests:
+        assert note.startswith("no slot table")
+    from inspector_widget import results
+    data = strings.dump_compose_to_dict(resp)
+    cli_note = results.compose_note(data, "--enable-inspection",
+                                    strings.ENABLE_INSPECTION_WARNING)
+    assert ("--enable-inspection hot-reloads" in cli_note) is suggests
+    if not suggests:
+        assert cli_note == note  # the same words on both surfaces

@@ -228,20 +228,25 @@ def cmd_compose(args) -> int:
         )
         data = stringsmod.dump_compose_to_dict(comp)
         print(f"compose: {data.get('diagnostics','')}", file=sys.stderr)
-        if (not args.no_slot_table and not args.enable_inspection
-                and not stringsmod.compose_slot_table_populated(data)):
+        note = None
+        if not args.no_slot_table and not args.enable_inspection:
+            # The MCP's note, in this surface's spelling: never suggests the
+            # destructive hot reload where it cannot help (no Compose, obfuscated).
+            note = results.compose_note(data, "--enable-inspection",
+                                        stringsmod.ENABLE_INSPECTION_WARNING)
+        if note and note.startswith("slot table not populated"):
             print("compose: slot table not populated (semantics only). Re-run with "
                   "--enable-inspection for composable names/params/file:line. WARNING: "
                   + stringsmod.ENABLE_INSPECTION_WARNING % "--enable-inspection", file=sys.stderr)
+        elif note:
+            print(f"compose: {note}", file=sys.stderr)
         roots = [w["root"] for w in data.get("windows", []) if w.get("root")]
 
         rc = 0
         if args.json:
             result = results.with_target(data, args.serial, args.package)
-            if (not args.no_slot_table and not args.enable_inspection
-                    and not stringsmod.compose_slot_table_populated(data)):
-                result["note"] = results.slot_table_note(
-                    "--enable-inspection", stringsmod.ENABLE_INSPECTION_WARNING)
+            if note:
+                result["note"] = note
             rc = _emit_result(args, "dump_compose", data, result, what="compose JSON")
         else:
             lines = []

@@ -76,6 +76,10 @@ G1_COMMIT = "f2d308280ee5"
 _E3_FLAGS = ("E3: GRAVITY/INT_FLAG properties carry the agent's flag string as their value "
              "(it was 0 beside a label, or 0 alone in the MCP)")
 
+_NO_COMPOSE = ("a screen without a ComposeView (or with an obfuscated / unreadable Compose) "
+               "says why it has no slot table instead of recommending the destructive "
+               "enable_inspection hot reload (results.compose_note)")
+
 #: Legacy entries re-recorded after G1, and why: the only allowed deltas. Each
 #: carries its reason in the golden entry (``delta``).
 LEGACY_DELTAS: dict[tuple[str, str], str] = {
@@ -91,6 +95,9 @@ LEGACY_DELTAS: dict[tuple[str, str], str] = {
     ("cli", "dump_props"): _E3_FLAGS,
     ("cli", "get_properties"): _E3_FLAGS,
     ("cli", "inspect_node"): _E3_FLAGS,
+    ("mcp", "dump_compose"): _NO_COMPOSE,
+    ("cli", "compose"): _NO_COMPOSE,
+    ("cli", "compose_text"): _NO_COMPOSE,
 }
 
 

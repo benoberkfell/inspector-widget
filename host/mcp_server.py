@@ -716,9 +716,10 @@ def tool_dump_compose(
                                 include_slot_table=include_slot_table,
                                 enable_inspection=enable_inspection)
     data = results.with_target(st.dump_compose_to_dict(resp), serial, package)
-    if include_slot_table and not enable_inspection and not st.compose_slot_table_populated(data):
-        data["note"] = results.slot_table_note("enable_inspection=true",
-                                               st.ENABLE_INSPECTION_WARNING)
+    if include_slot_table and not enable_inspection:
+        note = results.compose_note(data, "enable_inspection=true", st.ENABLE_INSPECTION_WARNING)
+        if note:
+            data["note"] = note
     return data
 
 
