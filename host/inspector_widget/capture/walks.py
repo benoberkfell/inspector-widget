@@ -526,13 +526,13 @@ def bind_walk(record: dict[str, Any], binding: Binding,
         cov = s.get("covered_by")
         if isinstance(cov, dict) and cov.get("overlay"):
             cov["ref"] = _bind_key(binding, cov["overlay"], at)
-        # What the step's capture knows is drawn above what decides (the walk's own guess
-        # compares drawing orders across Views the dump hoists: V5 live, the card's heading
-        # "behind" the scrim drawn under it, the buttons the scrim covers not)
         if s.get("cap") and not s.get("unbound"):
             rank = binding.vrank(s["cap"], s.get("ref"), s.get("bounds"))
             if rank is not None:
                 s["vrank"] = rank  # the out-of-order check reads the capture's visual order
+        # What the step's capture knows is drawn above what decides (the walk's own guess
+        # compares drawing orders across Views the dump hoists: V5 live, the card's heading
+        # "behind" the scrim drawn under it, the buttons the scrim covers not)
         known = binding.covered(s.get("cap")) if s.get("cap") and not s.get("unbound") \
             else None
         if known is not None:
