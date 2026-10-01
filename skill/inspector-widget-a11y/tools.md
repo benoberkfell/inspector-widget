@@ -4,7 +4,8 @@ The Inspector Widget MCP server (codename `viewspector`, at `host/mcp_server.py`
 has 26 tools and lists 18 by default: the 15 inspection tools below and the 3
 TalkBack tools. The 8 capture-and-walk tools are listed with
 `INSPECTOR_WIDGET_TOOLSET=capture` (or `all`; every tool stays callable by
-name). The host CLI (`host/cli.py`) mirrors all of them in 24 subcommands for
+name); `capture,talkback` lists them with the TalkBack tools, the set for
+TalkBack navigation bugs. The host CLI (`host/cli.py`) mirrors all of them in 24 subcommands for
 scripting. This is the reference for the accessibility workflow plus the
 View/Compose tools you may reach for, and the MCP↔CLI mapping.
 
@@ -33,8 +34,10 @@ the reply: a larger result becomes a **spill envelope** `{truncated, tool,
 bytes, max_bytes, summary, preview, spill_path, hint}` of at most 3,000 bytes,
 with the whole brief result in the `spill_path` file (read it with jq). The
 hint says what to narrow; `max_bytes` exists on `dump_tree`, `get_properties`,
-`dump_compose`, `dump_accessibility`, `a11y_lint`, `inspect` and `tb_walk`
-(for the others, only `INSPECTOR_WIDGET_MAX_BYTES` raises it).
+`dump_compose`, `dump_accessibility`, `a11y_lint` and `inspect` (for the
+others, only `INSPECTOR_WIDGET_MAX_BYTES` raises it). The capture-and-walk and
+TalkBack tools budget themselves instead (`max_bytes` per tool, an explicit
+`truncated` / omitted marker, never a spill).
 
 ### Discovery / session
 - **`list_devices()`** → `{devices:[{serial, api, abi, model, state}], count}`.
@@ -134,15 +137,37 @@ hint says what to narrow; `max_bytes` exists on `dump_tree`, `get_properties`,
   `a11y~IoU`), grey `none`).
 
 ### TalkBack (device-wide: TalkBack runs for every app; settings are restored)
-- **`talkback(serial, action=status|on|off|restore, package?)`** → TalkBack state,
-  or what changed.
-- **`tb_walk(serial, package, start="current", direction="next", max_steps=60,
-  until="wrap", expect=[...], ...)`** → presses the real TalkBack's next/previous,
-  records where focus lands and diffs that order with the predicted one
-  (`dump_accessibility`'s `focus_order`) and a visual order.
-- **`tb_scenario(serial, package, kind=focus_after|restore|survive, target?,
-  action="activate", ...)`** → where real TalkBack focus goes after an action,
-  after back, or after a list update.
+Listed in the default toolset (in their pre-capture shape) and with
+`INSPECTOR_WIDGET_TOOLSET=talkback`, `capture,talkback` or `all`; one
+implementation either way, so results name capture refs. Failures are error
+envelopes with a code (`talkback_unavailable`, `busy`, `injector_failed`,
+`start_not_found`, `app_left_foreground` ...). Never retried.
+- **`talkback(action=status|on|off|restore, serial?, package?, verbose_log=false)`**
+  → TalkBack state, or what changed (`on` snapshots the settings first).
+- **`tb_walk(serial?, package?, start="current", direction="next", max_steps=60,
+  until="wrap", expect=[...], recapture="on_unknown", leave_on=false, ...)`** →
+  captures the screen with TalkBack on, presses the real TalkBack's
+  next/previous, and returns `{capture, walk, recaptured?, start, steps, ended,
+  lines, diff, findings, restore, next}` (at most 5 KB at 60 steps): one line
+  per step by ref (`3. n14 "Add to favorites, Button" via=autoscroll(n10)
+  !double_stop`), `diff` = actual vs model by class and ref (`model`, `skip`,
+  `double`, `out_of_order`, `loop`, `trap`, `escape`, `stuck`, `left_app` ...).
+  `start` and `expect` take refs, selectors (`@tag`, `#rid`, `Type"label"`) or
+  labels. Focus on a node no capture holds (scrolled in) recaptures, at most
+  once per 3 steps. Stored as `<store>/walks/<id>.json`.
+- **`tb_scenario(kind=focus_after|restore|survive, serial?, package?, target?,
+  action="activate", mutate?, wait_ms=2000, ...)`** → where real TalkBack focus
+  goes after an action (`activate`, `back`, `tap:<ref>`, `key:<combo>`), after
+  back, or after a list update (`mutate`); `{scenario, capture, after, target,
+  did, timeline, focus, verdict, finding?, cause?, restore}` (at most 1 KB;
+  `cause` from the before / after captures).
+- **`image(overlay="walk", walk=<id>)`** draws a walk on its capture (numbered
+  arcs in TalkBack's order, the model's next stop dashed, mismatches red);
+  **`captures(what="walks")`** lists the stored walks, `captures(action="show",
+  id=<walk id>)` shows every step.
+- The loop: `capture -> lint(rules=["tb"]) -> outline(view="reading",
+  explain=true) -> node(ref, facets="tb") -> tb_walk(start=ref) ->
+  image(overlay="walk")` (SKILL.md §5).
 
 ### Capture and walk (`INSPECTOR_WIDGET_TOOLSET=capture` or `all`)
 Capture once, keep it by id, walk it with small budgeted queries (no device
@@ -160,7 +185,11 @@ I/O after the capture). Refs (`n23`) carry across captures of one app.
   (one bug repeated in list cells is one `×N in <list> cells` line),
   **`diff(a="prev", b="latest")`** (issue deltas only on nodes both captures
   hold: `resolved`, `new`, plus `gone_with_node` / `on_new_nodes` counts), and
-  **`captures(action=list|show|pin|unpin|label|drop|export|gc)`**.
+  **`captures(action=list|show|pin|unpin|label|drop|export|gc, what=...)`**
+  (`what="walks"`: the stored TalkBack walks). The TalkBack model runs on a
+  capture: `outline(view="reading", explain=true, include_skipped=true, from=,
+  direction=, granularity=)`, `node(ref, facets="tb")` and `lint(rules=["tb"])`
+  ([rules.md](rules.md#talkback-navigation-rules-tb)).
 - `serial`/`package` default to this caller's own last attach or capture (the
   MCP server's; `INSPECTOR_WIDGET_SESSION=serial/package` for a CLI), then the
   store's shared default; a query resolved by the shared default while the
@@ -191,16 +220,17 @@ python host/cli.py a11y-lint  --serial SERIAL --package PKG [--json -] [--rule R
 python host/cli.py inspect    --serial SERIAL --package PKG [--json -] [--properties] [--overlay out.png]
 python host/cli.py inspect-node    --serial SERIAL --package PKG (--node-key KEY | --view-id ID | --semantics-id ID | --bounds x,y,w,h) [--json -] [--no-image]
 python host/cli.py component-image --serial SERIAL --package PKG (--node-key KEY | ...) --out out.png
-python host/cli.py talkback   status|on|off|restore --serial SERIAL
-python host/cli.py tb-walk    --serial SERIAL --package PKG [--expect A,B,...] [--json -]
-python host/cli.py tb-scenario focus-after|restore|survive --serial SERIAL --package PKG [--json -]
+python host/cli.py talkback   [status|on|off|restore] [-s SERIAL] [--json]
+python host/cli.py tb-walk    [-s SERIAL] [-p PKG] [--start REF] [--prev] [--expect A,B ...] [--until edge] [--json]
+python host/cli.py tb-scenario focus-after|restore|survive [--target REF] [--action tap:REF] [--mutate ...] [--json]
 python host/cli.py capture    [-s SERIAL] [-p PKG] [--label L] [--json]      # prints the summary (-q: the id)
 python host/cli.py outline    [-c CAPTURE] [--view reading] [--root SEL] [--fields -bounds] [--json]
 python host/cli.py find       [-c CAPTURE] [--type T] [--tag T] [--flags click] [--max-dp 47] [--count] [--json]
 python host/cli.py node       REF [REF...] [--props nondefault] [--json]
 python host/cli.py lint       [-c CAPTURE] [--rule R1] [--within SEL] [--json]
 python host/cli.py diff       [A] [B] [--json]
-python host/cli.py captures   [ls|show|pin|unpin|label|rm|export|gc] [ID] [LABEL]
+python host/cli.py captures   [ls|show|pin|unpin|label|rm|export|gc] [ID] [LABEL] [--what walks]
+python host/cli.py image      [REF] [--overlay walk --walk WALK_ID] [--out out.png]
 ```
 
 The tree and lint subcommands take the MCP output parameters as flags with the
@@ -228,10 +258,7 @@ text with `--json`.
 | `inspect` | `inspect --json -` (`--overlay out.png`) |
 | `inspect_node` | `inspect-node --node-key KEY` (or `--view-id` / `--semantics-id` / `--bounds x,y,w,h`) |
 | `component_image` | `component-image --node-key KEY --out out.png` |
-| `talkback` | `talkback status\|on\|off\|restore` |
-| `tb_walk` | `tb-walk` |
-| `tb_scenario` | `tb-scenario focus-after\|restore\|survive` |
-| `capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`, `diff` | the same names (`--kebab-case` flags) |
+| `capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`, `diff`, `talkback`, `tb_walk`, `tb_scenario` | the same names (`--kebab-case` flags; `tb-walk --prev`, `tb-scenario focus-after`) |
 | `detach` | `detach` |
 
 `inspect-node` / `component-image` take the same keys and raise the same errors

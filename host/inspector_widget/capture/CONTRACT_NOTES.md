@@ -1391,14 +1391,38 @@ what now holds:
   `all` (26). The default is `legacy,talkback`: exactly the 18 tools (and the
   18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
   logs a warning and lists the default. Every tool stays callable by name.
-  Measured tools/list (compact): default 18,337 B, capture 11,634 (12,000),
-  legacy 13,247, capture,talkback 16,724, all 28,385 (the capture tools spend each
-  parameter description once; the instructions carry the rest). Instructions:
-  764 B (capture), 875 B (capture,talkback), 714 B (the default).
+  Measured tools/list (compact): default 18,337 B, capture 11,994 (12,000),
+  legacy 13,247, talkback 5,113, capture,talkback 15,521, all 27,182 (the capture
+  tools spend each parameter description once; the instructions carry the rest;
+  no listing averages over 1,300 B a tool). Instructions: 739 B (capture), 892 B
+  (capture,talkback and all), 718 B (the default).
+- **The TalkBack tools** (`talkback`, `tb_walk`, `tb_scenario`) are specs too
+  (toolset `talkback`), over `ops.talkback` / `ops.tb_walk` / `ops.tb_scenario`.
+  While the legacy tools are listed without the capture tools
+  (`surface.legacy_talkback`: the default), tools/list shows them in their
+  pre-capture shape (`mcp_server._TB_LEGACY_LISTING`), byte for byte; every
+  call validates against the surface spec (a superset) and runs the one
+  implementation. `cli_set` gives `tb-walk --prev`, `repeat` a repeatable
+  `--expect`. They are `destructiveHint` (and not idempotent), never retried.
+- **Walks** (`capture/walks.py`): `ops._TbCaptures` is the engine's hook
+  (`talkback.walk.run_walk(hook=, full=True)`, `scenarios.run_scenario(hook=)`):
+  a capture once TalkBack has settled (`props` off, diagnostic `taken with
+  TalkBack on (tb_walk)`; refs and selectors in `start`, `expect`, `target`,
+  `tap:` resolve there to node keys), a recapture when focus lands on a node no
+  capture holds (at most one per 3 steps, plus one at the end if needed), and a
+  scenario's before / after captures. `walks.Binding` maps each step's a11y node
+  key to the capture's ref (the latest capture taken at or before the step
+  first; a re-minted Compose id by class + label + IoU >= 0.8);
+  `walks.bind_walk` re-runs `talkback.diff.analyze` on the refs. Records are
+  `<store>/walks/<id>.json` (`w` + 6: a walk, `t` + 6: a scenario; the newest
+  100 kept, `gc(all=true)` wipes them), each with its `captures`.
 - **Instructions** (`instructions(listed)`, at most 900 B): the spec 5.13 text when
   `capture` is listed, else a legacy text naming the toolset variable; plus a
-  TalkBack sentence when `tb_walk` is listed. Sent in initialize by the SDK 1.x
-  and 2.x servers (a Server without the parameter gets none) and the fallback.
+  TalkBack sentence when `tb_walk` is listed (with the capture tools: the loop
+  `capture -> lint(rules=["tb"]) -> outline(view="reading",explain=true) ->
+  node(ref,facets="tb") -> tb_walk(start=ref) -> image(overlay="walk")`, also in
+  tb_walk's description). Sent in initialize by the SDK 1.x and 2.x servers (a
+  Server without the parameter gets none) and the fallback.
 - **Running.** `execute(name, args, ctx, surface=, passthrough=)` returns a
   `Result` (a dict, plus `images` and `is_error`); `run()` gives `(text, images,
   is_error)`. `image(inline=true)` adds `inline_tokens` to the text and the PNG

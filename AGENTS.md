@@ -213,7 +213,10 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 The capture-and-walk tools come from one registry, `inspector_widget/surface.py` (the MCP
 schemas and the CLI flags, same names and defaults), over `inspector_widget/ops.py`: `capture`
 snapshots the app once into the on-disk store both surfaces share; the others query a stored
-capture without device I/O. `INSPECTOR_WIDGET_TOOLSET` (`legacy`, `capture`, `talkback`, `all`,
+capture without device I/O. The TalkBack tools are in the same registry: `tb_walk` and
+`tb_scenario` capture the screen with TalkBack on, name every step by capture ref, and store the
+walk under `<store>/walks/` (`captures(what="walks")`, `image(overlay="walk")`); the default
+listing still shows their pre-capture schema, but every call runs `ops.tb_walk` & co. `INSPECTOR_WIDGET_TOOLSET` (`legacy`, `capture`, `talkback`, `all`,
 or a comma list) picks what the MCP server lists; the default is `legacy,talkback` until the
 deliberate flip (WP S4), and every tool stays callable by name. The MCP `instructions` name only
 listed tools (with the default listing, `dump_accessibility`'s `focus_order` is the predicted
