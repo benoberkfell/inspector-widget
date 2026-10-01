@@ -1750,6 +1750,8 @@ def _tb_walk_record(ctx: OpContext, hook: _TbCaptures, session: Any, opts: dict[
         settle_ms=opts["settle_ms"], recapture=opts["recapture"], utterance=opts["utterance"],
         injector=opts["injector"], leave_on=opts["leave_on"], save=False, hook=hook, full=True))
     record["id"] = record.get("walk") or tbwalk._walk_id()
+    # the engine's own note predates the capture store: say which captures were added
+    record["recapture"] = ", ".join(f"step {at}: {lc.id}" for at, lc in hook.taken[1:]) or None
     exp = hook.resolve_expect(list(expect) if expect else None)
     walks.bind_walk(record, hook.binding(), expect=exp)
     if expect:

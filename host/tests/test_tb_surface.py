@@ -245,6 +245,8 @@ def test_focus_on_a_node_no_capture_holds_recaptures(tb_env):
     assert re.match(r"^n\d+$", new["ref"]) and new["cap"] == res["recaptured"][0]
     old = next(s for s in rec["steps"] if s.get("key") == "view:1020")
     assert old["cap"] == res["capture"] and old["ref"] == "n6"
+    # the stored record names the recapture (not the engine's pre-store "model only")
+    assert rec["recapture"] == f"step {new['i']}: {res['recaptured'][0]}"
     # recapture="never": the scrolled-in item has no ref, and says so
     res2 = ok("tb_walk", recapture="never", until="edge", **FAST)
     assert "recaptured" not in res2
