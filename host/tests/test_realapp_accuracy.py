@@ -130,7 +130,8 @@ def test_real_app_lint_counts_now():
         "thunderbird_drawer": (1, 0, 2, 0),       # was 1, 11, 2: 11 R7 on unselected tabs
         "thunderbird_message": (1, 4, 4, 0),      # was 1, 1, 7: 3 real 40dp buttons excused
         "nia_feed": (0, 0, 14, 0),                # was 5, 0, 9: R1 on chips scrolled half away
-        "nia_settings_dialog": (0, 0, 4, 14),     # was 5, 0, 13 with 14 behind the dialog
+        "nia_settings_dialog": (0, 0, 0, 14),     # was 5, 0, 13 with 14 behind the dialog,
+                                                  # and 4 R12 on rows saying "Not selected"
     }
 
 

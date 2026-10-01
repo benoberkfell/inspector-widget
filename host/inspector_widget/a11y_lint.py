@@ -826,12 +826,16 @@ def _fix(n: _Node, view: str, compose: str, web: str) -> str:
 
 
 def _web_inline(n: _Node) -> bool:
-    """A web target in a run of text (WCAG 2.5.8's inline exception): a sibling with words
-    shares its line, so the line height sets its size (a link in a sentence or a list)."""
+    """A web target in a run of text (WCAG 2.5.8's inline exception): a sibling of plain text
+    (not a target itself) shares its line, so the line height sets its size (a link in a
+    sentence or a list). A row of links or buttons with nothing else on it is no such run."""
     if not _is_web(n) or n.parent is None or n.h <= 0:
         return False
     for sib in n.parent.children:
         if sib is n or sib.h <= 0 or not (sib.text or sib.cd).strip():
+            continue
+        if _actionable(sib) or {"focusable", "screen_reader_focusable"} & sib.flags \
+                or sib.role_description.lower() == "link":
             continue
         if sib.y < n.y + n.h and n.y < sib.y + sib.h:
             return True
@@ -859,7 +863,7 @@ class _Run:
         self.mode = mode
         self.source_diag = source_diag  # the dump's agent diagnostics (a11y-services=...)
         self._tb: Any = None
-        self._selected_tabs: Dict[int, int] = {}
+        self._selected_tabs: Dict[int, List[_Node]] = {}
         self.nodes: List[_Node] = []
         self.by_id: Dict[int, _Node] = {}
         self.label_for_targets: Set[int] = set()
@@ -960,16 +964,20 @@ class _Run:
         tn = tb[0].by_raw.get(id(n.raw)) if tb is not None else None
         return tb[1].focus_decision(tn) if tn is not None else None
 
-    def has_selected_tab(self, n: _Node) -> bool:
-        """A node with the Tab role other than ``n`` is selected in ``n``'s window."""
-        win = n.win
-        k = id(win)
-        if k not in self._selected_tabs:
-            self._selected_tabs[k] = sum(
-                1 for m in self.nodes if m.win is win and self.role(m) == "Tab"
-                and ("selected" in m.flags or (m.collection_item_info or {}).get("selected")))
-        own = 1 if ("selected" in n.flags or (n.collection_item_info or {}).get("selected")) else 0
-        return self._selected_tabs[k] - own > 0
+    def selected_tabs(self, root: _Node) -> List[_Node]:
+        """The selected nodes with the Tab role in ``root``'s subtree."""
+        k = id(root)
+        hit = self._selected_tabs.get(k)
+        if hit is None:
+            hit, stack = [], [root]
+            while stack:
+                m = stack.pop()
+                if self.role(m) == "Tab" and (
+                        "selected" in m.flags or (m.collection_item_info or {}).get("selected")):
+                    hit.append(m)
+                stack.extend(m.children)
+            self._selected_tabs[k] = hit
+        return hit
 
     # -- derived facts ------------------------------------------------------ #
     def dp(self, px: float) -> float:
@@ -1176,12 +1184,11 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
     if label:
         return []
     silent = bool(n.children) and run.focus_decision(n) == (False, "silent_container")
-    clickable = "clickable" in n.flags or "CLICK" in n.actions
-    if silent and (not clickable or _is_collection(n) or "scrollable" in n.flags):
+    if silent and (_is_collection(n) or "scrollable" in n.flags):
         # TalkBack never stops on it (shouldFocusNode: focusable, nothing of its own to say,
-        # its children are the stops), so it is never announced, and a list's long-click
-        # belongs to its rows: AntennaPod's long-clickable RecyclerViews, measured on
-        # TalkBack 17.0.
+        # its children are the stops), so it is never announced, and a list's click or
+        # long-click belongs to its rows: AntennaPod's long-clickable RecyclerViews, measured
+        # on TalkBack 17.0.
         run.stats_inc("r1_silent_containers")
         return []
     role = run.role(n)
@@ -1202,10 +1209,11 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
         web=("give the element text in the page's HTML, an aria-label, or alt text for an "
              "image"))
     reason = sorted({"clickable", "long_clickable"} & n.flags) or sorted({"CLICK", "LONG_CLICK"} & n.actions)
-    clipped = _clipped_axes(n, run)
+    clipped = _clipped_axes(n, run) if (n.kind != "view" or n.children) else set()
     if clipped:
         # Partly scrolled out of view: Compose drops the children a list has scrolled away (and
-        # a View's may be off screen), so the label can be in the part not shown. TalkBack
+        # a View's children may be off screen; a childless View has no name to lose), so the
+        # label can be in the part not shown. TalkBack
         # scrolls it in before it speaks (Now in Android's feed: an unnamed chip at the list's
         # top edge reads "Android Auto is not followed. Button" once scrolled in).
         return [run.finding(
@@ -1218,7 +1226,7 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
              "clipped_axes": sorted(clipped)})]
     if silent:
         said = ("TalkBack never stops on it (it has nothing of its own to say and its children "
-                "are the stops), so its click cannot be reached with TalkBack")
+                "are the stops), so its click or long-press cannot be reached with TalkBack")
     else:
         said = f"TalkBack announces it only as \"{(role or 'unlabelled').lower()}\""
     return [run.finding(
@@ -1275,11 +1283,14 @@ def _is_pager(c: _Node) -> bool:
 
 def _scroll_edges(c: _Node) -> Optional[Set[str]]:
     """The edges of scroll container ``c`` that more content lies beyond ("top", "bottom",
-    "left", "right"), from the scroll actions it offers; None when it offers none (then any
-    edge along its scroll axes may hide content)."""
+    "left", "right"), from the scroll actions it offers: none when it offers actions but no
+    scroll action (it cannot scroll: a list that fits); None when it reports no actions at all
+    (then any edge along its scroll axes may hide content)."""
+    if not c.actions:
+        return None
     acts = c.actions & _SCROLL_NAMES
     if not acts:
-        return None
+        return set()
     axes = _scroll_axes(c)
     edges = {e for a, e in (("SCROLL_UP", "top"), ("SCROLL_DOWN", "bottom"),
                             ("SCROLL_LEFT", "left"), ("SCROLL_RIGHT", "right")) if a in acts}
@@ -1295,11 +1306,11 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
 
     Only on evidence: it touches an edge of a scroll container that can still scroll that
     way (more content lies past that edge, so ``n`` may continue there; a container that
-    offers no scroll action counts for every edge of its axes), its bounds run past its
-    window's, it reports clipped bounds (``bounds_clipped``), or Compose laid it out larger
-    than its bounds. Merely touching the window's edge is not evidence: a 40dp overflow button
-    sits flush with the screen's right edge in every toolbar (Thunderbird, Now in Android,
-    AntennaPod) and is really 40dp."""
+    reports no actions counts for every edge of its axes), its bounds run past its window's or
+    reach its bottom, it reports clipped bounds (``bounds_clipped``), or Compose laid it out
+    larger than its bounds. The window's right edge is no evidence: a 40dp overflow button sits
+    flush with it in every toolbar (Thunderbird, Now in Android, AntennaPod) and is really
+    40dp."""
     axes: Set[str] = set()
     c = n.clip
     while c is not None:
@@ -1326,10 +1337,13 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
         c = c.clip
     win = n.win
     if win is not None and win.w > 0 and win.root is not n:
-        # Bounds that run past the window's (not just up to its edge) are not all shown.
+        # Bounds that run past the window's (not just up to its edge) are not all shown, and
+        # content reaching the window's bottom usually continues below it (a peeking sheet, a
+        # half-shown footer). Its right edge is not such evidence: the overflow button of every
+        # toolbar sits there, a real 40dp target.
         if n.x < win.x - _EDGE_TOL or n.x + n.w > win.x + win.w + _EDGE_TOL:
             axes.add("w")
-        if n.y < win.y - _EDGE_TOL or n.y + n.h > win.y + win.h + _EDGE_TOL:
+        if n.y < win.y - _EDGE_TOL or n.y + n.h >= win.y + win.h - _EDGE_TOL:
             axes.add("h")
     if "bounds_clipped" in n.flags:
         axes |= {"w", "h"}
@@ -1844,18 +1858,37 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
          "has_selected": False, "has_statedesc": False})]
 
 
+def _tab_group(n: _Node) -> Optional[_Node]:
+    """The group a tab belongs with: its nearest collection, traversal group or scroller
+    (a lazy list puts each tab in an item of its own), else its parent."""
+    p = n.parent
+    while p is not None:
+        if _is_collection(p) or "is_traversal_group" in p.flags or "scrollable" in p.flags:
+            return p
+        p = p.parent
+    return n.parent
+
+
 def _tab_state_known(n: _Node, run: _Run) -> bool:
     """A tab's state is its selection: TalkBack says "selected" on the selected tab and
     "Tab, 2 of 3" from CollectionItemInfo; an unselected tab carries no flag of its own.
     Material TabLayout / BottomNavigationView and Compose Tab / NavigationDrawerItem set
-    exactly that. So an unselected tab is fine when a tab it belongs with is selected: not
-    only a sibling. Each item of a lazy list has its own parent (Thunderbird's drawer: every
-    folder is a Tab in its own LazyColumn item, and its account actions sit in a second list
-    whose selection is the folder list's), so any selected tab in the window counts, as
-    TalkBack 17 confirms ("selected. Inbox. 7. Tab" then "Outbox. Tab")."""
+    exactly that. So an unselected tab is fine when a tab of its group is selected, or of a
+    group beside it: Thunderbird's drawer has every folder Tab in a LazyColumn item of its own
+    and its account actions in a second list next to it, whose selection is the folder list's
+    (TalkBack 17: "selected. Inbox. 7. Tab", then "Outbox. Tab")."""
     if n.collection_item_info is not None:
         return True
-    return run.has_selected_tab(n)
+    group = _tab_group(n)
+    if group is None:
+        return False
+    if any(t is not n for t in run.selected_tabs(group)):
+        return True
+    parent = group.parent
+    if parent is None:
+        return False
+    return any(sib is not group and (_is_collection(sib) or "is_traversal_group" in sib.flags)
+               and run.selected_tabs(sib) for sib in parent.children)
 
 
 # --------------------------------------------------------------------------- #
@@ -2165,7 +2198,9 @@ def rule_duplicate_label(run: _Run) -> List[Finding]:
     for n in run.nodes:
         if not _visible(n) or not _actionable(n) or _editable(n):
             continue
-        lbl, _ = run.effective_label(n)
+        # The name, not the state: merged radio rows each saying "Not selected" are not one
+        # label (Now in Android's settings: "Not selected. Android. Radio button").
+        lbl, _ = run.effective_label(n, with_state=False)
         if not lbl or lbl.startswith("<"):
             continue
         groups.setdefault(_norm_label(lbl), []).append(n)
@@ -2197,7 +2232,7 @@ def rule_duplicate_label(run: _Run) -> List[Finding]:
                 continue
             same_parent = [o for o in others if o.parent is m.parent]
             sev = "warn" if same_parent else "info"
-            lbl = run.effective_label(m)[0]
+            lbl = run.effective_label(m, with_state=False)[0]
             out.append(run.finding(
                 "a11y.duplicate.label", sev, m,
                 f"{len(others) + 1} actionable elements are all announced as \"{lbl}\""

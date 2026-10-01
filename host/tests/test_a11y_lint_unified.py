@@ -1376,7 +1376,8 @@ def test_r2_a_scroll_edge_counts_only_where_the_container_scrolls_further():
     def at_edges(actions):
         top = view(21, "android.widget.ImageButton", flags=CLICK, cd="Top", b=(900, 260, 44, 30))
         rv = view(20, "androidx.recyclerview.widget.RecyclerView", flags=("scrollable",),
-                  b=(0, 260, 1080, 1814), kids=[top], actions=actions)
+                  b=(0, 260, 1080, 1814), kids=[top])
+        rv["actions"] = [a if isinstance(a, dict) else {"id": 0, "name": a} for a in actions]
         return of(lint(screen(decor(1, rv))), "a11y.touch_target.small")
     # At the top of a list that can only scroll forward, nothing is cut off at the top.
     assert [x.severity for x in at_edges(["SCROLL_FORWARD"])] == ["warn"]
@@ -1465,3 +1466,64 @@ def test_r2_a_sliver_at_the_bottom_of_a_scroll_view_is_clipped():
     f = of(lint(screen(decor(1, scroll, b=(0, 0, 1280, 2856))), density=480),
            "a11y.touch_target.small")
     assert sorted((x.node_key, x.severity) for x in f) == [("view:261", "info"), ("view:404", "info")]
+
+
+
+def test_r2_a_list_that_cannot_scroll_clips_nothing():
+    # Its actions say it cannot scroll (a list that fits): its first and last rows are whole.
+    rows = [view(21 + i, "android.widget.ImageButton", flags=CLICK, cd=f"Row {i}",
+                 b=(0, 260 + 40 * i, 300, 40)) for i in range(2)]
+    lst = view(20, "android.widget.ListView", b=(0, 260, 1080, 80), kids=rows,
+               collection_info={"row_count": 2, "column_count": 1}, actions=["ACCESSIBILITY_FOCUS"])
+    sev = {f.node_key: f.severity for f in of(lint(screen(decor(1, lst))), "a11y.touch_target.small")}
+    assert sev == {"view:21": "warn", "view:22": "warn"}
+
+
+def test_r1_a_childless_view_at_a_scroll_edge_stays_an_error():
+    # A View with no children has no name to lose to the scroll: only its own.
+    ib = view(21, "android.widget.ImageButton", flags=CLICK, b=(900, 2000, 160, 74))
+    rv = view(20, "androidx.recyclerview.widget.RecyclerView", flags=("scrollable",),
+              b=(0, 260, 1080, 1814), kids=[ib], actions=["SCROLL_FORWARD"])
+    f = of(lint(screen(decor(1, rv)), enabled=["R1"]), "a11y.label.missing")
+    assert [x.severity for x in f] == ["error"]
+
+
+def test_r1_a_long_clickable_container_that_is_not_a_list_is_still_flagged():
+    # Its long-press cannot be reached with TalkBack: only lists are exempt.
+    box = view(20, "android.widget.FrameLayout", flags=("long_clickable",), b=(0, 300, 1080, 300),
+               kids=[view(21, "android.widget.Button", text="Play", flags=CLICK, b=(0, 300, 500, 150)),
+                     view(22, "android.widget.ImageButton", cd="More", flags=CLICK, b=(600, 300, 160, 160))])
+    f = of(lint(screen(decor(1, box)), enabled=["R1"]), "a11y.label.missing")
+    assert [x.node_key for x in f] == ["view:20"] and "long-press" in f[0].message
+
+
+def test_r7_a_separate_tab_bar_without_a_selection_is_still_flagged():
+    # A selected tab elsewhere on screen (a TabLayout) says nothing about a bottom bar of tabs.
+    def tab(hv, text, x, y, selected=False):
+        return comp(30, hv, flags=CLICK + (("selected",) if selected else ()), text=text,
+                    b=(x, y, 200, 150), role_description="Tab")
+    tabs = comp(30, 1, b=(0, 200, 1080, 150), kids=[tab(2, "News", 0, 200, True), tab(3, "Sport", 300, 200)],
+                is_traversal_group=True, flags=("is_traversal_group",))
+    bar = comp(30, 10, b=(0, 2200, 1080, 150), kids=[tab(11, "Home", 0, 2200), tab(12, "Saved", 300, 2200)])
+    page = comp(30, 20, b=(0, 0, 1080, 2400), kids=[comp(30, 21, b=(0, 0, 1080, 400), kids=[tabs]), bar])
+    f = of(lint(screen(decor(1, view(30, ACV, b=(0, 0, 1080, 2400), kids=[page]))), enabled=["R7"]),
+           "a11y.state.not_exposed")
+    assert sorted(keys(f)) == ["compose:30:11", "compose:30:12"]
+
+
+def test_web_targets_in_a_row_of_targets_are_not_inline():
+    links = [_web(7 + i, flags=CLICK, role_description="link", text=t, b=(100 + 200 * i, 700, 150, 30))
+             for i, t in enumerate(("Home", "About", "Help"))]
+    row = _web(5, b=(24, 700, 1000, 30), kids=links)
+    f = of(lint(screen(decor(1, _webview(row))), density=160), "a11y.touch_target.small")
+    assert sorted(keys(f)) == ["virtual:50:7", "virtual:50:8", "virtual:50:9"]
+
+
+def test_r12_compares_names_not_states():
+    # Now in Android's settings: merged radio rows whose own label is only their state.
+    def radio(sem, name, y):
+        return comp(40, sem, flags=CLICK + ("checkable",), state="Not selected", b=(0, y, 1080, 120),
+                    kids=[comp(40, sem + 1, "android.widget.TextView", text=name, b=(100, y, 600, 120))])
+    group = comp(40, 1, b=(0, 100, 1080, 400), kids=[radio(10, "Default", 100), radio(20, "Android", 220)])
+    rep = lint(screen(decor(1, view(40, ACV, b=(0, 0, 1080, 2400), kids=[group]))), enabled=["R12"])
+    assert of(rep, "a11y.duplicate.label") == []
