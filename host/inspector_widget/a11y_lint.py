@@ -817,17 +817,12 @@ def _is_web(n: _Node) -> bool:
     return n.kind == "virtual" and bool({"NEXT_HTML_ELEMENT", "PREVIOUS_HTML_ELEMENT"} & n.actions)
 
 
-def _fix(n: _Node, view: str, compose: str, web: str, provider: Optional[str] = None) -> str:
-    """The fix advice for ``n``'s toolkit: a View, a Compose node, web content in a WebView
-    (the page's HTML), or another provider's virtual node."""
+def _fix(n: _Node, view: str, compose: str, web: str) -> str:
+    """The fix advice for ``n``'s toolkit: a View, web content in a WebView (the page's HTML),
+    else Compose (by far the most common virtual-node provider)."""
     if _is_web(n):
         return web
-    if n.kind == "view":
-        return view
-    if n.kind == "virtual":
-        return provider or ("set it on the virtual node in the host's AccessibilityNodeProvider "
-                            "(ExploreByTouchHelper.onPopulateNodeForVirtualView)")
-    return compose
+    return view if n.kind == "view" else compose
 
 
 def _web_inline(n: _Node) -> bool:
@@ -1205,9 +1200,7 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
                  "pass a contentDescription to the Icon/Image inside it, or add "
                  "Modifier.semantics { contentDescription = \"...\" }"),
         web=("give the element text in the page's HTML, an aria-label, or alt text for an "
-             "image"),
-        provider="set a contentDescription on the virtual node in the host's "
-                 "AccessibilityNodeProvider (ExploreByTouchHelper.onPopulateNodeForVirtualView)")
+             "image"))
     reason = sorted({"clickable", "long_clickable"} & n.flags) or sorted({"CLICK", "LONG_CLICK"} & n.actions)
     clipped = _clipped_axes(n, run)
     if clipped:
@@ -1302,10 +1295,11 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
 
     Only on evidence: it touches an edge of a scroll container that can still scroll that
     way (more content lies past that edge, so ``n`` may continue there; a container that
-    offers no scroll action counts for every edge of its axes), it reports clipped bounds
-    (``bounds_clipped``), or Compose laid it out larger than its bounds. Merely touching the
-    window's edge is not evidence: a 40dp overflow button sits flush with the screen's right
-    edge in every toolbar (Thunderbird, Now in Android, AntennaPod) and is really 40dp."""
+    offers no scroll action counts for every edge of its axes), its bounds run past its
+    window's, it reports clipped bounds (``bounds_clipped``), or Compose laid it out larger
+    than its bounds. Merely touching the window's edge is not evidence: a 40dp overflow button
+    sits flush with the screen's right edge in every toolbar (Thunderbird, Now in Android,
+    AntennaPod) and is really 40dp."""
     axes: Set[str] = set()
     c = n.clip
     while c is not None:
@@ -1330,6 +1324,13 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
                 or (n.x + n.w >= c.x + c.w - _EDGE_TOL and more("right"))):
             axes.add("w")
         c = c.clip
+    win = n.win
+    if win is not None and win.w > 0 and win.root is not n:
+        # Bounds that run past the window's (not just up to its edge) are not all shown.
+        if n.x < win.x - _EDGE_TOL or n.x + n.w > win.x + win.w + _EDGE_TOL:
+            axes.add("w")
+        if n.y < win.y - _EDGE_TOL or n.y + n.h > win.y + win.h + _EDGE_TOL:
+            axes.add("h")
     if "bounds_clipped" in n.flags:
         axes |= {"w", "h"}
     if n.layout_w and n.layout_w > n.w + 1:
@@ -1411,10 +1412,7 @@ def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
                  "modifier"),
         web=(f"in the page's CSS give the link or button min-width/min-height of {min_dp}px "
              "(CSS px are dp at the WebView's default zoom) or padding, or keep it inline in a "
-             "sentence (WCAG 2.5.8's inline exception)"),
-        provider=(f"report virtual node bounds of at least {min_dp}x{min_dp}dp from the host's "
-                  "AccessibilityNodeProvider (ExploreByTouchHelper.getVirtualViewAt / "
-                  "onPopulateNodeForVirtualView) and accept touches over that area"))
+             "sentence (WCAG 2.5.8's inline exception)"))
     return [run.finding(
         "a11y.touch_target.small", sev, n,
         f"Touch target is {w_dp}x{h_dp}dp (< {min_dp}dp{floor}). Make the touchable area at "
@@ -1749,9 +1747,7 @@ def rule_role_missing(n: _Node, run: _Run) -> List[Finding]:
               "setRoleDescription)"),
         compose=("pass role = Role.Button to Modifier.clickable/selectable, or add "
                  "Modifier.semantics { role = Role.Button }"),
-        web="use a <button> or <a href> in the page's HTML, or give the element role=\"button\"",
-        provider=("set the virtual node's className (android.widget.Button) in the host's "
-                  "AccessibilityNodeProvider"))
+        web="use a <button> or <a href> in the page's HTML, or give the element role=\"button\"")
     return [run.finding(
         "a11y.role.missing_on_clickable", sev, n,
         f"Clickable element \"{label}\" exposes no role. TalkBack reads the label and "
