@@ -460,6 +460,34 @@ with every consumer.
   `LoadedCapture.props(udid)`.** Results are cached per call. `nondefault` also
   reads the same-class views, because `normalize.nondefault_props` needs the
   class majority.
+- **TalkBack's walk (`outline(view="reading")`, `capture/tb.py`).** With no reading
+  argument the view is the stored order (`Index.reading`), lines as before. Any of
+  `explain`, `granularity` (default|heading|control), `from` (a selector),
+  `direction` (next|prev) or `include_skipped` runs the TalkBack model over the
+  stored a11y tree (`TbCapture.of(ix, loaded)`, cached on the index object):
+  - the prefix is the stop's number in the default forward order (`UNode.stop`), so
+    a heading-only or backward walk keeps the numbers;
+  - `explain`: the quoted text is what TalkBack says on arrival (collection and
+    window transitions included; for a sliver at a list edge TalkBack scrolls in
+    first, the label with `speak=after_scroll`), plus `why=` (click, longclick,
+    focusable, srf, scroll_item, leaf, text_orphan, web), `via=` when the order
+    comes from a link or a reorder (`before:<ref>`, `after:<ref>`, `bounds_swap`,
+    `window:<ref>`), `ghost=`, `show_on_screen=`, `autoscroll=`;
+  - `from`: the stops a swipe reaches from that node to the edge (the node first
+    when it is a stop); the header says `from`, `direction`, `ended`;
+  - `include_skipped`: `- ` lines, in TalkBack's traversal order, for the nodes with
+    content or actions it passes over: `merged_into=<ref>`, `hidden_by=<ref>`,
+    `covered_by=<ref>`, or `why=` silent_container, offscreen, zero_size,
+    invisible, not_important, under_system_bar, window_wrapper ...;
+  - every reading line shows all `tb.*` issue codes;
+  - without an a11y facet the stored order is sliced, reversed and filtered by
+    flags instead, and the header says `model: "stored order ..."`;
+  - the reading arguments are part of the cursor hash and the next hints; on any
+    other view they are `bad_args`.
+- **node()'s `tb` facet** (`facets="tb"`, and in `all` when the model can run):
+  `{stop, why | why_not ("code[: detail]"), ghost?, speak, parts [{t, from (ref),
+  k}], prev, next, edge_in, reachable (swipe|scroll|not)}`; a merged node adds
+  `speak_in` (what it contributes). About 400 B.
 - **Facet statuses read.** `meta.facet_status("slots")` and
   `meta.facet_status("a11y")`. `outline(view="slots")` on a capture that has
   Compose nodes but no slot groups is `facet_unavailable` (hint:

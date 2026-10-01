@@ -16,8 +16,9 @@ _JSON_NAMES = {"true": True, "false": False, "null": None}
 
 
 def parse_call(text: str) -> tuple[str, list[Any], dict[str, Any]]:
-    """``(tool, positional args, keyword args)`` of a hint; ``in=`` becomes ``in_``."""
-    src = re.sub(r"([(,])in=", r"\1in_=", text)
+    """``(tool, positional args, keyword args)`` of a hint; ``in=`` becomes ``in_``
+    (find's keyword) and ``from=`` stays ``from`` (outline's)."""
+    src = re.sub(r"([(,])(in|from)=", r"\1\2_=", text)
     tree = ast.parse(src, mode="eval").body
     if not isinstance(tree, ast.Call) or not isinstance(tree.func, ast.Name):
         raise ValueError(f"not a call: {text!r}")
@@ -30,7 +31,7 @@ def parse_call(text: str) -> tuple[str, list[Any], dict[str, Any]]:
         return ast.literal_eval(node)
 
     return (tree.func.id, [value(a) for a in tree.args],
-            {k.arg: value(k.value) for k in tree.keywords})
+            {("from" if k.arg == "from_" else k.arg): value(k.value) for k in tree.keywords})
 
 
 def run_hint(pipe: Any, loaded: Any, text: str) -> dict:

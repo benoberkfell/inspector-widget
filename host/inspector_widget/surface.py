@@ -158,14 +158,12 @@ def _rules_check(v: Any) -> Any:
 # outline; the instructions say the rest.
 def _serial(doc: bool = False) -> Param:
     return Param("serial", "string", cli=("-s",),
-                 help="Default: the last session, $ANDROID_SERIAL or the only device"
-                 if doc else "")
+                 help="Default: last session, $ANDROID_SERIAL, the only device" if doc else "")
 
 
 def _package(doc: bool = False) -> Param:
     return Param("package", "string", cli=("-p",),
-                 help="Default: the last session or the only running debuggable app"
-                 if doc else "")
+                 help="Default: last session, the only debuggable app running" if doc else "")
 
 
 def _capture(doc: bool = False) -> Param:
@@ -196,28 +194,28 @@ GRAMMAR = ('Line: ref Type #rid @tag "label" flags [x,y wxh] !issue +N(hidden) t
            'indent 2/level; screen px.')
 
 D_CAPTURE = (
-    "Snapshot the app ONCE (views, properties, Compose, accessibility, per-window "
-    "screenshots, lint) into the store. Returns the capture id (c7h2kq), lint and issue "
-    "lines, a preview outline and next. Then query it with outline, find, node, image, lint, "
-    "diff (no device I/O); refs (n23) carry across captures. After the UI changes capture "
-    "again; diff_from=\"prev\" adds what changed.")
-D_CAPTURES = ("List and manage stored captures: list, show, pin, unpin, label (id+label), "
-              "drop, export (writes files, returns paths), gc (all=true wipes the store).")
+    "Snapshot the app ONCE (views, properties, Compose, accessibility, screenshots, lint) "
+    "into the store; returns its id (c7h2kq), lint and issue lines, a preview outline. Query "
+    "it with outline, find, node, image, lint, diff (no device I/O); refs (n23) carry across "
+    "captures. After the UI changes capture again; diff_from=\"prev\" adds what changed.")
+D_CAPTURES = ("List and manage stored captures; label takes id+label; export writes files "
+              "and returns paths; gc all=true wipes the store.")
 D_OUTLINE = ("Tree of a capture, one line per node. view: ui (Views + Compose + a11y merged), "
-             "views, compose, slots (composables, src=File.kt:line), a11y, reading (TalkBack "
-             "stops in order). Semantic detail collapses wrappers. " + GRAMMAR)
+             "views, compose, slots (composables, src=File.kt:line), a11y, reading (TalkBack's "
+             "stops; explain=true: its words, why=, via=; include_skipped: - lines "
+             "merged_into=/hidden_by=/why=). Semantic detail collapses wrappers. " + GRAMMAR)
 D_FIND = ("Find nodes in a capture; filters are ANDed. text: substring of label/text/desc/"
           "state/hint; type/rid/tag/src: globs; flags: all of; issue: rule, code or severity; "
-          "within: a selector; at: [x,y]; min_dp/max_dp: min(w,h) of the touch (a11y) "
-          "bounds.")
+          "within: a selector; at: [x,y]; min_dp/max_dp: touch (a11y) size.")
 D_NODE = ("Everything about one node (or refs, up to 10): ids, bounds, tap_xy, layout/clip, "
-          "a11y, compose (slots with file:line), issues, props, parent. ref: n23, a key "
-          "(view:12), a point x,y, or #rid, @tag, Type\"label\" joined by ' > ' (direct child).")
-D_IMAGE = ("PNG of a node (crop from its own window's screenshot) or an overlay: marks "
-           "(boxes labelled by ref), lint, reading, bounds, compose. Returns the path.")
+          "a11y, compose (slots with file:line), issues, props, parent; facets=\"tb\": "
+          "TalkBack (why, speech, prev/next). ref: n23, a key (view:12), a point x,y, or "
+          "#rid, @tag, Type\"label\" joined by ' > ' (direct child).")
+D_IMAGE = ("PNG of a node (a crop of its own window's screenshot) or an overlay (marks: "
+           "boxes labelled by ref). Returns the path.")
 D_LINT = ("Accessibility lint (R1..R18) of a capture grouped by rule, with fixes; "
-          "rules=[\"render.\"] for render signals (clipped, hidden, offscreen). contrast=true "
-          "samples the stored screenshot (~4s, cached).")
+          "rules=[\"tb\"]: TalkBack navigation; [\"render.\"]: clipped, hidden, offscreen. "
+          "contrast=true samples the stored screenshot (~4s, cached).")
 D_DIFF = ("Compare two captures of one app by ref: changed, moved, added, removed, "
           "rebound; issue deltas; \"new screen\" when little is shared.")
 
@@ -232,8 +230,9 @@ INSTRUCTIONS = (
     "screen pixels. After the UI changes, capture again (capture(diff_from=\"prev\") also "
     "reports what changed). serial and package are optional once a session exists.")
 #: Added when the TalkBack tools are listed with the capture tools.
-INSTRUCTIONS_TALKBACK = (" TalkBack: outline(view=\"reading\") predicts its order; tb_walk "
-                         "drives the real screen reader and diffs the two.")
+INSTRUCTIONS_TALKBACK = (" TalkBack: outline(view=\"reading\",explain=true) and "
+                         "lint(rules=[\"tb\"]) predict it; tb_walk drives the real one and "
+                         "diffs.")
 #: ... with the legacy tools (no outline): dump_accessibility's focus_order predicts it.
 INSTRUCTIONS_TALKBACK_LEGACY = (" TalkBack: dump_accessibility's focus_order predicts its "
                                 "order; tb_walk drives the real screen reader and compares.")
@@ -283,7 +282,7 @@ def instructions(listed: Iterable[str]) -> str:
 
 
 _FLAGS_HELP = "click longclick focus focused scroll checkable checked selected disabled " \
-              "heading edit password hidden truncated redacted ..."
+              "heading edit password hidden ..."
 
 
 def _specs() -> list[ToolSpec]:
@@ -336,6 +335,11 @@ def _specs() -> list[ToolSpec]:
             Param("max_children", "integer", 12, minimum=1, maximum=1000),
             Param("max_lines", "integer", 80, minimum=1, maximum=400),
             _fields(doc=True), _cursor(), _format(), _max_bytes(6000), _serial(), _package(),
+            # view="reading" only (TalkBack's walk); unset means the default
+            Param("explain", "boolean"),
+            Param("granularity", "string", enum=("default", "heading", "control")),
+            Param("from", "string"), Param("direction", "string", enum=("next", "prev")),
+            Param("include_skipped", "boolean"),
         ], ops.outline, True, {"capture"}, D_OUTLINE, _render_lines),
         ToolSpec("find", "find", "find nodes in a capture (filters are ANDed)", [
             _capture(),
@@ -365,7 +369,7 @@ def _specs() -> list[ToolSpec]:
             Param("ref", "string", positional=True, nargs="*"),
             Param("refs", "array", items="string"),
             _capture(),
-            Param("facets", "string", help="core,issues,a11y,layout,compose,text,props,"
+            Param("facets", "string", help="core,issues,a11y,tb,layout,compose,text,props,"
                                            "children,ancestors or all"),
             Param("props", "string|array", "none", items="string",
                   keep_words=("none", "key", "nondefault", "all"),
@@ -392,7 +396,7 @@ def _specs() -> list[ToolSpec]:
         ToolSpec("lint", "lint", "accessibility lint of a capture, grouped", [
             _capture(),
             Param("rules", "array", items="string", cli=("--rule",), check=_rules_check,
-                  help="ids, R1..R18, codes, a11y. or render."),
+                  help="ids, R1..R18, codes, a11y., render. or tb"),
             Param("severity", "string", "info", enum=("error", "warn", "info")),
             Param("within", "string"),
             Param("contrast", "boolean", False), Param("wcag", "boolean", False),
@@ -754,8 +758,9 @@ def cli_args(ts: ToolSpec, ns: argparse.Namespace) -> dict[str, Any]:
         elif isinstance(v, str) and p.type == "string|array" and v not in p.keep_words \
                 and "," in v:
             v = _split(v)
-        if v is None or v == p.default:
-            continue
+        if v is None or v == p.default or (p.type == "boolean" and p.default is None
+                                           and v is False):
+            continue  # an unset flag (a boolean without a default reads as false)
         out[p.name] = v
     return out
 
@@ -811,7 +816,7 @@ def _parse_call(text: str) -> tuple[str, list[Any], dict[str, Any]] | None:
     import ast
     import re
 
-    src = re.sub(r"([(,])in=", r"\1in_=", text.strip())
+    src = re.sub(r"([(,])(in|from)=", r"\1\2_=", text.strip())
     try:
         tree = ast.parse(src, mode="eval").body
     except SyntaxError:
@@ -829,7 +834,8 @@ def _parse_call(text: str) -> tuple[str, list[Any], dict[str, Any]] | None:
 
     try:
         pos = [value(a) for a in tree.args]
-        kw = {("in" if k.arg == "in_" else k.arg): value(k.value) for k in tree.keywords}
+        kw = {(k.arg[:-1] if k.arg in ("in_", "from_") else k.arg): value(k.value)
+              for k in tree.keywords}
     except (ValueError, KeyError, TypeError):
         return None
     return tree.func.id, pos, kw

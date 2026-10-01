@@ -91,12 +91,13 @@ FIND_DOMAINS = ("ui", "slots", "all")
 FIND_SORTS = ("tree", "reading", "top", "area")
 HAS_TERMS = ("label", "role", "state", "stop", "slots", "props", "issues", "a11y", "compose",
              "view")
-FACETS = ("core", "issues", "a11y", "layout", "compose", "text", "props", "children",
+FACETS = ("core", "issues", "a11y", "tb", "layout", "compose", "text", "props", "children",
           "ancestors")
 DEFAULT_FACETS = ("core", "layout", "a11y", "compose", "issues")
-#: Order in which node() adds facets until the budget is used (spec 5.7).
-FACET_PRIORITY = ("core", "issues", "a11y", "layout", "compose", "text", "props", "children",
-                  "ancestors")
+#: Order in which node() adds facets until the budget is used (spec 5.7). ``tb`` (what
+#: TalkBack does with the node: capture/tb.py) is added when asked for.
+FACET_PRIORITY = ("core", "issues", "a11y", "tb", "layout", "compose", "text", "props",
+                  "children", "ancestors")
 PROPS_MODES = ("none", "key", "nondefault", "all")
 PARAMS_MODES = ("brief", "raw")
 SEVERITY_ORDER = {"error": 0, "warn": 1, "info": 2}
@@ -1201,7 +1202,61 @@ def _tree_members(tree: Tree) -> set[str]:
 
 
 _OUTLINE_ARGS = ("root", "view", "depth", "detail", "origin", "max_children", "max_lines",
-                 "fields", "cursor", "format", "max_bytes")
+                 "fields", "cursor", "format", "max_bytes", "explain", "granularity", "from",
+                 "direction", "include_skipped")
+#: outline arguments of view="reading" only (TalkBack's order).
+READING_ARGS = ("explain", "granularity", "from", "direction", "include_skipped")
+GRANULARITIES = ("default", "heading", "control")
+DIRECTIONS = ("next", "prev")
+#: how a stop is reached that a reading line need not repeat (the order itself says it)
+_PLAIN_VIA = frozenset({"tree", "chain", "first", "start", None})
+
+
+def _reading_items(ix: Index, loaded: Any, *, granularity: str, direction: str,
+                   start: str | None, include_skipped: bool) -> tuple[list[Any], dict[str, Any]]:
+    """The reading walk's items (capture/tb.py ReadItems) and facts for the header: the
+    TalkBack model over the stored a11y tree, else the stored order (sliced, reversed,
+    filtered by flags) with ``model: "stored order"``."""
+    from . import tb as T
+
+    tbc = T.TbCapture.of(ix, loaded) if loaded is not None else None
+    meta: dict[str, Any] = {}
+    if start is not None:
+        meta["from"] = start
+    if direction != "next":
+        meta["direction"] = direction
+    if granularity != "default":
+        meta["granularity"] = granularity
+    if tbc is None:
+        meta["model"] = "stored order (no accessibility tree to model)"
+        return T.fallback_reading(ix, granularity=granularity, start=start,
+                                  direction=direction), meta
+    items, facts = tbc.reading(granularity=granularity, start=start, direction=direction,
+                               include_skipped=include_skipped)
+    if start is not None:
+        meta["ended"] = facts.get("ended")
+        if facts.get("start"):
+            meta["ended"] = f"{facts['ended']}: {facts['start']}"
+    return items, meta
+
+
+def _reading_extra(it: Any, explain: bool) -> dict[str, Any]:
+    """What a reading line adds to the node's row: the ``-`` mark and reason of a skipped
+    node; with ``explain``, a stop's speech (it replaces the label), why= and via=."""
+    if it.stop is None and (it.why or it.ref_key):
+        tail = {it.ref_key: it.ref} if it.ref_key else {"why": it.why}
+        return {"mark": "-", "tail": tail}
+    if not explain:
+        return {}
+    tail: dict[str, Any] = {}
+    if it.why:
+        tail["why"] = it.why
+    if it.via not in _PLAIN_VIA:
+        tail["via"] = it.via
+    for k in ("ghost", "autoscroll", "show_on_screen", "speak"):
+        if it.extra.get(k):
+            tail[k] = it.extra[k]
+    return {"speak": it.speak, "tail": tail}
 
 
 def outline(ix: Index, **params: Any) -> dict[str, Any]:
@@ -1210,9 +1265,29 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
 
     Returns ``{capture, view, root?, shown, total, offset?, lines|rows, hidden?,
     truncated?, next?}`` (spec 5.5). ``depth`` counts display levels below the
-    root(s) (0 = the roots only). ``view="views"`` implies ``detail="all"``."""
+    root(s) (0 = the roots only). ``view="views"`` implies ``detail="all"``.
+
+    ``view="reading"`` (TalkBack's order, from the TalkBack model over the stored
+    accessibility tree, ``capture/tb.py``) also takes ``explain`` (each stop's line
+    quotes what TalkBack says on arrival and adds ``why=`` click|focusable|srf|
+    text_orphan|leaf|..., ``via=`` when a link or a reorder put it there, ``ghost=``),
+    ``granularity`` (default|heading|control: TalkBack's navigation settings), ``from``
+    (a selector: the walk from that node), ``direction`` (next|prev) and
+    ``include_skipped`` (``- `` lines for the nodes with content the walk passes over:
+    ``merged_into=``, ``hidden_by=``, ``covered_by=`` or ``why=`` silent_container,
+    offscreen, zero_size, invisible, not_important ...). The prefix is the stop's
+    number in the default forward order."""
     _check_unknown("outline", params, _OUTLINE_ARGS)
     view = _enum("view", params.get("view"), OUTLINE_VIEWS, "ui")
+    explain = _bool("explain", params.get("explain"), False)
+    granularity = _enum("granularity", params.get("granularity"), GRANULARITIES, "default")
+    direction = _enum("direction", params.get("direction"), DIRECTIONS, "next")
+    include_skipped = _bool("include_skipped", params.get("include_skipped"), False)
+    from_arg = _str("from", params.get("from"))
+    if view != "reading" and (explain or include_skipped or from_arg
+                              or granularity != "default" or direction != "next"):
+        raise _bad("explain, granularity, from, direction and include_skipped apply to "
+                   "view=\"reading\"", hint='outline(view="reading", explain=true)')
     root_arg = _str("root", params.get("root"))
     root_node = resolve_selector(ix, root_arg, tomb=params.get("tomb")) if root_arg else None
     if root_node is not None and root_node.kind == "slot" and params.get("view") is None:
@@ -1235,19 +1310,36 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
         raise OpError("facet_unavailable", "+props: needs the capture's properties",
                       hint="The ops layer passes loaded=; call node(ref, props=...) instead.")
     if root_node is not None and view == "reading":
-        raise _bad("root does not apply to view=\"reading\"")
+        raise _bad("root does not apply to view=\"reading\"",
+                   hint='outline(view="reading", from="n12") walks from a node')
+    from_node = resolve_selector(ix, from_arg, tomb=params.get("tomb")) if from_arg else None
 
     norm = {"view": view, "detail": detail, "origin": origin if view == "slots" else None,
             "depth": depth, "max_children": max_children, "fields": fields.spec(),
             "root": root_node.id if root_node else None}
+    if view == "reading" and (explain or include_skipped or from_node is not None
+                              or granularity != "default" or direction != "next"):
+        norm.update(explain=explain, granularity=granularity, direction=direction,
+                    include_skipped=include_skipped,
+                    **{"from": from_node.id if from_node is not None else None})
     h = args_hash(norm)
     offset = _cursor_offset(ix, "outline", params.get("cursor"), h)
 
     hidden_counts: dict[str, int] = {}
-    if view == "reading":
+    reading_rows: list[dict[str, Any]] | None = None
+    reading_meta: dict[str, Any] = {}
+    if view == "reading" and norm.get("granularity") is None:
         nodes = [ix.nodes[r] for r in ix.reading if r in ix.nodes]
         items = [_Item([n.id], n.id, 0) for n in nodes]
         orders = [n.stop if n.stop is not None else i + 1 for i, n in enumerate(nodes)]
+    elif view == "reading":
+        ritems, reading_meta = _reading_items(
+            ix, params.get("loaded"), granularity=granularity, direction=direction,
+            start=from_node.id if from_node is not None else None,
+            include_skipped=include_skipped)
+        items = [_Item([it.nid], it.nid, 0) for it in ritems]
+        orders = [it.stop for it in ritems]
+        reading_rows = [_reading_extra(it, explain) for it in ritems]
     else:
         tree = ix.tree(view)
         roots = list(tree.roots)
@@ -1275,12 +1367,20 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
     def row_of(i: int, minimal: bool) -> dict[str, Any]:
         it = items[i]
         n = ix.nodes[it.anchor]
+        extra = reading_rows[i] if reading_rows is not None else None
         if minimal:
-            return {"ref": n.id}
+            return {"ref": n.id} if extra is None or not extra.get("mark") else {
+                "mark": "-", "ref": n.id}
         chain = [ix.nodes[m] for m in it.members] if len(it.members) > 1 else None
-        return node_row(ix, n, fields, chain=chain, hidden=it.plus,
-                        depth=it.depth if view != "reading" else None,
-                        order=orders[i] if view == "reading" else None, props_fn=props_fn)
+        row = node_row(ix, n, fields, chain=chain, hidden=it.plus,
+                       depth=it.depth if view != "reading" else None,
+                       order=orders[i] if view == "reading" else None, props_fn=props_fn,
+                       mark=(extra or {}).get("mark"), all_tb=view == "reading")
+        if extra:
+            if extra.get("speak") and "label" in fields.line:
+                row["label"] = L.cut(extra["speak"])  # what TalkBack says, not the label
+            row.update(extra.get("tail") or {})
+        return row
 
     def render(i: int, minimal: bool) -> Any:
         row = row_of(i, minimal)
@@ -1290,6 +1390,10 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
     base: dict[str, Any] = {"capture": cid, "view": view}
     if root_node is not None:
         base["root"] = root_node.id
+    if reading_rows is not None:
+        for k in ("from", "direction", "granularity", "ended", "model"):
+            if reading_meta.get(k) is not None:
+                base[k] = reading_meta[k]
     base["total"] = total
     if offset:
         base["offset"] = offset
@@ -1297,8 +1401,8 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
         base["hidden"] = hidden_counts
 
     user_args = {k: params[k] for k in ("view", "root", "depth", "detail", "origin",
-                                        "max_children", "fields")
-                 if params.get(k) is not None}
+                                        "max_children", "fields") + READING_ARGS
+                 if params.get(k) is not None and params.get(k) != ""}
     # page shape: not in the cursor hash, but page 2 should look like page 1
     page_args = {k: params[k] for k in ("max_lines", "max_bytes", "format")
                  if params.get(k) not in (None, "")}
@@ -2088,7 +2192,8 @@ def _key_in_ids(n: UNode) -> bool:
 def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, raw: bool,
                 ancestors: bool, children: bool, props_fn: PropsFn | None, idx: int,
                 image: Any, issue_fmt: Callable[[Issue], str] | None,
-                multi_window: bool, implicit_props: bool = False
+                multi_window: bool, implicit_props: bool = False,
+                tb_fn: Callable[[UNode], Any] | None = None
                 ) -> tuple[list[_Part], list[_Part]]:
     """(core parts, optional parts in priority order) of one node's dossier."""
     core: list[tuple[str, Any]] = [("ref", n.id)]
@@ -2169,6 +2274,10 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
             v = _a11y_facet(ix, n)
             if v is not None:
                 opt.append(_Part(idx, "a11y", "a11y", v))
+        elif facet == "tb" and "tb" in facets and n.kind != "slot":
+            v = tb_fn(n) if tb_fn is not None else None
+            opt.append(_Part(idx, "tb", "tb", v if v is not None else
+                             "unavailable (the capture has no accessibility tree to model)"))
         elif facet == "layout" and "layout" in facets:
             v = _layout_facet(ix, n)
             if v is not None:
@@ -2199,6 +2308,21 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
             opt.append(_Part(idx, "ancestors", "ancestors", [crumb(a) for a in anc],
                              f"({len(anc)})"))
     return core_parts, opt
+
+
+def _tb_facet_fn(ix: Index, loaded: Any) -> Callable[[UNode], Any] | None:
+    """node()'s ``tb`` facet: the TalkBack model's account of a node (capture/tb.py), or
+    None when the capture's accessibility tree cannot be modelled."""
+    from . import tb as T
+
+    tbc = T.TbCapture.of(ix, loaded) if loaded is not None else None
+    if tbc is None:
+        return None
+
+    def facet(n: UNode) -> Any:
+        return tbc.facet(n.id)
+
+    return facet
 
 
 def _shrink(part: _Part, room: int) -> Any:
@@ -2245,6 +2369,10 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
     """``node(ref | refs[<=10], capture, facets="core,layout,a11y,compose,issues",
     props="none"|"key"|"nondefault"|"all"|[names/globs], params="brief"|"raw",
     ancestors=false, children=false, image=false, max_bytes=3000 (6000 batch))``.
+
+    ``facets`` may add ``tb``: what TalkBack does with the node (stop number, why or why
+    not, what it says and from which nodes, the stops before and after, how focus arrives,
+    whether it can be reached), from the TalkBack model over the stored a11y tree.
 
     A dossier of one node, or ``{capture, nodes:[...]}`` for several (per-node
     errors are reported in place). Facets are added in priority order core >
@@ -2295,6 +2423,9 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
     tomb = params.get("tomb")
     cid = _cid(ix)
     multi_window = len(ix.windows()) > 1
+    tb_fn = _tb_facet_fn(ix, loaded) if "tb" in facets else None
+    if tb_fn is None and "tb" in facets and "tb" not in _str_list("facets", raw_facets):
+        facets = [f for f in facets if f != "tb"]  # "all" without a model: no tb facet
 
     resolved: list[tuple[str, UNode | None, OpError | None]] = []
     for s in sels:
@@ -2320,7 +2451,7 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
         c, o = _node_parts(ix, n, facets=facets, props_mode=props_mode, raw=raw,
                            ancestors=ancestors, children=children, props_fn=props_fn, idx=i,
                            image=image, issue_fmt=issue_fmt, multi_window=multi_window,
-                           implicit_props=implicit_props)
+                           implicit_props=implicit_props, tb_fn=tb_fn)
         docs.append({})
         cores.append(c)
         opts.append(o)
