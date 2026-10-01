@@ -1298,6 +1298,29 @@ def test_findings_under_a_modal_dialog_are_counted_apart():
     assert "covered_by_rule" not in lint(screen(activity), enabled=["R1"]).to_dict()
 
 
+def test_r12_does_not_pair_a_dialog_button_with_its_twin_behind_the_dialog():
+    # A "Close" on the activity and another on the dialog over it: TalkBack reaches only the
+    # dialog's while it is open, so neither is a duplicate of the other.
+    activity = decor(2, view(3, "android.widget.Button", text="Close", flags=CLICK,
+                             b=(100, 300, 300, 160)))
+    dialog = view(9, "android.widget.FrameLayout", b=(100, 800, 880, 600),
+                  kids=[view(10, "android.widget.Button", text="Close", flags=CLICK,
+                             b=(140, 840, 300, 160))])
+    data = screen(activity, dialog)
+    data["windows"][0]["covered_by"] = 9
+    rep = lint(data, enabled=["R12"])
+    assert rep.findings == [] and "covered" not in rep.summary
+    # Two twins behind the dialog are still a pair, counted under it.
+    activity2 = decor(2, view(3, "android.widget.Button", text="Close", flags=CLICK,
+                              b=(100, 300, 300, 160)),
+                      view(4, "android.widget.Button", text="Close", flags=CLICK,
+                           b=(500, 300, 300, 160)))
+    data2 = screen(activity2, dialog)
+    data2["windows"][0]["covered_by"] = 9
+    rep2 = lint(data2, enabled=["R12"])
+    assert rep2.reachable == [] and sorted(keys(rep2.covered)) == ["view:3", "view:4"]
+
+
 # --------------------------------------------------------------------------- #
 # Real-app false positives (REALAPP_RESULTS B8), in miniature; test_realapp_accuracy.py runs
 # the real dumps.

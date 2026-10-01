@@ -2196,7 +2196,7 @@ def rule_duplicate_label(run: _Run) -> List[Finding]:
     RecyclerView / LazyColumn / ListView ("Delete" in every row) are fine; repeats
     under the same parent are not."""
     out: List[Finding] = []
-    groups: Dict[str, List[_Node]] = {}
+    groups: Dict[Tuple[str, bool], List[_Node]] = {}
     for n in run.nodes:
         if not _visible(n) or not _actionable(n) or _editable(n):
             continue
@@ -2205,7 +2205,10 @@ def rule_duplicate_label(run: _Run) -> List[Finding]:
         lbl, _ = run.effective_label(n, with_state=False)
         if not lbl or lbl.startswith("<"):
             continue
-        groups.setdefault(_norm_label(lbl), []).append(n)
+        # A twin on a window under an open dialog is out of reach while the dialog is up: the
+        # dialog's "Close" and the activity's behind it are not heard together.
+        covered = n.win is not None and n.win.covered_by is not None
+        groups.setdefault((_norm_label(lbl), covered), []).append(n)
 
     def per_row_ok(a: _Node, b: _Node) -> bool:
         ca, cb = a.collection_ctx, b.collection_ctx
