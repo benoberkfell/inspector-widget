@@ -135,3 +135,25 @@ def test_a_full_height_strip_beside_two_lines_is_read_first_then_line_by_line():
     trailing = [{"key": "name", "bounds": (0, 0, 300, 40)}, {"key": "sub", "bounds": (0, 60, 300, 40)},
                 {"key": "more", "bounds": (400, 0, 80, 100)}]
     assert order_items(trailing) == ["name", "sub", "more"]
+
+
+def test_a_list_row_that_is_a_stop_keeps_its_own_buttons_with_it():
+    # Thunderbird's message list: each row (a collection item, a stop) holds a Select and an
+    # Add star stop. The row and its buttons are one block, read row by row as TalkBack does,
+    # not every row first and then every row's buttons (the TalkBack-on dump has the item info
+    # itself; a TalkBack-off capture gets it from talkback/recycler.py).
+    import gzip
+    import json
+    from pathlib import Path
+
+    import tb_capture_fixtures as F
+
+    from inspector_widget.capture import tb as T
+
+    ix, raw = F.live_capture("thunderbird_list_tb_off")
+    nav = T.TbCapture.of(ix, raw).nav
+    assert tb.visual_order(nav)["order"][5:12] == [
+        "view:66", "view:85", "view:84", "view:86", "view:105", "view:104", "view:106"]
+    path = Path(__file__).parent / "data" / "realapps" / "thunderbird_list_views.a11y.json.gz"
+    nav = tb.Navigator(tb.build(json.loads(gzip.decompress(path.read_bytes()))))
+    assert tb.visual_order(nav)["order"][5:9] == ["view:352", "view:371", "view:370", "view:372"]

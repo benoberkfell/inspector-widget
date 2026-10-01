@@ -92,8 +92,12 @@ def _sidebar(items: List[_Item]) -> Optional[Tuple[_Item, bool]]:
 
 
 def _container(rules: Rules, n: TbNode, stops: set) -> Optional[TbNode]:
-    """The accessibility container that keeps ``n`` with its neighbours: the nearest ancestor
-    that is a collection item, a traversal group, or a focusable node that is not a stop."""
+    """The accessibility container that keeps ``n`` with its neighbours: ``n`` itself when it
+    is a collection item (a list row that is a stop holds its own inline controls: the row and
+    its buttons are one block, as TalkBack reads them), else the nearest ancestor that is a
+    collection item, a traversal group, or a focusable node that is not a stop."""
+    if n.get("collection_item_info"):
+        return n
     for a in n.ancestors():
         if a.get("collection_item_info") or a.has("is_traversal_group") \
                 or a.get("is_traversal_group"):
