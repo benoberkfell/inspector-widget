@@ -388,4 +388,8 @@ def test_the_lint_names_what_r12_nodes_share(tmp_path):
         assert lint["counts"]["info"] == 6 and len(nodes) == 6
         assert not any('"Not selected"[*]' in x for x in nodes)
         for name in ("Headlines", "UI", "Compose"):
-            assert sum(f'named "{name}" like n' in x for x in nodes) == 2, nodes
+            # the row and its Checkbox, each with its twin; a row whose label is its state
+            # says the name it shares ('n28 "Not selected" named "Headlines" like n29')
+            pair = [x for x in nodes if f'"{name}"' in x]
+            assert len(pair) == 2 and all(" like n" in x for x in pair), nodes
+        assert not any('"Not selected"' in x and " named " not in x for x in nodes), nodes

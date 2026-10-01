@@ -691,6 +691,9 @@ def _map_findings(report: Any, dump: _A11yDump, ix: Index, res: _LintResult,
             continue
         ev = _evidence(f, nid, dump, lookup)
         conf = "inferred" if ev.pop("low_confidence", False) else "exact"
+        n = ix.nodes[nid]
+        if ev.get("name") is not None and ev["name"] == (n.label or n.text or n.desc):
+            ev.pop("name")  # R12's shared name is the node's own label: nothing to add
         cov = (getattr(f, "window", None) or {}).get("covered_by")
         if cov is not None:
             # on a window under an open dialog: the dialog's window, counted apart (_covered)
@@ -1152,10 +1155,11 @@ def _detail(iss: Issue) -> str:
         bits.append(str(ev["why"]))
     elif iss.id == OFFSCREEN and ev.get("outside"):
         bits.append(f"outside {ev['outside']}")
-    elif iss.id == DUP_RULE and ev.get("name"):
+    elif iss.id == DUP_RULE and (ev.get("name") or ev.get("node_ids")):
         others = [str(x) for x in ev.get("node_ids") or []]
         like = " ".join(others[:2]) + (f" +{len(others) - 2}" if len(others) > 2 else "")
-        bits.append(f"named {_quote(ev['name'], 24)}" + (f" like {like}" if like else ""))
+        named = f"named {_quote(ev['name'], 24)}" if ev.get("name") else ""
+        bits.append(" ".join(x for x in (named, f"like {like}" if like else "") if x))
     note = ev.get("note")
     out = " ".join(bits)
     if note:
@@ -1412,7 +1416,9 @@ def _rule_items(ix: Index, kept: list[tuple[str, Issue]], per_rule: int,
         if rid == DUP_RULE:  # one collapse per shared name (a row's own label can be its state)
             by_name: dict[Any, list[tuple[str, Issue]]] = {}
             for nid, iss in members:
-                by_name.setdefault(iss.evidence.get("name"), []).append((nid, iss))
+                n = ix.nodes[nid]
+                name = iss.evidence.get("name") or n.label or n.text or n.desc
+                by_name.setdefault(name, []).append((nid, iss))
             lines = [ln for grp in by_name.values() for ln in _collapsed(ix, grp)]
         else:
             lines = _collapsed(ix, members)
