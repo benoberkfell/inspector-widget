@@ -213,8 +213,18 @@ _CATALOG: tuple[Rule, ...] = (
        "{ … }) }; View: ViewCompat.addAccessibilityAction"),
     _r("tb.webview_block", "error",
        "Focus stops before a WebView: TalkBack cannot move into its page (a walk finding).",
-       "Rerun with TalkBack started first (relaunch); give the page a native way in (a "
+       "Turn TalkBack on, restart the app and walk again; give the page a native way in (a "
        "button that focuses the WebView)"),
+    _r("tb.interleaved", "warn",
+       "A card's stop is read after another card's stops (side-by-side cards; a walk "
+       "finding).",
+       "One traversal group per card (Modifier.semantics { isTraversalGroup = true }), or one "
+       "stop per card with its controls as custom actions"),
+    _r("tb.autoscroll_row_skip", "warn",
+       "TalkBack's auto-scroll along a sideways grid's bottom row passes over the rows above "
+       "(a walk finding).",
+       "A vertical layout (FlowRow, rows in a vertical list), or a traversal group with "
+       "traversalIndex = index per item"),
     _r("tb.covered_stop", "warn",
        "Draws over stops of its own window (an action-mode bar over the toolbar): hidden, "
        "TalkBack still reads them.",

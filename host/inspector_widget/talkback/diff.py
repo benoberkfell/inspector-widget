@@ -75,8 +75,8 @@ FIXES = {
                  "overlay a paneTitle.",
     "tb.webview_block": "TalkBack cannot put focus on the WebView's page (its focus action "
                         "brings no focus event). A WebView created before TalkBack started can "
-                        "stay closed to it until it is created again: rerun with TalkBack "
-                        "started first (relaunch) to see what a TalkBack user gets; and give the "
+                        "stay closed to it until it is created again: turn TalkBack on, restart "
+                        "the app and walk again to see what a TalkBack user gets; and give the "
                         "page a native way in (a button that focuses the WebView).",
     "tb.interleaved": "Make each card one traversal group (Compose: Modifier.semantics { "
                       "isTraversalGroup = true } on the card; Views: a focusable card, or "

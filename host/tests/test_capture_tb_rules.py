@@ -185,6 +185,27 @@ def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():
     assert R.resolve("double_stop") == ["tb.double_stop"]
 
 
+def test_the_codes_the_occlusion_work_added_are_all_known_to_the_catalog():
+    # tb.interleaved and tb.autoscroll_row_skip were walk findings the catalog did not know
+    # (lint(rules=["interleaved"]) was bad_args) next to tb.webview_block and
+    # tb.covered_stop, which it did
+    for code in ("tb.webview_block", "tb.covered_stop", "tb.interleaved",
+                 "tb.autoscroll_row_skip"):
+        assert R.is_known(code), code
+        assert R.resolve(code.split(".", 1)[1]) == [code]
+    ix, raw = F.fixture_capture("thunderbird_list_compose")
+    out = analyzers.lint_view(ix, raw, rules=["interleaved"])
+    assert out["rules"] == [] and "only in a walk" in out["note"]
+    # a fix names no parameter the tools do not have (tb_walk's relaunch came later)
+    from inspector_widget import surface
+    from inspector_widget.talkback import diff
+
+    params = {p.name for t in surface.SPECS for p in t.params}
+    for code in ("tb.webview_block", "tb.interleaved", "tb.autoscroll_row_skip"):
+        for fix in (R.RULES[code].fix, diff.FIXES[code]):
+            assert "relaunch" in params or "relaunch" not in fix, (code, fix)
+
+
 def test_finding_details_name_the_other_nodes():
     ix, raw = F.corpus_capture("tb_c9-bad-walk")
     out = analyzers.lint_view(ix, raw, rules=["tb"], group="none")
