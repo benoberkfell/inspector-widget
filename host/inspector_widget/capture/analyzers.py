@@ -1140,6 +1140,8 @@ def _tb_detail(iss: Issue) -> str:
         return f"hides {ev.get('texts')} text(s): {_quote(ev.get('first') or '', 24)}"
     if rid == "tb.custom_action_missing":
         src = f" ({ev['src']})" if ev.get("src") else ""
+        if others:  # the action sits on a container TalkBack never focuses
+            return f"{ev.get('gesture')}: its custom action is on {others[0]}, never focused{src}"
         return f"{ev.get('gesture')} without a custom action{src}"
     return ""
 

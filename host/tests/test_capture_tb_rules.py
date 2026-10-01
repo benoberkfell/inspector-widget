@@ -235,9 +235,13 @@ def test_custom_action_missing_needs_the_slot_table():
         ("a11y:7:11", "tb.custom_action_missing", "SwipeToDismissBox", "inferred"),
         ("a11y:7:18", "tb.custom_action_missing", "SwipeToDismissBox", "inferred"),
         ("a11y:7:25", "tb.custom_action_missing", "SwipeToDismissBox", "inferred")]
-    # GOOD: the merged row offers a "Delete" custom action
-    good = with_slots("tb_c11-good-walk", ["a11y:7:5", "a11y:7:12", "a11y:7:19"])
-    assert [i for _n, i in good if i.id == "tb.custom_action_missing"] == []
+    # GOOD puts customActions on the SwipeToDismissBox node (a11y:7:5 ...), which TalkBack
+    # never focuses: the stop is still the Text, whose menu has no "Delete" (the live
+    # capture with the real slot table says the same: test_capture_tb_corpus_live.py)
+    good = with_slots("tb_c11-good-walk", ["a11y:7:11", "a11y:7:18", "a11y:7:25"])
+    assert [(n, i.evidence["node_ids"]) for n, i in good
+            if i.id == "tb.custom_action_missing"] == [
+        ("a11y:7:11", ["a11y:7:5"]), ("a11y:7:18", ["a11y:7:12"]), ("a11y:7:25", ["a11y:7:19"])]
 
 
 def test_a_capture_never_fails_on_the_tb_rules(monkeypatch):

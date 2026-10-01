@@ -668,11 +668,16 @@ GESTURE_COMPOSABLES = ("SwipeToDismissBox", "SwipeToDismiss", "SwipeableActionsB
 GESTURE_MODIFIERS = ("anchoreddraggable", "swipeable", "swipetodismiss")
 
 
+def _labelled_actions(n: Any) -> list[dict[str, Any]]:
+    return [a for a in n.raw.get("actions") or () if isinstance(a, dict) and a.get("label")]
+
+
 def _custom_actions_missing(ix: Index, tbc: TbCapture) -> list[tuple[str, Issue]]:
     """tb.custom_action_missing: a stop emitted inside a swipe-to-dismiss (or anchored
     draggable) composable that offers no labelled custom action. Needs the slot table
     (``capture(slots="enable")``); silent without it."""
     out: list[tuple[str, Issue]] = []
+    stops = {id(x) for x in tbc.linear()}
     for n in tbc.linear():
         nid = tbc.nid(n)
         node = ix.nodes.get(nid) if nid else None
@@ -701,14 +706,22 @@ def _custom_actions_missing(ix: Index, tbc: TbCapture) -> list[tuple[str, Issue]
             hops += 1
         if gesture is None:
             continue
-        labelled = [a for a in n.raw.get("actions") or ()
-                    if isinstance(a, dict) and a.get("label")]
-        if labelled:
+        if _labelled_actions(n):
             continue
         name, s = gesture
         ev: dict[str, Any] = {"gesture": name}
         if s.src:
             ev["src"] = s.src
+        # The action on a container TalkBack never focuses (A11yProbe C11 GOOD: customActions
+        # on the SwipeToDismissBox, the stop is the Text inside): still out of reach.
+        holder = next((a for a in list(n.ancestors())[:6] if _labelled_actions(a)), None)
+        if holder is not None:
+            if id(holder) in stops:
+                continue  # TalkBack focuses the holder too: the action is in its menu
+            ev["why"] = "action_on_a_node_talkback_never_focuses"
+            hid = tbc.nid(holder)
+            if hid:
+                ev["node_ids"] = [hid]  # named by ref, as the other rules' other nodes
         out.append((nid, Issue("tb.custom_action_missing", "warn", ev, "inferred")))
     return out
 
