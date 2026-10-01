@@ -336,7 +336,7 @@ collapse like the a11y ones (`×6 in #message_list cells`). `lint()` reports
 `tb.skipped` with the a11y rules (no false positive on the corpus GOOD variants
 or the recorded real apps); `lint(rules=["tb"])` lists every `tb.*` rule,
 including the heuristic and opt-in ones (`tb.double_stop`, `tb.ghost_stop`,
-`tb.out_of_order`, `tb.boundary_jump`, `tb.custom_action_missing`). Tree
+`tb.out_of_order`, `tb.boundary_jump`, `tb.covered_stop`, `tb.custom_action_missing`). Tree
 outlines and `lint()` carry the default codes only (`!escape`); the reading view
 (`outline(view="reading")`, whose `next` then points at `lint(rules=["tb"])`),
 `lint(rules=["tb"])` and `find(issue="tb.<rule>")` carry every code
@@ -360,25 +360,41 @@ model and TalkBack disagreed.
   Not reported: what is hidden for a panel open over it (an open
   `DrawerLayout` drawer hides the content, a modal bottom or side sheet its
   siblings: that keeps focus in the panel), or under a scrim.
-- **Walk:** predicted stops a full lap never reached (`diff.skip`,
-  `diff.unvisited`), or text on screen no stop read.
+- **Walk:** predicted stops the walk went past and never read (`diff.skip`,
+  `diff.unvisited`), or text on screen no stop of a full lap read. Only over the
+  span the walk covered: "in a full lap" only once a wrap brought it back to a
+  stop it had read, and the presses of a stuck walk that moved nothing are no
+  edge. Text behind a drawer's scrim, a sheet or a dialog, or hidden from
+  accessibility, is not skipped (nobody sees it). A stop the model learned of
+  only on a re-model after the walk had passed where it goes (a collapsing
+  toolbar's title that appears once the list scrolls) is an `info` with basis
+  `model`, not a skip.
 - **Fix:** drop the hiding flag (a ComposeView cell with `noHideDescendants`
   hides the whole cell), or fold the text into a stop's label.
 
 ### `tb.double_stop` — one item takes two swipes  (opt-in)
 - **Static:** a stop with another stop inside it that says the same thing, or
   both clickable (a clickable row and its own Switch / IconButton).
-- **Walk:** consecutive stops, one inside the other (`diff.double`).
+- **Walk:** consecutive stops, one inside the other (`diff.double`). Not a text
+  field and its clear button; `info` when both are clickable and the inner one
+  says something else (a row with its own Play or Download button: a custom action
+  on the row is better, but nothing is said twice).
 - **Fix:** Compose `Modifier.toggleable(role = Role.Switch)` / `clickable` on the
   row and `onCheckedChange = null` on the child; View: the child
   `clickable` / `focusable = false`; secondary actions as `customActions`.
 
 ### `tb.ghost_stop` — a stop with nothing useful to hear or see  (opt-in)
 - **Static:** an unlabelled stop (also `a11y.label.missing`), a focusable
-  container whose text children are invisible, a stop of no area or wholly off
-  its window (`offscreen`: a pager's off-screen page TalkBack reads anyway, such
-  as a WebView's show notes), a sliver at a scroll edge TalkBack cannot scroll in.
-- **Walk:** TalkBack lands there.
+  container whose text children are invisible, a stop of no area (`zero_size`)
+  or wholly off its window or clipped away by the scrollable or pager it is in
+  (`offscreen`: a pager's off-screen page TalkBack reads anyway), a sliver at a
+  scroll edge TalkBack cannot scroll in. Web content is `offscreen` when its
+  WebView is not shown (the page of a pager or a collapsed sheet: AntennaPod's
+  show notes, 0 px tall below the screen); elements past a shown WebView's fold
+  are not (Chromium scrolls them in). The capture's summary lists such web stops
+  (`render.offscreen`), so they show without `rules=["tb"]`.
+- **Walk:** TalkBack lands there; a step outside its window or past the edge of
+  the list or pager it sits in is `offscreen`.
 - **Fix:** label it, or hide it (`clearAndSetSemantics {}` /
   `hideFromAccessibility`; View `importantForAccessibility="no"`, `GONE` rather
   than `alpha = 0`).
@@ -401,11 +417,19 @@ model and TalkBack disagreed.
 
 ### `tb.escape` — focus walks out of a dialog or sheet  (default, error)
 - **Static:** stops drawn under a same-window overlay (a `Box` + scrim "dialog",
-  a `BottomSheetScaffold` sheet, a custom View overlay) stay reachable. What is
-  drawn above what follows the View tree's drawing order: elevation first (the
-  capture's View properties), then child order; without properties, an elevated
-  kind of View (a FAB, an AppBarLayout, a CardView) drawn earlier is not
-  counted under a later scrim.
+  a `BottomSheetScaffold` sheet, a custom View overlay, an open drawer whose
+  content TalkBack still gets) stay reachable. What is drawn above what follows
+  the View tree's drawing order: elevation first (the capture's View properties),
+  then child order; without properties, an elevated kind of View (a FAB, an
+  AppBarLayout, a CardView) drawn earlier is not counted under a later scrim.
+  An overlay covers only where it draws: its whole box when it has a background
+  (View properties), takes touches over most of the window or is a surface (most
+  of the window, holding content of its own: a bottom sheet, a fragment over
+  another), else only where its children show something. An empty full-screen
+  `FrameLayout` drawn last (a loading frame whose child is `GONE`) covers nothing.
+  Every node under an overlay carries `!covered` (`render.covered`, `node(ref,
+  facets="tb")` says `covered_by`), and the a11y findings on them are counted
+  apart, as under a dialog window (`summary.covered`).
 - **Walk:** focus leaves the overlay for nodes behind it, or reaches a window
   under a modal one (`diff.escape`): one finding per run of steps ("steps 3-11:
   ... read 9 stops behind it"). What is behind the overlay comes from the walk's
@@ -413,6 +437,21 @@ model and TalkBack disagreed.
 - **Fix:** a real `Dialog` / `ModalBottomSheet` (its own window), or hide what it
   covers while it is open (Compose `hideFromAccessibility`, View
   `noHideDescendants`), and give the overlay a `paneTitle`.
+
+### `tb.covered_stop` — stops something draws over  (opt-in)
+- **Static:** an overlay smaller than a sheet draws over stops of its own window
+  that TalkBack still reads by swiping (explore-by-touch cannot reach them):
+  AppCompat's action-mode bar over the toolbar (`windowActionModeOverlay`), whose
+  hidden toolbar buttons TalkBack reads first. Anchored on the overlay, naming the
+  covered stops; the overlay's own stops, read last because it is added at the end
+  of the View tree, get one `tb.out_of_order` that says so (`why: in_overlay`).
+- **Walk:** the steps under such an overlay, one finding per overlay, every step
+  tagged; a sheet the walk was never inside of, too (inside it first, it is
+  `tb.escape`).
+- **Fix:** while the overlay shows, `importantForAccessibility=
+  noHideDescendants` on what it covers (restored when it goes; Compose
+  `hideFromAccessibility`) and move accessibility focus into it; or let it
+  replace what it covers in the hierarchy.
 
 ### `tb.window_order` — a popup is read last  (default)
 - **Static / walk:** a non-focusable `PopupWindow` / dropdown is sorted after the
@@ -430,18 +469,28 @@ model and TalkBack disagreed.
   item (a grid only when it is clearly a vertical one), and says so in the
   capture's diagnostics when it cannot. The lint line quotes the wrong "N of M"
   itself (`says "2 of 21": counts 1 silent item(s), e.g. n12`).
-- **Walk:** the same at the stops TalkBack visited (`diff.speech`).
+  The item's stop may be inside it (a ComposeView cell per row: Thunderbird's
+  Compose message list says "2 of 6" on its first message). A RecyclerView item
+  bound before a service started has no item info and is not important in a dump
+  taken with TalkBack on: no "N of M", and a plain page root of ViewPager2 is no
+  "Page" stop (its texts are stops of their own); the capture's diagnostics say
+  so (`recycler_bound_before_service`, ViewPager2's internal RecyclerView too).
+- **Walk:** the same at the stops TalkBack visited (`diff.speech`), and "In list.
+  N items" against the items a lap that went through the list reached ("6 items"
+  for 5 messages).
 - **Fix:** compose the texts in reading order, or
   `clearAndSetSemantics { contentDescription = "Socks, $5" }`; keep empty
-  header / footer items out of the adapter.
+  header / footer / spacer items out of the adapter or lazy list
+  (`contentPadding` instead of a spacer item).
 
 ### `tb.edge_stuck` — content a swipe cannot reach  (default)
 - **Static:** content past a scroll edge with no scroll action in that
   direction, a pager's other pages with nothing that turns them (no tabs or
   selected page indicator, no "Next" / "Previous page" button, no labelled
   custom action on the pager or above it).
-- **Walk:** an edge while the container can still scroll, two presses that move
-  nothing (`ended: "stuck"`), hidden items after the last stop (`diff.stuck`).
+- **Walk:** an edge while the container can still scroll (at a pager's edge: "TalkBack
+  never turns a page", with the pager fix), two presses that move nothing
+  (`ended: "stuck"`), hidden items after the last stop (`diff.stuck`).
 - **Fix:** scroll semantics and actions (`verticalScroll`, `LazyColumn`,
   RecyclerView, NestedScrollView); page buttons or custom actions for a pager.
 
@@ -462,7 +511,29 @@ model and TalkBack disagreed.
 - **`tb.trap`** — the app takes focus back between presses (`via=stolen`). Fix:
   request focus once, not on every recomposition or timer tick.
 - **`tb.revisit`** — a stop read twice in one lap (items re-laid out while
-  TalkBack scrolls them). Fix: stable lazy keys, one stop per card.
+  TalkBack scrolls them): the same node by key (a Compose node of a host no list
+  recycles is one node, whatever its text says now), not an alike node of another
+  card. Fix: stable lazy keys, one stop per card.
+- **`tb.webview_block`** (error) — stuck before a WebView (or the page holding
+  one): two presses moved nothing and the model's next stop is the WebView's root;
+  the finding names it and the list or pager it sits in. TalkBack's focus action
+  on the root brings no focus event; seen with TalkBack started after the app,
+  where the dump looks the same as when TalkBack gets in. Fix: rerun with
+  TalkBack started first to see what a user gets; give the page a native way in.
+- **`tb.interleaved`** — a stop read after another card's stops though its own card
+  was read before them (side-by-side cards in a staggered grid: each Bookmark read
+  after the other card). Fix: one traversal group per card
+  (`Modifier.semantics { isTraversalGroup = true }`), or one stop per card with its
+  controls as custom actions.
+- **`tb.autoscroll_row_skip`** — in a grid that scrolls sideways with several rows,
+  TalkBack's auto-scroll lands along the bottom row, so the rows above in every
+  column it scrolls in are passed over; names the items never reached (Now in
+  Android's 3-row topic grid). Fix: a vertical layout (`FlowRow`, rows in a
+  vertical list), or a traversal group with `traversalIndex = index` per item.
+- **A window of another app on top** (a permission request, the 16 KB
+  compatibility dialog): a capture says so in its diagnostics and has no stop of
+  the app; `tb_walk` / `tb_scenario` fail at once naming it. Dismiss it (BACK, or
+  answer it), then retry.
 - **`tb.focus_lost`** — no node holds focus after a press (the focused item was
   disposed while scrolling). Fix: stable keys / `LazyListState`.
 - **`tb_scenario` verdicts:** `tb.initial_focus` (after an action focus lands on a
