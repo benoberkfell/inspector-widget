@@ -118,6 +118,19 @@ def test_non_focusable_children_only():
     assert say(card).text == "Title"
 
 
+def test_a_lone_symbol_is_spoken_by_its_name():
+    # G26: SpeechCleanupUtils.cleanUp names a text that is a single symbol. TalkBack 17.0 on
+    # AntennaPod's show notes: "• " -> "Bullet. 1 of 19. In list. 19 items"; a "." -> "Period".
+    assert say(n(2, cls="android.widget.TextView", text="• ", flags=FOCUS)).text == "Bullet"
+    assert say(n(2, cls="android.widget.TextView", text=".", flags=FOCUS)).text == "Period"
+    row = n(2, flags=FOCUS, b=(0, 0, 1080, 200), children=[
+        n(3, cls="android.widget.TextView", text="•", b=(0, 0, 40, 80)),
+        n(4, cls="android.widget.TextView", text="Item", b=(60, 0, 500, 80))])
+    assert say(row).text == "Bullet. Item"  # a child's lone symbol too
+    # more than one character is read as it is
+    assert say(n(2, cls="android.widget.TextView", text="••", flags=FOCUS)).text == "••"
+
+
 # ------------------------------------------------------------------------------------- Unlabelled
 def test_unlabelled_leaf_says_its_role_or_unlabelled():
     # getUnlabelledNodeDescription (TB/compositor/AccessibilityNodeFeedbackUtils.java:300):

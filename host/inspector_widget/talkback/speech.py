@@ -150,6 +150,30 @@ def _trim(s: Optional[str]) -> str:
     return s if s and s.strip() else ""
 
 
+#: What TalkBack says for a text that is one symbol and nothing else (SpeechCleanupUtils
+#: .cleanUp: a single character is replaced by its spoken name, res/values/strings.xml
+#: "symbol_*"). Measured on TalkBack 17.0: AntennaPod's show notes, whose list bullets are
+#: their own web elements ("•" -> "Bullet. 1 of 19. In list. 19 items"), and a paragraph
+#: that is only "." ("Period"). The rest are TalkBack's English names for the same table.
+SYMBOL_NAMES = {
+    "•": "Bullet", ".": "Period", ",": "Comma", ":": "Colon", ";": "Semicolon",
+    "!": "Exclamation mark", "?": "Question mark", "&": "Ampersand", "*": "Asterisk",
+    "@": "At", "#": "Pound", "%": "Percent", "+": "Plus", "=": "Equals", "/": "Slash",
+    "\\": "Backslash", "|": "Vertical bar", "-": "Dash", "_": "Underscore",
+    "~": "Tilde", "^": "Caret", "$": "Dollar", "€": "Euro", "£": "Pound sterling",
+    "¥": "Yen", "©": "Copyright", "®": "Registered trademark", "™": "Trademark",
+    "°": "Degree", "…": "Ellipsis", "—": "Em dash", "–": "En dash", "·": "Middle dot",
+    "§": "Section", "¶": "Paragraph", "×": "Multiplication", "÷": "Division",
+}
+
+
+def spoken_text(s: str) -> str:
+    """A node's text as TalkBack speaks it: a lone symbol (whitespace, non-breaking spaces
+    included, around it) by its name; anything else as it is."""
+    t = (s or "").strip()
+    return SYMBOL_NAMES.get(t, s) if len(t) == 1 else s
+
+
 def node_text(n: TbNode) -> str:
     """AccessibilityNodeInfoUtils.getNodeText (UT :501): the contentDescription, else the text."""
     return _trim(n.content_description) or _trim(n.text)
@@ -272,6 +296,7 @@ class _Composer:
             name = self.text_or_label(n)
             role_word = self.role_description(n)
             state = self.state_description(n)
+        name = spoken_text(name)
         segs, seen = [], set()
         for text, kind in ((state, state_kind), (name, "name"), (role_word, "role")):
             if text and text.lower() not in seen:  # CompositorUtils.dedupJoin

@@ -276,8 +276,7 @@ def test_going_back_into_a_page_nobody_can_see_reads_it_and_says_so():
                                                   if moved]
     said = [s for _m, _k, _l, s in walk["steps"]]
     model = [m["speak"] for m in back.steps]
-    assert model[:-1] == said[:-1]
-    assert (model[-1], said[-1]) == (".", "Period")  # a lone "." is spoken by its name
+    assert model == said  # a lone "." is spoken by its name: "Period" (speech.SYMBOL_NAMES)
     hidden = [h for h in back.hints if h["kind"] == "web_hidden_page"]
     assert [(h["web_root"], h["trap"], h["before"]) for h in hidden] == [
         ("virtual:695:23", False, "view:289")]
