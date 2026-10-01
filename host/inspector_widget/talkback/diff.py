@@ -1061,7 +1061,8 @@ def _check_n_of_m(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out[:3]
 
 
-_IN_LIST = re.compile(r"\bIn (list|grid)\b\.?\s*(\d+) (items|rows)(?:\.\s*(\d+) columns)?", re.I)
+_IN_LIST = re.compile(r"\bIn (list|grid)\b[.,]?\s*(\d+) (items?|rows?)(?:[.,]\s*(\d+) columns?)?",
+                      re.I)
 
 
 def _item_of(s: Dict[str, Any], container: str) -> str:
