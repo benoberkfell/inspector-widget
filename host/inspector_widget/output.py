@@ -450,11 +450,26 @@ def preview_lines(result: Any, max_lines: int = PREVIEW_MAX_LINES,
     return lines
 
 
+#: Tools with a max_bytes argument of their own beside OUTPUT_PARAMS' (tb_walk's
+#: walk budget, which finalize also applies).
+OWN_MAX_BYTES_TOOLS = frozenset({"tb_walk"})
+
+
+def takes_max_bytes(tool: str) -> bool:
+    """Whether ``tool`` takes a ``max_bytes`` argument (and ``--max-bytes``)."""
+    return tool in OWN_MAX_BYTES_TOOLS or any(
+        p.name == "max_bytes" for p in OUTPUT_PARAMS.get(tool, []))
+
+
 def _hint(tool: str, detail: str | None = None) -> str:
     narrow = "Narrow with max_depth=2 or root=<id>, " if tool in TREE_TOOLS else ""
     brief = 'use detail="brief", ' if detail == "full" else ""
-    return (f"{narrow}raise max_bytes (<={HARD_MAX_BYTES}), {brief}or read "
-            "spill_path with jq.")
+    if takes_max_bytes(tool):
+        return (f"{narrow}raise max_bytes (<={HARD_MAX_BYTES}), {brief}or read "
+                "spill_path with jq.")
+    # No max_bytes argument here: only the environment raises this tool's budget.
+    return (f"{narrow}{brief}read spill_path with jq, or raise the budget with "
+            f"{ENV_MAX_BYTES} (0 = unlimited) in the server's environment.")
 
 
 def envelope(tool: str, result: Any, text: str, max_bytes: int, spill_path: str | None,

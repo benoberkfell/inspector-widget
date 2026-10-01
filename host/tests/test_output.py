@@ -770,3 +770,26 @@ def test_the_preview_names_the_rid_of_a_brief_inspect_node():
                       "view": {"id": 11, "class_name": "RecyclerView",
                                "resource": "@com.oberkfell.a11yprobe:id/interop_list"}}]}
     assert out.preview_lines(ins) == ["view:11 RecyclerView #interop_list [0,309 1280x2475]"]
+
+
+def test_the_spill_hint_names_max_bytes_only_where_the_tool_takes_it():
+    """A spill envelope must not tell the agent to pass max_bytes to a tool that
+    rejects it (inspect_node, compose_overlay, ...): the call would fail with
+    "unknown argument(s): max_bytes"."""
+    import mcp_server
+
+    big = {"roots": [{"text": "x" * 400, "children": []} for _ in range(200)]}
+    for tool, entry in mcp_server.TOOLS.items():
+        if tool in surface_tools():
+            continue  # the capture tools budget themselves (no spill envelope)
+        env = json.loads(out.finalize(tool, big, max_bytes=1000))
+        takes = "max_bytes" in entry["schema"].get("properties", {})
+        assert takes == out.takes_max_bytes(tool), tool
+        assert ("raise max_bytes" in env["hint"]) is takes, (tool, env["hint"])
+        if not takes:
+            assert out.ENV_MAX_BYTES in env["hint"]
+
+
+def surface_tools():
+    from inspector_widget import surface
+    return set(surface.CAPTURE_TOOLS)
