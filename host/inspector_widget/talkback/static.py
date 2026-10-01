@@ -27,7 +27,9 @@ Codes, with what each looks at:
     the Compose content under it, AndroidView content read out of place).
 ``tb.escape``
     A same-window scrim (a clickable node over most of the window) with stops drawn under
-    it that TalkBack still reaches: focus walks out of the dialog or sheet. Needs to know
+    it that TalkBack still reaches: focus walks out of the dialog or sheet. Or, with no
+    scrim, a View over most of the window that holds stops and is drawn over others (an
+    expanded persistent bottom sheet, a fragment added over another). Needs to know
     what is drawn above what (``drawn_above``, from the capture's View tree); without it
     the rule says nothing.
 ``tb.window_order``
@@ -581,6 +583,47 @@ def _overlays(cx: _Ctx) -> Iterator[Tuple[Any, List[TbNode], int]]:
             pct = round(100 * _area(_rect_of(scrim).intersect(w.bounds))
                         / max(1, _area(w.bounds)))
             yield node, [cx.tree.by_raw[id(r)] for r in under], pct
+        yield from _sheets(cx, w, stops)
+
+
+def _sheets(cx: _Ctx, w: TbWindow, stops: List[TbNode]
+            ) -> Iterator[Tuple[Any, List[TbNode], int]]:
+    """Overlays with no scrim: a View over most of the window that holds stops of its own and
+    is drawn over other stops (their centre inside it), which TalkBack still reaches. An
+    expanded persistent bottom sheet (AntennaPod's player: BottomSheetBehavior hides nothing
+    when it is not modal) or a fragment added over another one; focus walks out of it into
+    the screen it covers. Only Views (a Compose host drawn over Views is often a transparent
+    overlay), not scrollables (a list laid over a header), not the window root, and the
+    outermost such View; a scrim's dialog is :func:`_overlays`' own case."""
+    if cx.drawn_above is None:
+        return
+    area = max(1, _area(w.bounds))
+    stop_raw = [n.raw for n in stops]
+    scrims = {id(r) for r in _scrims(cx, w)}
+    taken: Set[int] = set()  # the subtrees of sheets already reported
+    for raw, parent in _raw_nodes(w):
+        if parent is None or id(raw) in taken or "visible_to_user" not in (raw.get("flags") or ()):
+            continue
+        if int(raw.get("virtual_id", -1)) != -1 or "scrollable" in (raw.get("flags") or ()) \
+                or raw.get("provider_class"):
+            continue
+        if _area(_rect_of(raw).intersect(w.bounds)) < SCRIM_AREA * area:
+            continue
+        inside = _subtree_ids(raw)
+        if inside & scrims:
+            continue
+        own = [n for n in stops if id(n.raw) in inside]
+        if len(own) < 2:
+            continue
+        under = _under(cx, raw, stop_raw)
+        if not under:
+            continue
+        node = cx.tree.by_raw.get(id(raw)) or cx.tree.excluded_by_raw.get(id(raw))
+        if node is None:
+            continue
+        taken |= inside
+        pct = round(100 * _area(_rect_of(raw).intersect(w.bounds)) / area)
+        yield node, [cx.tree.by_raw[id(r)] for r in under], pct
 
 
 def _escapes(cx: _Ctx) -> Iterator[Finding]:

@@ -298,3 +298,39 @@ def test_text_said_through_its_own_description_is_not_skipped():
                 n(6, cls="android.widget.TextView", text="00:04:21", cd="Position: 4 minutes",
                   b=(0, 150, 400, 100))])
     assert "tb.skipped" not in [f.code for f in findings(root(row))]
+
+
+def _player_over_feed(sheet_kw=None):
+    """AntennaPod's expanded player: a persistent bottom sheet (no scrim, not modal) over the
+    feed, whose toolbar and rows TalkBack goes on to read after the player's last button."""
+    feed = [n(2, cls="android.widget.ImageButton", cd="Back", flags=FOCUS, actions=[CLICK],
+              b=(0, 168, 168, 168)),
+            n(3, cls="android.widget.TextView", text="Episode 1", flags=FOCUS, actions=[CLICK],
+              b=(0, 400, 1080, 200)),
+            n(4, cls="android.widget.TextView", text="Episode 2", flags=FOCUS, actions=[CLICK],
+              b=(0, 600, 1080, 200))]
+    sheet = n(9, cls="android.widget.FrameLayout", b=(0, 0, 1080, 2200), children=[
+        n(10, cls="android.widget.ImageButton", cd="Pause", flags=FOCUS, actions=[CLICK],
+          b=(400, 1800, 200, 200)),
+        n(11, cls="android.widget.ImageButton", cd="Skip episode", flags=FOCUS,
+          actions=[CLICK], b=(700, 1800, 200, 200))], **(sheet_kw or {}))
+    return root(*feed, sheet), sheet
+
+
+def test_focus_walking_out_of_an_expanded_sheet_with_no_scrim_is_an_escape():
+    r, sheet = _player_over_feed()
+
+    def above(a, b):
+        return True if a is sheet else (False if b is sheet else None)
+
+    fs = findings(r, drawn_above=above, codes=["tb.escape"])
+    assert [(f.code, f.node.key) for f in fs] == [("tb.escape", "view:9")]
+    assert [o.key for o in fs[0].others] == ["view:2", "view:3", "view:4"]
+    nav = tb.Navigator(tb.build([r]))
+    assert set(static.covered(nav, above)) == {"view:2", "view:3", "view:4"}
+    # without the View tree nothing is known about what is drawn above what
+    assert findings(r, codes=["tb.escape"]) == []
+    # a Compose host over Views is often a transparent overlay (a snackbar host): left alone
+    r2, sheet2 = _player_over_feed({"provider_class": "AndroidComposeView"})
+    assert findings(r2, drawn_above=lambda a, b: True if a is sheet2 else None,
+                    codes=["tb.escape"]) == []
