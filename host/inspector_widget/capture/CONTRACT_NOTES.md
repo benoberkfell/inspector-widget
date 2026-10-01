@@ -309,7 +309,8 @@ with every consumer.
   under 18,500 B. With the three TalkBack tools that took trimming (P0-2): shorter
   tool and parameter descriptions, `package` without one, a shared `scale`, and
   `a11y_lint.rules` without its 47-id enum (the handler checks the ids first and
-  names the valid ones). It is 18,337 B with all 18 tools.
+  names the valid ones). It was 18,337 B with all 18 tools; 18,479 B since the
+  a11y_lint and tb_walk descriptions say what their results now hold.
   - `max_bytes` defaults to the environment value both in the schema and on the
     CLI, so the two stay equal.
   - The CLI adds `--pretty` everywhere. `add_cli_flags` skips flags a subparser
@@ -437,7 +438,7 @@ with every consumer.
   | 259-view | `dump_tree(max_depth=1)` | 169,658 | 297 | 2,000 |
   | 259-view | `dump_tree` / `dump_accessibility` / `inspect` / `+props` | 170 KB-3.85 MB | envelopes of 766-866 | 3,000 |
 
-  `tools/list` is 18,337 B compact (18 tools).
+  `tools/list` is 18,479 B compact (18 tools).
 
 ## Query engine and line grammar (C6, `capture/query.py`, `capture/lines.py`)
 
@@ -1388,11 +1389,11 @@ what now holds:
   server skips its own jsonschema check for these tools.
 - **Toolsets.** `INSPECTOR_WIDGET_TOOLSET` is a name or a comma list: `legacy`
   (the 15), `capture` (the 4 session tools + the 8 = 12), `talkback` (4 + 3),
-  `all` (26). The default is `legacy,talkback`: exactly the 18 tools (and the
-  18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
+  `all` (26). The default is `legacy,talkback`: exactly the 18 tools of before
+  (18,479 B; two descriptions grew), until the deliberate flip (S4). An unknown name
   logs a warning and lists the default. Every tool stays callable by name.
-  Measured tools/list (compact): default 18,337 B, capture 11,994 (12,000),
-  legacy 13,247, talkback 5,114, capture,talkback 15,522, all 27,183 (the capture
+  Measured tools/list (compact): default 18,479 B, capture 11,994 (12,000),
+  legacy 13,320, talkback 4,957, capture,talkback 15,522, all 27,256 (the capture
   tools spend each parameter description once; the instructions carry the rest;
   no listing averages over 1,300 B a tool). Instructions: 739 B (capture), 892 B
   (capture,talkback and all), 718 B (the default).

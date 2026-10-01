@@ -13,9 +13,11 @@ ttsOutput, press by press, ``utt: "logcat"``). On the screen each walk started f
 
 * the capture's speakable is the utterance, apart from the collection / container /
   window transitions TalkBack appends on arrival ("1 of 20. In list. 20 items"):
-  RO1 matched 348 of 594 utterances (58.6%), the model matches 588 (99.0%);
+  RO1 matched 348 of 594 utterances (58.6%), the model matches 592 (99.7%; 588 before
+  TalkBack 17's web roles reached the model);
 * the model's announcement along the walk's path (the reading view's text, transitions
-  included) equals the utterance character for character in 584 of 594 (98.3%).
+  included) equals the utterance character for character in 593 of 594 (99.8%; 584
+  before its pager and web wording).
 
 The few that differ are pinned below with the reason.
 """
@@ -41,23 +43,12 @@ OWN_EXCEPTIONS = {
                             "node in the start dump",
     ("tb_v9-bad-walk", 4): "TalkBack 17 focuses the silent container (says nothing); the "
                            "model (16.2) skips it: a pinned model delta",
-    ("tb_v13-bad-walk", 3): "web content: the WebView itself",
-    ("tb_v13-bad-walk", 4): "web content: 'heading 2' is the web role",
-    ("tb_v13-bad-walk", 6): "web content: 'link' is the web role",
-    ("tb_v13-bad-walk", 7): "web content: 'link' is the web role",
 }
-#: (entry, step) whose utterance the in-walk announcement does not give exactly.
+#: (entry, step) whose utterance the in-walk announcement does not give exactly. The pager
+#: transitions ("In horizontal pager", "Out of grid pager") and the web roles ("heading 2",
+#: "link") the model once missed are TalkBack 17's words since the a11y-accuracy merge.
 WALK_EXCEPTIONS = {
-    ("tb_c8-bad-walk", 1): "TalkBack 17 says 'In horizontal pager' (the 16.2 port: 'In pager')",
-    ("tb_c8-bad-walk", 4): "TalkBack 17 says 'Out of grid pager'",
     ("tb_c12-bad-walk", 6): OWN_EXCEPTIONS[("tb_c12-bad-walk", 6)],
-    ("tb_c16-bad-walk", 1): "'In horizontal pager'",
-    ("tb_c16-bad-walk", 3): "'Out of grid pager'",
-    ("tb_v13-bad-walk", 1): "'In horizontal pager'",
-    ("tb_v13-bad-walk", 4): "web content: the web role read twice by the model",
-    ("tb_v13-bad-walk", 8): "'Out of grid pager'",
-    ("tb_v13-good-walk", 4): "'In horizontal pager'",
-    ("tb_v13-good-walk", 6): "'Out of grid pager'",
 }
 
 
@@ -118,9 +109,9 @@ def test_the_capture_speaks_every_stop_as_talkback_does():
         else:
             misses[(eid, i)] = (speak, said)
     assert total == 594
-    assert set(misses) <= set(OWN_EXCEPTIONS), {k: misses[k] for k in set(misses) -
+    assert set(misses) == set(OWN_EXCEPTIONS), {k: misses.get(k) for k in set(misses) ^
                                                 set(OWN_EXCEPTIONS)}
-    assert matched >= 588, matched
+    assert matched == 592, matched
 
 
 def test_the_index_rule_alone_missed_four_in_ten(monkeypatch):
@@ -161,9 +152,9 @@ def test_the_reading_walk_speech_is_talkbacks_word_for_word():
                     exact += 1
                 else:
                     misses[(eid, s["i"])] = (said, s["speak"])
-    assert set(misses) <= set(WALK_EXCEPTIONS), {k: misses[k] for k in set(misses) -
+    assert set(misses) == set(WALK_EXCEPTIONS), {k: misses.get(k) for k in set(misses) ^
                                                  set(WALK_EXCEPTIONS)}
-    assert total == 594 and exact >= 584
+    assert total == 594 and exact == 593
 
 
 def test_now_in_android_settings_radio_rows():
