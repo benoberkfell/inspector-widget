@@ -767,11 +767,23 @@ with every consumer.
     `ROLE_BY_A11Y_CLASS[a11y class]`; then the primary app slot name; then the View
     class; then the a11y class simple name unless it is `View`. `role` holds the
     first step's value.
-  - `label`: a11y speakable (contentDescription > text > stateDescription; a node
-    that is screen-reader-focusable, clickable or long-clickable and has none
-    speaks its non-focusable descendants, joined by ", "); then Compose
-    ContentDescription > Text > EditableText > StateDescription; then View text.
-    `label`, `text`, `desc`, `state` and `hint` are capped at 1,000 chars.
+  - `label`: for a TalkBack stop, the name inside what the TalkBack model says
+    (`capture/tb.py`: the parts of the announcement that name the node, joined by
+    ", ": "Default" in "Selected. Default. Radio button"); otherwise, and for a stop
+    whose announcement names nothing ("Button"), the a11y speakable rule RO1
+    (contentDescription > text > stateDescription; a node that is
+    screen-reader-focusable, clickable or long-clickable and has none speaks its
+    non-focusable descendants, joined by ", "); then Compose ContentDescription >
+    Text > EditableText > StateDescription; then View text. `label`, `text`, `desc`,
+    `state` and `hint` are capped at 1,000 chars.
+  - `a11y.speakable`: for a TalkBack stop, the model's announcement on a first focus
+    (TalkBack 17.0 wording, no collection or window transition: what `tb_walk`'s
+    model column shows) with `a11y.speak_src: "tb"`; for any other node its RO1
+    text. When the model cannot run, every node gets its RO1 text, focusable ones
+    `speak_src: "ro1"`, and the index a `speech:` diagnostic. `node()` leaves
+    `speak_src` out when it is "tb". A capture diff reports a speakable change only
+    when the state, label, text, description or hint changes it does not already
+    report do not explain it.
   - `flags`: the union of a11y, Compose attr and View property flags, in `FLAGS`
     order. `focus` is dropped when `click` or `longclick` is set (clickable implies
     focusable), matching the spec's outline examples. Two flags say what the

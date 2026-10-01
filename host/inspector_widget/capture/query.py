@@ -1913,6 +1913,8 @@ def _a11y_facet(ix: Index, n: UNode) -> Any:
                 out[k] = acts
         elif k == "res" and n.rid and str(v).rsplit("/", 1)[-1] == n.rid:
             continue  # viewIdResourceName that only repeats the rid
+        elif k == "speak_src" and v == "tb":
+            continue  # the default: the speakable is the TalkBack model's (facet tb says more)
         else:
             out[k] = _cap(v)
     if n.stop is not None:

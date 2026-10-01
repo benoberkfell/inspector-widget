@@ -193,10 +193,15 @@ def test_state_text_a11y_and_visibility_details():
         f'~ {ref} hint - -> "Tap"',
         f"~ {ref} visible 100% -> 25%",
         f"~ {ref} role Switch -> Toggle",
-        f'~ {ref} speakable "Mute, Off" -> "Mute, On"',
+        # (the speakable "Mute, Off" -> "Mute, On" only follows the state: said once)
         f"~ {ref} actions +LONG_CLICK",
         f"~ {ref} flags +longclick",
     ]
+    # a speakable change beyond what the state and text changes explain is reported
+    b3 = chain.publish(one("c00005", state="On", flags=["click", "checkable", "checked"],
+                           a11y={"speakable": "Volume, On", "actions": ["CLICK"]}))
+    lines = d.diff(a, b3, max_bytes=0)["lines"]
+    assert f'~ {ref} speakable "Mute, Off" -> "Volume, On"' in lines
     # a label change that the speakable text simply follows is reported once
     c = chain.publish(one("c00003", label="Sound", text="Sound",
                           a11y={"speakable": "Sound", "actions": ["CLICK"]}))

@@ -282,6 +282,11 @@ class _A:
     target: str | None = None
     conf: str = "exact"
     spoken: str | None = None
+    #: the name inside ``spoken`` (TalkBack model stops only): the label
+    name: str | None = None
+    #: where ``spoken`` came from: "tb" (the TalkBack model's announcement of a stop),
+    #: "ro1" (the index's own rule, for a stop the model could not speak), None
+    speak_src: str | None = None
 
     @property
     def packed(self) -> int:
@@ -842,9 +847,29 @@ class _Builder:
                 continue
             root_view = int(w.root_view_id)
             self.a11y_roots.append(self._flatten(w.root, None, (0,), root_view, res))
+        speech = self._model_speech(msg)
         for a in self.a11y:
-            a.spoken = self._spoken(a)
+            said = speech.get((a.root_view, a.path)) if speech else None
+            if said is not None and said.text:
+                a.spoken, a.name, a.speak_src = said.text, said.name, "tb"
+            else:
+                a.spoken = self._spoken(a)
+                if speech is None and a.focusable:
+                    a.speak_src = "ro1"
         self._join()
+
+    def _model_speech(self, msg: Any) -> dict[tuple[int, tuple[int, ...]], Any] | None:
+        """What TalkBack says at each stop, from the calibrated model (capture/tb.py), keyed
+        like ``_A`` (window root, child-index path); None when the model cannot run (the
+        index then speaks every node by its own rule, RO1, and says so)."""
+        try:
+            from .tb import stop_speech
+
+            return stop_speech(msg)
+        except Exception as e:  # noqa: BLE001 - a capture never fails on the speech model
+            self.diags.append(f"speech: TalkBack model failed ({type(e).__name__}: "
+                              f"{str(e)[:80]}); speakable is the index's own text (ro1)")
+            return None
 
     def _flatten(self, n: Any, parent: int | None, path: tuple[int, ...], root_view: int,
                  res: StringResolver) -> int:
@@ -1151,6 +1176,8 @@ class _Builder:
             f["class"] = a.txt["class_name"]
         if a.spoken:
             f["speakable"] = _cap(a.spoken)
+        if a.speak_src:
+            f["speak_src"] = a.speak_src
         role = a.txt.get("role_description")
         if role:
             f["role"] = role
@@ -1397,7 +1424,10 @@ class _Builder:
         if node.kind == "a11y":
             rid = ax.get("view_id_resource_name")
             node.rid = rid.rsplit("/", 1)[-1] if rid else None
-        label = a.spoken if a is not None else None
+        # a stop's name in what TalkBack says ("Default" in "Selected. Default. Radio
+        # button"), else the node's own text (RO1)
+        label = (a.name or self._spoken(a)) if a is not None and a.speak_src == "tb" else (
+            a.spoken if a is not None else None)
         if not label:
             label = at.get("ContentDescription") or at.get("Text") or at.get("EditableText") \
                 or at.get("StateDescription")

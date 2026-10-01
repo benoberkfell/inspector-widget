@@ -28,6 +28,7 @@ tools since P0-2.
 | `analyzers.py`, `rules.py` | C7 | `analyze` (render signals, lint adapter, reading order), `lint_view`, `lint_summary`; the rule catalog |
 | `diff.py` | C8 | `diff(a, b)` by ref: changed, moved, added, removed, rebound; "new screen" verdict |
 | `images.py` | C9 | per-window crops, Set-of-Mark/lint/reading overlays, inline images, pixel diff |
+| `tb.py` | T5 | the TalkBack model (`..talkback`) over the stored a11y tree, bound to refs: stop speech for the index (`speakable`, `speak_src`), explanations, reading walks (granularity, from, direction, skipped nodes), the node `tb` facet, the `tb.*` rules |
 | `../output.py`, `../normalize*.py` | P0-1 | compact JSON, `Budget`, spill envelope, brief slimming, value normalization |
 
 Importing the package root loads only `model`: no protobuf, no Pillow.

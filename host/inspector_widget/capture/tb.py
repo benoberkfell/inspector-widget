@@ -1,0 +1,576 @@
+"""TalkBack over a capture: the calibrated model run on the stored accessibility tree.
+
+The capture keeps the accessibility tree (``raw/a11y.pb``) verbatim, so everything the
+TalkBack model (:mod:`inspector_widget.talkback`) predicts can be asked of a capture
+without the device: which nodes are stops and why, what TalkBack says at each, in what
+order a swipe visits them, and what the model sees wrong (the ``tb.*`` rules). This module
+ties the model's nodes to the capture's nodes (refs), so every answer names refs.
+
+:class:`TbCapture` is that binding. ``TbCapture.of(ix, loaded)`` builds it once per index
+(cached) from the capture's a11y facet; it is None when the capture has none. Node dicts of
+the a11y dump map to index nodes through the same mapper the lint and the reading order use
+(:meth:`analyzers._A11yDump.mapper`), so a duplicated (host, virtual) pair is never guessed.
+
+What it serves:
+
+* **Speech** (:func:`stop_speech`, used by the index builder): the announcement of every
+  stop, as the TalkBack 17.0 wording of the model gives it for a first focus (no collection
+  or window transition): the text ``tb_walk``'s model column shows. ``speak_src`` says it
+  came from the model ("tb"); the index falls back to its own RO1 text ("ro1") when the
+  model cannot run.
+* **Explanations** (:meth:`TbCapture.explain`): why a node is a stop (``click``,
+  ``focusable``, ``text_orphan``, ``leaf`` ...) or why not (``merged_into:<ref>``,
+  ``hidden_by:<ref>``, ``silent_container``, ``covered_by:<ref>``, ``offscreen``,
+  ``zero_size``, ``invisible``, ``not_important`` ...), with ghost reasons for stops that
+  say nothing useful.
+* **Reading walks** (:meth:`TbCapture.reading`): the stops in swipe order with what TalkBack
+  says on arrival (collection and window transitions included), per granularity (default,
+  heading, control), from any node, forward or backward, optionally with the nodes the walk
+  passes over and why.
+* **The tb facet** of ``node()`` (:meth:`TbCapture.facet`).
+
+Everything here is pure (no device, no protobuf beyond decoding the stored facet).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..talkback import Navigator, build as tb_build
+from ..talkback.explain import ghost_reasons, why_stop
+from ..talkback.speech import Announcement, SpeechState, announce
+from ..talkback.tree import Excluded, TbNode
+from .model import Index
+
+#: Parts of an announcement that name the node (as opposed to its state, role, position).
+NAME_KINDS = frozenset({"name", "child", "name(fake)", "event"})
+GRANULARITIES = ("default", "heading", "control")
+DIRECTIONS = ("next", "prev")
+#: Model wording echoed in responses (speech.DEFAULT_VERSION; rules.TB_RULES_REV).
+SPEAK_SRC_MODEL = "tb"
+SPEAK_SRC_FALLBACK = "ro1"
+
+#: The attribute an Index carries its binding under (Index is unhashable, so no weak map).
+_CACHE_ATTR = "_tb_capture"
+
+
+@dataclass
+class StopSpeech:
+    """What TalkBack says at one stop on a first focus, and the name in it."""
+
+    text: str
+    name: str | None
+    unlabelled: bool
+
+
+@dataclass
+class ReadItem:
+    """One line of a reading walk: a stop (``stop`` set) or a node passed over."""
+
+    nid: str
+    stop: int | None = None
+    speak: str | None = None
+    why: str | None = None  # a stop's reason, or a skipped node's code
+    ref_key: str | None = None  # a skipped node's code that names a node: merged_into ...
+    ref: str | None = None  # ... and that node
+    via: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+def name_of(ann: Announcement) -> str | None:
+    """The naming parts of an announcement, joined: the node's name without its state,
+    role, position or heading words ("Default" in "Selected. Default. Radio button")."""
+    parts = [p["text"] for p in ann.parts if p.get("kind") in NAME_KINDS and p.get("text")]
+    return ", ".join(parts) or None
+
+
+def _decode(resp: Any) -> Any:
+    from .analyzers import _A11yDump
+
+    if isinstance(resp, _A11yDump):
+        return resp
+    if isinstance(resp, (bytes, bytearray)):
+        from ..proto import view_inspection_pb2 as pb
+
+        resp = pb.DumpA11yResponse.FromString(bytes(resp))
+    return _A11yDump(resp)
+
+
+def _iter_paths(root: dict[str, Any]):
+    stack: list[tuple[dict[str, Any], tuple[int, ...]]] = [(root, (0,))]
+    while stack:
+        n, path = stack.pop()
+        yield n, path
+        kids = n.get("children") or []
+        for i in range(len(kids) - 1, -1, -1):
+            stack.append((kids[i], path + (i,)))
+
+
+class TbCapture:
+    """The TalkBack view of one capture's accessibility tree, bound to its nodes.
+
+    ``resp``: the stored DumpA11yResponse (bytes, message, or an analyzers ``_A11yDump``);
+    ``ix``: the index to name nodes in (None: speech by dump position only)."""
+
+    def __init__(self, resp: Any, ix: Index | None = None) -> None:
+        self.dump = _decode(resp)
+        self.tree = tb_build(self.dump.data)
+        self.nav = Navigator(self.tree)
+        self.rules = self.nav.rules
+        self.ix = ix
+        self._lookup = self.dump.mapper(ix) if ix is not None else None
+        self._nid_of_raw: dict[int, str | None] = {}
+        self._by_nid: dict[str, TbNode | Excluded] | None = None
+        self._by_key: dict[str, TbNode] = {}
+        for n in self.tree.nodes:
+            self._by_key.setdefault(n.key, n)
+        self._own: dict[int, Announcement] = {}
+        self._linear: list[TbNode] | None = None
+        self._stop_no: dict[int, int] | None = None
+        self._walk_speech: dict[int, Announcement] | None = None
+
+    # ------------------------------------------------------------------ binding
+    @classmethod
+    def of(cls, ix: Index, loaded: Any) -> TbCapture | None:
+        """The (cached) binding for ``ix``, built from ``loaded``'s a11y facet; None when
+        the capture has no accessibility tree or the model cannot read it."""
+        hit = getattr(ix, _CACHE_ATTR, None)
+        if hit is not None:
+            return hit or None
+        tbc: TbCapture | None = None
+        try:
+            from .analyzers import _Src
+
+            src = loaded if isinstance(loaded, _Src) else _Src(loaded)
+            dump = src.a11y_dump() if loaded is not None else None
+            if dump is not None and dump.has_roots:
+                tbc = cls(dump, ix)
+        except Exception:  # noqa: BLE001 - the queries degrade to the stored reading order
+            tbc = None
+        try:
+            object.__setattr__(ix, _CACHE_ATTR, tbc if tbc is not None else False)
+        except AttributeError:  # pragma: no cover - an index without a __dict__
+            pass
+        return tbc
+
+    def nid_of_raw(self, raw: dict[str, Any] | None) -> str | None:
+        if raw is None or self._lookup is None:
+            return None
+        k = id(raw)
+        if k not in self._nid_of_raw:
+            self._nid_of_raw[k] = self._lookup(raw)
+        return self._nid_of_raw[k]
+
+    def nid(self, n: TbNode | Excluded | None) -> str | None:
+        return None if n is None else self.nid_of_raw(n.raw)
+
+    def node(self, nid: str) -> TbNode | Excluded | None:
+        """The TalkBack-view node (or the excluded dump node) behind an index node."""
+        if self._by_nid is None:
+            self._by_nid = {}
+            for w in self.dump.data.get("windows") or []:
+                if not w.get("root"):
+                    continue
+                for raw, _path in _iter_paths(w["root"]):
+                    x = self.tree.by_raw.get(id(raw)) or self.tree.excluded_by_raw.get(id(raw))
+                    i = self.nid_of_raw(raw)
+                    if x is not None and i is not None:
+                        self._by_nid.setdefault(i, x)
+        return self._by_nid.get(nid)
+
+    def by_key(self, key: str) -> TbNode | None:
+        return self._by_key.get(key)
+
+    def window_ref(self, root_view_id: Any) -> str | None:
+        if self.ix is None or root_view_id is None:
+            return None
+        return self.ix.resolve_id(f"w:{int(root_view_id)}") or \
+            self.ix.resolve_id(f"view:{int(root_view_id)}")
+
+    def _window_nid(self, n: TbNode) -> str | None:
+        return self.window_ref(n.window.root_view_id) or self.nid(n.window.root)
+
+    # ------------------------------------------------------------------ speech
+    def own(self, n: TbNode) -> Announcement:
+        """What TalkBack says when ``n`` takes focus first (no transitions)."""
+        a = self._own.get(id(n))
+        if a is None:
+            a = self._own[id(n)] = announce(self.nav, n, transitions=False)
+        return a
+
+    def linear(self) -> list[TbNode]:
+        """Every stop, window by window, in swipe order (the capture's reading order)."""
+        if self._linear is None:
+            self._linear = self.nav.linear()
+            self._stop_no = {id(n): i + 1 for i, n in enumerate(self._linear)}
+        return self._linear
+
+    def stop_no(self, n: TbNode) -> int | None:
+        self.linear()
+        return (self._stop_no or {}).get(id(n))
+
+    def walk_speech(self, n: TbNode) -> Announcement:
+        """What TalkBack says when a forward swipe from the previous stop lands on ``n``:
+        the collection position and transitions included."""
+        if self._walk_speech is None:
+            st = SpeechState()
+            self._walk_speech = {id(x): announce(self.nav, x, st) for x in self.linear()}
+        return self._walk_speech.get(id(n)) or self.own(n)
+
+    def stop_speech(self) -> dict[tuple[int, tuple[int, ...]], StopSpeech]:
+        """``{(root_view_id, path): StopSpeech}`` for every stop: the index builder's key."""
+        out: dict[tuple[int, tuple[int, ...]], StopSpeech] = {}
+        stops = {id(n) for n in self.linear()}
+        for w in self.dump.data.get("windows") or []:
+            if not w.get("root"):
+                continue
+            rid = int(w.get("root_view_id") or 0)
+            for raw, path in _iter_paths(w["root"]):
+                n = self.tree.by_raw.get(id(raw))
+                if n is None or id(n) not in stops:
+                    continue
+                a = self.own(n)
+                out[(rid, path)] = StopSpeech(a.text, name_of(a), a.unlabelled)
+        return out
+
+    # ------------------------------------------------------------------ explain
+    def explain(self, nid: str) -> dict[str, Any]:
+        """``{"stop": int|None, "why"|"why_not": code, ...}`` for one index node, codes in
+        ref space (see the module docstring)."""
+        x = self.node(nid)
+        if x is None:
+            return {"stop": None, "why_not": "not_in_a11y_tree", "reachable": "not"}
+        if isinstance(x, Excluded):
+            if x.reason == "hidden":
+                by = self.nid_of_raw(x.hidden_by)
+                out = {"stop": None, "why_not": f"hidden_by:{by}" if by and by != nid
+                       else "hidden_by_itself", "reachable": "not",
+                       "detail": "importantForAccessibility=noHideDescendants removes the "
+                                 "subtree from what TalkBack gets"}
+                return out
+            parent = self.nid(x.parent)
+            return {"stop": None, "why_not": "not_important", "reachable": "not",
+                    "detail": "not important for accessibility: TalkBack never gets it; its "
+                              "children are read in its place"
+                              + (f" (under {parent})" if parent else "")}
+        return self._explain_tb(x)
+
+    def _explain_tb(self, n: TbNode) -> dict[str, Any]:
+        if not n.window.reported:
+            dropped = n.window.dropped or "skipped"
+            if dropped.startswith("covered_by:"):
+                by = self.window_ref(dropped.split(":", 1)[1])
+                return {"stop": None, "why_not": f"covered_by:{by or dropped.split(':', 1)[1]}",
+                        "reachable": "not",
+                        "detail": "its window is under a modal window TalkBack reads instead"}
+            return {"stop": None, "why_not": dropped, "reachable": "not"}
+        stop = why_stop(self.rules, n)
+        if stop is not None:
+            out: dict[str, Any] = {"stop": self.stop_no(n), "why": stop}
+            ghost = self.ghost(n)
+            if ghost:
+                out["ghost"] = ghost
+            out["reachable"] = "swipe" if self.stop_no(n) is not None else "not"
+            return out
+        code, ref, detail = self.why_not(n)
+        out = {"stop": None, "why_not": f"{code}:{ref}" if ref else code}
+        if detail:
+            out["detail"] = detail
+        out["reachable"] = self.reachable(n, code)
+        return out
+
+    def why_not(self, n: TbNode) -> tuple[str, str | None, str | None]:
+        """(code, the node it names or None, a short detail) for a TalkBack-view non-stop."""
+        ok, branch = self.rules.focus_decision(n)
+        if ok:
+            return "stop", None, None
+        if branch == "not_visible":
+            if "holder_invisible_with_service" in n.corrections:
+                return "hidden_holder", None, "an AndroidView holder is invisible while a " \
+                                              "screen reader runs"
+            if "obscured_by_system_bar" in n.corrections:
+                return "under_system_bar", None, None
+            if n.rect.is_empty():
+                return "zero_size", None, None
+            if not n.rect.intersects(n.window.bounds):
+                return "offscreen", None, None
+            return "invisible", None, "not visible to the user (alpha 0, hidden, or clipped)"
+        if branch == "focusable_ancestor":
+            anc = self.rules.focusable_ancestor(n)
+            if anc is not None:
+                return "merged_into", self.nid(anc), None
+            return "no_speech", None, None
+        if branch == "silent_container":
+            kids = [self.nid(c) for c in n.children if self.rules.should_focus_node(c)]
+            kids = [k for k in kids if k]
+            return "silent_container", None, (
+                "focusable but nothing of its own to say; the stops are "
+                + (",".join(kids[:6]) if kids else "its descendants"))
+        if branch == "window_wrapper":
+            return "window_wrapper", None, "the size of its window, has children, not focusable"
+        return branch or "no_speech", None, None
+
+    def reachable(self, n: TbNode, code: str) -> str:
+        if code in ("merged_into", "stop"):
+            return "swipe"
+        if code in ("offscreen", "zero_size", "invisible"):
+            for a in n.ancestors():
+                if self.rules.filter_auto_scroll(a):
+                    return "scroll"
+        return "not"
+
+    def ghost(self, n: TbNode) -> list[str]:
+        """Ghost reasons of a stop, refs for the scrollable a clipped sliver sits in."""
+        out = []
+        for g in ghost_reasons(self.rules, n):
+            if g.startswith("clipped:"):
+                sc = self.by_key(g.split(":", 1)[1])
+                g = f"clipped:{self.nid(sc) or g.split(':', 1)[1]}"
+            out.append(g)
+        return out
+
+    def edge_in(self, n: TbNode, prev: TbNode | None) -> str:
+        """How a forward swipe reaches ``n``: ``tree``, ``bounds_swap``, ``chain``,
+        ``before:<ref>``, ``after:<ref>``, ``window:<ref>`` (the first stop of another
+        window) or ``first``."""
+        if prev is None:
+            return "first"
+        if prev.window is not n.window:
+            return f"window:{self._window_nid(n)}"
+        via = self.nav.traversal(n.window).via(n)
+        if ":" in via:
+            kind, key = via.split(":", 1)
+            other = self.by_key(key)
+            return f"{kind}:{self.nid(other) or key}"
+        return via
+
+    # ------------------------------------------------------------------ reading
+    def reading(self, *, granularity: str = "default", start: str | None = None,
+                direction: str = "next", include_skipped: bool = False,
+                limit: int = 2000) -> tuple[list[ReadItem], dict[str, Any]]:
+        """The stops in swipe order (``ReadItem``\\ s) and facts about the walk.
+
+        Without ``start`` every stop of the screen in reading order (``direction="prev"``:
+        backwards from the last); with ``start`` (a node id) the stops a swipe reaches from
+        that node until the edge, the start itself first when it is a stop the granularity
+        keeps. ``include_skipped`` adds the nodes the walk passes over that carry content
+        or actions, each with its reason."""
+        forward = direction != "prev"
+        accept = self.rules.node_filter(granularity)
+        meta: dict[str, Any] = {}
+        items: list[ReadItem] = []
+        if start is None:
+            seq = [n for n in self.linear() if accept(n)]
+            if not forward:
+                seq.reverse()
+            st = SpeechState()
+            stops = {id(n) for n in seq}
+            if include_skipped:
+                order = self._traversal_all(forward)
+            else:
+                order = seq
+            prev: TbNode | None = None
+            for x in order:
+                if isinstance(x, TbNode) and id(x) in stops:
+                    item = self._stop_item(x, announce(self.nav, x, st), prev)
+                    prev = x
+                    if item is not None:
+                        items.append(item)
+                elif include_skipped:
+                    item = self._skip_item(x)
+                    if item is not None:
+                        items.append(item)
+                if len(items) >= limit:
+                    break
+            meta["ended"] = "edge"
+            return items, meta
+        x = self.node(start)
+        if x is None or isinstance(x, Excluded):
+            meta["start"] = "not a TalkBack node: " + self.explain(start).get("why_not", "?")
+            meta["ended"] = "empty"
+            return items, meta
+        pivot: TbNode = x
+        st = SpeechState()
+        seen = {id(pivot)}
+        if self.rules.should_focus_node(pivot) and accept(pivot) and pivot.window.reported:
+            item = self._stop_item(pivot, announce(self.nav, pivot, st), None)
+            if item is not None:
+                item.via = "start"
+                items.append(item)
+        reach_edge = False
+        ended = "edge"
+        while len(items) < limit:
+            res = self.nav.step(pivot, forward, granularity, reach_edge)
+            target = res["target"]
+            if target is None or res["via"] == "wrap":
+                break
+            if id(target) in seen:
+                ended = "loop"
+                break
+            seen.add(id(target))
+            if include_skipped and target.window is pivot.window:
+                for s in self._between(pivot, target, forward):
+                    item = self._skip_item(s)
+                    if item is not None:
+                        items.append(item)
+            item = self._stop_item(target, announce(self.nav, target, st), pivot,
+                                   via=res["via"])
+            if item is not None:
+                if res.get("autoscroll") is not None:
+                    item.extra["autoscroll"] = self.nid(res["autoscroll"]) or "?"
+                if res.get("show_on_screen") is not None:
+                    item.extra["show_on_screen"] = self.nid(res["show_on_screen"]) or "?"
+                items.append(item)
+            pivot = target
+            reach_edge = res["reach_edge"]
+        meta["ended"] = ended
+        return items, meta
+
+    def _stop_item(self, n: TbNode, ann: Announcement, prev: TbNode | None,
+                   via: str | None = None) -> ReadItem | None:
+        nid = self.nid(n)
+        if nid is None:
+            return None
+        item = ReadItem(nid=nid, stop=self.stop_no(n), speak=ann.text,
+                        why=why_stop(self.rules, n))
+        if via is None or not via.startswith("window"):
+            item.via = self.edge_in(n, prev)
+        else:
+            item.via = f"window:{self._window_nid(n)}"
+        ghost = self.ghost(n)
+        if ghost:
+            item.extra["ghost"] = ",".join(ghost)
+        return item
+
+    def _skip_item(self, x: TbNode | Excluded) -> ReadItem | None:
+        nid = self.nid(x)
+        if nid is None or not _has_content(self.rules, x):
+            return None
+        if isinstance(x, Excluded):
+            ex = self.explain(nid)
+            code = ex["why_not"]
+        else:
+            code, ref, _detail = self.why_not(x)
+            if code == "stop":
+                return None
+            code = f"{code}:{ref}" if ref else code
+        kind, _, ref = code.partition(":")
+        if ref:
+            return ReadItem(nid=nid, ref_key=kind, ref=ref)
+        return ReadItem(nid=nid, why=kind)
+
+    def _traversal_all(self, forward: bool) -> list[TbNode | Excluded]:
+        """Every node TalkBack's traversal passes, window by window, with the dump nodes it
+        never gets placed after the node they were hoisted into (or hidden under)."""
+        hoisted: dict[int, list[Excluded]] = {}
+        for ex in self.tree.excluded:
+            if ex.reason == "hidden" and ex.raw is not ex.hidden_by:
+                continue  # the top of a hidden subtree stands for it (its count is shown)
+            hoisted.setdefault(id(ex.parent), []).append(ex)
+        out: list[TbNode | Excluded] = []
+        for w in self.nav.windows:
+            if not self.nav.accepts_window(w):
+                continue
+            for n in self.nav.traversal(w).order:
+                out.append(n)
+                out.extend(hoisted.get(id(n), ()))
+        if not forward:
+            out.reverse()
+        return out
+
+    def _between(self, a: TbNode, b: TbNode, forward: bool) -> list[TbNode]:
+        trav = self.nav.traversal(a.window)
+        i, j = trav.pos.get(id(a)), trav.pos.get(id(b))
+        if i is None or j is None:
+            return []
+        if forward and i < j:
+            return trav.order[i + 1:j]
+        if not forward and j < i:
+            return list(reversed(trav.order[j + 1:i]))
+        return []
+
+    # ------------------------------------------------------------------ node facet
+    def facet(self, nid: str) -> dict[str, Any]:
+        """The ``tb`` facet of ``node()``: stop, why / why_not, what TalkBack says and from
+        which nodes, the neighbouring stops, how focus arrives, whether it is reachable."""
+        x = self.node(nid)
+        ex = self.explain(nid)
+        out: dict[str, Any] = {"stop": ex.get("stop")}
+        if ex.get("why"):
+            out["why"] = ex["why"]
+        if ex.get("why_not"):
+            wn = ex["why_not"]
+            out["why_not"] = f"{wn}: {ex['detail']}" if ex.get("detail") else wn
+        if ex.get("ghost"):
+            out["ghost"] = ex["ghost"]
+        if isinstance(x, TbNode) and ex.get("stop") is not None:
+            lin = self.linear()
+            i = (self.stop_no(x) or 1) - 1
+            ann = self.walk_speech(x)
+            out["speak"] = ann.text
+            out["parts"] = [self._part(p) for p in ann.parts][:8]
+            prev = lin[i - 1] if i > 0 else None
+            nxt = lin[i + 1] if i + 1 < len(lin) else None
+            out["prev"] = self.nid(prev) if prev is not None else None
+            out["next"] = self.nid(nxt) if nxt is not None else None
+            out["edge_in"] = self.edge_in(x, prev)
+        elif isinstance(x, TbNode):
+            own = self.own(x)
+            if own.text and ex.get("why_not", "").startswith("merged_into"):
+                out["speak_in"] = own.text  # what this node adds to the stop that reads it
+        out["reachable"] = ex.get("reachable", "not")
+        return out
+
+    def _part(self, p: Mapping[str, Any]) -> dict[str, Any]:
+        src = self.by_key(p.get("from") or "")
+        return {"t": p.get("text"), "from": self.nid(src) or p.get("from"), "k": p.get("kind")}
+
+
+def _has_content(rules: Any, x: TbNode | Excluded) -> bool:
+    """A node worth a line among the skipped: it has text, a description, a hint or a
+    state, or it acts (click, long-click, focus, checkable)."""
+    raw = x.raw
+    if any(raw.get(k) for k in ("text", "content_description", "hint_text",
+                                "state_description")):
+        return True
+    fl = set(raw.get("flags") or ())
+    if isinstance(x, Excluded):
+        return bool(fl & {"clickable", "long_clickable", "checkable"}) or (
+            x.reason == "hidden" and x.raw is x.hidden_by)
+    return bool(fl & {"clickable", "long_clickable", "checkable", "screen_reader_focusable"}) \
+        or rules.is_actionable_for_accessibility(x)
+
+
+def stop_speech(resp: Any) -> dict[tuple[int, tuple[int, ...]], StopSpeech]:
+    """``{(root_view_id, child-index path): StopSpeech}`` for every TalkBack stop of a
+    DumpA11yResponse (message or bytes)."""
+    return TbCapture(resp).stop_speech()
+
+
+def fallback_reading(ix: Index, *, granularity: str = "default", start: str | None = None,
+                     direction: str = "next") -> list[ReadItem]:
+    """The stored reading order when the model cannot run (no raw a11y facet): sliced,
+    reversed and filtered by the node's flags."""
+    nodes = [ix.nodes[r] for r in ix.reading if r in ix.nodes]
+    if granularity == "heading":
+        nodes = [n for n in nodes if "heading" in n.flags]
+    elif granularity == "control":
+        nodes = [n for n in nodes if set(n.flags) & {"click", "longclick", "checkable", "edit"}]
+    if direction == "prev":
+        nodes.reverse()
+    if start is not None:
+        ids = [n.id for n in nodes]
+        nodes = nodes[ids.index(start):] if start in ids else []
+    return [ReadItem(nid=n.id, stop=n.stop,
+                     speak=(n.facets.get("a11y") or {}).get("speakable") or n.label)
+            for n in nodes]
+
+
+def tb_of(ix: Index, loaded: Any) -> TbCapture | None:
+    return TbCapture.of(ix, loaded)
+
+
+__all__ = ["DIRECTIONS", "GRANULARITIES", "NAME_KINDS", "ReadItem", "StopSpeech", "TbCapture",
+           "fallback_reading", "name_of", "stop_speech", "tb_of"]

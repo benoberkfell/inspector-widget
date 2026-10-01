@@ -236,10 +236,14 @@ def test_launcher_clipped_heading_row(launcher):
 
 def test_launcher_types_labels_and_flags(launcher):
     row = launcher.nodes["sem:82:327"]
-    # a focusable row speaks its non-focusable children (RO1), like Compose's merged Text
+    # a focusable row speaks its non-focusable children, like Compose's merged Text; the
+    # label is the name in what TalkBack says, the speakable all of it (the model's 17.0
+    # wording: ". " between parts)
     assert row.label == row.text == (
         "▶ All scenarios (lint everything), every BAD/GOOD variant on one scrollable screen")
-    assert row.facets["a11y"]["speakable"] == row.label
+    assert row.facets["a11y"]["speakable"] == (
+        "▶ All scenarios (lint everything). every BAD/GOOD variant on one scrollable screen")
+    assert row.facets["a11y"]["speak_src"] == "tb"
     assert row.src == "MainActivity.kt:140" and row.type == "ListItem"
     assert "RequestFocus" in row.facets["compose"]["actions"]
     lst = launcher.nodes["sem:82:325"]

@@ -51,6 +51,7 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -163,6 +164,38 @@ def _fmt_value(v: Any) -> str:
         return v if v and " " not in v and '"' not in v and len(v) <= LABEL_MAX else quote(v)
     return quote(json.dumps(v, ensure_ascii=False, separators=(",", ":"), default=str))
 
+
+#: Words TalkBack speaks for a state (checked, selected, on/off ...): a speakable change
+#: made of these follows a state flip the diff already reports.
+_STATE_SPEECH = frozenset({"checked", "not", "selected", "on", "off", "expanded", "collapsed",
+                           "disabled", "partially", "unchecked"})
+_WORD = re.compile(r"[\w$%]+")
+
+
+def _speech_words(s: str | None) -> set[str]:
+    return {w.lower() for w in _WORD.findall(s or "")}
+
+
+def _speech_follows(x: UNode, y: UNode, fx: set[str], fy: set[str], sx: str | None,
+                    sy: str | None) -> bool:
+    """Whether a speakable change only follows changes reported already: the words that
+    went or came are those of the node's state, label, text, description or hint as they
+    changed, or state words of a flag flip (the TalkBack announcement of a Switch says its
+    state: "ON. Notifications. Switch" -> "OFF. Notifications. Switch")."""
+    if not sx or not sy:
+        return False
+    gone, came = _speech_words(sx) - _speech_words(sy), _speech_words(sy) - _speech_words(sx)
+    old: set[str] = set()
+    new: set[str] = set()
+    for name in ("state", "label", "text", "desc", "hint"):
+        ov, nv = getattr(x, name), getattr(y, name)
+        if ov != nv:
+            old |= _speech_words(ov)
+            new |= _speech_words(nv)
+    if any((f in fx) != (f in fy) for f in STATE_FLAGS):
+        old |= _STATE_SPEECH
+        new |= _STATE_SPEECH
+    return bool(gone or came) and gone <= old and came <= new
 
 def _norm_value(v: Any) -> Any:
     if isinstance(v, Mapping) and "value" in v:
@@ -387,7 +420,7 @@ class _Cmp:
             out.append(f"role {x.role or '-'} -> {y.role or '-'}")
         ax, ay = x.facets.get("a11y") or {}, y.facets.get("a11y") or {}
         sx, sy = ax.get("speakable"), ay.get("speakable")
-        if sx != sy and (sx, sy) != label_change:
+        if sx != sy and (sx, sy) != label_change and not _speech_follows(x, y, fx, fy, sx, sy):
             out.append(f"speakable {quote(sx)} -> {quote(sy)}")
         acts_x, acts_y = list(ax.get("actions") or ()), list(ay.get("actions") or ())
         added = [a for a in acts_y if a not in acts_x]
