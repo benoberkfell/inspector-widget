@@ -989,11 +989,12 @@ with every consumer.
 - **`analyze(ix, loaded, lint=, density=, font_scale=)`** accepts a
   `LoadedCapture`, a `RawCapture` (at capture time, before publish) or None
   (render signals only).
-  - It owns every `render.*` and `a11y.*` issue and replaces them on each run, so
-    it is idempotent. Issues with other ids are kept.
+  - It owns every `render.*`, `a11y.*` and `tb.*` issue and replaces them on each
+    run, so it is idempotent. Issues with other ids are kept. `lint="none"` writes
+    no `a11y.*` or `tb.*` issue.
   - It sets `UNode.stop` and `Index.reading` only when the capture has an a11y
     facet.
-  - Diagnostics use the prefixes `lint:`, `contrast:` and `reading:`. After a
+  - Diagnostics use the prefixes `lint:`, `contrast:`, `reading:` and `tb:`. After a
     contrast run, `contrast: sampled N windows` is also how `lint_view` and
     `lint_summary` know contrast ran.
   - Run it on the ref-space index (after `apply_refs`). Links in evidence
@@ -1056,22 +1057,43 @@ with every consumer.
 - **False positives at a scroll edge.** A touch-target finding on a node clipped
   at a scroll edge gets `note: "likely false positive: clipped at scroll edge"`.
   A contrast finding there gets a low-confidence note and conf inferred.
+- **TalkBack rules (`tb.*`, `capture/tb.py` over `talkback/static.py`).** The
+  TalkBack model's static findings (basis "model"): `tb.double_stop`,
+  `tb.ghost_stop`, `tb.out_of_order`, `tb.boundary_jump`, `tb.escape`,
+  `tb.window_order`, `tb.wrong_announcement`, `tb.edge_stuck`, `tb.skipped`, and
+  `tb.custom_action_missing` (from the slot table). Each is an issue on the node it
+  is about, its other nodes in `node_ids`; `tb.out_of_order`/`tb.boundary_jump`
+  (a heuristic visual order) and `tb.custom_action_missing` (slot links) are
+  `conf: inferred`. What is drawn above what (`tb.escape`, and the layers a reading
+  order is judged in) and the containers a visual order keeps together come from
+  the capture's View tree (`tb.drawn_above`, `tb.view_chain`): the a11y dump leaves
+  out the Views TalkBack never gets. The per-scenario expectations on the TalkBack
+  corpus, and the precision bar (no finding on any GOOD variant), are in
+  `tests/test_capture_tb_rules.py`.
 - **Rule catalog (`rules.py`).**
   - It holds R1..R12 plus R13..R18 (the unified lint's rules). `lint_view` reports
     a rule the installed lint cannot produce under `unavailable`.
   - It also holds the four render rules, plus the reserved `render.text_overflow`,
-    `render.covered` and `render.drawn_mismatch` (`planned`).
-  - `resolve()` accepts ids, aliases, ATF check names, short codes and family
-    prefixes (`a11y.`, `render.`), all case-insensitive. Anything else raises
-    `OpError("bad_args")`.
+    `render.covered` and `render.drawn_mismatch` (`planned`), and the `tb.*` rules
+    (short code `x` of `tb.x`).
+  - `resolve()` accepts ids, aliases, ATF check names, short codes, family
+    prefixes (`a11y.`, `render.`, `tb.`) and bare families (`tb`), all
+    case-insensitive. Anything else raises `OpError("bad_args")`.
   - Short codes are unique: a group with one rule keeps the group (`role`), a
     group with several gets `group_x` (`label_missing`, `label_redundant`,
     `text_fixed_scaling`, `text_too_small`). The bare group still selects all of
     them (`resolve("label")`, `find(issue="label")`).
   - An issue id the catalog does not know is still shown, with a generic entry.
 - **`lint_view()`.**
-  - By default it reports `a11y.*` rules. `render.*` issues appear with
-    `rules=["render."]`, and `next` points at `find(issue="render.")`.
+  - By default it reports `a11y.*` rules and the precise TalkBack rules
+    (`rules.DEFAULT_TB`: escape, window_order, wrong_announcement, edge_stuck,
+    skipped: none fires on a GOOD corpus variant or a recorded real capture, none
+    repeats an a11y rule). `rules=["tb"]` lists every `tb.*` rule. `render.*`
+    issues appear with `rules=["render."]`, and `next` points at
+    `find(issue="render.")`. `lint_summary` counts the default ones.
+  - Outline, find and diff lines show a `tb.*` code only for a default rule; the
+    reading view (`outline(view="reading")`) shows them all
+    (`lines.issue_codes(all_tb=True)`).
   - `contrast=True` and `wcag=True` results are cached as `lint.<hash8>.json`,
     stored by canonical key.
   - Cursors are `<capture>:l:<hash8 of args>:<offset>`. A cursor from other
@@ -1087,8 +1109,10 @@ with every consumer.
     with every collection index `[i]` and every label from the item segment down
     to (not including) the node's own segment wildcarded: a Compose row's merged
     label (an email subject) differs per row, the unlabelled button in it does
-    not. A rule's `+N more: lint(rules=[...],group="node",...)` repeats the
-    caller's `within`, `severity`, `contrast` and `wcag`.
+    not. A `tb.*` finding wildcards the node's own label too (it is about every
+    row: "×6 in #message_list cells"). A rule's `+N more: lint(rules=[...],
+    group="node",...)` repeats the caller's `within`, `severity`, `contrast` and
+    `wcag`.
 - **Outline expand hint.** `outline(root=<ref>)` (or `max_children`) follows the
   cut that hides the most descendants on the page (ties in tree order), not the
   first cut.

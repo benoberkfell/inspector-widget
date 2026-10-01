@@ -53,7 +53,35 @@ def load_walk(e: dict[str, Any] | str) -> tuple[dict[str, Any], pb.DumpA11yRespo
     return rec, resp
 
 
-def _view_from(a: Any, res: StringResolver, st: Strings, out: pb.ViewNode) -> None:
+#: The View hierarchy the accessibility dump leaves out, from the scenario source: the
+#: containers a not-important View hoists away hold the drawing order a same-window overlay
+#: depends on. ``{entry prefix: {parent View id: [kept View id | [View ids of a synthetic,
+#: not-important container], ...]}}``, children in drawing (child) order.
+SPINES: dict[str, dict[int, list[Any]]] = {
+    # TbViewActivity.v5Scrim: FrameLayout[background column, scrim, card]
+    "tb_v5-bad": {17: [[3, 4, 5, 6, 7, 8, 9, 10, 11], 12, [14, 15, 16]]},
+    # TbHybrid.h5FragmentOverlay: FrameLayout[the Fragment's View column, ComposeView]
+    "tb_h5-bad": {2: [[10, 11, 12, 13, 14, 15, 16, 17, 18], 22]},
+}
+_SYNTHETIC = 900_000
+
+
+def _view_kids(a: Any) -> list[Any]:
+    """The Views under ``a`` (through virtual nodes: AndroidView holders hang on the View
+    above them, as the host's AndroidViewsHandler holds them)."""
+    out = []
+    stack = list(reversed(a.children))
+    while stack:
+        c = stack.pop()
+        if int(c.virtual_id) == -1 and int(c.host_view_id):
+            out.append(c)
+        else:
+            stack.extend(reversed(c.children))
+    return out
+
+
+def _view_from(a: Any, res: StringResolver, st: Strings, out: pb.ViewNode,
+               spine: dict[int, list[Any]] | None = None) -> None:
     out.id = int(a.host_view_id)
     cls = res.opt(a.class_name) or "android.view.View"
     out.class_name = st.id(cls.rsplit(".", 1)[-1])
@@ -67,18 +95,43 @@ def _view_from(a: Any, res: StringResolver, st: Strings, out: pb.ViewNode) -> No
         out.view_id_name = st.id(rid.rsplit("/", 1)[-1])
     if "WebView" in cls:
         out.flags |= pb.ViewNode.IS_WEBVIEW
-    stack = list(reversed(a.children))
-    while stack:
-        c = stack.pop()
-        if int(c.virtual_id) == -1 and int(c.host_view_id):
-            _view_from(c, res, st, out.children.add())
-        else:  # a virtual node: the Views under it (AndroidView holders) hang here
-            stack.extend(reversed(c.children))
+    kids = _view_kids(a)
+    order = (spine or {}).get(int(a.host_view_id))
+    if not order:
+        for c in kids:
+            _view_from(c, res, st, out.children.add(), spine)
+        return
+    by_id = {int(c.host_view_id): c for c in kids}
+    placed: set[int] = set()
+    for item in order:
+        if isinstance(item, list):
+            box = out.children.add()
+            box.id = _SYNTHETIC + item[0]
+            box.class_name = st.id("LinearLayout")
+            members = [by_id[i] for i in item if i in by_id]
+            if members:
+                x0 = min(m.bounds.layout.x for m in members)
+                y0 = min(m.bounds.layout.y for m in members)
+                x1 = max(m.bounds.layout.x + m.bounds.layout.w for m in members)
+                y1 = max(m.bounds.layout.y + m.bounds.layout.h for m in members)
+                box.bounds.layout.x, box.bounds.layout.y = x0, y0
+                box.bounds.layout.w, box.bounds.layout.h = x1 - x0, y1 - y0
+            for m in members:
+                _view_from(m, res, st, box.children.add(), spine)
+                placed.add(int(m.host_view_id))
+        elif item in by_id:
+            _view_from(by_id[item], res, st, out.children.add(), spine)
+            placed.add(item)
+    for c in kids:
+        if int(c.host_view_id) not in placed:
+            _view_from(c, res, st, out.children.add(), spine)
 
 
 def raw_from_a11y(resp: pb.DumpA11yResponse, *, cid: str = "ctbfix",
-                  package: str = PACKAGE, dpi: int = 420) -> RawCapture:
-    """A RawCapture holding ``resp`` plus a View spine and window list derived from it."""
+                  package: str = PACKAGE, dpi: int = 420,
+                  spine: dict[int, list[Any]] | None = None) -> RawCapture:
+    """A RawCapture holding ``resp`` plus a View spine and window list derived from it
+    (``spine``: the containers the dump leaves out, see :data:`SPINES`)."""
     res = StringResolver(resp.strings)
     st = Strings()
     views = pb.DumpTreeResponse()
@@ -87,7 +140,7 @@ def raw_from_a11y(resp: pb.DumpA11yResponse, *, cid: str = "ctbfix",
         if not w.HasField("root"):
             continue
         wins.root_ids.append(int(w.root_view_id))
-        _view_from(w.root, res, st, views.roots.add())
+        _view_from(w.root, res, st, views.roots.add(), spine)
     st.fill(views.strings)
     meta = CaptureMeta(id=cid, lineage=("emulator-5556", package),
                        device={"dpi": dpi, "font_scale": 1.0})
@@ -105,7 +158,9 @@ def build(raw: RawCapture, lint: str = "tree") -> Index:
 def corpus_capture(eid: str) -> tuple[Index, RawCapture]:
     """``(index, raw)`` of one corpus entry's start screen (key space, analyzed)."""
     _rec, resp = load_walk(eid)
-    raw = raw_from_a11y(resp, cid=("c" + eid.replace("_", "").replace("-", ""))[:12])
+    spine = next((v for k, v in SPINES.items() if eid.startswith(k + "-")), None)
+    raw = raw_from_a11y(resp, cid=("c" + eid.replace("_", "").replace("-", ""))[:12],
+                        spine=spine)
     return build(raw), raw
 
 

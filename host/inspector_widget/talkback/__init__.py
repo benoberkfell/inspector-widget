@@ -15,6 +15,9 @@ against TalkBack 17.0.0 on emulator-5554 (the default wording, :data:`VERSIONS`)
 * :mod:`.explain`: reason codes for stops, non-stops and edges: :func:`explain`.
 * :mod:`.visual`: a heuristic reading-intent order: :func:`visual_order`, and
   :func:`.visual.order_items` for plain boxes.
+* :mod:`.static`: what the model alone can tell is wrong with a screen (the static
+  ``tb.*`` findings: double and ghost stops, order, escape, ...); the capture lint's
+  TalkBack rules (``capture/tb.py``).
 
 :meth:`Navigator.initial_focus` gives the focus a window gets when it appears (simulate's
 ``start="initial"``); :attr:`TbNode.signature` identifies a node across captures without ids

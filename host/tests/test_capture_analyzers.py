@@ -83,7 +83,7 @@ def test_catalog_covers_every_rule_the_lint_emits():
     for rid in a11y_lint.ALL_RULE_IDS:
         assert rid in R.RULES, rid
     for rule in R.RULES.values():
-        assert re.fullmatch(r"(a11y\.[a-z_]+\.[a-z_]+|render\.[a-z_]+)", rule.id)
+        assert re.fullmatch(r"(a11y\.[a-z_]+\.[a-z_]+|render\.[a-z_]+|tb\.[a-z_]+)", rule.id)
         assert rule.sev in R.SEVERITIES and rule.msg
     assert [R.ALIASES[f"R{i}"] for i in range(1, 13)] == [
         "a11y.label.missing", "a11y.touch_target.small", "a11y.contrast.low",

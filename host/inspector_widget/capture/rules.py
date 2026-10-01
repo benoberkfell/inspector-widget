@@ -7,8 +7,8 @@ node.
 
 A rule has:
 
-* ``id``: ``a11y.<group>.<x>`` (accessibility lint) or ``render.<x>`` (render
-  signals).
+* ``id``: ``a11y.<group>.<x>`` (accessibility lint), ``render.<x>`` (render
+  signals) or ``tb.<x>`` (TalkBack navigation, from the TalkBack model).
 * ``short``: the code used after ``!`` in outline lines: the group for
   ``a11y.<group>.<x>`` when the group has one rule (``role``, ``touch_target``),
   ``group_x`` when it has several (``label_missing`` and ``label_redundant``,
@@ -24,7 +24,7 @@ A rule has:
 * ``planned``: the rule id is reserved but nothing produces it yet.
 
 ``resolve()`` turns user input (ids, aliases, ATF names, short codes, family
-prefixes such as ``a11y.``) into rule ids and rejects anything else with
+prefixes such as ``a11y.``, or a bare family: ``tb``) into rule ids and rejects anything else with
 ``OpError("bad_args")`` (E10). Pure Python; importing it loads nothing heavy.
 """
 
@@ -163,6 +163,49 @@ _CATALOG: tuple[Rule, ...] = (
     _r("render.covered", "warn", "Drawn under another node.", planned=True),
     _r("render.drawn_mismatch", "info", "Drawn pixels differ from the declared bounds.",
        planned=True),
+    # TalkBack navigation, from the TalkBack model (capture/tb.py, talkback/static.py).
+    _r("tb.double_stop", "warn",
+       "A stop with another stop inside it: one item takes two swipes.",
+       "Merge them: Modifier.toggleable/clickable on the row and onCheckedChange=null on "
+       "the child (View: child clickable/focusable=false); secondary actions as customActions"),
+    _r("tb.ghost_stop", "warn",
+       "TalkBack stops here but there is nothing useful to hear or see (unlabelled, only "
+       "invisible children, no area).",
+       "Label it, or hide it: clearAndSetSemantics {} / hideFromAccessibility (View: "
+       "importantForAccessibility=no, GONE not alpha 0)"),
+    _r("tb.out_of_order", "warn", "TalkBack reads this stop against the visual order.",
+       "Modifier.semantics { isTraversalGroup = true } per column or card (+ traversalIndex "
+       "inside it); View: accessibilityTraversalBefore/After to a unique target"),
+    _r("tb.boundary_jump", "warn",
+       "The order jumps across a View/Compose boundary, against the visual order.",
+       "Put the overlay View in the layout flow (or link it with traversalBefore); "
+       "isTraversalGroup around the AndroidView; an important interop root"),
+    _r("tb.escape", "error",
+       "Stops drawn under a same-window overlay stay reachable: focus walks out of the "
+       "dialog or sheet.",
+       "A real Dialog / ModalBottomSheet, or hide what it covers while open (Compose "
+       "hideFromAccessibility, View noHideDescendants) and give the overlay a paneTitle"),
+    _r("tb.window_order", "warn",
+       "A popup window is read after the content of the window under it.",
+       "A focusable or modal popup (PopupWindow(focusable=true), "
+       "ListPopupWindow.setModal(true)), or show it in the layout flow"),
+    _r("tb.wrong_announcement", "warn",
+       "TalkBack says it wrong: a merged row reads its texts out of screen order, or list "
+       "positions count an item it never stops on.",
+       "Compose the texts in reading order or clearAndSetSemantics { contentDescription = "
+       "\"…\" }; keep empty header/footer items out of the adapter"),
+    _r("tb.edge_stuck", "warn",
+       "Content TalkBack cannot reach by swiping: past an edge nothing scrolls, or on a "
+       "pager's other pages.",
+       "Scroll semantics and actions (verticalScroll, RecyclerView, NestedScrollView); page "
+       "buttons or custom actions for a pager"),
+    _r("tb.skipped", "warn", "Visible text TalkBack never reads: an ancestor hides it.",
+       "Drop importantForAccessibility=noHideDescendants (or hideFromAccessibility), or fold "
+       "the text into a stop's label"),
+    _r("tb.custom_action_missing", "warn",
+       "A gesture-only action (swipe to dismiss, drag) has no accessibility action.",
+       "Modifier.semantics { customActions = listOf(CustomAccessibilityAction(\"Delete\") "
+       "{ … }) }; View: ViewCompat.addAccessibilityAction"),
 )
 
 _CATALOG = _unique_shorts(_CATALOG)
@@ -173,7 +216,15 @@ RULES: dict[str, Rule] = {r.id: r for r in _CATALOG}
 ALIASES: dict[str, str] = {r.alias: r.id for r in _CATALOG if r.alias}
 #: ATF check name -> rule id
 ATF_NAMES: dict[str, str] = {r.atf: r.id for r in _CATALOG if r.atf}
-FAMILIES = ("a11y", "render")
+FAMILIES = ("a11y", "render", "tb")
+#: The tb.* rules the default lint reports with the a11y ones: no finding on any GOOD
+#: variant of the TalkBack corpus nor on the recorded real captures, and none that repeats
+#: an a11y rule (an unlabelled ghost stop is a11y.label.missing). The others are heuristic
+#: (out_of_order, boundary_jump: a guessed visual order), inferred (custom_action_missing:
+#: slot links) or a design call on common layouts (double_stop: a row with inline buttons):
+#: lint(rules=["tb"]) lists every tb rule.
+DEFAULT_TB = ("tb.escape", "tb.window_order", "tb.wrong_announcement", "tb.edge_stuck",
+              "tb.skipped")
 
 _LOOKUP: dict[str, str] = {}
 for _rule in _CATALOG:
@@ -243,6 +294,8 @@ def resolve(specs: Iterable[str] | str | None) -> list[str] | None:
                 ids = list(_BY_SHORT[key])
             elif key.endswith(".") and any(r.id.startswith(key) for r in _CATALOG):
                 ids = [r.id for r in _CATALOG if r.id.startswith(key)]
+            elif key in FAMILIES:  # a bare family name: "tb" = every TalkBack rule
+                ids = [r.id for r in _CATALOG if r.family == key and not r.planned]
             if ids:
                 out.extend(i for i in ids if i not in out)
             else:
@@ -251,8 +304,9 @@ def resolve(specs: Iterable[str] | str | None) -> list[str] | None:
         valid = " ".join(f"{r.alias}={r.id}" for r in _CATALOG if r.alias)
         raise OpError(
             "bad_args", f"unknown rule {', '.join(repr(u) for u in unknown)}",
-            hint=f"Use a rule id, alias, short code or family (a11y., render.). {valid} "
-                 "render.clipped render.hidden render.offscreen render.zero_size",
+            hint=f"Use a rule id, alias, short code or family (a11y., render., tb). {valid} "
+                 "render.clipped render.hidden render.offscreen render.zero_size tb.escape "
+                 "tb.double_stop tb.ghost_stop tb.out_of_order ...",
         )
     return out or None
 
@@ -271,7 +325,7 @@ def at_least(sev: str, minimum: str) -> bool:
 
 
 __all__ = [
-    "ALIASES", "ATF_NAMES", "FAMILIES", "RULES", "SEVERITIES", "SEV_RANK", "Rule",
+    "ALIASES", "ATF_NAMES", "DEFAULT_TB", "FAMILIES", "RULES", "SEVERITIES", "SEV_RANK", "Rule",
     "at_least", "get", "group", "is_known", "matches_code", "resolve", "short", "short_code",
     "worst",
 ]

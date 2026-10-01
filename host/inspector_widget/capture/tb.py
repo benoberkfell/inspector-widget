@@ -28,6 +28,9 @@ What it serves:
   heading, control), from any node, forward or backward, optionally with the nodes the walk
   passes over and why.
 * **The tb facet** of ``node()`` (:meth:`TbCapture.facet`).
+* **Static rules** (:func:`issues`): :mod:`inspector_widget.talkback.static` findings as
+  capture issues (``tb.*``), the other nodes involved named in ``node_ids``; what is drawn
+  above what comes from the capture's View tree (:func:`drawn_above`).
 
 Everything here is pure (no device, no protobuf beyond decoding the stored facet).
 """
@@ -39,10 +42,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..talkback import Navigator, build as tb_build
-from ..talkback.explain import ghost_reasons, why_stop
+from ..talkback.explain import why_stop
 from ..talkback.speech import Announcement, SpeechState, announce
 from ..talkback.tree import Excluded, TbNode
-from .model import Index
+from .model import Index, Issue
 
 #: Parts of an announcement that name the node (as opposed to its state, role, position).
 NAME_KINDS = frozenset({"name", "child", "name(fake)", "event"})
@@ -244,12 +247,11 @@ class TbCapture:
             return {"stop": None, "why_not": "not_in_a11y_tree", "reachable": "not"}
         if isinstance(x, Excluded):
             if x.reason == "hidden":
-                by = self.nid_of_raw(x.hidden_by)
-                out = {"stop": None, "why_not": f"hidden_by:{by}" if by and by != nid
-                       else "hidden_by_itself", "reachable": "not",
-                       "detail": "importantForAccessibility=noHideDescendants removes the "
-                                 "subtree from what TalkBack gets"}
-                return out
+                by = self.nid_of_raw(x.hidden_by) or "?"
+                return {"stop": None, "why_not": f"hidden_by:{by}", "reachable": "not",
+                        "detail": ("importantForAccessibility=noHideDescendants"
+                                   + (" (on this node)" if by == nid else "")
+                                   + " removes the subtree from what TalkBack gets")}
             parent = self.nid(x.parent)
             return {"stop": None, "why_not": "not_important", "reachable": "not",
                     "detail": "not important for accessibility: TalkBack never gets it; its "
@@ -322,9 +324,12 @@ class TbCapture:
         return "not"
 
     def ghost(self, n: TbNode) -> list[str]:
-        """Ghost reasons of a stop, refs for the scrollable a clipped sliver sits in."""
+        """Ghost reasons of a stop (talkback.static.ghost: not for a clipped item TalkBack
+        scrolls into view first), refs for the scrollable a clipped sliver sits in."""
+        from ..talkback.static import ghost
+
         out = []
-        for g in ghost_reasons(self.rules, n):
+        for g in ghost(self.nav, n):
             if g.startswith("clipped:"):
                 sc = self.by_key(g.split(":", 1)[1])
                 g = f"clipped:{self.nid(sc) or g.split(':', 1)[1]}"
@@ -374,7 +379,7 @@ class TbCapture:
             prev: TbNode | None = None
             for x in order:
                 if isinstance(x, TbNode) and id(x) in stops:
-                    item = self._stop_item(x, announce(self.nav, x, st), prev)
+                    item = self._stop_item(x, announce(self.nav, x, st), prev, forward=forward)
                     prev = x
                     if item is not None:
                         items.append(item)
@@ -416,12 +421,10 @@ class TbCapture:
                     if item is not None:
                         items.append(item)
             item = self._stop_item(target, announce(self.nav, target, st), pivot,
-                                   via=res["via"])
+                                   via=res["via"], forward=forward)
             if item is not None:
                 if res.get("autoscroll") is not None:
                     item.extra["autoscroll"] = self.nid(res["autoscroll"]) or "?"
-                if res.get("show_on_screen") is not None:
-                    item.extra["show_on_screen"] = self.nid(res["show_on_screen"]) or "?"
                 items.append(item)
             pivot = target
             reach_edge = res["reach_edge"]
@@ -429,7 +432,9 @@ class TbCapture:
         return items, meta
 
     def _stop_item(self, n: TbNode, ann: Announcement, prev: TbNode | None,
-                   via: str | None = None) -> ReadItem | None:
+                   via: str | None = None, forward: bool = True) -> ReadItem | None:
+        from ..talkback.static import show_on_screen
+
         nid = self.nid(n)
         if nid is None:
             return None
@@ -439,6 +444,14 @@ class TbCapture:
             item.via = self.edge_in(n, prev)
         else:
             item.via = f"window:{self._window_nid(n)}"
+        sos = show_on_screen(self.nav, n, forward)
+        if sos is not None:
+            item.extra["show_on_screen"] = self.nid(sos) or "?"
+            if ann.unlabelled:
+                # a sliver at the edge: TalkBack scrolls it in first and says what it shows
+                # then, which this dump does not hold; the line keeps the node's label
+                item.speak = None
+                item.extra["speak"] = "after_scroll"
         ghost = self.ghost(n)
         if ghost:
             item.extra["ghost"] = ",".join(ghost)
@@ -549,6 +562,163 @@ def stop_speech(resp: Any) -> dict[tuple[int, tuple[int, ...]], StopSpeech]:
     return TbCapture(resp).stop_speech()
 
 
+def drawn_above(ix: Index) -> Any:
+    """``drawn_above(a, b)`` for two dump nodes of one capture, from its View tree: True when
+    ``a``'s View is drawn over ``b``'s (at their lowest common ancestor, ``a``'s branch is a
+    later child: View child order is drawing order), False when under, None when the View
+    tree cannot tell (the same View, e.g. two Compose nodes of one ComposeView; one View
+    inside the other; another window; a View the capture lacks)."""
+    tree = ix.tree("views")
+    pos: dict[str, int] = {}
+    parent: dict[str, str] = {}
+    for i, r in enumerate(tree.roots):
+        pos[r] = i
+    for p, kids in tree.children.items():
+        for i, c in enumerate(kids):
+            pos[c] = i
+            parent[c] = p
+    paths: dict[str, list[int] | None] = {}
+
+    def path(nid: str) -> list[int] | None:
+        if nid in paths:
+            return paths[nid]
+        out: list[int] = []
+        cur: str | None = nid
+        seen: set[str] = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            if cur not in pos:
+                paths[nid] = None
+                return None
+            out.append(pos[cur])
+            cur = parent.get(cur)
+        paths[nid] = out[::-1]
+        return paths[nid]
+
+    def view_of(raw: dict[str, Any]) -> str | None:
+        host = raw.get("host_view_id")
+        return ix.resolve_id(f"view:{int(host)}") if host else None
+
+    def above(a: dict[str, Any], b: dict[str, Any]) -> bool | None:
+        va, vb = view_of(a), view_of(b)
+        if va is None or vb is None or va == vb:
+            return None
+        pa, pb = path(va), path(vb)
+        if not pa or not pb or pa[0] != pb[0]:
+            return None
+        for x, y in zip(pa, pb):
+            if x != y:
+                return x > y
+        return None  # one View holds the other
+
+    return above
+
+
+def view_chain(ix: Index) -> Any:
+    """``view_chain(view id)``: the View's ancestors in the capture's View tree, nearest
+    first, as ``(view id, (x, y, w, h))`` (its visible rect)."""
+    parents = ix.tree("views").parents()
+
+    def chain(vid: int) -> list[tuple[int, tuple[int, int, int, int]]]:
+        out: list[tuple[int, tuple[int, int, int, int]]] = []
+        cur = ix.resolve_id(f"view:{int(vid)}")
+        seen: set[str] = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            cur = parents.get(cur)
+            node = ix.nodes.get(cur) if cur is not None else None
+            if node is None or node.kind != "view":
+                break
+            udid = node.ids.get("view")
+            if udid is None or not node.b:
+                break
+            out.append((int(udid), tuple(int(v) for v in node.b[:4])))  # type: ignore[misc]
+        return out
+
+    return chain
+
+
+#: Composables (or modifiers) that act on a gesture TalkBack cannot perform: without a
+#: labelled custom action the action is unreachable with a screen reader.
+GESTURE_COMPOSABLES = ("SwipeToDismissBox", "SwipeToDismiss", "SwipeableActionsBox")
+GESTURE_MODIFIERS = ("anchoreddraggable", "swipeable", "swipetodismiss")
+
+
+def _custom_actions_missing(ix: Index, tbc: TbCapture) -> list[tuple[str, Issue]]:
+    """tb.custom_action_missing: a stop emitted inside a swipe-to-dismiss (or anchored
+    draggable) composable that offers no labelled custom action. Needs the slot table
+    (``capture(slots="enable")``); silent without it."""
+    out: list[tuple[str, Issue]] = []
+    for n in tbc.linear():
+        nid = tbc.nid(n)
+        node = ix.nodes.get(nid) if nid else None
+        slots = ((node.facets.get("compose") or {}).get("slots") or []) if node else []
+        if not slots:
+            continue
+        gesture = None
+        seen: set[str] = set()
+        frontier = list(slots)
+        hops = 0
+        while frontier and gesture is None and hops < 8:
+            nxt = []
+            for sid in frontier:
+                s = ix.nodes.get(sid)
+                if s is None or sid in seen:
+                    continue
+                seen.add(sid)
+                name = (s.facets.get("slot") or {}).get("name") or s.type or ""
+                mods = str((s.facets.get("slot") or {}).get("mods") or "").lower()
+                if name in GESTURE_COMPOSABLES or any(m in mods for m in GESTURE_MODIFIERS):
+                    gesture = (name, s)
+                    break
+                if s.parent:
+                    nxt.append(s.parent)
+            frontier = nxt
+            hops += 1
+        if gesture is None:
+            continue
+        labelled = [a for a in n.raw.get("actions") or ()
+                    if isinstance(a, dict) and a.get("label")]
+        if labelled:
+            continue
+        name, s = gesture
+        ev: dict[str, Any] = {"gesture": name}
+        if s.src:
+            ev["src"] = s.src
+        out.append((nid, Issue("tb.custom_action_missing", "warn", ev, "inferred")))
+    return out
+
+
+def issues(ix: Index, loaded: Any, *, density: int | None = None,
+           tbc: TbCapture | None = None) -> tuple[list[tuple[str, Issue]], list[str]]:
+    """The static ``tb.*`` findings of a capture (:mod:`inspector_widget.talkback.static`,
+    plus tb.custom_action_missing from the slot table) as ``(node id, Issue)`` pairs, and
+    diagnostics. A finding's other nodes go in the issue's ``node_ids`` evidence; a
+    heuristic finding (the visual order) is ``conf: inferred``."""
+    from ..talkback import static
+
+    tbc = tbc or TbCapture.of(ix, loaded)
+    if tbc is None:
+        return [], []
+    out: list[tuple[str, Issue]] = []
+    unmapped = 0
+    for f in static.findings(tbc.nav, density=density or 420, drawn_above=drawn_above(ix),
+                             view_chain=view_chain(ix)):
+        nid = tbc.nid(f.node)
+        if nid is None:
+            unmapped += 1
+            continue
+        ev = dict(f.evidence)
+        others = [o for o in (tbc.nid(x) for x in f.others) if o and o != nid]
+        if others:
+            ev["node_ids"] = others
+        out.append((nid, Issue(f.code, f.sev, ev,
+                               "inferred" if f.conf == "heuristic" else "exact")))
+    out.extend(_custom_actions_missing(ix, tbc))
+    diags = [f"tb: {unmapped} TalkBack findings not mapped to nodes"] if unmapped else []
+    return out, diags
+
+
 def fallback_reading(ix: Index, *, granularity: str = "default", start: str | None = None,
                      direction: str = "next") -> list[ReadItem]:
     """The stored reading order when the model cannot run (no raw a11y facet): sliced,
@@ -572,5 +742,6 @@ def tb_of(ix: Index, loaded: Any) -> TbCapture | None:
     return TbCapture.of(ix, loaded)
 
 
-__all__ = ["DIRECTIONS", "GRANULARITIES", "NAME_KINDS", "ReadItem", "StopSpeech", "TbCapture",
-           "fallback_reading", "name_of", "stop_speech", "tb_of"]
+__all__ = ["DIRECTIONS", "GESTURE_COMPOSABLES", "GRANULARITIES", "NAME_KINDS", "ReadItem",
+           "StopSpeech", "TbCapture", "drawn_above", "fallback_reading", "issues", "name_of",
+           "stop_speech", "tb_of"]

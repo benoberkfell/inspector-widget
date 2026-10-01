@@ -853,11 +853,25 @@ def reading_order(ix: Index, loaded: Any) -> tuple[list[tuple[int, str]], list[s
 # --------------------------------------------------------------------------- #
 # analyze()
 # --------------------------------------------------------------------------- #
-_DIAG_PREFIXES = ("lint:", "contrast:", "reading:")
+_DIAG_PREFIXES = ("lint:", "contrast:", "reading:", "tb:")
 
 
 def _owned(issue_id: str) -> bool:
-    return issue_id.startswith(("render.", "a11y."))
+    return issue_id.startswith(("render.", "a11y.", "tb."))
+
+
+def _tb_issues(ix: Index, src: _Src, density: int) -> tuple[list[tuple[str, Issue]], list[str]]:
+    """The static TalkBack rules (capture/tb.py) over the stored a11y tree; a failure costs
+    only these issues and says so."""
+    from . import tb
+
+    dump = src.a11y_dump()
+    if dump is None or not dump.has_roots:
+        return [], []
+    try:
+        return tb.issues(ix, None, density=density, tbc=tb.TbCapture(dump, ix))
+    except Exception as e:  # noqa: BLE001 - a capture never fails on the TalkBack rules
+        return [], [f"tb: not run ({type(e).__name__}: {str(e)[:80]})"]
 
 
 def _issue_sort_key(iss: Issue) -> tuple:
@@ -866,12 +880,14 @@ def _issue_sort_key(iss: Issue) -> tuple:
 
 def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None = None,
             font_scale: float | None = None) -> None:
-    """Write render and lint issues, TalkBack stops and ``Index.reading`` into ``ix``.
+    """Write render, lint and TalkBack issues, TalkBack stops and ``Index.reading`` into
+    ``ix``.
 
-    ``lint``: ``"tree"`` (tree rules), ``"full"`` (tree rules plus contrast from the
-    stored screenshots) or ``"none"``. Issues the analyzers own (``render.*`` and
-    ``a11y.*``) are replaced, so running it again is idempotent. Diagnostics
-    (unmapped findings or stops, contrast status) go to ``ix.diagnostics``.
+    ``lint``: ``"tree"`` (tree rules and the static ``tb.*`` rules), ``"full"`` (plus
+    contrast from the stored screenshots) or ``"none"``. Issues the analyzers own
+    (``render.*``, ``a11y.*`` and ``tb.*``) are replaced, so running it again is
+    idempotent. Diagnostics (unmapped findings or stops, contrast status) go to
+    ``ix.diagnostics``.
     """
     if lint not in LINT_MODES:
         raise OpError("bad_args", f"lint must be one of {', '.join(LINT_MODES)}")
@@ -915,6 +931,9 @@ def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None =
             diags.append(f"lint: {len(unmapped)} findings not mapped to nodes: "
                          + ", ".join(unmapped[:3]) + (" …" if len(unmapped) > 3 else ""))
         _annotate_touch_fp(lint_pairs, render)
+        tb_pairs, tb_diags = _tb_issues(ix, src, density)
+        lint_pairs.extend(tb_pairs)
+        diags.extend(tb_diags)
 
     for n in ix.nodes.values():
         if n.issues:
@@ -958,7 +977,7 @@ def lint_summary(ix: Index) -> dict[str, str]:
     render_by: dict[str, list[str]] = {}
     for n in ix.nodes.values():
         for iss in n.issues:
-            if iss.id.startswith("a11y."):
+            if iss.id.startswith("a11y.") or iss.id in R.DEFAULT_TB:
                 a11y_by[R.short(iss.id)] += 1
                 sev_by[iss.sev] += 1
             elif iss.id.startswith("render."):
@@ -1028,12 +1047,14 @@ _SEG_SPLIT = re.compile(r"(?<!\\)/")
 _LABEL_IN_SEG = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
-def _template(anchor: str | None) -> str | None:
+def _template(anchor: str | None, own: bool = False) -> str | None:
     """The collapse key of an anchor inside a collection: every item index
     ``[i]`` becomes ``[*]``, and so does every label from the item segment down
     to (not including) the node's own segment: a Compose list row's merged
     label (an email subject) differs per row, while the unlabelled button inside
-    it is the same composable in every row. None outside a collection."""
+    it is the same composable in every row. ``own``: the node's own label too (a
+    TalkBack finding on the row itself: every row has it, whatever it says). None
+    outside a collection."""
     if not anchor or "[" not in anchor:
         return None
     t = re.sub(r"(?<!\\)\[\d+\]", "[*]", anchor)
@@ -1045,7 +1066,7 @@ def _template(anchor: str | None) -> str | None:
         return t
     last = len(segs) - 1
     for i in range(first, len(segs)):
-        if i < last or i == first:
+        if i < last or i == first or own:
             segs[i] = _LABEL_IN_SEG.sub('"*"', segs[i])
     return "/".join(segs)
 
@@ -1084,10 +1105,51 @@ def _num(v: Any) -> str:
     return str(v)
 
 
+def _tb_detail(iss: Issue) -> str:
+    """A tb.* finding's evidence in a few words (the other nodes are refs)."""
+    ev = iss.evidence or {}
+    others = [str(x) for x in ev.get("node_ids") or []]
+    rid = iss.id
+    if rid == "tb.double_stop":
+        inner = " ".join(others[:2]) + (f" +{len(others) - 2}" if len(others) > 2 else "")
+        return f"and {inner} inside ({ev.get('why', '')})".replace(" ()", "")
+    if rid == "tb.ghost_stop":
+        return f"{ev.get('why', '')}: says {_quote(ev.get('said') or '', 24)}"
+    if rid in ("tb.out_of_order", "tb.boundary_jump"):
+        after = f" after {others[0]}" if others else ""
+        return f"read {ev.get('read')}{after}, seen {ev.get('visual')} of {ev.get('of')}"
+    if rid == "tb.escape":
+        ex = " ".join(others[:2])
+        return (f"{ev.get('under')} stops under it ({ev.get('area_pct')}% of the window), "
+                f"e.g. {ex}")
+    if rid == "tb.window_order":
+        return f"read after {ev.get('read_after')} stops below its top, e.g. " + \
+            (others[0] if others else "?")
+    if rid == "tb.wrong_announcement":
+        if ev.get("why") == "speech_order":
+            return (f"says {_quote(ev.get('said') or '', 24)}, "
+                    f"shown {_quote(ev.get('shown') or '', 24)}")
+        return (f"says {_quote(ev.get('said') or '', 24)}: {ev.get('silent_items')} silent "
+                f"item(s) counted")
+    if rid == "tb.edge_stuck":
+        if ev.get("why") == "pager":
+            return "a pager: TalkBack never scrolls to the next page"
+        return (f"{ev.get('past_edge')} past its edge ({_quote(ev.get('first') or '', 20)}), "
+                "nothing scrolls")
+    if rid == "tb.skipped":
+        return f"hides {ev.get('texts')} text(s): {_quote(ev.get('first') or '', 24)}"
+    if rid == "tb.custom_action_missing":
+        src = f" ({ev['src']})" if ev.get("src") else ""
+        return f"{ev.get('gesture')} without a custom action{src}"
+    return ""
+
+
 def _detail(iss: Issue) -> str:
     ev = iss.evidence or {}
     bits = []
-    if iss.id == TOUCH_RULE and "w_dp" in ev:
+    if iss.id.startswith("tb."):
+        bits.append(_tb_detail(iss))
+    elif iss.id == TOUCH_RULE and "w_dp" in ev:
         bits.append(f"{_num(ev['w_dp'])}x{_num(ev.get('h_dp'))}dp")
     elif iss.id == CONTRAST_RULE and "ratio" in ev:
         bits.append(f"{ev['ratio']}:1")
@@ -1165,6 +1227,7 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     explicit = selected is not None
     if selected is None:
         selected = [r.id for r in RULES.values() if r.family == "a11y" and not r.planned]
+        selected += list(R.DEFAULT_TB)
     selected_set = set(selected)
 
     src = _Src(loaded)
@@ -1203,7 +1266,7 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if unmapped:
         out["unmapped"] = len(unmapped)
     available = set(getattr(a11y_lint, "ALL_RULE_IDS", ())) | {
-        r.id for r in RULES.values() if r.family == "render" and not r.planned}
+        r.id for r in RULES.values() if r.family in ("render", "tb") and not r.planned}
     unavailable = [RULES[r].label for r in selected if explicit and r in RULES
                    and r not in available]
     if unavailable:
@@ -1359,9 +1422,10 @@ def _collapsed(ix: Index, members: list[tuple[str, Issue]]) -> list[tuple[str, i
     ``src`` or a template anchor (collection ordinals wildcarded) become one line.
     Returns ``[(line, findings it covers)]`` in first-occurrence order."""
     groups: dict[tuple, list[tuple[str, Issue]]] = {}
+    own = bool(members) and members[0][1].id.startswith("tb.")
     for nid, iss in members:
         n = ix.nodes[nid]
-        tpl = _template(n.anchor)
+        tpl = _template(n.anchor, own)
         key: tuple = ("src", n.src) if n.src else (("tpl", tpl) if tpl else ("node", nid))
         groups.setdefault(key, []).append((nid, iss))
     out: list[tuple[str, int]] = []
@@ -1371,13 +1435,15 @@ def _collapsed(ix: Index, members: list[tuple[str, Issue]]) -> list[tuple[str, i
             continue
         ids = [nid for nid, _ in grp]
         first = ix.nodes[ids[0]]
-        tpl = _template(first.anchor)
+        tpl = _template(first.anchor, own)
         container = _lca(ix, ids)
         where = f"in {_sel_of(container)} cells" if (container is not None and tpl) else (
             f"under {_sel_of(container)}" if container is not None else "")
         # src plus type ("FeedRow.kt:42 IconButton"), else the template's last segment
         what = (" ".join(x for x in (first.src, first.type) if x) if first.src
                 else (tpl.rsplit("/", 1)[-1] if tpl else first.type or ""))
+        if what.strip('"*:0123456789') == "":  # only a wildcard label or an ordinal
+            what = first.type or ""
         examples = " ".join(_ref(ix.nodes[i]) for i in ids[:3])
         more = f" +{len(ids) - 3}" if len(ids) > 3 else ""
         head = f"×{len(ids)} {where}".rstrip()
