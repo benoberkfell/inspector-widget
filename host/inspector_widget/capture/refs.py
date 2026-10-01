@@ -60,6 +60,18 @@ Passes 3 and 4 repeat until nothing new matches, since a geometry match can make
 its children matchable by structure. Ambiguous candidates get new refs, and their
 subtrees are kept out of the geometry pass, so look-alikes are never swapped.
 
+5. **Recall** (``plan(..., tomb=...)``): a node still unmatched (a rebound cell
+   included, never an ambiguous one) is matched against the lineage's recent
+   tombstones (``recent_tomb``: refs retired in the last ``TOMB_RECENT`` captures),
+   so a node that left and came back (a dialog closed and opened again, a list row
+   scrolled away during a walk and back) keeps its ref (``match: "returned"``). A
+   tombstone records the node's identity when it left (``tomb_entry``'s fifth
+   item): by device identity when the pid and the Compose generation are those of
+   the capture it left, inside a collection cell only when the cell shows the same
+   item (its identity label) again; else by a unique locator (``#rid`` outside
+   collections, ``@tag`` or uniqueId anywhere), unique on both sides. A tombstone is
+   recalled at most once, and never when two nodes claim it.
+
 A first capture (``prev=None``) allocates every ref in pre-order: ui tree first
 (windows in z order), then the slot tree. Allocation is one ``alloc(n)`` call per
 capture and is deterministic for identical inputs.
@@ -92,6 +104,9 @@ from .model import (
 
 TOMB_CAP = 5000
 TOMB_LABEL_MAX = 40
+#: Tombstones keep the identity a recall needs (their fifth item) for refs retired in
+#: this many latest captures of the lineage; older ones keep only the first four.
+TOMB_RECENT = 5
 GEOMETRY_MIN_IOU = 0.8
 #: Upper bound on structure+geometry rounds (each round usually settles a level).
 MAX_ROUNDS = 8
@@ -193,10 +208,33 @@ def _cut(s: str | None, n: int) -> str | None:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def tomb_entry(node: UNode, capture_id: str | None) -> list:
-    """``[type, label<=40, sel, last_capture]`` (spec 3.9). ``type`` falls back to the kind."""
-    return [node.type or node.kind, _cut(node.label, TOMB_LABEL_MAX), node.sel or node.ref,
-            capture_id]
+def tomb_entry(node: UNode, capture_id: str | None,
+               ident: Mapping[str, Any] | None = None) -> list:
+    """``[type, label<=40, sel, last_capture]`` (spec 3.9). ``type`` falls back to the kind.
+    ``ident`` (what a recall matches on, see ``_tomb_ident``) is appended as a fifth item."""
+    out = [node.type or node.kind, _cut(node.label, TOMB_LABEL_MAX), node.sel or node.ref,
+           capture_id]
+    if ident:
+        out.append(dict(ident))
+    return out
+
+
+def recent_tomb(state: LineageState, n: int = TOMB_RECENT) -> dict[str, list]:
+    """The lineage's tombstones a recall may use: the refs last seen in one of its ``n``
+    latest captures, with the identity a recall needs (``plan(..., tomb=...)``)."""
+    recent = set((state.history or [])[:n])
+    if state.latest:
+        recent.add(state.latest)
+    return {ref: e for ref, e in (state.tomb or {}).items()
+            if len(e) > 4 and isinstance(e[4], dict) and e[3] in recent}
+
+
+def slim_tomb(tomb: Mapping[str, list], recent: Iterable[str]) -> dict[str, list]:
+    """``tomb`` with the identity item dropped from the tombstones whose last capture is
+    not in ``recent`` (no recall reads them any more), so the lineage file stays small."""
+    keep = set(recent)
+    return {ref: (list(e) if len(e) <= 4 or e[3] in keep else list(e[:4]))
+            for ref, e in tomb.items()}
 
 
 def merge_tomb(tomb: Mapping[str, list], updates: Mapping[str, list],
@@ -806,6 +844,109 @@ class _Matcher:
 
 
 # --------------------------------------------------------------------------- #
+# Pass 5: recall from the lineage's recent tombstones
+# --------------------------------------------------------------------------- #
+_IDENT_LABEL_MAX = 80
+
+
+def _tomb_ident(side: _Side, nid: str, meta: Any) -> dict[str, Any]:
+    """What a later recall matches a retired node on: its canonical key with the pid and
+    Compose generation that made the key device identity, its locators, and the cell it
+    sat in (its identity label) when it was a collection item's."""
+    n = side.nodes[nid]
+    out: dict[str, Any] = {"key": n.key, "kind": n.kind}
+    pid = getattr(meta, "pid", None)
+    if pid is not None:
+        out["pid"] = int(pid)
+        out["gen"] = int(getattr(meta, "compose_generation", 0) or 0)
+    loc = side.locators(nid)
+    if loc:
+        out["loc"] = [list(x) for x in loc]
+    item = side.item_of.get(nid)
+    if item is not None:
+        out["cell"] = _cut(side.item_ident.get(item), _IDENT_LABEL_MAX)
+    layout = _layout_of(n)
+    if layout:
+        out["layout"] = layout
+    if n.since:
+        out["since"] = n.since
+    return out
+
+
+def _recall(matcher: _Matcher, new_meta: Any, tomb: Mapping[str, list]
+            ) -> dict[str, tuple[str, list]]:
+    """``{new node id: (ref, tombstone)}``: the nodes the matcher left unmatched that a
+    recent tombstone names (module docstring, pass 5). One-to-one; contested refs and
+    nodes that two tombstones claim are left alone."""
+    new = matcher.new
+    pid = getattr(new_meta, "pid", None)
+    gen = int(getattr(new_meta, "compose_generation", 0) or 0)
+    by_key: dict[str, list[str]] = {}
+    by_loc: dict[tuple, list[str]] = {}
+    for ref, e in tomb.items():
+        if len(e) <= 4 or not isinstance(e[4], dict):
+            continue
+        ident = e[4]
+        if ident.get("key") and pid is not None and ident.get("pid") == int(pid) \
+                and int(ident.get("gen") or 0) == gen:
+            by_key.setdefault(str(ident["key"]), []).append(ref)
+        for loc in ident.get("loc") or ():
+            by_loc.setdefault(tuple(loc), []).append(ref)
+    if not by_key and not by_loc:
+        return {}
+    loc_count: Counter = Counter(loc for nid in new.order for loc in new.locators(nid))
+
+    def cell_ok(nid: str, ident: Mapping[str, Any], by_locator: tuple | None) -> bool:
+        item = new.item_of.get(nid)
+        if item is None:
+            return "cell" not in ident
+        if "cell" not in ident:
+            return False
+        if by_locator is not None and by_locator[0] in ("tag", "uid"):
+            return True  # a per-item testTag or uniqueId names the item itself
+        ident_now = _cut(new.item_ident.get(item), _IDENT_LABEL_MAX)
+        return by_locator is None and ident_now is not None and ident_now == ident["cell"]
+
+    claims: dict[str, list[str]] = {}
+    chosen: dict[str, str] = {}
+    for nid in new.order:
+        if nid in matcher.n2p or nid in matcher.amb_new:
+            continue
+        n = new.nodes[nid]
+        cands: list[str] = []
+        for ref in by_key.get(n.key, ()):
+            ident = tomb[ref][4]
+            if ident.get("kind") != n.kind or not cell_ok(nid, ident, None):
+                continue
+            parsed = parse_key(n.key)
+            if parsed is not None and parsed[0] in WEAK_KEY_KINDS and (
+                    tomb[ref][0] != (n.type or n.kind)
+                    or tomb[ref][1] != _cut(n.label, TOMB_LABEL_MAX)):
+                continue
+            cands.append(ref)
+        if not cands:
+            for loc in new.locators(nid):
+                refs_ = by_loc.get(loc) or []
+                if loc_count[loc] != 1 or len(refs_) != 1:
+                    continue
+                ref = refs_[0]
+                ident = tomb[ref][4]
+                if ident.get("kind") != n.kind or tomb[ref][0] != (n.type or n.kind):
+                    continue
+                if n.kind == "view" and ident.get("layout") and _layout_of(n) \
+                        and ident["layout"] != _layout_of(n):
+                    continue
+                if not cell_ok(nid, ident, loc):
+                    continue
+                cands.append(ref)
+                break
+        if len(set(cands)) == 1:
+            chosen[nid] = cands[0]
+            claims.setdefault(cands[0], []).append(nid)
+    return {nid: (ref, tomb[ref]) for nid, ref in chosen.items() if len(claims[ref]) == 1}
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 def _in_ref_space(nid: str, n: UNode) -> bool:
@@ -827,14 +968,16 @@ def _check_inputs(new: Index, prev: Index | None) -> None:
 
 
 def plan(new: Index, prev: Index | None, *, same_pid: bool, same_generation: bool,
-         alloc: Alloc) -> Assignment:
+         alloc: Alloc, tomb: Mapping[str, list] | None = None) -> Assignment:
     """Decide every node's ref without touching ``new`` (see the module docstring).
 
     ``new`` is a key-space index (``build_index`` output); ``prev`` is the latest
     published index of the same lineage (ref-space) or None. ``alloc(n)`` reserves
     ``n`` consecutive fresh ref numbers and returns the first one (the store's
     ``next_refs`` under its refs lock); it is called at most once, and not at all
-    when every node carries over.
+    when every node carries over. ``tomb`` is the lineage's recent tombstones
+    (``recent_tomb``): a node left unmatched that one of them names takes its ref back
+    (pass 5).
     """
     _check_inputs(new, prev)
     out = Assignment()
@@ -858,6 +1001,14 @@ def plan(new: Index, prev: Index | None, *, same_pid: bool, same_generation: boo
             out.since[key] = pnode.since or prev_id
         fresh = [nid for nid in order if nid not in matcher.n2p]
         out.ambiguous = sum(1 for nid in fresh if nid in matcher.amb_new)
+        recalled = _recall(matcher, new.meta, tomb) if tomb and fresh else {}
+        for nid, (ref, entry) in recalled.items():
+            key = new.nodes[nid].key
+            out.refmap[key] = ref
+            out.match[key] = "returned"
+            out.since[key] = (entry[4].get("since") if len(entry) > 4 else None) or entry[3]
+        if recalled:
+            fresh = [nid for nid in fresh if nid not in recalled]
     if fresh:
         start = int(alloc(len(fresh)))
         if start < 1:
@@ -879,21 +1030,26 @@ def plan(new: Index, prev: Index | None, *, same_pid: bool, same_generation: boo
         prev_id = prev.meta.id if prev.meta is not None else None
         for pid in matcher.prev.order:
             if pid not in matcher.p2n and pid not in matcher.no_ref:
-                out.tomb[pid] = tomb_entry(prev.nodes[pid], prev_id)
+                out.tomb[pid] = tomb_entry(prev.nodes[pid], prev_id,
+                                           _tomb_ident(matcher.prev, pid, prev.meta))
     return out
 
 
 def assign(new: Index, prev: Index | None, *, same_pid: bool, same_generation: bool,
-           alloc: Alloc) -> tuple[dict[str, str], dict]:
+           alloc: Alloc, tomb: Mapping[str, list] | None = None
+           ) -> tuple[dict[str, str], dict]:
     """Carry refs from ``prev`` to ``new`` (spec 3.9; contract in section 10).
 
     Returns ``(refmap, tomb_updates)``: ``refmap`` maps every canonical key of
     ``new`` to its ref (pass it to ``apply_refs``); ``tomb_updates`` maps each old
-    ref that found no node to ``[type, label<=40, sel, last_capture]`` (fold it into
-    the lineage with ``merge_tomb``). Also records ``match``, ``since`` and
-    ``rebound_of`` on ``new``'s nodes, which is the only change made to ``new``.
+    ref that found no node to ``[type, label<=40, sel, last_capture, identity]``
+    (fold it into the lineage with ``merge_tomb``). ``tomb``: the lineage's recent
+    tombstones (``recent_tomb``), which a node that came back takes its ref from. Also
+    records ``match``, ``since`` and ``rebound_of`` on ``new``'s nodes, which is the
+    only change made to ``new``.
     """
-    result = plan(new, prev, same_pid=same_pid, same_generation=same_generation, alloc=alloc)
+    result = plan(new, prev, same_pid=same_pid, same_generation=same_generation, alloc=alloc,
+                  tomb=tomb)
     annotate(new, result)
     return dict(result.refmap), dict(result.tomb)
 
@@ -918,6 +1074,7 @@ __all__ = [
     "IDENTITY_KEY_KINDS",
     "TOMB_CAP",
     "TOMB_LABEL_MAX",
+    "TOMB_RECENT",
     "WEAK_KEY_KINDS",
     "Assignment",
     "LineageState",
@@ -930,6 +1087,8 @@ __all__ = [
     "merge_tomb",
     "plan",
     "preorder",
+    "recent_tomb",
+    "slim_tomb",
     "stale_ref_error",
     "tomb_entry",
     "touch_tomb",

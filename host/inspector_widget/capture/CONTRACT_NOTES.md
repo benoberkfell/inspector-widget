@@ -105,7 +105,9 @@ with every consumer.
     lineage. Call `label()` after publishing to learn `moved_from`.
   - It honours `meta.pinned`: `bad_args` when 20 are pinned already.
   - It merges `tomb` updates. Refs present in `refmap` leave the tomb, which is
-    capped at 5,000 with the oldest dropped first.
+    capped at 5,000 with the oldest dropped first. Only the tombstones retired in
+    the latest `refs.TOMB_RECENT` captures keep their identity item
+    (`refs.slim_tomb`), so the lineage file stays small.
   - It sets the default session and caches the index in memory.
   - If the id was taken between staging and rename, it re-ids and rewrites
     meta.json and the index.
@@ -870,7 +872,7 @@ with every consumer.
 
 ## Refs and carry-over (C5, `capture/refs.py`)
 
-- **`assign(new, prev, *, same_pid, same_generation, alloc) -> (refmap, tomb_updates)`**
+- **`assign(new, prev, *, same_pid, same_generation, alloc, tomb=None) -> (refmap, tomb_updates)`**
   - `new` is a key-space index (the `build_index` output). `prev` is the lineage's
     latest published index (ref space) or None. A `prev` whose node ids are not
     refs raises `ValueError`; two different lineages raise `OpError("bad_args")`.
@@ -881,7 +883,17 @@ with every consumer.
     allocation is deterministic for identical inputs.
   - `refmap` maps every canonical key of `new` to its ref; hand it to
     `apply_refs`. `tomb_updates` maps each old ref that found no node to
-    `[type (or kind), label cut to 40 chars with …, sel (or the ref), prev capture id]`.
+    `[type (or kind), label cut to 40 chars with …, sel (or the ref), prev capture id,
+    identity]`; the fifth item (key, pid and Compose generation, locators, the
+    identity label of its collection cell) is what a recall matches on.
+  - `tomb` is the lineage's recent tombstones (`refs.recent_tomb(state)`: refs
+    retired in the last `TOMB_RECENT` = 5 captures). A node left unmatched by passes
+    1-4 that one of them names takes its old ref back (`match: "returned"`): by
+    device identity in the same process and Compose generation (inside a
+    collection cell only when the cell shows the same item again), else by a
+    locator unique on both sides (`#rid` outside collections, `@tag` or uniqueId
+    anywhere). So a dialog closed and shown again, or a row scrolled away during a
+    walk and back, keeps its ref. A contested tombstone is never recalled.
   - Side effect: `assign` writes `match`, `since` and `rebound_of` onto `new`'s
     nodes (`refs.annotate`), so `apply_refs` carries them into the published
     index. `since` is the capture where the ref was first assigned: the prev

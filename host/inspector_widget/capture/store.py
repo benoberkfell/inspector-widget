@@ -94,6 +94,8 @@ from .model import (
     skp_file,
 )
 
+from .refs import TOMB_RECENT, slim_tomb
+
 try:  # POSIX
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -976,7 +978,9 @@ class CaptureStore:
         ``prev`` is the next older capture, and its tombstones are dropped because
         they name refs the newer latest holds), applies ``meta.label`` (moving the
         label from another capture of the lineage), merges ``tomb`` updates (refs
-        present in ``refmap`` leave the tomb) and sets the default session.
+        present in ``refmap`` leave the tomb; only the tombstones retired in the latest
+        ``refs.TOMB_RECENT`` captures keep the identity a recall reads) and sets the
+        default session.
         ``meta.pinned`` pins it (bad_args when 20 are pinned already).
         """
         meta = raw.meta
@@ -1026,6 +1030,8 @@ class CaptureStore:
                     st.tomb[ref] = list(info)
             for ref in refmap.values():
                 st.tomb.pop(ref, None)
+            # only the tombstones of the latest captures keep what a recall matches on
+            st.tomb = slim_tomb(st.tomb, st.history[:TOMB_RECENT])
             self._write_lineage((serial, package), st)
             self.set_default_session(serial, package)
             if self.gc_on_publish:

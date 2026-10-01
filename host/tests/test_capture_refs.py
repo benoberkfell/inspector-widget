@@ -948,3 +948,151 @@ def test_a_rid_reused_by_another_screen_never_carries_to_another_view_class():
                              cid="c00003"))
     assert c.by_key["view:700"] == b.by_key["view:450"]
     assert c.by_key["view:701"] == b.by_key["view:451"]
+
+
+# --------------------------------------------------------------------------- recall (L8)
+class RecallChain(Chain):
+    """Chain plus what the store adds: each capture is also matched against the
+    lineage's recent tombstones (refs.recent_tomb), and a recalled ref leaves the tomb."""
+
+    def publish(self, new, *, same_pid=None, same_generation=None):
+        sp, sg = refs.identity_flags(new.meta, self.prev.meta if self.prev else None)
+        ids = [ix.meta.id for ix in reversed(self.history)]
+        state = m.LineageState(latest=ids[0] if ids else None, history=ids,
+                               tomb=dict(self.tomb))
+        self.last = refs.plan(new, self.prev, same_pid=sp, same_generation=sg,
+                              alloc=self.alloc, tomb=refs.recent_tomb(state))
+        refs.annotate(new, self.last)
+        out = m.remap_ids(new, self.last.refmap)
+        self.tomb = refs.merge_tomb(self.tomb, self.last.tomb)
+        for ref in self.last.refmap.values():
+            self.tomb.pop(ref, None)
+        self.prev = out
+        self.history.append(out)
+        return out
+
+
+def _rows(shown, *, cid, pid=100):
+    """A RecyclerView showing ``shown`` = [(row View udid, item label)] top down; each row
+    is a LinearLayout holding a TextView (udid + 100)."""
+    rows = [V("LinearLayout", u, V("TextView", u + 100, label=lb, b=(0, 100 * i, 400, 60)),
+              b=(0, 100 * i, 400, 90)) for i, (u, lb) in enumerate(shown)]
+    return scene(V("DecorView", 1, V("RecyclerView", 2, *rows, b=(0, 0, 400, 500)),
+                   b=(0, 0, 400, 800)), cid=cid, pid=pid)
+
+
+TOP = [(100, "Item 0"), (101, "Item 1"), (102, "Item 2"), (103, "Item 3"), (104, "Item 4")]
+DOWN = [(102, "Item 2"), (103, "Item 3"), (104, "Item 4"), (100, "Item 5"), (101, "Item 6")]
+
+
+def test_a_row_scrolled_away_and_back_keeps_its_ref():
+    # A walk scrolls the list: rows 100 and 101 are recycled for items 5 and 6 (new refs:
+    # another item), then scrolled back to items 0 and 1. They used to get a third set of
+    # refs; the tombstones of items 0 and 1 give theirs back.
+    chain = RecallChain()
+    a = chain.publish(_rows(TOP, cid="c00001"))
+    b = chain.publish(_rows(DOWN, cid="c00002"))
+    for k in ("view:100", "view:200"):
+        assert chain.ref(k, b) != chain.ref(k, a) and b.nodes[chain.ref(k, b)].match == "new"
+    c = chain.publish(_rows(TOP, cid="c00003"))
+    for k in ("view:100", "view:200", "view:101", "view:201"):
+        assert chain.ref(k, c) == chain.ref(k, a), k
+        assert c.nodes[chain.ref(k, c)].match == "returned"
+        assert c.nodes[chain.ref(k, c)].since == "c00001" and not c.nodes[chain.ref(k, c)].rebound_of
+    assert c.nodes[chain.ref("view:200", c)].label == "Item 0"
+    assert chain.ref("view:102", c) == chain.ref("view:102", a)  # never left: "id"
+    # items 5 and 6 left in turn: their refs are the tombstones now, the recalled ones not
+    assert {chain.ref(k, b) for k in ("view:100", "view:101")} <= set(chain.tomb)
+    assert chain.ref("view:100", a) not in chain.tomb
+    # a recycled row that shows yet another item is a new node, not item 5 or item 0
+    d = chain.publish(_rows([(102, "Item 2"), (103, "Item 3"), (104, "Item 4"),
+                             (100, "Item 7"), (101, "Item 8")], cid="c00004"))
+    assert d.nodes[chain.ref("view:100", d)].match == "new"
+    assert chain.ref("view:100", d) not in {chain.ref("view:100", x) for x in (a, b, c)}
+
+
+def _dialog_screen(*, cid, dialog=None, pid=100):
+    roots = [V("DecorView", 1, V("LinearLayout", 2, V("Button", 3, label="Delete", rid="delete",
+                                                         b=(0, 0, 200, 100)),
+                                 b=(0, 0, 400, 800)), b=(0, 0, 400, 800))]
+    if dialog is not None:
+        u = dialog
+        roots.append(V("DecorView", u,
+                       V("TextView", u + 1, label="Delete this message?", rid="alertTitle",
+                         b=(40, 300, 320, 60)),
+                       V("Button", u + 2, label="OK", rid="button1", b=(240, 400, 120, 60)),
+                       b=(20, 280, 360, 220)))
+    return scene(*roots, cid=cid, pid=pid)
+
+
+def test_a_dialog_closed_and_opened_again_keeps_its_refs():
+    chain = RecallChain()
+    chain.publish(_dialog_screen(cid="c00001"))
+    b = chain.publish(_dialog_screen(cid="c00002", dialog=50))
+    refs_b = {k: chain.ref(k, b) for k in ("view:50", "view:51", "view:52")}
+    chain.publish(_dialog_screen(cid="c00003"))  # closed: its refs are tombstones
+    assert set(refs_b.values()) <= set(chain.tomb)
+    d = chain.publish(_dialog_screen(cid="c00004", dialog=50))  # the same Dialog shown again
+    assert {k: chain.ref(k, d) for k in refs_b} == refs_b
+    assert {d.nodes[r].match for r in refs_b.values()} == {"returned"}
+    assert chain.last.stats["returned"] == 3 and chain.last.allocated == 0
+    # a re-created dialog (new Views, the same ids): the unique #rids carry; its root,
+    # with nothing to tell it by, is new
+    chain.publish(_dialog_screen(cid="c00005"))
+    f = chain.publish(_dialog_screen(cid="c00006", dialog=60))
+    assert chain.ref("view:61", f) == refs_b["view:51"]
+    assert chain.ref("view:62", f) == refs_b["view:52"]
+    assert f.nodes[chain.ref("view:60", f)].match == "new"
+
+
+def test_recall_needs_the_same_process_and_recent_tombstones():
+    chain = RecallChain()
+    chain.publish(_dialog_screen(cid="c00001"))
+    b = chain.publish(_dialog_screen(cid="c00002", dialog=50))
+    ok_ref = chain.ref("view:52", b)
+    chain.publish(_dialog_screen(cid="c00003"))
+    # another process: udids mean nothing now; only the unique #rids carry back
+    d = chain.publish(_dialog_screen(cid="c00004", dialog=50, pid=200))
+    assert d.nodes[chain.ref("view:50", d)].match == "new"
+    assert chain.ref("view:52", d) == ok_ref and d.nodes[ok_ref].match == "returned"
+    # tombstones older than TOMB_RECENT captures are not recalled
+    chain = RecallChain()
+    chain.publish(_dialog_screen(cid="c00001"))
+    b = chain.publish(_dialog_screen(cid="c00002", dialog=50))
+    gone = chain.ref("view:50", b)
+    for i in range(refs.TOMB_RECENT + 1):
+        chain.publish(_dialog_screen(cid=f"c0001{i}"))
+    later = chain.publish(_dialog_screen(cid="c00020", dialog=50))
+    assert chain.ref("view:50", later) != gone and gone in chain.tomb
+
+
+def test_a_contested_tombstone_is_never_guessed():
+    entry = ["Button", "OK", "#button1", "c00001",
+             {"key": "view:52", "kind": "view", "pid": 100, "gen": 0,
+              "loc": [["rid", 1, "button1"]]}]
+    twin = ["Button", "OK", "#button1", "c00001",
+            {"key": "view:72", "kind": "view", "pid": 100, "gen": 0,
+             "loc": [["rid", 1, "button1"]]}]
+    chain = RecallChain()
+    prev = chain.publish(_dialog_screen(cid="c00002"))
+
+    def recall(tomb):
+        return refs.plan(_dialog_screen(cid="c00003", dialog=60), prev, same_pid=True,
+                         same_generation=True, alloc=Counter(1000), tomb=tomb)
+
+    assert recall({"n50": entry, "n51": twin}).match["view:62"] == "new"  # one #rid, two refs
+    res = recall({"n50": entry})
+    assert res.refmap["view:62"] == "n50" and res.match["view:62"] == "returned"
+
+
+def test_only_recent_tombstones_keep_their_identity():
+    tomb = {"n1": ["View", None, "n1", "c00001", {"key": "view:1"}],
+            "n2": ["View", None, "n2", "c00005", {"key": "view:2"}],
+            "n3": ["View", None, "n3", "c00005"]}
+    st = m.LineageState(latest="c00005", history=["c00005", "c00004"], tomb=dict(tomb))
+    assert set(refs.recent_tomb(st)) == {"n2"}
+    slim = refs.slim_tomb(tomb, ["c00005", "c00004"])
+    assert slim["n1"] == ["View", None, "n1", "c00001"] and slim["n2"] == tomb["n2"]
+    assert slim["n3"] == tomb["n3"]
+    err = refs.stale_ref_error("n2", "c00006", tomb)  # the fifth item changes nothing here
+    assert "c00005" in err.hint

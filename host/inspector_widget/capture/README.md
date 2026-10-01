@@ -43,7 +43,8 @@ session --fetch--> RawCapture --build_index--> Index (canonical keys, ref=None)
                               prev = store.load(latest).index()      <- no lock
                                       |
          with store.refs_lock():   (milliseconds: hold it for these three only)
-             refs.assign(ix, prev, alloc=store.next_refs) -> refmap, tomb
+             refs.assign(ix, prev, alloc=store.next_refs,
+                         tomb=refs.recent_tomb(st)) -> refmap, tomb
              ix = index.apply_refs(ix, refmap)           (ids become refs)
              cid = store.publish(raw, ix, refmap, tomb=tomb)
                                       |

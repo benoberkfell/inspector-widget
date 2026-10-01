@@ -681,7 +681,7 @@ def publish_capture(ctx: OpContext, lineage: tuple[str, str], session: Any,
             moved_from = st.labels.get(label)
         same_pid, same_gen = refs.identity_flags(raw.meta, pix.meta if pix else None)
         refmap, tomb = refs.assign(ix, pix, same_pid=same_pid, same_generation=same_gen,
-                                   alloc=store.next_refs)
+                                   alloc=store.next_refs, tomb=refs.recent_tomb(st))
         ix = index.apply_refs(ix, refmap)
         raw.meta.label = label
         raw.meta.pinned = pin
