@@ -360,3 +360,33 @@ def test_a_popup_read_last_is_named_by_ref():
     assert len(wo) == 1
     assert re.match(r"step \d+: window n\d+ \(from y=\d+\) is read only after", wo[0]["msg"]), \
         wo[0]["msg"]
+
+
+def test_a_navigation_rail_is_in_order_as_the_capture_reads_it():
+    """Live, emulator-5556 (Now in Android on a 2076x2152 foldable): TalkBack reads the
+    NavigationRail's three tabs, then the top app bar, then the feed. The walk's own guess
+    (one XY-cut over the steps' boxes) read the first tab with the app bar and called
+    "Saved" and "Interests" out of order; the lint never did. A walk bound to its capture
+    orders its steps the way tb.out_of_order does (groups, the View tree), so both agree.
+    tests/data/tb_walks_live/ holds that walk and the refs of its capture
+    (tests/fixtures/tb_captures/nia_foryou_rail)."""
+    import copy
+    import gzip
+    from pathlib import Path
+
+    import tb_capture_fixtures as F
+    from inspector_widget.capture.index import apply_refs
+    from inspector_widget.talkback import diff
+
+    data = Path(__file__).parent / "data" / "tb_walks_live"
+    rec = json.loads(gzip.decompress((data / "nia_foryou_rail-walk.json.gz").read_bytes()))
+    refmap = json.loads(gzip.decompress((data / "nia_foryou_rail-refmap.json.gz").read_bytes()))
+    ix, raw = F.live_capture("nia_foryou_rail")
+    flat = {f["code"]: f["refs"] for f in diff.analyze(copy.deepcopy(rec))["findings"]}
+    assert flat["tb.out_of_order"] == ["n1544", "n1551"]  # the rail's tabs, by the boxes alone
+    bound = W.bind_walk(copy.deepcopy(rec), W.Binding([(0, _Loaded(apply_refs(ix, refmap),
+                                                                   raw))]))
+    assert {f["code"]: f["refs"] for f in bound["findings"]} == {
+        "tb.double_stop": ["n2551", "n2552"]}  # the topic chip and its checkbox: real
+    assert bound["vs_model"]["agree"] == 9
+    assert [s["vrank"][3] for s in bound["steps"][:4]] == [0, 1, 2, 3]

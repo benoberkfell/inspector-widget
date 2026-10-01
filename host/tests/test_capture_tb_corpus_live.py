@@ -75,9 +75,12 @@ EXTRA_TRUTH = {"tb_c11_bad_slots": {"tb.custom_action_missing"}}
 #: tb.* counts on each live capture: the derived corpus table, plus C11 with slots
 LIVE_TABLE = {f"{k.replace('-', '_')}": v for k, v in TABLE.items()}
 #: live captures of real apps beside the corpus
-REAL_APPS = {"thunderbird_list_tb_off"}
+REAL_APPS = {"thunderbird_list_tb_off", "nia_foryou_rail"}
 LIVE_TABLE.update({
     "thunderbird_list_tb_off": {"tb.double_stop": 6, "tb.wrong_announcement": 1},
+    # a tb_walk's capture (TalkBack on): the topic chips and their checkboxes; no order
+    # finding on the NavigationRail (test_capture_walks.py has the walk)
+    "nia_foryou_rail": {"tb.double_stop": 6},
     "tb_c11_bad_slots": {"tb.custom_action_missing": 3},
     # GOOD's fix is unreachable for TalkBack (module docstring): the evidence says so
     "tb_c11_good_slots": {"tb.custom_action_missing": 3},

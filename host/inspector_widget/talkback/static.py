@@ -424,10 +424,33 @@ def _visual(cx: _Ctx, items: List[TbNode]) -> List[TbNode]:
     return expand(0)
 
 
-def _order_layer(cx: _Ctx, stops: List[TbNode]) -> Iterator[Finding]:
+def _layer_items(stops: List[TbNode]) -> List[TbNode]:
     # a stop that holds other stops has no place of its own in a reading order
-    items = [s for s in stops if not s.rect.is_empty() and not any(
+    return [s for s in stops if not s.rect.is_empty() and not any(
         o is not s and s.rect.contains(o.rect) and not o.rect.is_empty() for o in stops)]
+
+
+def visual_ranks(nav: Navigator, *, drawn_above: Optional[DrawnAbove] = None,
+                 view_chain: Optional[ViewChain] = None) -> Dict[str, Tuple[int, int, int]]:
+    """Each stop's place in the order a sighted reader expects, as tb.out_of_order reads it:
+    ``{key: (window index, layer, position)}`` (a layer: what a same-window scrim covers, or
+    what is drawn over it). A walk bound to captures orders its steps by these, so the walk
+    and the lint agree on what is out of order."""
+    cx = _Ctx(nav, 420, drawn_above, view_chain)
+    out: Dict[str, Tuple[int, int, int]] = {}
+    by_index = {w.index: w for w in cx.tree.windows}
+    for wi, all_stops in cx.by_window().items():
+        for li, stops in enumerate(_layers(cx, by_index[wi], all_stops) or []):
+            items = _layer_items(stops)
+            if not items:
+                continue
+            for i, n in enumerate(_visual(cx, items)):
+                out.setdefault(n.key, (wi, li, i))
+    return out
+
+
+def _order_layer(cx: _Ctx, stops: List[TbNode]) -> Iterator[Finding]:
+    items = _layer_items(stops)
     if len(items) < 3:
         return
     visual = _visual(cx, items)
@@ -755,4 +778,5 @@ def findings(nav: Navigator, *, density: int = 420,
     return out
 
 
-__all__ = ["CODES", "Finding", "covered", "findings", "ghost", "show_on_screen"]
+__all__ = ["CODES", "Finding", "covered", "findings", "ghost", "show_on_screen",
+           "visual_ranks"]

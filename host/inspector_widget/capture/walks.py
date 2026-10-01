@@ -272,6 +272,7 @@ class _CaptureKeys:
         self.sigs: list[tuple[str, Rect, str]] = []
         self.windows: dict[int, str] = {}
         self._covered: dict[str, dict[str, Any]] | None | bool = False
+        self._ranks: dict[str, list[Any]] | None = None
         from .tb import TbCapture, _iter_paths
 
         tbc = self._tbc = TbCapture.of(self.ix, lc)
@@ -296,6 +297,35 @@ class _CaptureKeys:
             wref = tbc.window_ref(rv)
             if rv is not None and wref:
                 self.windows[int(rv)] = wref
+
+    def vrank(self, nid: str | None, bounds: Any = None) -> list[Any] | None:
+        """``[capture, window, layer, position]``: the stop's place in the visual order
+        tb.out_of_order reads in this capture (None when it is no stop of it, or when it
+        is not where ``bounds`` says: scrolled or recycled since the capture)."""
+        if self._tbc is None or not nid:
+            return None
+        from ..talkback.tree import TbNode
+
+        node = self._tbc.node(nid)  # the accessibility tree's box: what the walk records
+        if not isinstance(node, TbNode):
+            return None
+        b = _rect(bounds)
+        r = node.rect
+        if b is not None and any(abs(int(x) - int(y)) > 4 for x, y in
+                                 zip((r.left, r.top, r.width, r.height), b)):
+            return None
+        if self._ranks is None:
+            from ..talkback import static
+            from .tb import drawn_above, view_chain
+
+            ranks = static.visual_ranks(self._tbc.nav, drawn_above=drawn_above(self.ix),
+                                        view_chain=view_chain(self.ix))
+            self._ranks = {}
+            for key, (wi, li, pos) in ranks.items():
+                ref = self.keys.get(key)
+                if ref is not None:
+                    self._ranks[ref] = [self.id, wi, li, pos]
+        return self._ranks.get(nid)
 
     def covered(self) -> dict[str, dict[str, Any]] | None:
         """``{stop ref: covered_by}`` for the stops drawn under a same-window overlay, as
@@ -386,6 +416,12 @@ class Binding:
 
     def has(self, key: str | None) -> bool:
         return bool(key) and any(key in c.keys for _a, c in self._caps)
+
+    def vrank(self, cid: str | None, ref: str | None, bounds: Any = None) -> list[Any] | None:
+        for _a, c in self._caps:
+            if c.id == cid:
+                return c.vrank(ref, bounds)
+        return None
 
     def covered(self, cid: str | None) -> dict[str, dict[str, Any]] | None:
         """What capture ``cid`` says is drawn under an overlay (None: it cannot tell)."""
@@ -493,6 +529,10 @@ def bind_walk(record: dict[str, Any], binding: Binding,
         # What the step's capture knows is drawn above what decides (the walk's own guess
         # compares drawing orders across Views the dump hoists: V5 live, the card's heading
         # "behind" the scrim drawn under it, the buttons the scrim covers not)
+        if s.get("cap") and not s.get("unbound"):
+            rank = binding.vrank(s["cap"], s.get("ref"), s.get("bounds"))
+            if rank is not None:
+                s["vrank"] = rank  # the out-of-order check reads the capture's visual order
         known = binding.covered(s.get("cap")) if s.get("cap") and not s.get("unbound") \
             else None
         if known is not None:

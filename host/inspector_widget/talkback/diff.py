@@ -430,6 +430,22 @@ def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out[:5]
 
 
+def _capture_order(seg: List[Dict[str, Any]], keys: set) -> Optional[Tuple[List[str], str]]:
+    """V from the walk's capture (``vrank``: capture/walks.py binds each step to the place
+    tb.out_of_order gives it, from the View tree and the semantics groups) when every stop
+    of the segment has one, in one capture, window and layer; else None (the XY-cut over
+    the steps' boxes decides)."""
+    ranks: Dict[str, Any] = {}
+    for s in seg:
+        if s["key"] in keys and s["key"] not in ranks:
+            ranks[s["key"]] = s.get("vrank")
+    if not ranks or any(r is None for r in ranks.values()):
+        return None
+    if len({tuple(r[:3]) for r in ranks.values()}) != 1:
+        return None
+    return sorted(ranks, key=lambda k: ranks[k][3]), "capture"
+
+
 def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Out-of-order stops per screen state: the lap is split where the screen
     changed (auto-scroll, another window, a stolen focus) or focus escaped an
@@ -453,7 +469,8 @@ def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[
                  if not any(k2 != k and _contains(r, r2) for k2, r2 in items)]  # type: ignore[arg-type]
         if len(items) < 3:
             continue
-        v, src = visual_order(items)  # type: ignore[arg-type]
+        v, src = _capture_order(seg, {k for k, _r in items}) or \
+            visual_order(items)  # type: ignore[arg-type]
         sources.add(src)
         rank = {k: i for i, k in enumerate(v)}
         seq_steps = [s for s in seg if s["key"] in rank]

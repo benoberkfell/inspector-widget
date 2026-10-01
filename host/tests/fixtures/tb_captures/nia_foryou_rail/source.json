@@ -1,0 +1,5 @@
+{
+ "app": "com.google.samples.apps.nowinandroid.demo.debug (nia-demoDebug.apk)",
+ "how": "am start -S; tb_walk(start=first, max_steps=9): its capture",
+ "screen": "For you on a 2076x2152 foldable: a NavigationRail beside the top app bar and the topic grid, TalkBack on (the walk capture)"
+}
