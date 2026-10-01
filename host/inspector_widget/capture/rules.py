@@ -211,11 +211,15 @@ _CATALOG: tuple[Rule, ...] = (
        "A gesture-only action (swipe to dismiss, drag) has no accessibility action.",
        "Modifier.semantics { customActions = listOf(CustomAccessibilityAction(\"Delete\") "
        "{ … }) }; View: ViewCompat.addAccessibilityAction"),
+    _r("tb.webview_block", "error",
+       "Focus stops before a WebView: TalkBack cannot move into its page (a walk finding).",
+       "Rerun with TalkBack started first (relaunch); give the page a native way in (a "
+       "button that focuses the WebView)"),
     _r("tb.covered_stop", "warn",
-       "A stop something in its own window draws over (an action-mode bar over the toolbar): "
-       "hidden on screen, TalkBack still reads it by swiping.",
-       "While the overlay shows, importantForAccessibility=noHideDescendants on what it "
-       "covers (Compose hideFromAccessibility), restored after; focus the overlay"),
+       "Draws over stops of its own window (an action-mode bar over the toolbar): hidden, "
+       "TalkBack still reads them.",
+       "While the overlay shows, noHideDescendants on what it covers (Compose "
+       "hideFromAccessibility); focus the overlay"),
 )
 
 _CATALOG = _unique_shorts(_CATALOG)

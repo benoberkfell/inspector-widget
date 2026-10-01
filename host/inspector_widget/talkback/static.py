@@ -35,8 +35,9 @@ Codes, with what each looks at:
     know what is drawn above what (``drawn_above``, from the capture's View tree); without
     it the rule says nothing.
 ``tb.covered_stop``
-    A stop something smaller in its own window draws over, which TalkBack still reads by
-    swiping: Thunderbird's toolbar under the action-mode bar (TB-4). A tb.out_of_order on
+    Stops something smaller in their own window draws over, which TalkBack still reads by
+    swiping: Thunderbird's toolbar under the action-mode bar (TB-4). Anchored on the
+    overlay, ``others`` the covered stops. A tb.out_of_order on
     the overlay's own stops (read last: it is added at the end of the View tree) says
     ``why: in_overlay`` and names the overlay, once for its whole run of stops.
 ``tb.window_order``
@@ -242,11 +243,53 @@ def ghost(nav: Navigator, n: TbNode, density: int = 420) -> List[str]:
     r = n.rect
     if shown_first:
         return out  # neither tiny nor off screen once TalkBack has scrolled it in
-    if not r.is_empty() and not r.intersects(n.window.bounds):
+    host = _web_host(n)
+    if host is not None:
+        # web content: Chromium scrolls its own page as focus moves through it, so an
+        # element past the WebView's edge is reachable; unless the WebView itself is not
+        # shown (the page of a pager or a sheet that is clipped away): then nobody sees what
+        # TalkBack reads, however on screen the elements say they are (AntennaPod's player)
+        if viewport(host).is_empty():
+            out.append("offscreen")
+        elif not r.is_empty() and min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
+            out.append("tiny")
+        return out
+    if r.is_empty() and _outside(r, n.window.bounds):
+        out.append("offscreen")
+    elif r.is_empty():
+        out.append("zero_size")
+    elif not r.intersects(n.window.bounds) or viewport(n).is_empty():
         out.append("offscreen")  # read where nobody sees it (a pager's off-screen page)
-    elif not r.is_empty() and min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
+    elif min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
         out.append("tiny")
     return out
+
+
+def _web_host(n: TbNode) -> Optional[TbNode]:
+    """The WebView View whose page ``n`` is part of (None: not web content)."""
+    if n.facet != "virtual":
+        return None
+    return next((a for a in n.ancestors() if a.facet in ("view", "interop")
+                 and str(a.raw.get("class_name") or "") == _WEBVIEW), None)
+
+
+def _outside(r: Rect, o: Rect) -> bool:
+    """Whether ``r`` (possibly empty) lies wholly past an edge of ``o``."""
+    return (r.top >= o.bottom or r.bottom <= o.top or r.left >= o.right
+            or r.right <= o.left)
+
+
+def viewport(n: TbNode) -> Rect:
+    """What shows of ``n``'s box: clipped by its window and by every scrollable or pager
+    around it; empty when ``n`` is a View the platform reports not visible (clipped away by
+    an ancestor: a ViewPager2 page that is not current, a collapsed sheet's content)."""
+    if n.facet in ("view", "interop") and not n.visible:
+        return Rect()
+    r = n.rect.intersect(n.window.bounds)
+    for a in n.ancestors():
+        if a.has("scrollable") and not a.rect.is_empty():
+            r = r.intersect(a.rect)
+    return r if not r.is_empty() else Rect()
 
 
 def _ghosts(cx: _Ctx) -> Iterator[Finding]:
@@ -660,13 +703,20 @@ def _covered_stops(cx: _Ctx) -> Iterator[Finding]:
     if not cov:
         return
     escaped = {id(n) for _o, under, _p in _overlays(cx) for n in under}
+    groups: Dict[int, Tuple[Cover, List[TbNode]]] = {}
     for n in cx.stops:
         c = cov.get(id(n.raw))
         if c is None or id(n) in escaped:
             continue
+        groups.setdefault(id(c.overlay), (c, []))[1].append(n)
+    for _k, (c, under) in groups.items():
         node = _node_of(cx, c.overlay)
-        yield Finding("tb.covered_stop", "warn", n, [node] if node is not None else [],
-                      {"kind": c.kind, "by": c.cls, "area_pct": round(100 * c.area)})
+        if node is None:
+            continue
+        # anchored on the overlay, as tb.escape is; each covered stop carries the capture's
+        # render.covered marker
+        yield Finding("tb.covered_stop", "warn", node, under[:MAX_OTHERS],
+                      {"covers": len(under), "kind": c.kind, "area_pct": round(100 * c.area)})
 
 
 def covered(nav: Navigator, drawn_above: Optional[DrawnAbove],
@@ -875,30 +925,39 @@ def _actionable(n: TbNode) -> bool:
 
 
 def _positions(cx: _Ctx) -> Iterator[Finding]:
+    """A list whose positions ("N of M") or count count an item TalkBack never stops on: an
+    empty header (Thunderbird's in-app notification banner, a 0x0 ComposeView at adapter
+    position 0: "2 of 6" on the first message) or footer. An item is the list's child with
+    item info; its stop is the item itself or the first stop inside it (a ComposeView cell:
+    Thunderbird's Compose rows). Silent: no stop, no text, and on screen or with nothing
+    actionable in it (an item scrolled off still counts)."""
     for c in cx.tree.nodes:
         ci = c.get("collection_info")
         if not ci or not c.window.reported or not cx.rules.filter_collection(c):
             continue
         items = [k for k in c.children if k.get("collection_item_info")]
-        stops = [k for k in items if id(k) in cx.stop_ids]
-        if not stops:
+        firsts = [(k, next((d for d in k.iter() if id(d) in cx.stop_ids), None)) for k in items]
+        reached = [(k, f) for k, f in firsts if f is not None]
+        if not reached:
             continue
         # An item TalkBack never stops on still counts in "N of M", on screen or not (an
         # empty header scrolled off the top: Thunderbird's message list says "2 of 7").
-        silent = [k for k in items if id(k) not in cx.stop_ids
+        silent = [k for k, f in firsts if f is None
                   and (k.visible or not any(_actionable(d) for d in k.iter()))
-                  and not any(id(d) in cx.stop_ids for d in k.iter())
                   and not any(d.text or d.content_description for d in k.iter())]
         if not silent:
             continue
-        first = stops[0]
+        item0, first = reached[0]
         ann = cx.walk(first)
         # the "N of M" part on its own: it sits at the end, past what a cut ``said`` keeps
         pos = next((p["text"] for p in ann.parts if p.get("kind") == "collection"
-                    and p.get("from") == first.key and _POSITION.search(p["text"] or "")),
-                   None)
+                    and _POSITION.search(p["text"] or "")), None)
+        at = {id(k): i for i, (k, _f) in enumerate(firsts)}
+        lead = sum(1 for k in silent if at[id(k)] < at[id(item0)])
         ev: Dict[str, Any] = {"said": ann.text[:60], "silent_items": len(silent),
                               "why": "position_counts_silent_item"}
+        if lead < len(silent):
+            ev["trailing"] = len(silent) - lead  # the count says more items than it holds
         if pos:
             ev["said_pos"] = pos
         yield Finding("tb.wrong_announcement", "warn", first, silent[:MAX_OTHERS], ev)

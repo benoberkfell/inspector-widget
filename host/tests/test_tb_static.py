@@ -370,8 +370,9 @@ def test_the_toolbar_under_an_action_mode_bar_is_covered():
 
     fs = findings(r, drawn_above=above, codes=["tb.covered_stop", "tb.out_of_order"])
     cov = [f for f in fs if f.code == "tb.covered_stop"]
-    assert [f.node.key for f in cov] == ["view:32", "view:24", "view:86"]
-    assert all(f.others[0].key == "view:236" and f.evidence["kind"] == "bar" for f in cov)
+    assert [(f.node.key, [o.key for o in f.others]) for f in cov] == [
+        ("view:236", ["view:32", "view:24", "view:86"])]
+    assert cov[0].evidence == {"covers": 3, "kind": "bar", "area_pct": 7}
     # the bar's stops are read last: one out-of-order finding for the whole bar, which says why
     order = [f for f in fs if f.code == "tb.out_of_order"]
     assert [(f.node.key, f.evidence.get("why"), f.evidence.get("stops")) for f in order] == [

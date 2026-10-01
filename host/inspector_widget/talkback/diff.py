@@ -73,6 +73,11 @@ FIXES = {
     "tb.escape": "Use a real Dialog / ModalBottomSheet, or hide the content behind the overlay while "
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
+    "tb.webview_block": "TalkBack cannot put focus on the WebView's page (its focus action "
+                        "brings no focus event). A WebView created before TalkBack started can "
+                        "stay closed to it until it is created again: rerun with TalkBack "
+                        "started first (relaunch) to see what a TalkBack user gets; and give the "
+                        "page a native way in (a button that focuses the WebView).",
     "tb.covered_stop": "While the overlay is shown, hide what it covers from accessibility "
                        "(View: importantForAccessibility=noHideDescendants on the covered "
                        "View, restored when it goes; Compose: hideFromAccessibility), and move "
@@ -323,7 +328,7 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
                 first = (f"step {s['i']}: model " + (f"{exp['ref']} {_q(exp['label'])}" if exp else "(end)")
                          + f", actual {_name(s)}")
         pos = P.index(k) if k in P else None
-    visited = {_pk(s) for s in _moves(_first_screen(walk["steps"]))}
+    visited = _visited(walk)
     unpredicted = [s for s in lap if _pk(s) not in P]
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     unvisited = _unvisited(walk, P, visited, covered)
@@ -351,44 +356,151 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
     return vs, findings
 
 
-def _coverage(walk: Dict[str, Any], P: List[str], visited: set) -> Tuple[int, int, str]:
-    """The part of P the walk went over: all of it after a full lap; from where it
-    started to the end it reached (an edge); else between the stops it reached."""
-    idx = [i for i, k in enumerate(P) if k in visited]
-    if not idx:
-        return 0, -1, ""
-    if _lap_complete(walk):
-        return 0, len(P) - 1, "in a full lap"
-    first = next((_pk(s) for s in _moves(walk["steps"]) if _pk(s) in P), None)
-    start = P.index(first) if first is not None else min(idx)
-    if any(s.get("edge") for s in _first_screen(walk["steps"])):
-        if walk.get("direction", "next") == "next":
-            return start, len(P) - 1, "from the start to the edge"
-        return 0, start, "from the start back to the edge"
-    return min(idx), max(idx), "between the stops it did reach"
+def _visited(walk: Dict[str, Any]) -> set:
+    """Every key the walk read on its first screen: the node's own and the model's for it."""
+    out: set = set()
+    for s in _moves(_first_screen(walk["steps"])):
+        out.add(s.get("key"))
+        out.add(_pk(s))
+    return out
+
+
+def _full_lap(walk: Dict[str, Any]) -> bool:
+    """A full lap, really: the walk ended on the wrap (back on a stop it read), or after a
+    wrap it read again a stop it had read before it (a walk that wrapped on its last press,
+    or two presses before its end, went over only part of the screen twice)."""
+    steps = _first_screen(walk["steps"])
+    if len(steps) == len(walk["steps"]) and walk.get("ended") == "wrap":
+        return True
+    before: set = set()
+    wrapped = False
+    for s in steps:
+        if s.get("via") == "wrap":
+            wrapped = True
+        if not s.get("moved") or not s.get("key") or s.get("edge"):
+            continue
+        if wrapped and (s.get("key") in before or _pk(s) in before) and s.get("via") != "wrap":
+            return True
+        if not wrapped:
+            before |= {s.get("key"), _pk(s)}
+    return False
+
+
+def _coverage(walk: Dict[str, Any], P: List[str], visited: set
+              ) -> Tuple[List[Tuple[int, int]], str]:
+    """The parts of P the walk went over (``[(lo, hi)]``, inclusive) and how to say it: all
+    of it after a full lap (:func:`_full_lap`); from where it started to the edge it reached
+    (and, after a wrap, from the top to where it stopped); else between the stops it reached.
+    The presses of a stuck walk that moved nothing are no edge."""
+    steps = _first_screen(walk["steps"])
+    if not any(k in visited for k in P):
+        return [], ""
+    if _full_lap(walk):
+        return [(0, len(P) - 1)], "in a full lap"
+    fwd = walk.get("direction", "next") == "next"
+    tail = len(steps)
+    if walk.get("ended") == "stuck":
+        while tail and (steps[tail - 1].get("edge") or not steps[tail - 1].get("moved")):
+            tail -= 1  # the presses that moved nothing at the end: stuck, not an edge
+    segs: List[List[int]] = [[]]
+    edges: List[bool] = [False]
+    for s in steps[:tail]:
+        if s.get("via") == "wrap":
+            segs.append([])
+            edges.append(False)
+        if s.get("edge"):
+            edges[-1] = True
+            continue
+        if s.get("moved") and s.get("key"):
+            k = _pk(s) if _pk(s) in P else s.get("key")
+            if k in P:
+                segs[-1].append(P.index(k))
+    spans: List[Tuple[int, int]] = []
+    for j, (seg, edge) in enumerate(zip(segs, edges, strict=True)):
+        if not seg:
+            continue
+        lo, hi = min(seg), max(seg)
+        if edge:  # went on to the edge
+            if fwd:
+                hi = len(P) - 1
+            else:
+                lo = 0
+        if j > 0:  # came round from the other end after the wrap
+            if fwd:
+                lo = 0
+            else:
+                hi = len(P) - 1
+        spans.append((lo, hi))
+    if not spans:
+        return [], ""
+    if len(spans) > 1:
+        scope = "from the start to the edge and round again to where it stopped"
+    elif any(edges):
+        scope = "from the start to the edge" if fwd else "from the start back to the edge"
+    else:
+        scope = "between the stops it did reach"
+    return spans, scope
 
 
 def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows: set) -> List[str]:
     """Predicted stops never visited, where the walk went over them (:func:`_coverage`)."""
     pwin = {p["key"]: p.get("window") for p in walk.get("predicted") or []}
-    lo, hi, _scope = _coverage(walk, P, visited)
-    return [k for k in P[lo:hi + 1] if k not in visited and pwin.get(k) not in covered_windows]
+    spans, _scope = _coverage(walk, P, visited)
+    seen: set = set()
+    out = []
+    for lo, hi in spans:
+        for k in P[lo:hi + 1]:
+            if k not in visited and k.split("#")[0] not in visited and k not in seen \
+                    and pwin.get(k) not in covered_windows:
+                seen.add(k)
+                out.append(k)
+    return out
 
 
 def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Predicted stops the walk went past and never read (tb.skipped, warn). A stop the model
+    added on a re-model (TalkBack scrolled something new in) where the walk had already been
+    (a collapsing toolbar's title that appears once the list scrolls) is the model's late
+    knowledge, not a skip: basis model, info (L4)."""
     P = [p["key"] for p in walk.get("predicted") or []]
     pref = {p["key"]: p for p in walk.get("predicted") or []}
-    visited = {_pk(s) for s in _moves(_first_screen(walk["steps"]))}
+    visited = _visited(walk)
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     miss = _unvisited(walk, P, visited, covered)
     if not miss:
         return []
-    names = ", ".join(f"{pref[k]['ref']} {_q(pref[k]['label'])}" for k in miss[:3])
-    more = f" (+{len(miss) - 3} more)" if len(miss) > 3 else ""
-    scope = _coverage(walk, P, visited)[2]
-    return [_finding("tb.skipped", "warn",
-                     f"TalkBack never reached {len(miss)} predicted stop(s) {scope}: {names}{more}",
-                     refs=[pref[k]["ref"] for k in miss], keys=miss)]
+    remodels = [s for s in walk["steps"] if s.get("remodel")]
+    fwd = walk.get("direction", "next") == "next"
+    late = []
+    for k in miss:
+        a = pref[k].get("added")
+        if not a or a > len(remodels):
+            continue
+        at = remodels[a - 1]  # the step whose node the model learned the stop from
+        here = _pk(at) if _pk(at) in P else at.get("key")
+        if here in P and (P.index(k) < P.index(here) if fwd else P.index(k) > P.index(here)):
+            late.append(k)
+    real = [k for k in miss if k not in late]
+    scope = _coverage(walk, P, visited)[1]
+    out = []
+
+    def names(ks: List[str]) -> str:
+        more = f" (+{len(ks) - 3} more)" if len(ks) > 3 else ""
+        return ", ".join(f"{pref[k]['ref']} {_q(pref[k]['label'])}" for k in ks[:3]) + more
+
+    if real:
+        out.append(_finding("tb.skipped", "warn",
+                            f"TalkBack never reached {len(real)} predicted stop(s) {scope}: "
+                            f"{names(real)}", refs=[pref[k]["ref"] for k in real], keys=real))
+    if late:
+        f = _finding("tb.skipped", "info",
+                     f"{len(late)} stop(s) the model learned of only after the walk had passed "
+                     f"where they go (a re-model when TalkBack scrolled: e.g. a collapsing "
+                     f"toolbar's title): {names(late)}; not judged", basis="model",
+                     refs=[pref[k]["ref"] for k in late], keys=late)
+        f.pop("fix", None)
+        out.append(f)
+    return out
 
 
 def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
@@ -406,7 +518,12 @@ def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
     if r is not None:
         x, y, w, h = r
         win = s.get("window_rect")
-        if w <= 0 or h <= 0 or (win and not _intersects(r, tuple(win))):  # type: ignore[arg-type]
+        box = s.get("container_rect")  # the scrollable or pager it sits in: its viewport
+        if w <= 0 or h <= 0 or (win and not _intersects(r, tuple(win))) \
+                or (box and box[2] > 0 and box[3] > 0
+                    and not _intersects(r, tuple(box))):  # type: ignore[arg-type]
+            # outside the window, or past the edge of the pager or list it is in (a WebView's
+            # page clipped away with the pager page holding it: AntennaPod's player, AP-3)
             reasons.append("offscreen")
         elif _dp(min(w, h), density) < TINY_DP:
             reasons.append("tiny")
@@ -460,6 +577,9 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                 overlap = len(ti & to) / len(ti) if ti else 0.0
                 both = "clickable" in (outer.get("flags") or []) and \
                     "clickable" in (inner.get("flags") or [])
+                if outer.get("cls") == "EditText" or "edit box" in (outer.get("speak") or "").lower():
+                    prev = s  # a text field and its clear button: two things to do, not a defect
+                    continue
                 f = None
                 if overlap >= DOUBLE_STOP_OVERLAP:
                     f = _finding(
@@ -468,8 +588,10 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                         f"both stops, and {int(overlap * 100)}% of the inner one's words are already "
                         f"spoken at the outer one", [prev, s])
                 elif both:
+                    # the inner control does something else (play, download, follow): a row
+                    # with a secondary action; worth a custom action, not a defect (info)
                     f = _finding(
-                        "tb.double_stop", "warn",
+                        "tb.double_stop", "info",
                         f"steps {prev['i']}-{s['i']}: {_name(outer)} and {_name(inner)} inside it are "
                         f"both clickable stops: one item takes two swipes, and activating the outer "
                         f"one may not do what the inner control does", [prev, s])
@@ -662,8 +784,20 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         # Stuck right before (or on) a WebView whose page is off screen: that is why.
         trap = next((t for t in walk.get("web_traps") or ()
                      if last.get("key") in (t.get("before"), t.get("web_root"))), None)
+        block = _web_ahead(walk, last) if trap is None else None
         if trap is not None:
             out.append(web_trap_finding(trap, [last]))
+        elif block is not None:
+            web, holder = block
+            where = f" (on a page of {holder})" if holder else ""
+            f = _finding("tb.webview_block", "error",
+                         f"TalkBack stopped at {_name(last)}: two presses in a row moved nothing, "
+                         f"and the next stop is the WebView {web.get('ref') or web['key']}"
+                         f"{where}: TalkBack cannot move focus into it", [last],
+                         refs=[last.get("ref"), web.get("ref") or web["key"]],
+                         keys=[last.get("key"), web["key"]])
+            f["webview"] = web.get("ref") or web["key"]
+            out.append(f)
         else:
             out.append(_finding("tb.edge_stuck", "error",
                                 f"TalkBack stopped at {_name(last)}: two presses in a row moved "
@@ -678,6 +812,9 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                 + (f" ({s['scrolled']} scrolled: the focused item was disposed)" if s.get("scrolled")
                    else "") + "; the next swipe starts over from the top", [prev] if prev else []))
     edge = walk.get("edge") or {}
+    if any(f["code"] in ("tb.webview_block", "tb.trap") for f in out) \
+            and at_edge is not None and last is not None and at_edge.get("key") == last.get("key"):
+        edge = {}  # stuck before a WebView: that is why, not a container left unscrolled
     where = (f" (step {edge_i})" if edge_i is not None else "")
     if edge.get("hidden_after") and at_edge is not None and not edge.get("can_scroll"):
         out.append(_finding("tb.edge_stuck", "warn",
@@ -686,13 +823,78 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                             f"({_q(edge.get('hidden_first'))}…): they are clipped, and nothing "
                             f"TalkBack can scroll brings them in", [at_edge]))
     if edge.get("can_scroll") and at_edge is not None:
-        out.append(_finding("tb.edge_stuck", "warn",
-                            f"TalkBack hit the edge{where} at {_name(at_edge)} while its container "
-                            f"{edge.get('container_ref') or edge.get('container')} "
-                            f"({edge.get('container_cls')}) can still scroll "
-                            f"{'/'.join(edge['can_scroll'])}: the rest is unreachable by swipe/keys",
-                            [at_edge]))
+        tries = _edge_presses(steps, at_edge)
+        f = _finding("tb.edge_stuck", "warn",
+                     f"TalkBack hit the edge{where} at {_name(at_edge)}{tries} while its container "
+                     f"{edge.get('container_ref') or edge.get('container')} "
+                     f"({edge.get('container_cls')}) can still scroll "
+                     f"{'/'.join(edge['can_scroll'])}: the rest is unreachable by swipe/keys",
+                     [at_edge])
+        if _pager(edge.get("container_cls"), edge["can_scroll"]):
+            f["msg"] = (f"TalkBack hit the edge{where} at {_name(at_edge)}{tries}: the pager "
+                        f"{edge.get('container_ref') or edge.get('container')} has more pages "
+                        f"({'/'.join(edge['can_scroll'])}), and TalkBack never turns a page")
+            f["fix"] = FIX_PAGER
+        out.append(f)
     return out
+
+
+#: tb.edge_stuck at a pager's edge (FIXES has the scrolling one): TalkBack never auto-scrolls
+#: a pager (FILTER_AUTO_SCROLL), so its other pages need a way in.
+FIX_PAGER = ("Give the pager a way to its other pages that TalkBack reaches: tabs, visible "
+             "Next/Previous page buttons, or custom actions on the pager (\"Next page\").")
+
+
+def _pager(cls: Optional[str], can: Sequence[str]) -> bool:
+    """A pager by its class, or a container that only pages or scrolls sideways."""
+    c = (cls or "").lower()
+    if "pager" in c:
+        return True
+    return bool(can) and set(can) <= {"left", "right", "page_left", "page_right"}
+
+
+def _edge_presses(steps: List[Dict[str, Any]], at: Dict[str, Any]) -> str:
+    """`` (n of m presses)`` when the walk pressed more than once at the edge stop and some
+    of those presses moved focus on: an edge TalkBack does not always hit (a flaky
+    end-of-grid auto-scroll), said as such; else nothing."""
+    key = at.get("key")
+    presses = [s for s in steps if s.get("i", -1) > at.get("i", -1) and s.get("key") == key
+               and not s.get("moved")]
+    later = [s for s in steps if s.get("i", -1) > at.get("i", -1) and s.get("moved")
+             and s.get("key") and s.get("via") != "wrap"]
+    if len(presses) > 1 or (presses and later):
+        return f" ({len(presses)} of {len(presses) + len(later[:1])} presses moved nothing)"
+    return ""
+
+
+def _web_ahead(walk: Dict[str, Any], last: Dict[str, Any]
+               ) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+    """``(the WebView's predicted stop, the pager or list it sits in)`` when the model's next
+    stop after ``last`` is a WebView's root, or a page holding one (its box holds the
+    WebView's), whatever the geometry says; else None (G7: AntennaPod's episode page, stuck
+    after Download with TalkBack started after the app, w9wtb7e)."""
+    pred = walk.get("predicted") or []
+    keys = [p["key"] for p in pred]
+    k = _pk(last)
+    if k not in keys:
+        return None
+    step = 1 if walk.get("direction", "next") == "next" else -1
+    i = keys.index(k) + step
+    if not 0 <= i < len(pred):
+        return None
+    nxt = pred[i]
+    web = nxt if nxt.get("cls") == "WebView" else None
+    if web is None and nxt.get("bounds"):
+        ahead = pred[i + step:i + 6 * step:step] if step > 0 else pred[max(0, i - 5):i][::-1]
+        web = next((p for p in ahead if p.get("cls") == "WebView" and p.get("bounds")
+                    and p.get("window") == nxt.get("window")
+                    and _contains(tuple(nxt["bounds"]), tuple(p["bounds"]), 0.5)), None)
+    if web is None:
+        return None
+    holder = None
+    if last.get("container"):
+        holder = f"{last['container']} ({last.get('container_cls')})"
+    return web, holder
 
 
 def _check_expect(lap: List[Dict[str, Any]], expect: Sequence[str]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -745,18 +947,43 @@ def _check_trap(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                      refs=firsts)]
 
 
+def _same_stop(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Whether two steps read the same node: the same key (a Compose semantics id names one
+    node; a View key, recycled by a list, only with the same label), or a node Compose
+    re-minted (the model's key for both) in the same place of the tree (the same parent).
+    Two alike nodes of two cards (NiA's "Bookmark" and "HEADLINES" of the card a scroll put
+    in the slot of the one read before) are not, whatever the model matched them to."""
+    ka, kb = a.get("key"), b.get("key")
+    if ka and ka == kb:
+        if _pk(a) == _pk(b):
+            return True
+        # the model told them apart (a "#n" stop): a View a list rebound to another item, or
+        # a node of a ComposeView cell a list rebound; a Compose node of a host no list
+        # recycles is one node, whatever its text says now (NIA-11, wtt0adx: the card read
+        # in full, then its Bookmark, then the same card again as its other text)
+        if str(ka).startswith("view:"):
+            return False
+        host = "view:" + str(ka).split(":")[1]
+        anc = list(b.get("ancestors") or [])
+        return not (host in anc and b.get("container") in anc[anc.index(host) + 1:])
+    if _pk(a) != _pk(b) or not a.get("ancestors") or not b.get("ancestors"):
+        return False
+    return a["ancestors"][0] == b["ancestors"][0]
+
+
 def _check_revisit(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: Dict[str, Dict[str, Any]] = {}
+    seen: List[Dict[str, Any]] = []
     out = []
     for s in lap:
         if s.get("via") == "stolen":
-            seen = {}  # the app sent focus back: what follows is read again because of that (tb.trap)
-        k = _pk(s)
-        if k in seen and seen[k]["i"] != s["i"] - 1:
+            seen = []  # the app sent focus back: what follows is read again because of that (tb.trap)
+        hit = next((x for x in seen if _same_stop(x, s)), None)
+        if hit is not None and hit["i"] != s["i"] - 1:
             out.append(_finding("tb.revisit", "warn",
-                                f"step {s['i']}: {_name(s)} was already read at step {seen[k]['i']} "
-                                f"in this lap", [seen[k], s]))
-        seen.setdefault(k, s)
+                                f"step {s['i']}: {_name(s)} was already read at step {hit['i']} "
+                                f"in this lap", [hit, s]))
+        if hit is None:
+            seen.append(s)
     return _collapse(out, "stops read again")
 
 
@@ -809,10 +1036,67 @@ def _check_n_of_m(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         r, cr = _rect(s), s.get("container_rect")
         n, total = int(m.group(1)), int(m.group(2))
         if n > 1 and r is not None and cr and r[1] - cr[1] < r[3]:
-            out.append(_finding(
+            f = _finding(
                 "tb.wrong_announcement", "warn",
                 f"step {s['i']}: the first row of {c} is announced \"{n} of {total}\": "
-                f"{n - 1} item(s) before it count but TalkBack never stops on them", [s]))
+                f"{n - 1} item(s) before it count but TalkBack never stops on them", [s])
+            f["container"] = c
+            out.append(f)
+    return out[:3]
+
+
+_IN_LIST = re.compile(r"\bIn (list|grid)\b\.?\s*(\d+) (items|rows)(?:\.\s*(\d+) columns)?", re.I)
+
+
+def _item_of(s: Dict[str, Any], container: str) -> str:
+    """The item of ``container`` a step's stop sits in: its ancestor right below the
+    container (the stop itself when it is the item)."""
+    anc = list(s.get("ancestors") or [])
+    if container in anc:
+        i = anc.index(container)
+        return anc[i - 1] if i > 0 else (s.get("ref") or s.get("key") or "")
+    return s.get("ref") or s.get("key") or ""
+
+
+def _check_list_count(walk: Dict[str, Any], skip: Sequence[str] = ()) -> List[Dict[str, Any]]:
+    """TalkBack's "In list. N items" (CollectionInfo) against the items a walk that went
+    all the way through the list reached: an empty header or a spacer item counts, though
+    TalkBack never stops on it (Thunderbird: "6 items" for 5 messages, wygfouz; Now in
+    Android's Interests: "20 items" for 19 topics, a bottom Spacer item). Only for a list the
+    first lap entered and left again (or a full lap): a walk that stopped inside it cannot
+    tell. ``skip``: containers a "N of M" finding already names."""
+    if walk.get("direction", "next") != "next":
+        return []
+    lap = [s for s in first_lap(walk["steps"]) if s.get("moved") and s.get("key")]
+    full = _lap_complete(walk)
+    out = []
+    done: set = set(skip)
+    for j, s in enumerate(lap):
+        m = _IN_LIST.search(s.get("speak") or "") if s.get("utt") == "logcat" else None
+        c = s.get("container")
+        if m is None or not c or c in done or m.group(1).lower() != "list":
+            continue
+        done.add(c)
+        run = [x for x in lap[j:] if x.get("container") == c]
+        after = [x for x in lap[j:] if x.get("container") != c]
+        before = [x for x in lap[:j] if x.get("container") != c]
+        if not full and not (before and after):
+            continue  # the lap did not go all the way through it
+        items: List[Any] = []
+        auto = any(x.get("via") == "autoscroll" for x in run)
+        for x in run:
+            it = _item_of(x, c)
+            key = (it, x.get("label")) if auto and it == (x.get("ref") or x.get("key")) else it
+            if key not in items:
+                items.append(key)
+        n = int(m.group(2))
+        if n > len(items):
+            out.append(_finding(
+                "tb.wrong_announcement", "warn",
+                f"step {s['i']}: {_name(s)} says \"In list. {n} items\" for {c}, but the lap "
+                f"reached {len(items)} item(s) in it: {n - len(items)} item(s) count that "
+                f"TalkBack never stops on (an empty header, footer or spacer item)", [s],
+                refs=[s.get("ref"), c], keys=[s.get("key")]))
     return out[:3]
 
 
@@ -912,7 +1196,9 @@ def analyze(walk: Dict[str, Any], expect: Optional[Sequence[str]] = None) -> Dic
     findings += _check_trap(walk)
     findings += _check_revisit(walk, lap)
     findings += _check_leave_scrollable(walk)
-    findings += _check_n_of_m(walk)
+    n_of_m = _check_n_of_m(walk)
+    findings += n_of_m
+    findings += _check_list_count(walk, [f["container"] for f in n_of_m])
     findings += _check_speech_order(walk)
     findings += _check_cut_off_end(walk)
     findings += _check_window_order(walk)

@@ -110,7 +110,10 @@ REAL = {
     "a11yprobe_viewscreen": {"tb.ghost_stop": 3},
     "nia_foryou": {"tb.double_stop": 3},
     "nia_settings": {},
-    "thunderbird_list_compose": {"tb.double_stop": 6, "tb.ghost_stop": 6},
+    # TB-1 on Compose rows: the empty banner ComposeView at position 0 counts; the first
+    # message is "2 of 7" (each row's stops are inside its ComposeView cell)
+    "thunderbird_list_compose": {"tb.double_stop": 6, "tb.ghost_stop": 6,
+                                 "tb.wrong_announcement": 1},
     # its empty header item counts: TalkBack (on before the app) says "2 of 7" on the first
     # row, live on emulator-5556; the item is scrolled off the top (talkback/recycler.py)
     "thunderbird_list_views": {"tb.double_stop": 6, "tb.wrong_announcement": 1},
@@ -171,7 +174,7 @@ def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():
     ix, raw = F.fixture_capture("thunderbird_list_compose")
     out = analyzers.lint_view(ix, raw, rules=["tb"])
     by = {r["rule"]: r for r in out["rules"]}
-    assert set(by) == {"tb.double_stop", "tb.ghost_stop"}
+    assert set(by) == {"tb.double_stop", "tb.ghost_stop", "tb.wrong_announcement"}
     assert by["tb.double_stop"]["nodes"] == [
         "×6 in #message_list cells: sem:785:838 sem:795:861 sem:805:886 +3"]
     assert by["tb.ghost_stop"]["nodes"] == [

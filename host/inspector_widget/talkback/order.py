@@ -917,13 +917,12 @@ def web_hidden_page(rules: Rules, root: TbNode, before: Optional[TbNode],
     head = (f"TalkBack hands focus{after} to the WebView {root.key}, which is {where} but "
             "still in the accessibility tree")
     if trap:
-        tail = (": its root reports itself on screen, so (as on AntennaPod's player, TalkBack "
-                "17.0) the focus action \"returns true\", no focus event follows, and every next "
-                "press targets the WebView again. Focus never moves on: a trap.")
+        tail = (": its root reports itself on screen, so the focus action \"returns true\" "
+                "with no focus event after it, and every next press targets the WebView again: "
+                "focus never moves on, a trap (seen on TalkBack 17.0).")
     else:
         n = len(rules.web_elements(root))
-        tail = (f": TalkBack reads it and its {n} web element(s), content nobody can see "
-                "(A11yProbe V13; AntennaPod's home reads the collapsed player's show notes).")
+        tail = (f": TalkBack reads it and its {n} web element(s), content nobody can see.")
     return {
         "kind": "web_hidden_page", "web_root": root.key, "trap": trap,
         "before": before.key if before is not None else None,

@@ -1178,7 +1178,13 @@ def _tb_detail(iss: Issue) -> str:
         return f"{ev.get('why', '')}: says {_quote(ev.get('said') or '', 24)}"
     if rid in ("tb.out_of_order", "tb.boundary_jump"):
         after = f" after {others[0]}" if others else ""
+        if ev.get("why") == "in_overlay" and len(others) > 1:  # talkback/static.py
+            return (f"read {ev.get('read')}{after}: {ev.get('stops', 1)} stop(s) of "
+                    f"{others[-1]}, drawn over what is read before it")
         return f"read {ev.get('read')}{after}, seen {ev.get('visual')} of {ev.get('of')}"
+    if rid == "tb.covered_stop":  # talkback/occlusion.py
+        ex = " ".join(others[:2]) + (f" +{len(others) - 2}" if len(others) > 2 else "")
+        return f"draws over {ev.get('covers')} stop(s) TalkBack reads ({ev.get('kind')}): {ex}"
     if rid == "tb.escape":
         ex = " ".join(others[:2])
         return (f"{ev.get('under')} stops under it ({ev.get('area_pct')}% of the window), "

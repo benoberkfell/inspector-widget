@@ -723,6 +723,8 @@ class PStop:
     cls: str
     ctx: Optional[str] = None  # item_context: the list item it sits in
     item_root: bool = False
+    #: the re-model (1 = the first) that added it: the model learned of it only then (L4)
+    added: Optional[int] = None
 
     @property
     def sig(self) -> str:
@@ -889,6 +891,7 @@ class Model:
                 continue
             if s.key in keys:  # a View (or ComposeView cell) rebound to another item
                 s = replace(s, key=f"{s.key}#{sum(k.split('#')[0] == s.key for k in keys)}")
+            s = replace(s, added=self.remodels)
             at = keys.index(prev) + 1 if prev in keys else len(keys)
             while prev in keys and at < len(keys) and keys[at] not in present:
                 at += 1
@@ -1662,7 +1665,8 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
 
     records = _build_records(steps, model, tts, ref_of)
     predicted = [{"key": p.key, "ref": ref_of(p.key), "label": p.label, "speak": p.speak,
-                  "bounds": list(p.bounds), "window": p.window, "cls": p.cls} for p in model.stops]
+                  "bounds": list(p.bounds), "window": p.window, "cls": p.cls,
+                  **({"added": p.added} if p.added else {})} for p in model.stops]
     density = _density(drv.serial)
     walk: Dict[str, Any] = {
         "serial": drv.serial, "package": drv.package, "start": start, "direction": direction,

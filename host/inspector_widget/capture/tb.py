@@ -927,6 +927,7 @@ def issues(ix: Index, loaded: Any, *, density: int | None = None,
                                "inferred" if f.conf == "heuristic" else "exact")))
     out.extend(_custom_actions_missing(ix, tbc))
     out.extend(_covered_marks(tbc, above, props))
+    out.extend(_offscreen_marks(tbc))
     diags = [f"tb: {unmapped} TalkBack findings not mapped to nodes"] if unmapped else []
     diags.extend(f"tb: {d['message']}" for d in tbc.tree.diagnostics
                  if d.get("kind") in SURFACED_DIAGNOSTICS)
@@ -954,6 +955,30 @@ def _covered_marks(tbc: TbCapture, above: Any, props: Any) -> list[tuple[str, Is
         if oid and oid != nid:
             ev["node_ids"] = [oid]
         out.append((nid, Issue("render.covered", "info", ev, "inferred")))
+    return out
+
+
+def _offscreen_marks(tbc: TbCapture) -> list[tuple[str, Issue]]:
+    """``render.offscreen`` on every web stop TalkBack reads where nobody can see it: 0 px
+    tall below the screen, or clipped away with its WebView (the page of a pager or sheet
+    that is not shown: AntennaPod's collapsed player reads 66 such stops before the mini
+    player, AP-1). The render signals leave out what a scrolled-out container holds; these
+    are stops TalkBack still reaches, so the capture's summary lists them."""
+    from ..talkback.static import ghost
+
+    out: list[tuple[str, Issue]] = []
+    for n in tbc.linear():
+        if n.facet != "virtual":
+            continue
+        why = [g for g in ghost(tbc.nav, n, tbc.density) if g in ("offscreen", "zero_size")]
+        nid = tbc.nid(n) if why else None
+        if nid is None:
+            continue
+        r = n.rect
+        out.append((nid, Issue("render.offscreen", "info",
+                               {"rect": [r.left, r.top, r.width, r.height],
+                                "outside": "viewport" if why[0] == "offscreen" else "zero_size",
+                                "stop": tbc.stop_no(n)}, "inferred")))
     return out
 
 
