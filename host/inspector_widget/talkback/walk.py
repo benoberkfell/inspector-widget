@@ -1676,9 +1676,9 @@ def _covered_by(n: Node) -> Optional[Dict[str, Any]]:
     keeps it: ``{"overlay", "kind", "cls", "pane_title", "area", "rect"}``; None when nothing
     does. Only what draws counts: an empty full-screen FrameLayout drawn last (AntennaPod's
     loading frame, its only child GONE) covers nothing. The walk's dump has no View
-    properties, so a View draws its whole box when it takes touches over most of the window
-    or is a surface (most of the window, with content of its own), else only where its
-    children draw."""
+    properties, so a View draws its whole box when it takes clicks over most of the window
+    (a scrim; a focusable list does not) or is a surface (most of the window, with content
+    of its own), else only where its children draw."""
     from .occlusion import NodeAccess, Occlusion
 
     c = Occlusion(NodeAccess()).covered_by(n)

@@ -16,13 +16,15 @@ sibling with a known order only when it holds a clickable scrim over the node (a
 
 Draws: a View occludes only where it draws. It draws its whole box when the capture's View
 properties give it a background or foreground (``draws``; a transparent colour or a ripple
-does not count), when it takes touches (clickable, long-clickable or focusable: a scrim, a
-sheet's root), or when it is a surface: most of its window (``SURFACE_AREA``) holding content
-of its own (two or more nodes with text or actions: a bottom sheet, a fragment added over
-another). Anything else draws only where its visible children do (text, an image, a control):
-AntennaPod's empty loading FrameLayout (no background, its only child GONE) covers nothing,
-while Thunderbird's action-mode bar covers the toolbar under it with its Done button, title
-and actions.
+does not count). Without View properties it also does when it is big and takes touches
+(clickable or long-clickable, not scrollable: a scrim, a sheet's root), or when it is a
+surface: most of its window (``SURFACE_AREA``) holding content of its own (two or more nodes
+with text or actions: a bottom sheet, a fragment added over another). When the properties
+say it paints nothing, it draws only where its children do. Anything else draws only where
+its visible children do (text, an image, a control): AntennaPod's empty loading FrameLayout
+(no background, its only child GONE) covers nothing, a full-screen RecyclerView over a
+toolbar covers it only where its rows are, while Thunderbird's action-mode bar covers the
+toolbar under it with its Done button, title and actions.
 
 What covers what (:class:`Cover` ``kind``):
 
@@ -58,6 +60,8 @@ DRAWER = ("DrawerLayout",)
 #: Drawables that draw nothing at rest (a ripple shows only while pressed).
 _NOT_OPAQUE = ("RippleDrawable", "UnprojectedRipple", "RippleForeground", "RippleBackground")
 _ACT = ("clickable", "long_clickable", "focusable")
+#: What a scrim takes: a click (focusable alone is a list, a scroll container).
+_TOUCH = ("clickable", "long_clickable")
 #: Parents that lay their children out one after another (or are widgets, not containers):
 #: their children never stack, so an overlap there is a transient, not an overlay.
 _FLOW = frozenset({"RecyclerView", "ListView",
@@ -354,20 +358,31 @@ class Occlusion:
         foreground, from the View properties), ``surface`` (most of the window, holding
         content of its own) or ``touch`` (it takes touches over most of the window: a scrim,
         a sheet's root). A small clickable View with no drawable is a touch area over a
-        control (Thunderbird's star_click_area), transparent: not whole."""
+        control (Thunderbird's star_click_area), transparent: not whole.
+
+        ``surface`` and ``touch`` are guesses for when the View properties are not known:
+        when they say the View paints nothing (no background, no foreground), it draws only
+        where its children do, however big it is (a transparent column of controls over a
+        full-screen image). ``touch`` takes a click (a scrim takes the touches it stops):
+        focusable alone is a list or a scroll container, which every RecyclerView and
+        ScrollView is, laid over a toolbar with its rows below it; a scrollable View is
+        never one."""
         acc = self.acc
         if not acc.visible(o) or acc.cls(o) == WEBVIEW:
             return None
         d = acc.draws(o)
         if d:
             return "drawable"
+        if d is False:
+            return None  # the View properties say it paints nothing of its own
         big = _area(acc.rect(o)) >= SURFACE_AREA * max(1, _area(self.window(o)))
         if not big:
             return None
-        if acc.is_view(o) and not acc.provider(o) and "scrollable" not in acc.flags(o) \
+        fl = acc.flags(o)
+        if acc.is_view(o) and not acc.provider(o) and "scrollable" not in fl \
                 and self.content(o) >= 2:
             return "surface"
-        if set(_ACT) & acc.flags(o) and d is not False:
+        if set(_TOUCH) & fl and "scrollable" not in fl:
             return "touch"
         return None
 
