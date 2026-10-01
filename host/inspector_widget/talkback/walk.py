@@ -1479,6 +1479,11 @@ def _seek_resolve(drv: Driver, cur: Snapshot, start: str, *, activate: bool
     if not stops:
         return None, cur
     m = select.resolve(stops, start)
+    if m is None and select.is_key(start) and start in cur.index.nodes:
+        # a node the model reads as no stop (under a modal window, not important ...):
+        # A11yAct can still put focus on it, as asked
+        drv.notes.append(f"start {start} is no stop the model reads; focused as given")
+        return None, cur
     if m is None and select.is_key(start):
         # a key from an earlier read: the tree changed since (a list update, a scroll)
         fresh = drv.reader.snapshot(fresh=True)

@@ -381,6 +381,21 @@ def test_a_walk_seek_has_its_own_budget(probe):
     assert any(n.startswith("start matched=label (exact) view:1024") for n in res["notes"])
 
 
+def test_a_key_of_a_node_that_is_no_stop_is_still_focused_as_given(probe):
+    scene = nav_scene()
+    content = scene.roots[0].children[0]
+    content.children.append(ViewSpec(1050, "ImageView", "android.widget", (300, 30, 40, 40),
+                                     a11y={"class_name": "android.widget.ImageView"}))
+    probe.scene_factory = lambda: scene
+    session = iw.attach(SERIAL, PKG)
+    try:
+        res = tbwalk.run_walk(session, start="view:1050", max_steps=1, until="steps", **FAST)
+    finally:
+        session.disconnect()
+    assert res["lines"][0].startswith("0. view:1050")
+    assert "start view:1050 is no stop the model reads; focused as given" in res["notes"]
+
+
 def test_a_stale_key_is_re_resolved_or_named(probe):
     session = iw.attach(SERIAL, PKG)
     try:
