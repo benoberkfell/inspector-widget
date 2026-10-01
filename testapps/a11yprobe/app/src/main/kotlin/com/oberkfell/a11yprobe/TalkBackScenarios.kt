@@ -532,7 +532,10 @@ private fun C10CheckboxState(variant: String) = TbColumn("C10 ${label(variant)}:
 
 // ---------------------------------------------------------------------------
 // C11 swipe_dismiss (static only): BAD rows deleted by a swipe TalkBack cannot
-// make. GOOD the same rows with a "Delete" custom action.
+// make. GOOD the same rows with a "Delete" custom action on the node TalkBack
+// focuses: the row's Card, merged (mergeDescendants), so its text and its action
+// are one stop. (On the SwipeToDismissBox around it the action would sit on a node
+// TalkBack never stops on, as unreachable as no action at all.)
 // ---------------------------------------------------------------------------
 @Composable
 private fun C11SwipeDismiss(variant: String) = TbColumn("C11 ${label(variant)}: reminders") {
@@ -543,11 +546,12 @@ private fun C11SwipeDismiss(variant: String) = TbColumn("C11 ${label(variant)}: 
             SwipeToDismissBox(
                 state = state,
                 backgroundContent = { Icon(Icons.Filled.Delete, contentDescription = null) },
-                modifier = if (variant == "good") Modifier.semantics {
-                    customActions = listOf(CustomAccessibilityAction("Delete") { rows.remove(r); true })
-                } else Modifier,
             ) {
-                Card(Modifier.fillMaxWidth()) { Text(r, Modifier.padding(16.dp)) }
+                Card(
+                    if (variant == "good") Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
+                        customActions = listOf(CustomAccessibilityAction("Delete") { rows.remove(r); true })
+                    } else Modifier.fillMaxWidth(),
+                ) { Text(r, Modifier.padding(16.dp)) }
             }
         }
     }

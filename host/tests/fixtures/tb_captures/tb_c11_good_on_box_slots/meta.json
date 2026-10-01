@@ -2,9 +2,9 @@
  "abi": "arm64-v8a",
  "agent_version": "viewspector-0.1",
  "api": 37,
- "compose_generation": 0,
+ "compose_generation": 1,
  "consistency": "settled",
- "created_at": 1790848137.793397,
+ "created_at": 1790826116.883706,
  "device": {
   "dpi": 390,
   "font_scale": 1.0,
@@ -14,21 +14,23 @@
    2152
   ]
  },
- "diagnostics": [],
+ "diagnostics": [
+  "the UI changed during capture; settled after 2 attempts"
+ ],
  "facets": {
   "a11y": {
-   "bytes": 1952,
-   "ms": 9,
+   "bytes": 2253,
+   "ms": 21,
    "status": "ok"
   },
   "compose": {
-   "bytes": 752,
-   "ms": 3,
+   "bytes": 887,
+   "ms": 17,
    "status": "ok"
   },
   "fingerprint": {
    "bytes": 0,
-   "ms": 5,
+   "ms": 12,
    "status": "ok"
   },
   "props": {
@@ -38,10 +40,9 @@
    "status": "off"
   },
   "shots": {
-   "bytes": 0,
+   "bytes": 111427,
    "ms": 0,
-   "reason": "screenshot=false",
-   "status": "off"
+   "status": "ok"
   },
   "skp": {
    "bytes": 0,
@@ -50,25 +51,24 @@
    "status": "off"
   },
   "slots": {
-   "bytes": 0,
-   "ms": 1,
-   "reason": "not populated (slots=\"enable\" is destructive: resets remember{} state)",
-   "status": "unavailable"
+   "bytes": 10059,
+   "ms": 87,
+   "status": "ok"
   },
   "views": {
    "bytes": 487,
-   "ms": 2,
+   "ms": 29,
    "status": "ok"
   },
   "windows": {
    "bytes": 5,
-   "ms": 1,
+   "ms": 5,
    "status": "ok"
   }
  },
- "fingerprint": "94808e94ddb859e94e8ec694bd450e33",
- "id": "cx7gee",
- "label": "tb_c11_good",
+ "fingerprint": "f23ffc5d569c2c74efa942f6f5f77016",
+ "id": "c4yw3a",
+ "label": "tb_c11_good_slots",
  "lineage": {
   "package": "com.oberkfell.a11yprobe",
   "serial": "emulator-5556"
@@ -78,13 +78,13 @@
   "lint": "tree",
   "props": false,
   "resolution_stack": false,
-  "screenshot": false,
+  "screenshot": true,
   "screenshot_scale": 1.0,
   "settle_ms": 0,
   "skp": false,
-  "slots": "if_available"
+  "slots": "enable"
  },
- "pid": 2143,
+ "pid": 11553,
  "schema": 1,
- "took_ms": 22
+ "took_ms": 1491
 }

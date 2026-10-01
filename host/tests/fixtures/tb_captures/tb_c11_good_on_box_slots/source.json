@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "am start -S -n com.oberkfell.a11yprobe/.MainActivity --es scenario tb_c11 --es variant good; capture(props=false, slots=\"enable\"); A11yProbe before the C11 GOOD fix (customActions on SwipeToDismissBox's modifier)",
+ "screen": "TalkBack corpus tb_c11 good, before the L2 fix: its Delete custom action on the SwipeToDismissBox node, which TalkBack never focuses (the stop is the row's Text)"
+}

@@ -1292,19 +1292,35 @@ def bind_scenario(out: dict[str, Any], binding: Binding, before_at: int,
     for ev in out.get("timeline") or []:
         if ev.get("focus"):
             ev["focus"] = _bind_key(binding, ev["focus"], after_at)
+    for st in out.get("walk") or []:
+        if st.get("ref"):
+            st["ref"] = _bind_key(binding, st["ref"], after_at) or st["ref"]
+    exp = out.get("expect")
+    for e in (exp if isinstance(exp, list) else [exp] if isinstance(exp, dict) else []):
+        for k in ("focus", "label"):  # a label the capture resolved is a node key
+            if e.get(k) and _KEY_IN_TEXT.fullmatch(str(e[k])):
+                e[k] = _bind_key(binding, e[k], after_at) or e[k]
     model = out.get("model")
     if isinstance(model, dict) and model.get("initial"):
         model["initial"] = _bind_key(binding, model["initial"], after_at)
     f = out.get("finding")
     if isinstance(f, dict) and f.get("msg"):
-        msg = f["msg"]
-        for key in re.findall(r"\b(?:view|compose|virtual):-?\d+(?::-?\d+)?", msg):
-            ref = _bind_key(binding, key, after_at)
-            if ref and ref != key:
-                msg = msg.replace(key, ref)
-        f["msg"] = msg
+        f["msg"] = _bind_text(binding, f["msg"], after_at)
+    if isinstance(out.get("why"), str):
+        out["why"] = _bind_text(binding, out["why"], after_at)
+    if isinstance(out.get("matched"), str):  # the target, found before the action
+        out["matched"] = _bind_text(binding, out["matched"], before_at)
     out["captures"] = binding.ids
     return out
+
+
+def _bind_text(binding: Binding, text: str, at: int) -> str:
+    """The node keys in a message as capture refs."""
+    for key in re.findall(r"\b(?:view|compose|virtual):-?\d+(?::-?\d+)?", text):
+        ref = _bind_key(binding, key, at)
+        if ref and ref != key:
+            text = text.replace(key, ref)
+    return text
 
 
 def survive_cause(before: Any, after: Any, target_ref: str | None) -> str | None:
@@ -1378,10 +1394,72 @@ def _cut(s: Any, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+#: Characters of an utterance a scenario result quotes.
+SPEECH_LEN = 72
+
+
+def _same_words(a: Any, b: Any) -> bool:
+    """What TalkBack said is what the node line already quotes (case, punctuation aside)."""
+    def w(x: Any) -> str:
+        return " ".join(re.findall(r"\w+", str(x or "").lower()))
+    return bool(w(a)) and w(a) == w(b)
+
+
+def _event_line(e: Mapping[str, Any], n: int = 40) -> str:
+    """One timeline entry: ``853 n14``, ``120 windows 2``, ``531 said "Navigate up…"
+    (initial)``, ``300 announced "1 selected"``."""
+    t = e.get("t")
+    if "said" in e:
+        return f"{t} said {_quote(e['said'], n)}" + (f" ({e['why']})" if e.get("why") else "")
+    if "announced" in e:
+        return f"{t} announced {_quote(e['announced'], n)}"
+    if "windows" in e and "focus" not in e:
+        return f"{t} windows {e['windows']}"
+    return (f"{t} " + str(e.get("focus") if e.get("focus") is not None else "-")
+            + (f" w{e['windows']}" if "windows" in e else ""))
+
+
+def _walk_line(w: Mapping[str, Any], n: int = 28) -> str:
+    """One press of a ``walk:<n>`` step: ``6 n26 "UNDO. Button"``."""
+    if w.get("edge"):
+        return f"{w.get('i')} — edge"
+    return f"{w.get('i')} {w.get('ref') or '-'} {_quote(w.get('speak'), n)}"
+
+
+#: ``label (exact) n8 "Item 2. Button" via n9; first of 3``: how, node, quote, the rest.
+_MATCHED = re.compile(r'^(?P<how>.+? \([a-z]+\)) (?P<node>\S+) ".*"(?P<rest>(?: via [^"]+?)?'
+                      r'(?:; first of \d+)?)$')
+
+
+def _matched_text(matched: Any, target: Mapping[str, Any] | None) -> str:
+    """What the selector matched, without the node when it is the target the result
+    already names: ``label (exact)``."""
+    m = _MATCHED.match(str(matched or ""))
+    if m and target and m.group("node") in (target.get("ref"), target.get("key")):
+        return m.group("how") + m.group("rest")
+    return _cut(matched, 90)
+
+
+def _expect_text(e: Mapping[str, Any]) -> str:
+    if e.get("reached"):
+        return f"{_quote(e.get('label'), 32)} reached ({e.get('at')})"
+    out = f"{_quote(e.get('label'), 32)} NOT reached" + (f" within {e['within']}" if e.get("within")
+                                                          else "")
+    if e.get("on_screen") is False:
+        out += "; no stop on screen speaks it"
+    return out + (f"; focus {e['focus']}" if e.get("focus") else "")
+
+
 def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYTES,
                     listed: Any = None) -> dict[str, Any]:
     """The tb_scenario response (at most ``max_bytes``, 1 KB by default). ``listed``:
-    as :func:`walk_result` (``keys`` for the refs, hints to listed tools)."""
+    as :func:`walk_result` (``keys`` for the refs, hints to listed tools).
+
+    It says what was matched and done, the windows, what TalkBack said before
+    (``speak_before``) and after (``speak_after``, ``announced``), the compact timeline
+    (focus moves, utterances with their focus reason, announcements), where focus
+    landed, the verdict and why, ``flags`` (an action that changed the screen silently),
+    the walk after the action (``lines``) and ``expect``, then the finding."""
     caps = list(rec.get("captures") or [])
     tgt = rec.get("target") if isinstance(rec.get("target"), dict) else None
     foc = rec.get("focus") if isinstance(rec.get("focus"), dict) else None
@@ -1391,6 +1469,8 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
     if len(caps) > 1:
         out["after"] = caps[-1]
     out["target"] = _named(tgt.get("ref"), tgt) if tgt else None
+    if rec.get("matched"):
+        out["matched"] = _matched_text(rec["matched"], tgt)
     did = rec.get("action") if rec.get("kind") != "survive" else rec.get("mutate")
     out["did"] = _cut(did, 60) if did else None
     if rec.get("kind") == "focus_after":
@@ -1404,15 +1484,33 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
             out["model_initial"] = model["initial"]
     elif rec.get("kind") == "restore":
         back = rec.get("back") or {}
-        out["windows"] = f"{(rec.get('opened') or {}).get('windows')}->{back.get('windows')}"
-    timeline = [f"{e.get('t')} " + ("windows " + str(e["windows"]) if "windows" in e and
-                                    "focus" not in e else
-                                    str(e.get("focus") if e.get("focus") is not None else "-")
-                                    + (f" w{e['windows']}" if "windows" in e else ""))
-                for e in rec.get("timeline") or []]
-    out["timeline"] = timeline
+        opened = rec.get("opened") or {}
+        out["windows"] = f"{opened.get('windows')}->{back.get('windows')}"
+        if opened.get("settled") is False:
+            out["settled"] = False
+    if rec.get("speak_before") and not _same_words(rec["speak_before"], (tgt or {}).get("speak")):
+        out["speak_before"] = _cut(rec["speak_before"], SPEECH_LEN)
+    out["timeline"] = [_event_line(e) for e in rec.get("timeline") or []]
     out["focus"] = _named(foc.get("ref"), foc) if foc else None
+    if rec.get("speak_after") and not _same_words(rec["speak_after"], (foc or {}).get("speak")):
+        out["speak_after"] = _cut(rec["speak_after"], SPEECH_LEN)
+    if rec.get("announced"):
+        out["announced"] = [_cut(a, 48) for a in rec["announced"]][:3]
     out["verdict"] = rec.get("verdict")
+    if rec.get("why"):
+        out["why"] = _cut(rec["why"], 120)
+    if rec.get("flags"):
+        out["flags"] = list(rec["flags"])
+    if rec.get("speech"):
+        out["speech"] = rec["speech"]
+    walk = [w for w in rec.get("walk") or [] if isinstance(w, Mapping)]
+    if walk:
+        out["lines"] = [_walk_line(w) for w in walk]
+    exp = rec.get("expect")
+    if isinstance(exp, dict):
+        out["expect"] = _expect_text(exp)
+    elif isinstance(exp, list):
+        out["expect"] = [_expect_text(e) for e in exp]
     f = rec.get("finding")
     finding = {k: f[k] for k in ("code", "sev", "msg", "fix") if f.get(k)} if f else None
     out["finding"] = finding
@@ -1426,22 +1524,39 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
     if hints:
         out["next"] = hints
     out = {k: v for k, v in out.items() if v not in (None, [], "")}
+    walked = _Lines(out, walk)
 
     def size() -> int:
         return utf8_len(dumps(out))
 
+    # A walk:<n> step's lines are what the call asked for: their quotes shrink first, and
+    # when they must go, the middle goes, never the last presses (where Undo comes, or not).
     shrink: list[Callable[[], bool]] = [
         lambda: _pop_list(out, "notes"),
-        lambda: _trim_list(out, "timeline", 6),
         lambda: _trim_text(out.get("finding"), "fix", 160),
-        lambda: _trim_list(out, "timeline", 3),
-        lambda: _trim_text(out.get("finding"), "msg", 120),
+        lambda: _trim_list(out, "timeline", 8),
+        lambda: _trim_text(out, "speak_before", 40),
+        lambda: _trim_text(out.get("finding"), "msg", 100),
         lambda: _trim_list(out, "next", 1),
-        lambda: _trim_text(out, "cause", 80),
+        lambda: _trim_text(out, "matched", 48),
         lambda: _trim_text(out.get("finding"), "fix", 80),
+        lambda: _trim_text(out, "cause", 80),
+        lambda: _trim_text(out, "speak_after", 48),
+        lambda: _trim_list(out, "timeline", 5),
         lambda: _pop_list(out, "panes"),
-        lambda: _pop_list(out, "timeline"),
+        lambda: _trim_text(out, "why", 80),
         lambda: _pop_list(out, "next"),
+        lambda: walked.quote(16),
+        lambda: _pop_list(out, "speech"),
+        lambda: _pop_text(out.get("finding"), "fix"),
+        lambda: _pop_list(out, "speak_before"),
+        lambda: walked.elide(2, 4),
+        lambda: walked.quote(12),
+        lambda: _trim_list(out, "timeline", 3),
+        lambda: _pop_list(out, "matched"),
+        lambda: walked.elide(1, 3),
+        lambda: _pop_list(out, "timeline"),
+        lambda: walked.elide(1, 2),
     ]
     for step in shrink:
         if size() <= max_bytes:
@@ -1454,12 +1569,50 @@ def _pop_list(d: dict[str, Any], key: str) -> bool:
     return d.pop(key, None) is not None
 
 
+class _Lines:
+    """A scenario's ``walk:<n>`` lines as the result shrinks them: every press with shorter
+    quotes first (:meth:`quote`), then the first ``head`` and last ``tail`` presses with
+    ``…+N…`` for the middle (:meth:`elide`). The last presses (where Undo comes, or the
+    walk ends) are never dropped."""
+
+    def __init__(self, out: dict[str, Any], walked: Sequence[Mapping[str, Any]]) -> None:
+        self.out, self.walked = out, list(walked)
+        self.n, self.keep = 28, None  # quote length; (head, tail) once elided
+
+    def render(self) -> list[str]:
+        full = [_walk_line(w, self.n) for w in self.walked]
+        if self.keep is None or len(full) <= sum(self.keep) + 1:
+            return full
+        head, tail = self.keep
+        return full[:head] + [f"…+{len(full) - head - tail}…"] + full[len(full) - tail:]
+
+    def _set(self) -> bool:
+        if "lines" not in self.out:
+            return False
+        new = self.render()
+        changed = new != self.out["lines"]
+        self.out["lines"] = new
+        return changed
+
+    def quote(self, n: int) -> bool:
+        self.n = min(self.n, n)
+        return self._set()
+
+    def elide(self, head: int, tail: int) -> bool:
+        self.keep = (head, tail)
+        return self._set()
+
+
 def _trim_list(d: dict[str, Any], key: str, n: int) -> bool:
     v = d.get(key)
     if isinstance(v, list) and len(v) > n:
-        d[key] = v[:n] + ([f"+{len(v) - n}"] if key == "timeline" else [])
+        d[key] = v[:n] + ([f"+{len(v) - n}"] if key in ("timeline", "lines") else [])
         return True
     return False
+
+
+def _pop_text(d: Any, key: str) -> bool:
+    return isinstance(d, dict) and d.pop(key, None) is not None
 
 
 def _trim_text(d: Any, key: str, n: int) -> bool:

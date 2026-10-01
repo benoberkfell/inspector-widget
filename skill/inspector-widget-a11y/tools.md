@@ -346,3 +346,86 @@ adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.ViewScenarioAct
 #   S6 RecyclerView grid                   D1 DialogFragment (Views + a ComposeView)   D2 Compose Dialog
 adb -s <serial> shell am start -S -W -n com.oberkfell.a11yprobe/.InteropActivity --es scenario S3
 ```
+
+---
+
+## tb_scenario actions and selectors
+
+**Selectors** (`tb_walk` `start`, `tb_scenario` `target`, `tap:` / `long_press:` /
+`expect:`) always land on a stop TalkBack really focuses: a Text inside a merged row
+climbs to the row, a container to its first stop. They are resolved among the model's
+stops before anything is pressed, and before TalkBack is turned on when the target is
+a plain label:
+
+| Selector | Matches |
+|---|---|
+| `n12` (a ref), `view:12`, `compose:8:509` | that node's stop (a stale key is re-read from a fresh dump) |
+| `#subject` / `@topicTag:19` | resource id / test tag (Compose `testTagsAsResourceId`) |
+| `Bookmark` | what the stop speaks: its label (a contentDescription replaces the text under it), its announcement and each `. ` part of it, the texts merged into it |
+| `Bookmark within 13 Things` | the same, among the stops inside the one `13 Things` names |
+| `2nd stop within Deep Links` (`first`, `last`, `<n>th`) | that stop of the card |
+
+Ranks: exact beats whole word beats substring (`Bookmark` picks `Bookmark` over
+`Unbookmark`). A walk start takes the first of a tie and says `start matched=label
+(exact) ...` in `notes`; a scenario that activates the target refuses a tie with an
+`ambiguous` error listing up to 5 candidates (`ref "speech"`), refuses a partial match
+under half the words it hits (`Wear OS` inside a card title), and refuses a match inside
+a word (with only `Unbookmark` or `Unfollow` on screen, `Bookmark` / `follow` would act
+on the opposite control: pass the whole word). A label no stop speaks fails at once
+(`label not found among N stops on <Activity>`) unless something can scroll it in;
+then the seek scrolls the main list of the window TalkBack reaches (never a list under
+an open dialog) with A11yAct, forward and back past where it began, with its own budget
+(never the walk's `max_steps`). Without A11yAct it presses "next" for one lap, through
+the edge and the wrap. A target under an open drawer, sheet or dialog is refused for an
+activation, a key or ref too (a walk may still start there, with a note).
+
+**Actions** (`action`; `mutate` for `survive`) chain steps with `;`. The verdict is
+about the focus after the last acting step; the steps after it only look:
+
+| Step | Does |
+|---|---|
+| `activate` | TalkBack's own click (Meta+Space, as a double tap) |
+| `long_press[:<sel>]` | ACTION_LONG_CLICK through the agent (as double-tap-and-hold): selection mode, context menus |
+| `custom:<label>` | the focused stop's custom action, as TalkBack's actions menu runs it; one that only a node TalkBack never focuses offers is named in the error |
+| `back` | system BACK |
+| `tap[:<sel>]` | an injected tap (bypasses TalkBack) |
+| `key:<combo>`, `broadcast:<am args>`, `probe:<action>` | a key combo, an `am broadcast`, A11yProbe's TB_PROBE |
+| `walk:<n>` | then press "next" up to n times; `lines` lists what TalkBack read (squeezed to fit, a long walk keeps its first and last presses, `…+N…` for the middle) |
+| `expect:<label>` | then: is focus on that stop, or did the walk reach it (`"Undo" reached (walk press 6)`) |
+| `wait:<ms>` | pause |
+| `pre:activity=<Class>`, `pre:pane=<title>` | checked before anything is pressed: wrong screen, error, nothing pressed. A pane is a title the screen shows (a pane or window title, a heading, the top bar's title), never a navigation bar's label |
+
+Examples: `tb_scenario(kind="focus_after", target="Unbookmark", action="activate;
+walk:8; expect:Undo")` (where focus goes when a list item disappears, and whether Undo
+is reachable in time); `action="long_press"` (selection mode with TalkBack running);
+`action="custom:Delete"`; `action="activate; back"` (does focus come back to the
+opener). A wrong step is `bad_args` naming this grammar.
+
+**Verdicts** (`focus_after`): `initial_ok` (a new screen, window, pane, drawer or sheet,
+focus on its first stop) · `returned_to_opener` (a screen opened and closed, focus back on
+the target; or a window closed and TalkBack's log says it put back the node it last
+focused there, or the app put focus there) · `under_closed_window` (a window closed and
+focus went to a node under it that nothing shows is its opener: TalkBack's initial focus
+on the first content is a finding; without the verbose log `why` says the reason is
+unknown) · `reset_to_top` (same screen, focus thrown
+to its first stop) · `moved_to_nav` (same screen, thrown to a navigation bar or tab) ·
+`nothing_happened` (focus stayed and nothing a screen reader reads changed: text,
+description, state description, checked or selected state) · `stayed_on_opener` ·
+`behind_overlay` · `on_close_or_unlabeled` (unlabelled, or close / dismiss / cancel;
+"Navigate up" and "Back" are not) · `left_app` · `none` · `elsewhere`. `why` says which.
+A finding where the target was removed gives the list-mutation fix (focus the neighbour,
+announce the result); one where it is still there (selection mode) the keep-focus fix.
+
+**What TalkBack said** (needs its verbose log: `talkback(action="on",
+verbose_log=true)`, else `speech: not logged`): the timeline interleaves focus moves
+with `said "..." (restore|initial|user|app)` (why focus went there: TalkBack put back the
+node it last focused in a window that came back, or kept focus on screen; its own initial
+focus on a window's first content; a navigation press; an accessibility action;
+`initial/restore` and `restore/app` on TalkBack 16, which does not log which) and
+`announced "..."` (window titles such as "1 selected",
+announcements, live regions). `speak_before` / `speak_after` are the target's and the
+landing node's utterances when they differ from the node lines; `flags` says
+`activated, nothing spoken`, `changed, nothing spoken` or `changed visually, speech
+did not` (the target's pixels changed: a state only drawn, TB-6's star). `restore`
+waits for the opened screen to settle before BACK (else `settled: false` and a note
+to raise `wait_ms`).

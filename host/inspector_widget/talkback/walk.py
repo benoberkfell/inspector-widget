@@ -1133,6 +1133,8 @@ class Driver:
         self.restored: Optional[Dict[str, Any]] = None
         self.restore_error: Optional[str] = None
         self.notes: List[str] = []
+        # when a scenario step sent its act (scenarios._do_step), the settle's time 0
+        self.acted_at: Optional[float] = None
         self.seek_presses = 0
         self.start_via = "keys"
         self.started: Dict[str, Any] = {}
@@ -1419,12 +1421,22 @@ class Step:
 
 
 def _match(sel: str, n: Optional[Node]) -> bool:
+    """Whether ``n`` is the node ``sel`` names: its key, or a label that is its label,
+    description, text or announcement, or a whole-word part of one (never a bare
+    substring: "Bookmark" does not name "Unbookmark"; :mod:`.select`)."""
     if n is None:
         return False
     if ":" in sel and n.key == sel:
         return True
-    s = sel.strip().lower()
-    return bool(s) and (s == n.label.lower() or s in n.label.lower() or s == (n.cd or "").lower())
+    from .select import _rank, norm
+    s = norm(sel)
+    if not s:
+        return False
+    for v in (n.label, n.cd, n.text, n.speech(400)):
+        r = _rank(s, norm(v))
+        if r is not None and r <= 1:
+            return True
+    return False
 
 
 def run_walk(session: Any, *, start: str = "current", direction: str = "next",
@@ -1755,39 +1767,280 @@ def _seen_again(s: "Step", new: Snapshot) -> bool:
                      ctx_a=s.node.ctx, ctx_b=f.ctx)
 
 
-def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_presses: int) -> Snapshot:
-    """Put focus where the walk starts. Anything but ``current`` + ``next`` first
-    proves the keymap with "next" (see :class:`.inject.KeyGuard`)."""
+#: A seek's own budget (presses to put focus on a start / target by label): one lap of the
+#: longest screen. Not the walk's max_steps, which are all the walk's.
+SEEK_MAX_PRESSES = 120
+#: Scroll pages a seek searches each way (A11yAct scroll) for a label not on the screen.
+SEEK_MAX_PAGES = 12
+SEEK_SCROLL_SETTLE_S = 0.4
+
+
+def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_presses: int = 0,
+                *, activate: bool = False) -> Snapshot:
+    """Put focus where the walk (or scenario) starts: ``current``, ``first``, or the stop a
+    selector names (:mod:`.select`: a key, ``#rid``, ``@tag``, ``<n>th stop within <label>``
+    or the words TalkBack speaks). The selector is resolved among the model's stops before
+    anything is pressed: a label no stop speaks, with nothing that can scroll it in, fails
+    at once (``label not found among N stops on <activity>``); one that can be scrolled in is
+    searched page by page (A11yAct scroll forward, then back past where it began). Focus is
+    then put on the stop with A11yAct, else by pressing "next" for at most one lap. With
+    ``activate`` (a scenario that will activate the target) several stops matching alike
+    are refused (``ambiguous``), and so is a stop under an open drawer, sheet or dialog.
+
+    ``max_presses`` is ignored: a seek has its own budget (:data:`SEEK_MAX_PRESSES`), so a
+    walk's ``max_steps`` are all its own. Anything but ``current`` + ``next`` first proves
+    the keymap with "next" (see :class:`.inject.KeyGuard`)."""
     if start == "current" and direction == "next":
         return cur
-    if start not in ("current", "first"):
-        acted = _act_focus(drv, cur, start)
-        if acted is not None:
-            if direction == "prev":  # prove the keymap, then back onto the target
-                return drv.return_to(acted.key, drv.prove(acted.key).snap)
-            return acted
-    before = cur
-    w = drv.prove(cur.key)
-    snap = w.snap
-    if start == "current":
-        return drv.return_to(before.key, snap)  # back to where the user was
     if start == "first":
+        return _seek_first(drv, cur)
+    if start == "current":
+        before = cur
+        return drv.return_to(before.key, drv.prove(cur.key).snap)  # back to where the user was
+    m, cur = _seek_resolve(drv, cur, start, activate=activate)
+    acted = _act_focus(drv, cur, start, m)
+    if acted is not None:
+        if direction == "prev":  # prove the keymap, then back onto the target
+            return drv.return_to(acted.key, drv.prove(acted.key).snap)
+        return acted
+    return _seek_press(drv, cur, start, m, activate=activate)
+
+
+def _screen_name(drv: Driver) -> str:
+    """The activity in front, short: ``MessageHomeActivity``."""
+    try:
+        top = device.top_activity(drv.serial) or ""
+    except Exception:  # noqa: BLE001 - only for a message
+        top = ""
+    return top.rsplit("/", 1)[-1].rsplit(".", 1)[-1] or "the screen"
+
+
+def _seek_stops(snap: Snapshot) -> Tuple[Dict[str, Any], List[Any]]:
+    from .. import a11y
+    from . import select
+    if snap.resp is None:
+        return {}, []
+    d = a11y.a11y_to_dict(snap.resp)
+    return d, select.stops_from_dump(d, legacy=bool(snap.index.legacy))
+
+
+def _cover_text(idx: DumpIndex, key: str) -> Optional[str]:
+    n = idx.nodes.get(key)
+    cov = _covered_by(n) if n is not None else None
+    return f"{cov.get('cls') or 'an overlay'} {cov.get('overlay')}" if cov else None
+
+
+def _seek_resolve(drv: Driver, cur: Snapshot, start: str, *, activate: bool
+                  ) -> Tuple[Optional[Any], Snapshot]:
+    """(the :class:`.select.Match` for ``start``, the snapshot it was found in). None when
+    only pressing through the screen can tell (no A11yAct to scroll with). Raises
+    ``start_not_found`` / ``ambiguous`` (:class:`.select.SelectError`)."""
+    from . import select
+    d, stops = _seek_stops(cur)
+    if not stops:
+        return None, cur
+    m = select.resolve(stops, start)
+    if m is None and select.is_key(start) and start in cur.index.nodes:
+        # a node the model reads as no stop (not important, under a modal window ...):
+        # A11yAct can still put focus on it, as asked. Not to activate it under an open
+        # dialog, drawer or sheet: a TalkBack user cannot reach it there (a ref from a
+        # capture taken before the dialog opened lands here too).
+        by = select.covering_window(d, start, legacy=bool(cur.index.legacy))
+        cov = f"the modal window {by}" if by is not None else _cover_text(cur.index, start)
+        if activate and cov:
+            raise select.SelectError(
+                "start_not_found", f"{start} lies under {cov}: a TalkBack user cannot reach it",
+                hint="Close the dialog/drawer/sheet first, or target a stop on it.")
+        drv.notes.append(f"{'target' if activate else 'start'} {start} is no stop the model "
+                         f"reads; focused as given" + (f" (it lies under {cov})" if cov else ""))
+        return None, cur
+    if m is None and select.is_key(start):
+        # a key from an earlier read: the tree changed since (a list update, a scroll)
+        fresh = drv.reader.snapshot(fresh=True)
+        d2, stops2 = _seek_stops(fresh)
+        m = select.resolve(stops2, start) or _registry_match(drv, start, stops2)
+        if m is None:
+            raise select.SelectError(
+                "start_not_found", f"{start} is not on the screen any more (the app changed "
+                                   f"its tree since the key was read)",
+                hint="Pass the label as TalkBack speaks it, or capture again for a fresh ref.")
+        cur, d, stops = fresh, d2, stops2
+    if m is None:
+        more = select.can_bring_more(d)
+        if more is None:
+            raise select.not_found_error(start, len(stops), _screen_name(drv))
+        found = _seek_scroll(drv, cur, start, d)
+        if found is None:
+            return None, cur  # no A11yAct: press through one lap
+        m, cur, searched = found
+        if m is None:
+            raise select.not_found_error(start, len(stops), _screen_name(drv), searched=searched)
+    select.vet(m, activate=activate, where=_screen_name(drv),
+               covered=lambda s: _cover_text(cur.index, s.key))
+    drv.notes.extend(m.notes)
+    if m.how != "key":  # a key names itself: nothing to say
+        drv.notes.append(f"{'target' if activate else 'start'} {m.describe()}")
+    return m, cur
+
+
+def _registry_match(drv: Driver, key: str, stops: List[Any]) -> Optional[Any]:
+    """A stale Compose key re-resolved through the session's key registry (correlate): the
+    stop that now speaks the label recorded for it, nearest its old box."""
+    from .. import correlate
+    from . import select
+    try:
+        hit = correlate.registry_for(drv.session).lookup(key)
+    except Exception:  # noqa: BLE001 - no registry
+        hit = None
+    if not hit or not (hit[1] or {}).get("label"):
+        return None
+    fp = hit[1]
+    m = select.resolve(stops, str(fp["label"]))
+    if m is None or m.how not in ("exact", "word"):
+        return None
+    box = fp.get("bounds") or {}
+    old = (int(box.get("x", 0)), int(box.get("y", 0)), int(box.get("w", 0)), int(box.get("h", 0)))
+    best = max(m.candidates, key=lambda s: iou(s.bounds, old))
+    m.node, m.candidates, m.how, m.via = best, [best], "registry", f"stale {key}"
+    return m
+
+
+def _seek_scroll(drv: Driver, cur: Snapshot, start: str, d: Dict[str, Any]
+                 ) -> Optional[Tuple[Optional[Any], Snapshot, str]]:
+    """Search a label no stop speaks yet by scrolling the screen's largest scrolling
+    container with A11yAct: forward page by page, then back past where it began (what lies
+    above, and the list put back). (match or None, snapshot, what was searched); None when
+    the agent cannot act (an older one: the caller presses through a lap instead)."""
+    from .. import a11y
+    from . import select
+    if not isinstance(drv.reader, A11yFocusReader):
+        return None
+    snap = cur
+    pages = 0
+    conts = select.scrollables(d)[:1]
+    for key, _ids in conts:
+        for action, n_max in (("scroll_forward", SEEK_MAX_PAGES), ("scroll_backward", 2 * SEEK_MAX_PAGES)):
+            for _ in range(n_max):
+                try:
+                    res = a11y.a11y_act_to_dict(drv.session.a11y_act(node_key=key, action=action))
+                except Exception:  # noqa: BLE001 - the container went away
+                    break
+                if not res.get("performed"):
+                    break
+                pages += 1
+                time.sleep(SEEK_SCROLL_SETTLE_S)
+                snap = drv.reader.snapshot(fresh=True)
+                _d, stops = _seek_stops(snap)
+                m = select.resolve(stops, start)
+                if m is not None:
+                    m.notes.append(f"scrolled {key} {pages} page(s) to reach it")
+                    return m, snap, ""
+    where = f"{conts[0][0]} scrolled {pages} page(s) forward and back" if conts else "nothing scrolled"
+    return None, snap, where
+
+
+def _seek_first(drv: Driver, cur: Snapshot) -> Snapshot:
+    """``start='first'``: TalkBack's "first" shortcut. The touch injector has no such
+    gesture: A11yAct puts focus on the model's first stop of the focused window, else
+    previous-swipes run to the edge (bounded)."""
+    from . import select
+    if "first" in getattr(drv.inj, "actions", ("first",)):
+        snap = drv.prove(cur.key).snap
         t, _ = drv.press("first")
         w2 = drv.wait(snap.key, t)
         drv.seek_presses += 1
         return w2.snap if w2.moved or w2.snap.key else snap
-    if _match(start, before.focus):
+    _d, stops = _seek_stops(cur)
+    win = cur.focus.window if cur.focus is not None else None
+    first = next((s for s in stops if win is None or s.window == win), stops[0] if stops else None)
+    if first is not None:
+        acted = _act_focus(drv, cur, first.key, select.Match(first, "position", "first", [first], "first"))
+        if acted is not None:
+            drv.notes.append(f"start first: {first.key} through A11yAct (the touch injector has "
+                             f"no 'first' gesture)")
+            return acted
+    snap = drv.prove(cur.key).snap
+    for _ in range(SEEK_MAX_PRESSES):
+        t, _ = drv.press("prev")
+        drv.seek_presses += 1
+        w = drv.wait(snap.key, t)
+        if not w.moved:
+            break  # the edge: focus is on the first stop
+        snap = w.snap
+    drv.notes.append("start first: previous-swipes to the edge (the touch injector has no "
+                     "'first' gesture)")
+    return snap
+
+
+def _seek_press(drv: Driver, cur: Snapshot, start: str, m: Optional[Any], *,
+                activate: bool = False) -> Snapshot:
+    """Press "next" until focus is on the stop ``m`` names (any of a tie), or a node ``start``
+    names, for at most one lap (:data:`SEEK_MAX_PRESSES`). Without ``m`` (the model could
+    not resolve it) the node focus reaches is vetted as a match would be: an activation
+    refuses one that ``start`` names only loosely.
+
+    At the last stop TalkBack's first "next" only reaches the edge and the second wraps to
+    the first stop (FocusProcessorForLogicalNavigation), so an edge is pressed through: a
+    target above the focus is reached after the wrap. The lap ends when a press that moved
+    lands on a stop already passed, or when two presses in a row do not move."""
+    from . import select
+    want = {c.key for c in m.candidates} if m is not None else set()
+
+    def hit(s: Snapshot) -> bool:
+        if s.focus is None:
+            return False
+        if want:
+            return s.key in want
+        if not _match(start, s.focus):
+            return False
+        if activate:
+            n = s.focus
+            one = select.Stop(key=n.key, order=0, speech=n.speech(400), label=n.label, cd=n.cd,
+                              text=n.text, cls=n.simple_cls, bounds=n.bounds, window=n.window,
+                              node={})
+            got = select.resolve([one], start)
+            if got is not None:
+                select.vet(got, activate=True, where=_screen_name(drv))
+        return True
+
+    before = cur
+    snap = drv.prove(cur.key).snap
+    if hit(before):
         t, _ = drv.press("prev")
         drv.seek_presses += 1
         return drv.wait(snap.key, t).snap
-    while not _match(start, snap.focus):
-        if drv.seek_presses >= max_presses:
-            raise WalkError("start_not_found", f"no focus stop matching {start!r} within "
-                                               f"{drv.seek_presses} presses",
-                            hint="Pass a node key or part of the label as spoken.")
+
+    def lap_error(presses: int, why: str) -> select.SelectError:
+        if m is not None:  # the model has the stop: TalkBack's "next" never got there
+            return select.SelectError(
+                "start_not_found",
+                f"TalkBack never focused {m.node.line(32)} in {presses} presses of \"next\" "
+                f"from {before.key} ({why})",
+                hint="It may be outside TalkBack's order or behind a trap: walk the screen "
+                     "(start='first') to see what TalkBack reaches.")
+        return select.not_found_error(start, len(_seek_stops(before)[1]), _screen_name(drv),
+                                      searched=f"{presses} presses, {why}")
+
+    seen: set = {before.key} - {None}
+    presses = still = 0
+    while not hit(snap):
+        if snap.key is not None:
+            seen.add(snap.key)
+        if presses >= SEEK_MAX_PRESSES:
+            raise lap_error(presses, "the seek's budget")
+        if still >= 2:
+            raise lap_error(presses, "focus stopped moving")
         t, _ = drv.press("next")
-        snap = drv.wait(snap.key, t).snap
+        w = drv.wait(snap.key, t)
         drv.seek_presses += 1
+        presses += 1
+        if not w.moved:
+            still += 1  # the edge: the next press wraps to the first stop
+            continue
+        still = 0
+        snap = w.snap
+        if snap.key in seen and not hit(snap):
+            raise lap_error(presses, "one lap")
     return snap
 
 
@@ -1829,35 +2082,40 @@ def _scrolled_key(drv: Driver, prev_idx: DumpIndex, new: Snapshot, t_sent: float
     return None
 
 
-def _act_focus(drv: Driver, cur: Snapshot, start: str) -> Optional[Snapshot]:
-    """Put TalkBack's focus straight on the node ``start`` names (A11yAct
-    ACTION_ACCESSIBILITY_FOCUS; TalkBack's next press continues from there).
-    None when the agent cannot, so the caller presses "next" instead."""
+def _act_focus(drv: Driver, cur: Snapshot, start: str, m: Optional[Any] = None) -> Optional[Snapshot]:
+    """Put TalkBack's focus straight on the stop ``m`` (a :class:`.select.Match`) or the
+    node key ``start`` names (A11yAct ACTION_ACCESSIBILITY_FOCUS; TalkBack's next press
+    continues from there). None when the agent cannot, so the caller presses "next"."""
     if not isinstance(drv.reader, A11yFocusReader):
         return None
-    target: Optional[str] = None
-    if ":" in start:
-        from .. import a11y
+    from .. import a11y
+    from . import select
+    target: Optional[str] = m.key if m is not None else None
+    if target is None and select.is_key(start):
         try:
             a11y.parse_node_key(start)
             target = start
         except ValueError:
             target = None
-    if target is None:
-        # A label: prefer a node the model reads as a stop (not a Text inside a row).
-        stops = {s.key for s in predict(cur.resp, bool(cur.index.legacy))[0]} if cur.resp else set()
-        found = [n for n in cur.index.order if _match(start, n)]
-        found.sort(key=lambda n: (n.key not in stops, not n.actionable()))
-        target = found[0].key if found else None
+    if target is None and cur.resp is not None:
+        found = select.resolve(_seek_stops(cur)[1], start)
+        target = found.key if found is not None else None
     if target is None:
         return None
-    from .. import a11y
-    d = a11y.a11y_act_to_dict(drv.session.a11y_act(node_key=target, action="accessibility_focus"))
+    if cur.key == target:
+        drv.start_via = "a11y_act"
+        return cur  # already there: no focus event would come
+    try:
+        d = a11y.a11y_act_to_dict(drv.session.a11y_act(node_key=target, action="accessibility_focus"))
+    except ValueError as exc:  # a key the agent cannot address
+        drv.notes.append(f"A11yAct could not focus {target}: {exc}")
+        return None
     if not d.get("performed"):
         drv.notes.append(f"A11yAct could not focus {target}: {d.get('error')}")
         return None
     snap = drv.reader.wait_change(cur.key, drv.timeout_s, drv.quiet_s).snap
-    if snap.key == target or _match(start, snap.focus):
+    ok = {target} | ({c.key for c in m.candidates} if m is not None else set())
+    if snap.key in ok or (m is None and _match(start, snap.focus)):
         drv.start_via = "a11y_act"
         return snap
     drv.notes.append(f"A11yAct focused {target} but TalkBack's focus is on {snap.key}")

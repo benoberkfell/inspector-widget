@@ -1678,10 +1678,21 @@ class _TbCaptures:
         return _stop_key(ix, lc, node, stop=stop) or sel
 
     def resolve_action(self, action: Any) -> Any:
-        """``tap:<ref or selector>`` taps that node (its key); other actions as given."""
-        if isinstance(action, str) and action.startswith("tap:"):
-            return "tap:" + str(self.resolve(action[4:], stop=False))
-        return action
+        """The selectors in an action sequence (``tap:``, ``long_press:``, ``expect:``) as
+        node keys: ``tap:<ref or selector>`` taps that node (its key), ``long_press:`` and
+        ``expect:`` name the stop TalkBack focuses for it; other steps as given."""
+        if not isinstance(action, str):
+            return action
+        out = []
+        for raw in action.split(";"):
+            step = raw.strip()
+            head, sep, arg = step.partition(":")
+            h, arg = head.strip().lower().replace("-", "_"), arg.strip()
+            if sep and arg and h in ("tap", "long_press", "longpress", "expect"):
+                if h != "expect" or _looks_like_selector(arg):
+                    step = f"{head.strip()}:{self.resolve(arg, stop=h != 'tap')}"
+            out.append(step)
+        return "; ".join(x for x in out if x)
 
     def step(self, st: Any, snap: Any) -> None:
         self._last_i = int(getattr(st, "i", 0) or 0)
@@ -2024,16 +2035,23 @@ def tb_scenario(ctx: OpContext, kind: Any = None, serial: Any = None, package: A
 
 
 def _tb_check_refs(ctx: OpContext, lineage: tuple[str, str], *sels: Any) -> None:
-    """Fail before TalkBack is touched when a ref (``n12``, or ``tap:n12``) names no node
-    of the app's latest capture: the walk's own capture carries refs over from it, so a
-    ref it lacks would only fail later, with the device already driven."""
+    """Fail before TalkBack is touched when a ref (``n12``, or ``tap:n12`` /
+    ``long_press:n12`` / ``expect:n12`` in an action sequence) names no node of the app's
+    latest capture: the walk's own capture carries refs over from it, so a ref it lacks
+    would only fail later, with the device already driven."""
     wanted: list[str] = []
     for x in sels:
         for v in (x if isinstance(x, list) else [x]):
-            if isinstance(v, str):
-                v = v[4:] if v.startswith("tap:") else v
-                if REF_RE.match(v):
-                    wanted.append(v)
+            if not isinstance(v, str):
+                continue
+            for step in v.split(";") if ";" in v else [v]:
+                step = step.strip()
+                head, sep, arg = step.partition(":")
+                if sep and head.strip().lower().replace("-", "_") in (
+                        "tap", "long_press", "longpress", "expect"):
+                    step = arg.strip()
+                if REF_RE.match(step):
+                    wanted.append(step)
     if not wanted:
         return
     try:
@@ -2077,11 +2095,18 @@ def _tb_scenario_record(ctx: OpContext, hook: _TbCaptures, session: Any, k: str,
     taken = [at for at, _lc in hook.taken]
     before_at = 1 if 1 in taken else 0
     walks.bind_scenario(rec, hook.binding(), before_at=before_at, after_at=2)
+    before = next((lc for at, lc in reversed(hook.taken) if at <= 1), None)
+    after = next((lc for at, lc in hook.taken if at == 2), None)
+    tgt = (rec.get("target") or {}).get("ref") if isinstance(rec.get("target"), dict) else None
     if k == "survive":
-        before = next((lc for at, lc in reversed(hook.taken) if at <= 1), None)
-        after = next((lc for at, lc in hook.taken if at == 2), None)
-        tgt = (rec.get("target") or {}).get("ref") if isinstance(rec.get("target"), dict) else None
         rec["cause_text"] = walks.survive_cause(before, after, tgt)
+    if k != "restore" and not rec.get("speak_after") and not rec.get("announced") \
+            and "speech" not in rec and _visual_change(before, after, tgt):
+        # the target's pixels changed while TalkBack said nothing (a state only drawn)
+        flags = list(rec.get("flags") or [])
+        if "changed visually, speech did not" not in flags:
+            flags.append("changed visually, speech did not")
+        rec["flags"] = flags
     rec["notes"] = list(rec.get("notes") or []) + hook.notes
     rec.pop("saved", None)
     try:
@@ -2090,6 +2115,39 @@ def _tb_scenario_record(ctx: OpContext, hook: _TbCaptures, session: Any, k: str,
         rec["notes"].append(f"could not store the scenario: {exc}")
         rec["id"] = None
     return walks.scenario_result(rec, max_bytes=budget, listed=ctx.listed)
+
+
+def _visual_change(before: LoadedCapture | None, after: LoadedCapture | None,
+                   ref: str | None, threshold: float = 0.02) -> bool | None:
+    """Whether node ``ref``'s pixels differ between two captures' screenshots (more than
+    ``threshold`` of them changed; None when either capture cannot tell: no screenshot,
+    the node gone or moved)."""
+    if before is None or after is None or not ref or not REF_RE.match(str(ref)):
+        return None
+    try:
+        crops = []
+        for lc in (before, after):
+            ix = lc.index()
+            node = ix.get(str(ref))
+            r = images._rect(node.b) if node is not None else None
+            if node is None or r is None or r[2] <= 0 or r[3] <= 0:
+                return None
+            win = images._Win(lc, images._window_of(ix, node))
+            pw, ph, rgba = win.pixels()
+            s, ox, oy = win.scale, win.rect[0], win.rect[1]
+            x0, y0 = max(0, int((r[0] - ox) * s)), max(0, int((r[1] - oy) * s))
+            x1, y1 = min(pw, int((r[0] + r[2] - ox) * s)), min(ph, int((r[1] + r[3] - oy) * s))
+            if x1 <= x0 or y1 <= y0:
+                return None
+            crops.append(((x1 - x0, y1 - y0), images.crop_rgba(pw, rgba, x0, y0, x1, y1)))
+        (sa, a), (sb, b) = crops
+        if sa != sb:
+            return None
+        n = len(a) // 4
+        diff = sum(1 for i in range(0, len(a), 4) if a[i:i + 3] != b[i:i + 3])
+        return n > 0 and diff / n > threshold
+    except Exception:  # noqa: BLE001 - a hint only: no screenshot, an old capture
+        return None
 
 
 # --------------------------------------------------------------------------- #

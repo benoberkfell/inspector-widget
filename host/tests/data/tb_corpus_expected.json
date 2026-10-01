@@ -362,7 +362,13 @@
     "ended": "wrap"
    },
    "model_mismatch": null,
-   "calibration": false
+   "calibration": false,
+   "expected_speech": [
+    "Water plants",
+    "Call Ada",
+    "Pay rent"
+   ],
+   "note": "Each row is one stop, its merged Card, and carries the Delete custom action that TalkBack's actions menu offers (tb_scenario action='custom:Delete'). Until the L2 fix the action sat on the SwipeToDismissBox, which TalkBack never focuses."
   },
   {
    "scenario": "tb_c12",
