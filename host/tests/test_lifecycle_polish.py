@@ -235,6 +235,32 @@ def test_a_destructive_call_that_was_never_sent_is_retried(mcp, fake_device, war
     assert fake_device.commands().count("hello") == 2  # reconnected (warm) for the retry
 
 
+def test_capture_slots_enable_is_not_rerun_after_a_later_request_fails(
+        mcp, fake_device, warm_agent, monkeypatch):
+    """capture(slots="enable") sends DumpCompose(enable_inspection) first; when
+    a LATER request of the same capture fails to send, the hot reload already
+    ran, so the capture must not run again (two hot reloads)."""
+    real_write = clientmod.framing.write_message
+    state = {"enabled": False, "failed": 0}
+
+    def write(sock, payload):
+        req = pb.Request.FromString(payload)
+        command = req.WhichOneof("command")
+        if command == "dump_compose" and req.dump_compose.enable_inspection:
+            state["enabled"] = True
+        elif state["enabled"] and command == "get_windows" and not state["failed"]:
+            state["failed"] += 1
+            raise BrokenPipeError("broken pipe")
+        return real_write(sock, payload)
+
+    monkeypatch.setattr(clientmod.framing, "write_message", write)
+    res = mcp("capture", slots="enable")
+    reloads = [r.enable_inspection for r in fake_device.requests("dump_compose")]
+    assert state["failed"] == 1, (state, fake_device.commands())
+    assert reloads.count(True) == 1, reloads
+    assert "error" in res
+
+
 def test_retry_policy_table():
     call = mcp_server._CallState()
     lost, not_sent = SessionLostError("lost"), NotSentError("not sent")
@@ -248,7 +274,9 @@ def test_retry_policy_table():
     # capture reads the app, unless slots="enable" hot-reloads it first
     assert refusal("capture", {}, lost, call) is None
     assert refusal("capture", {"slots": "enable"}, lost, call) is not None
-    assert refusal("capture", {"slots": "enable"}, not_sent, call) is None
+    # its hot reload is one of several requests: a later one's NotSentError
+    # does not prove the reload was never delivered
+    assert refusal("capture", {"slots": "enable"}, not_sent, call) is not None
     # Every tool is classified: read-only, or one that is not simply repeated.
     unlisted = set(mcp_server.TOOLS) - mcp_server._READ_ONLY_TOOLS - mcp_server._NO_RETRY
     assert unlisted == {"dump_compose", "capture"}

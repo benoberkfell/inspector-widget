@@ -1707,7 +1707,9 @@ def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
     Never while the server shuts down, never for the _NO_RETRY tools, never once a
     detach stopped the agent the call used (the retry would re-inject it); and
     a call that changes the app (dump_compose with enable_inspection) only when
-    the request provably never reached the agent (NotSentError).
+    the request provably never reached the agent (NotSentError). Never
+    capture(slots="enable"): its hot reload is one of several requests, so a
+    later request's NotSentError says nothing about the reload already sent.
     """
     if _closing.is_set():
         return "the server is shutting down"
@@ -1715,7 +1717,15 @@ def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
         return "this tool is never retried"
     if SESSIONS.stopped_during(call):
         return "the app was detached while this call ran"
-    if _read_only(name, args) or isinstance(exc, _not_sent_error()):
+    if _read_only(name, args):
+        return None
+    if name == "capture":
+        # capture sends several requests, the hot reload first: a NotSentError
+        # proves only that the failing (later) request never left, not that
+        # the delivered DumpCompose(enable_inspection) did not run.
+        return ("capture(slots=\"enable\") hot-reloads the app before it reads it; "
+                "never run twice")
+    if isinstance(exc, _not_sent_error()):
         return None
     return "the request may have reached the agent, and running it twice is not harmless"
 
