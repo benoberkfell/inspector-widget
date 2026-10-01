@@ -47,3 +47,32 @@ timings), `talkback17_occlusion_walks.json.gz` (the occlusion-model round's live
 emulator-5554, each with a `note`) and `windows_nia_*.txt` (the window manager's list, trimmed,
 with Now in Android under the 16 KB compatibility dialog and the notification permission
 request, and in split screen beside a focused Settings, which covers none of it).
+
+## TalkBack-first relaunch evidence (emulator-5558, walk-fidelity)
+
+`talkback17_relaunch_walks.json.gz` holds AntennaPod walks taken in both TalkBack start orders
+with `relaunch` (G1), so the trap the model predicts (`talkback/order.py Navigator.traps`,
+pinned by `test_the_antennapod_player_trap_is_named_and_explained` from an emulator-5554 walk)
+can be re-judged. Same emulator and TalkBack as the hunt; host at the walk-fidelity branch.
+Each entry has the hunt entries' fields (`source`, `walk`, `talkback_started`, `density`,
+`start`, `steps` as `[moved, key, label, said]`, `note`) plus `ended`, `injector_proven` and the
+walk's finding codes (`findings`, with an `unverified` basis when the walk marked one). The
+dump the walk started from (`a11y_to_dict`, `windows` and `diagnostics` only, taken with
+TalkBack on) is inline as `dump` for the first walk of each group. Every run restarted the
+app, so the others have node keys of their own process and no dump: `same_screen_as` names
+the walk whose dump shows their screen; compare their labels and speech, not their keys.
+
+- `antennapod_player_expanded_tb_first_1..3`: `tb_scenario(relaunch=true,
+  target="#fragmentLayout", action="activate", leave_on=true)` opened the expanded player with
+  TalkBack running, then `tb_walk(start="#add_to_favorites_item", max_steps=12, until="steps")`.
+- `antennapod_player_expanded_tb_later_1..3`: the app started and the mini player tapped with
+  TalkBack off; the walk turned TalkBack on.
+- In all 6, after "swipe up to read shownotes. Shownotes" TalkBack goes on into the show notes
+  WebView ("Webview", then the notes and "Bullet. 1 of 19. In list. 19 items"). The
+  emulator-5554 trap did not happen in either start order.
+- `antennapod_episode_details_relaunch_tb_first_1..2`: AP-4 TalkBack first (opened with
+  `tb_scenario(relaunch=true, target=CardView"TWiT 1103…")`): the "Page. …" stop, then into the
+  show notes after "Download" (wzi9apx's shape).
+- `antennapod_episode_details_relaunch_tb_later_1..3`: AP-4 TalkBack after the app: no "Page"
+  stop; stuck after "Download" in 1 of 3 (`wznjfok`, its tb.edge_stuck now info with basis
+  `unverified: after_app`), into the WebView in the other 2.

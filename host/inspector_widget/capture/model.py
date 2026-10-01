@@ -79,6 +79,8 @@ ERROR_CODES: dict[str, str] = {
     "restore_failed": "The accessibility settings were not restored; run talkback(action=\"restore\").",
     "busy": "Another TalkBack walk or scenario holds this device; wait for it.",
     "app_left_foreground": "The app is not in the foreground; open it and retry.",
+    "launch_failed": "The app could not be started from its launcher; open it by hand and "
+                     "run without relaunch.",
     "injector_failed": "No key injector reached TalkBack (candidates: what was tried).",
     "keymap_unknown": "TalkBack did not react to its keyboard shortcuts.",
     "focus_unreadable": "The agent could not read accessibility focus.",

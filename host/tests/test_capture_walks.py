@@ -407,12 +407,18 @@ def test_a_cut_walk_names_no_tool_the_caller_does_not_list():
     rec = _record(n_steps=40, ref_keys={f"n{3 + i}": f"view:{1000 + i}" for i in range(40)})
     out = W.walk_result(rec, max_lines=5, listed=TALKBACK_ONLY)
     cut = next(ln for ln in out["lines"] if "omitted" in ln)
-    assert cut == "… 35 steps omitted: raise max_lines / max_bytes …"
+    # the TalkBack tools page a stored walk themselves (tb_walk(show=...), no device)
+    assert cut == '… 35 steps omitted: tb_walk(show="w3f9ak1",steps="2-36") …'
     assert _named_tools(out) <= TALKBACK_ONLY, _named_tools(out)
     assert "keys" not in out  # no inspect_node to take them
-    # every tool listed: the stored walk holds every line
+    # every tool listed: the same page of the stored walk
     full = W.walk_result(rec, max_lines=5)
-    assert any('captures(action="show",id="w3f9ak1")' in ln for ln in full["lines"])
+    assert any('tb_walk(show="w3f9ak1",steps="2-36")' in ln for ln in full["lines"])
+    # a listing without tb_walk shows the stored walk whole, else says what to raise
+    caps = W.walk_result(rec, max_lines=5, listed={"captures", "node"})
+    assert any('captures(action="show",id="w3f9ak1")' in ln for ln in caps["lines"])
+    bare = W.walk_result(rec, max_lines=5, listed={"talkback"})
+    assert any("raise max_lines / max_bytes" in ln for ln in bare["lines"])
     # the stored walk's own result hints only listed tools too
     shown = W.stored_result(dict(rec, findings=[
         {"code": "tb.double_stop", "sev": "warn", "refs": ["n5", "n6"], "steps": [2, 3],
@@ -443,3 +449,126 @@ def test_the_escape_hint_inspects_the_overlay_and_scrolled_refs_get_keys():
     listed = TALKBACK_ONLY | {"inspect_node"}
     out = W.walk_result(dict(rec, ref_keys=keys), listed=listed)
     assert out["next"][0] == 'inspect_node(node_key="compose:7:88")'
+
+
+# --------------------------------------------------------------------------- #
+# G2 / G3: lines that keep TalkBack's tail, results that keep every finding code,
+# and a stored walk paged by step range
+# --------------------------------------------------------------------------- #
+TB1 = ("Localpart of email address exceeds 64 characters. 6/15/2023. aaaaaaaaaabbbbbbbbbb"
+       "cccccccccc@example.com. You should still be able to read this message.. 2 of 6. "
+       "In list. 6 items")
+
+
+def test_step_lines_keep_the_head_and_the_tail():
+    """TB-1: the position and the count are the last words; a head-only cut lost them."""
+    line = W.step_line(_step(5, "n2202", TB1))
+    assert line.endswith('… 2 of 6. In list. 6 items"'), line
+    assert line.startswith('5. n2202 "Localpart of')
+    assert len(W.cut_speech(TB1, 48)) == 48
+    # the budget shortens the head first, then the tail from its front
+    assert W.cut_speech(TB1, 32) == "Localp… 2 of 6. In list. 6 items"
+    # shorter still, the position stays (tb.wrong_announcement is about it), then the count
+    assert W.cut_speech(TB1, 24) == "Localpa… 2 of 6… 6 items"
+    assert W.cut_speech("Localpart of email address, Edit box. Double tap to edit. 2 of 6. "
+                        "In list. 6 items", 24) == "Localpa… 2 of 6… 6 items"
+    assert W.cut_speech("Bullet. 1 of 19. In list. 19 items", 24) == "Bullet… 1 of 19"
+    assert W.cut_speech("Bullet. 1 of 19. In list. 19 items", 32) == "Bullet… 1 of 19… 19 items"
+    # no position: the last words still show ([conversation_counter], a state ...)
+    cut = W.cut_speech("Re: Thread. 2/10/2023. bob@example.com. [conversation_counter]. "
+                       "Thread start message here", 48)
+    assert cut.startswith("Re: Thread.") and cut.endswith("start message here")
+    assert W.step_line(_step(5, "n9", TB1), None).endswith('In list. 6 items"')
+    assert W.cut_speech("Compose. Button. Out of list", 48) == "Compose. Button. Out of list"
+
+
+def _nia1_record():
+    """Hunt wyymb0o's shape (NIA-1): five double stops, then tb.skipped (the real
+    high-severity bug) and the model's disagreement, on a 45-step walk."""
+    steps = [_step(0, "n3", "Not selected. Compose", via="start")]
+    steps += [_step(i, f"n{3 + i}", f"Not selected. Topic number {i}. Check box")
+              for i in range(1, 46)]
+    findings = [{"code": "tb.double_stop", "sev": "warn", "refs": [f"n{3 + i}", f"n{4 + i}"],
+                 "basis": "walk", "steps": [i, i + 1], "keys": [],
+                 "msg": f"steps {i}-{i + 1}: n{3 + i} 'Not selected. Topic number {i}' and "
+                        f"n{4 + i} 'Topic {i}. Check box' inside it are both clickable stops: one "
+                        f"item takes two swipes, and activating the outer one may not do what "
+                        f"the inner control does",
+                 "fix": FIX} for i in (1, 4, 7, 10, 13)]
+    findings.append({"code": "tb.skipped", "sev": "warn", "refs": ["n70", "n71", "n72"],
+                     "basis": "walk", "steps": [],
+                     "msg": "TalkBack never reached 6 predicted stop(s) in the walked span: "
+                            "'Performance', 'New APIs & Libraries', 'Kotlin', 'Privacy & "
+                            "Security', 'Platform & Releases', 'Accessibility'",
+                     "fix": "Make the content visible to TalkBack " * 4})
+    findings.append({"code": "model.mismatch", "sev": "info", "refs": ["n20"], "basis": "model",
+                     "steps": [17], "msg": "step 17: the model predicted n20 'Testing', TalkBack "
+                                           "went to n21 'Data Storage' after auto-scrolling"})
+    for i in (30, 31, 32, 33):
+        findings.append({"code": "tb.ghost_stop", "sev": "warn", "refs": [f"n{3 + i}"],
+                         "basis": "walk", "steps": [i],
+                         "msg": f"step {i}: n{3 + i} is a stop but is offscreen (0x0px)",
+                         "fix": FIX})
+    return _record(n_steps=46, findings=findings, steps=steps,
+                   vs_model={"agree": 16, "differ": 29, "first": "step 17: model n20, actual n21"},
+                   notes=["rows were bound before TalkBack started: positions and page stops "
+                          "differ for a real user; rerun with relaunch=true"])
+
+
+def test_no_distinct_finding_code_is_dropped_for_repeats():
+    rec = _nia1_record()
+    codes = {f["code"] for f in rec["findings"]}
+    for budget in (5000, 3000, 2000):
+        res = W.walk_result(rec, max_bytes=budget)
+        assert _size(res) <= budget, (budget, _size(res))
+        assert {f["code"] for f in res["findings"]} == codes, budget
+        assert "findings_omitted" not in res
+    small = W.walk_result(rec, max_bytes=2000)
+    double = next(f for f in small["findings"] if f["code"] == "tb.double_stop")
+    assert double["n"] == 5 and double["steps"] == "1-2,4-5,7-8,10-11,13-14"
+    assert small["diff"]["model"].startswith("16 agree, 29 differ")
+    # every step a finding marks, among the lines shown, carries its marker
+    for ln in small["lines"]:
+        m = re.match(r"^(\d+)\. ", ln)
+        if m and int(m.group(1)) in (1, 2, 4, 5, 7, 8, 30, 31):
+            assert "!" in ln, ln
+
+
+def test_a_collapsed_finding_lists_its_steps_once():
+    msg = ("6 double stops, the same pattern; first: steps 5-6: n2202 'Localpart' and n2203 "
+           "'SE' inside it are both clickable stops; also steps 8-9, steps 11-12")
+    rec = _record(findings=[{"code": "tb.double_stop", "sev": "warn", "count": 6,
+                             "refs": ["n2202"], "steps": [5, 6, 8, 9, 11, 12], "msg": msg}])
+    f = W.walk_result(rec)["findings"][0]
+    assert f["n"] == 6 and f["steps"] == "5-6,8-9,11-12"
+    assert f["msg"].startswith("steps 5-6: n2202") and "also" not in f["msg"]
+
+
+def test_a_stored_walk_is_paged_by_step_range_with_every_word():
+    rec = _record(n_steps=43)
+    for s in rec["steps"]:
+        s["speak"] = TB1
+    rec["findings"] = [{"code": "tb.wrong_announcement", "sev": "warn", "refs": ["n13"],
+                        "steps": [10], "msg": "announced 2 of 6", "basis": "walk"},
+                       {"code": "tb.ghost_stop", "sev": "warn", "refs": ["n33"], "steps": [30],
+                        "msg": "offscreen", "basis": "walk"}]
+    page = W.stored_result(rec, 4000, page={"steps": "8-16", "speech": "full"})
+    assert [ln.split(".", 1)[0] for ln in page["lines"]] == [str(i) for i in range(8, 17)]
+    assert all(ln.endswith(TB1 + '"') or "!" in ln for ln in page["lines"])
+    assert '10. n13 "' + TB1 + '" !wrong_announcement' in page["lines"]
+    assert page["shown"] == "steps 8-16"
+    assert [f["code"] for f in page["findings"]] == ["tb.wrong_announcement"]
+    assert page["findings_elsewhere"] == 1
+    assert _size(page) <= 4000
+    every = W.stored_result(rec, 4000, page={"steps": "8-16", "findings": "all"})
+    assert {f["code"] for f in every["findings"]} == {"tb.wrong_announcement", "tb.ghost_stop"}
+    assert every["findings"][0]["steps"] == "10"
+    # a page too big for its bytes says where the rest is
+    tight = W.stored_result(rec, 1500, page={"steps": "8-42", "speech": "full"})
+    assert _size(tight) <= 1500
+    assert tight["lines"][-1].startswith("… steps ") and 'tb_walk(show="w3f9ak1",steps="' \
+        in tight["lines"][-1]
+    with pytest.raises(OpError):
+        W.walk_result(rec, steps="8..16")
+    with pytest.raises(OpError):
+        W.walk_result(rec, speech="loud")

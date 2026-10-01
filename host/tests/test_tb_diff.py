@@ -176,6 +176,32 @@ def test_skipped_only_between_reached_stops_without_a_full_lap():
     assert skipped["refs"] == [items[1][0]] and "between the stops" in skipped["msg"]
 
 
+def test_a_wrap_that_never_got_back_to_the_start_is_no_full_lap():
+    """Walk wgrxxsk (emulator-5558, Thunderbird's thread list): started mid-screen, met the
+    edge, wrapped onto the toolbar and ran out of steps two stops later. tb.skipped said
+    "never reached 2 predicted stop(s) in a full lap" of the next two toolbar stops, which
+    the walk never got to."""
+    bar = [(f"view:{10 + i}", (i * 200, 0, 180, 120), lab)
+           for i, lab in enumerate(["Navigate up", "Thread", "Search", "Sort by", "More"])]
+    rows = _column(3, x=0)
+    steps = [step(0, rows[0][0], rows[0][1], rows[0][2], via="start")]
+    steps += [step(1 + i, k, b, lab) for i, (k, b, lab) in enumerate(rows[1:])]
+    steps.append(edge(3, rows[-1][0]))
+    steps += [step(4 + i, k, b, lab, via="wrap" if i == 0 else "next")
+              for i, (k, b, lab) in enumerate(bar[:3])]
+    predicted = [pstop(*it) for it in bar + rows]
+    res = diff.analyze(record(steps, predicted, ended="max_steps"))
+    assert "tb.skipped" not in codes(res), res["findings"]
+    assert not diff._lap_complete(record(steps, predicted, ended="max_steps"))
+    # once the walk is back on a stop it read before the edge, the lap is whole: the
+    # stops it never reached are skipped
+    steps.append(step(7, rows[0][0], rows[0][1], rows[0][2]))
+    rec = record(steps, predicted, ended="max_steps")
+    assert diff._lap_complete(rec)
+    skipped = next(f for f in diff.analyze(rec)["findings"] if f["code"] == "tb.skipped")
+    assert skipped["refs"] == ["view:13", "view:14"] and "in a full lap" in skipped["msg"]
+
+
 def test_loop_and_stuck_and_edge_that_can_scroll():
     a, b, c = _column(3)
     steps = [step(0, a[0], a[1], a[2], via="start"), step(1, b[0], b[1], b[2]),

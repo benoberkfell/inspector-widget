@@ -1555,10 +1555,9 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack status / on / off / restore",
                             idempotentHint=True),
         "description": (
-            _DEVICE_WIDE + "status (read-only): installed/enabled, touch exploration, services, "
-            "a pending restore, injectors. on: add TalkBack to the enabled services and wait for "
-            "touch exploration (stays on until off/restore/exit). off: TalkBack off. restore: "
-            "write the snapshot back and verify."
+            _DEVICE_WIDE + "status (read-only): enabled, services, a pending restore, "
+            "injectors. on: TalkBack on, log level VERBOSE (walks read its words; stays on "
+            "until off/restore/exit). off: TalkBack off. restore: write the snapshot back."
         ),
         "schema": {
             "type": "object",
@@ -1566,9 +1565,8 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "action": {"type": "string", "enum": ["status", "on", "off", "restore"]},
                 "package": dict(_PACKAGE, description="on: the app to keep in the foreground."),
-                "verbose_log": {"type": "boolean", "default": False,
-                                "description": "on: TalkBack log level VERBOSE first (walks read "
-                                               "exact announcements); restore resets it."},
+                "verbose_log": {"type": "boolean", "default": True,
+                                "description": "on: log level VERBOSE first; restore resets it."},
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -1578,12 +1576,12 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
         "handler": _tb_unavailable,
         "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus"),
         "description": (
-            _DEVICE_WIDE + "Presses REAL TalkBack's next/previous (uinput keyboard, touch "
-            "fallback), records where focus lands and diffs that order with the model's and a "
-            "visual order. Returns one line per step (a ref; keys maps refs to node keys for "
-            "inspect_node), how it ended (wrap, edge, loop, stuck, left_app, max_steps), the "
-            "diff with the model and tb.* findings with fixes; the full walk is saved. "
-            "~0.1-0.4s per step."
+            _DEVICE_WIDE + "Presses REAL TalkBack's next/previous, records where focus lands "
+            "and what TalkBack says, and diffs that order with the model's. Returns a line per "
+            "step (a ref; keys maps refs to node keys for inspect_node), how it ended, "
+            "talkback_started, the diff and tb.* findings with fixes; the walk is saved. "
+            "relaunch=true: TalkBack first, app restarted, as its users have it. "
+            "show=<walk id>: page a saved walk, no device."
         ),
         "schema": {
             "type": "object",
@@ -1591,36 +1589,33 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "start": {"type": "string", "default": "current",
-                          "description": "current, first, or a node key / label to walk to first."},
+                          "description": "current, first, or a node key / label."},
                 "direction": {"type": "string", "enum": ["next", "prev"], "default": "next"},
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 300, "default": 60},
                 "until": {"type": "string", "enum": ["wrap", "edge", "loop", "steps"],
                           "default": "wrap",
-                          "description": "wrap: one lap; edge: first edge; loop: until a move "
-                                         "repeats; steps: exactly max_steps."},
+                          "description": "wrap: one lap; steps: exactly max_steps."},
                 "expect": {"type": "array", "items": {"type": "string"},
-                           "description": "Expected order (labels or node keys); mismatches "
-                                          "become findings."},
+                           "description": "Expected order (labels or node keys)."},
                 "step_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 10000,
-                                    "default": 1500,
-                                    "description": "A press that moves no focus by then is an edge."},
-                "settle_ms": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 120,
-                              "description": "Focus must stay put this long to count."},
+                                    "default": 1500},
+                "settle_ms": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 120},
                 "recapture": {"type": "string", "enum": ["on_unknown", "never"],
-                              "default": "on_unknown",
-                              "description": "Re-model when focus reaches an unseen (scrolled-in) "
-                                             "node."},
+                              "default": "on_unknown"},
                 "utterance": {"type": "string", "enum": ["auto", "model", "logcat"],
-                              "default": "auto",
-                              "description": "auto: TalkBack's logcat when VERBOSE, else the "
-                                             "model; logcat: set VERBOSE (~5s) first."},
+                              "default": "auto", "description": "model: faster, its words."},
                 "injector": {"type": "string", "enum": ["auto", "uinput", "touch"],
                              "default": "auto"},
-                "leave_on": {"type": "boolean", "default": False,
-                             "description": "Leave TalkBack on (restore it later)."},
+                "leave_on": {"type": "boolean", "default": False},
                 "max_lines": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
                 "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 100000,
                               "default": 5000},
+                "relaunch": {"type": "boolean", "default": False},
+                "show": {"type": "string"},
+                "steps": {"type": "string", "description": "e.g. 17-42"},
+                "speech": {"type": "string", "enum": ["cut", "full"], "default": "cut"},
+                "findings": {"type": "string", "enum": ["compact", "all", "none"],
+                             "default": "compact"},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1633,7 +1628,7 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
             _DEVICE_WIDE + "Where REAL TalkBack focus goes. focus_after: do action, classify "
             "the landing (tb.initial_focus). restore: activate the target, go back, classify "
             "(tb.restore_failed). survive: focus the target, apply mutate, classify over wait_ms "
-            "(tb.focus_reset/lost/drift). The target is reached by pressing next."
+            "(tb.focus_reset/lost/drift). relaunch=true: TalkBack first, app restarted."
         ),
         "schema": {
             "type": "object",
@@ -1642,10 +1637,10 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "kind": {"type": "string", "enum": ["focus_after", "restore", "survive"]},
                 "target": {"type": "string",
-                           "description": "Node key or part of a label; default: current focus."},
+                           "description": "Node key or label; default: current focus."},
                 "action": {"type": "string", "default": "activate",
-                           "description": "activate (TalkBack's click) | back | tap (bypasses "
-                                          "TalkBack) | key:<combo>, e.g. key:META+SPACE"},
+                           "description": "activate | back | tap (bypasses TalkBack) | "
+                                          "key:<combo>, e.g. key:META+SPACE"},
                 "mutate": {"type": "string",
                            "description": "survive: tap:<selector> | activate | key:<combo> | "
                                           "broadcast:<args> | probe:<action>."},
@@ -1656,6 +1651,7 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
                 "step_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 10000,
                                     "default": 1500},
                 "settle_ms": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 120},
+                "relaunch": {"type": "boolean", "default": False},
             },
             "required": ["package", "kind"],
             "additionalProperties": False,

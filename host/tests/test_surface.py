@@ -237,14 +237,21 @@ def _listing(monkeypatch, toolset: str | None) -> dict:
 
 def test_the_default_listing_is_unchanged(monkeypatch):
     """Until the flip (S4) the server lists what it listed before the capture tools:
-    the 15 legacy and 3 TalkBack tools (18,479 B compact), byte for byte but two
+    the 15 legacy and 3 TalkBack tools (18,288 B compact), byte for byte but the
     descriptions: a11y_lint's says where the findings under an open dialog go, tb_walk's
-    what its result now holds (refs, keys, the diff). 18,337 B before both."""
+    what its result now holds (refs, keys, the diff). 18,337 B before both, 18,479 B
+    after them.
+
+    walk-fidelity (-191 B, 18,479 -> 18,288): tb_walk gains relaunch, show, steps, speech
+    and findings, tb_scenario relaunch, talkback's verbose_log defaults to true; to stay
+    under test_phase0_budget's 18,500 B the three TalkBack entries' texts were tightened
+    (descriptions and the parameter notes that only repeated a name), so the entries went
+    from 1,079 / 2,438 / 1,639 B to 981 / 2,322 / 1,662 B."""
     listing = _listing(monkeypatch, None)
     names = [t["name"] for t in listing["tools"]]
     assert names == [n for n in mcp_server.TOOLS if n not in surface.CAPTURE_TOOLS]
     assert set(names) == set(surface.LEGACY_TOOLS) | set(surface.TALKBACK_TOOLS)
-    assert _size(listing) == 18_479
+    assert _size(listing) == 18_288
 
 
 #: tools/list budgets, compact bytes: the default stays at most 20,000 (it is the
@@ -255,7 +262,7 @@ LISTING_AVG_MAX = 1300
 
 @pytest.mark.parametrize("toolset,count,limit", [
     (None, 18, 20_000), ("legacy,talkback", 18, 20_000), ("legacy", 15, 18_500),
-    ("capture", 12, 12_000), ("talkback", 7, 7 * LISTING_AVG_MAX),
+    ("capture", 12, 12_000), ("talkback", 7, 9_100),
     ("capture,talkback", 15, 15 * LISTING_AVG_MAX), ("all", 26, 32_000)])
 def test_toolset_listings(monkeypatch, toolset, count, limit):
     listing = _listing(monkeypatch, toolset)
@@ -268,6 +275,12 @@ def test_toolset_listings(monkeypatch, toolset, count, limit):
         if t["name"] in surface.CAPTURE_TOOLS:
             ro = t["annotations"]["readOnlyHint"]
             assert ro is surface.spec(t["name"]).read_only
+
+
+def test_the_capture_listing_keeps_its_bytes(monkeypatch):
+    """The capture toolset has about 6 B left under its 12,000 B: TalkBack paging went to
+    tb_walk(show=...) so that captures keeps its schema (11,994 B)."""
+    assert _size(_listing(monkeypatch, "capture")) == 11_994
 
 
 def test_the_capture_toolset_is_the_session_tools_plus_the_eight():

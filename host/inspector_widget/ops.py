@@ -142,6 +142,16 @@ class AttachProvider:
             session = self._sessions.get((serial, package))
         return getattr(session, "pid", None) if session is not None else None
 
+    def forget(self, serial: str, package: str) -> None:
+        """Drop the cached session of an app whose process was replaced (a TalkBack
+        relaunch), so the next get() attaches to the new one."""
+        with self._lock:
+            session = self._sessions.pop((serial, package), None)
+        close = getattr(session, "close", None) or getattr(session, "disconnect", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+
     def close_all(self) -> None:
         with self._lock:
             sessions = list(self._sessions.values())
@@ -1464,6 +1474,8 @@ TB_RECAPTURE = ("on_unknown", "never")
 TB_UTTERANCE = ("auto", "model", "logcat")
 TB_INJECTORS = ("auto", "uinput", "touch")
 TB_KINDS = ("focus_after", "restore", "survive")
+TB_SPEECH = walks.SPEECH
+TB_FINDINGS = walks.FINDINGS
 TB_MAX_STEPS = 60
 TB_STEP_TIMEOUT_MS = 1500
 TB_SETTLE_MS = 120
@@ -1478,7 +1490,7 @@ TB_CAPTURE = CaptureOptions(props=False)
 
 def _tb_error(exc: BaseException) -> OpError | None:
     """A TalkBack failure as an envelope code: busy, talkback_unavailable,
-    enable_failed, restore_failed, app_left_foreground, injector_failed (the
+    enable_failed, restore_failed, app_left_foreground, launch_failed, injector_failed (the
     injectors tried are the candidates), keymap_unknown, start_not_found ...
     A ValueError from the engine's own argument checks is bad_args."""
     from .talkback import device as tbdevice
@@ -1753,16 +1765,20 @@ def _stop_key(ix: Index, lc: LoadedCapture, node: UNode, stop: bool = True) -> s
 def talkback(ctx: OpContext, action: Any = None, serial: Any = None, package: Any = None,
              verbose_log: Any = None) -> dict[str, Any]:
     """``talkback``: status (read-only) | on | off | restore, DEVICE-WIDE. ``on``
-    snapshots the accessibility settings first; restore writes them back."""
+    snapshots the accessibility settings first; restore writes them back. ``on`` sets
+    TalkBack's log level to VERBOSE first unless ``verbose_log`` is false, so the walks
+    and scenarios chained after it (``leave_on``) read TalkBack's own words; a level that
+    cannot be set fails the call only when ``verbose_log`` was asked for."""
     from .talkback import device as tbdevice
 
     act = _enum("action", action, TALKBACK_ACTIONS, "status")
-    verbose = _bool("verbose_log", verbose_log, False)
+    verbose = _bool("verbose_log", verbose_log, True)
     s, _p = _tb_device(ctx, serial, package)
     # "on" keeps in front only an app the caller named (the default session's app may
     # be in the background by now: that is no reason to refuse)
     keep = _explicit(package) if act == "on" else None
-    out = dict(_tb_call(lambda: tbdevice.action(s, act, package=keep, verbose_log=verbose)))
+    out = dict(_tb_call(lambda: tbdevice.action(s, act, package=keep, verbose_log=verbose,
+                                                verbose_required=verbose_log is True)))
     if _explicit(serial) is None:
         out["serial"] = s  # device-wide: say which device it was
     hints = []
@@ -1780,10 +1796,30 @@ def tb_walk(ctx: OpContext, serial: Any = None, package: Any = None, start: Any 
             direction: Any = None, max_steps: Any = None, until: Any = None, expect: Any = None,
             step_timeout_ms: Any = None, settle_ms: Any = None, recapture: Any = None,
             utterance: Any = None, injector: Any = None, leave_on: Any = None,
-            max_lines: Any = None, max_bytes: Any = None) -> dict[str, Any]:
+            max_lines: Any = None, max_bytes: Any = None, relaunch: Any = None,
+            show: Any = None, steps: Any = None, speech: Any = None,
+            findings: Any = None) -> dict[str, Any]:
     """``tb_walk``: walk the real TalkBack through the app (DEVICE-WIDE: turned on,
     then restored), record each stop as a capture ref, diff actual vs predicted vs
-    visual, store ``<store>/walks/<id>.json``; at most ``max_bytes`` (5 KB)."""
+    visual, store ``<store>/walks/<id>.json``; at most ``max_bytes`` (5 KB).
+
+    ``relaunch``: TalkBack first (as its users have it): turn it on, restart the app
+    from its launcher, then walk. ``show`` (a walk id or ``latest``): page a stored walk
+    instead, with no device I/O; ``steps`` (``"17-42"``), ``speech`` (cut | full) and
+    ``findings`` (compact | all | none) shape the lines and findings of either."""
+    page = {"steps": _explicit(steps),
+            "speech": _enum("speech", speech, TB_SPEECH, "cut"),
+            "findings": _enum("findings", findings, TB_FINDINGS, "compact")}
+    walks.parse_steps(page["steps"])  # bad_args before anything runs
+    n_lines = _int("max_lines", max_lines, walks.WALK_MAX_LINES, 5, 300)
+    budget = _int("max_bytes", max_bytes, TB_WALK_MAX_BYTES, -(1 << 30), TB_WALK_HARD_MAX)
+    budget = query.MAX_BYTES_CEILING if budget <= 0 else max(1000, budget)
+    do_relaunch = _bool("relaunch", relaunch, False)
+    if _explicit(show) is not None:
+        if do_relaunch:
+            raise _bad("show pages a stored walk (no device); relaunch runs a new one",
+                       hint='tb_walk(show="w3f9ak1",steps="17-42") or tb_walk(relaunch=true)')
+        return _tb_show(ctx, _explicit(show), serial, package, budget, page)
     opts = {
         "start": _explicit(start) or "current",
         "direction": _enum("direction", direction, TB_DIRECTIONS, "next"),
@@ -1796,14 +1832,16 @@ def tb_walk(ctx: OpContext, serial: Any = None, package: Any = None, start: Any 
         "utterance": _enum("utterance", utterance, TB_UTTERANCE, "auto"),
         "injector": _enum("injector", injector, TB_INJECTORS, "auto"),
         "leave_on": _bool("leave_on", leave_on, False),
+        "relaunch": do_relaunch,
     }
     if expect is not None and (not isinstance(expect, list)
                                or not all(isinstance(e, str) for e in expect)):
         raise _bad("expect must be a list of refs, selectors or labels")
-    n_lines = _int("max_lines", max_lines, walks.WALK_MAX_LINES, 5, 300)
-    budget = _int("max_bytes", max_bytes, TB_WALK_MAX_BYTES, -(1 << 30), TB_WALK_HARD_MAX)
-    budget = query.MAX_BYTES_CEILING if budget <= 0 else max(1000, budget)
-    lineage, session, note = _tb_session(ctx, serial, package)
+    if do_relaunch:
+        lineage, note = _tb_relaunch_target(ctx, serial, package)
+        session: Any = _Relaunching(*lineage)
+    else:
+        lineage, session, note = _tb_session(ctx, serial, package)
     _tb_check_refs(ctx, lineage, opts["start"], expect)
     budget -= _tb_mark_bytes(lineage, note)
     hook = _TbCaptures(ctx, lineage, session, "tb_walk",
@@ -1811,29 +1849,96 @@ def tb_walk(ctx: OpContext, serial: Any = None, package: Any = None, start: Any 
     if note:
         hook.notes.append(note)
     try:
-        out = _tb_walk_record(ctx, hook, session, opts, expect, n_lines, budget)
+        out = _tb_relaunched_refs(do_relaunch, lambda: _tb_walk_record(
+            ctx, hook, session, opts, expect, n_lines, budget, page))
     finally:
         hook.release()
     return _tb_session_mark(out, lineage, note)
 
 
+def _tb_relaunched_refs(relaunched: bool, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """A ref that no longer resolves after a relaunch (a new process: list items get new
+    node identities) says so, and what to pass instead."""
+    try:
+        return fn()
+    except OpError as exc:
+        if not relaunched or exc.code != "ref_not_in_capture":
+            raise
+        raise OpError(exc.code, f"{exc} (the relaunch restarted the app)",
+                      hint="Refs from before a relaunch may name no node of the new process: "
+                           "pass a selector (#rid, @tag, Type\"label…\") or the label as "
+                           "spoken.") from None
+
+
+def _tb_show(ctx: OpContext, spec: str, serial: Any, package: Any, budget: int,
+             page: dict[str, Any]) -> dict[str, Any]:
+    """tb_walk(show=...): a stored walk (or scenario) paged, without the device."""
+    store = ctx.store
+    if spec == "latest":
+        wid = walks.resolve(store, None, query_lineage(ctx, serial, package), kind="w")
+    else:
+        wid = walks.resolve(store, spec, kind=None)
+    return walks.stored_result(walks.load(store, wid), budget, listed=ctx.listed, page=page)
+
+
+class _Relaunching:
+    """The app a relaunch starts (serial and package) until it runs: the walk's driver
+    attaches to the new process itself (:func:`_tb_reattach`)."""
+
+    pid = None
+
+    def __init__(self, serial: str, package: str) -> None:
+        self.serial, self.package = serial, package
+
+
+def _tb_relaunch_target(ctx: OpContext, serial: Any, package: Any
+                        ) -> tuple[tuple[str, str], str | None]:
+    """The app a relaunch starts, and the session note (as :func:`_tb_session`, without
+    attaching: the app need not be running)."""
+    if ctx.sessions is None:
+        raise OpError("unsupported", "this surface cannot reach a device")
+    s, p = _explicit(serial), _explicit(package)
+    if s and p:
+        return (s, p), None
+    default = _tb_default(ctx, s, p)
+    return (default if default is not None else _running_app(s, p)), ""
+
+
+def _tb_reattach(ctx: OpContext, hook: _TbCaptures) -> Callable[[str, str], Any]:
+    """The driver's way to the relaunched process: the provider's session, afresh (the
+    MCP server re-attaches a session whose process is gone; the CLI's forgets it), also
+    for the captures the walk takes."""
+    def attach(serial: str, package: str) -> Any:
+        forget = getattr(ctx.sessions, "forget", None)
+        if callable(forget):
+            forget(serial, package)
+        session = ctx.sessions.get(serial, package)
+        hook.session = session
+        return session
+    return attach
+
+
 def _tb_walk_record(ctx: OpContext, hook: _TbCaptures, session: Any, opts: dict[str, Any],
-                    expect: Any, n_lines: int, budget: int) -> dict[str, Any]:
+                    expect: Any, n_lines: int, budget: int,
+                    page: dict[str, Any] | None = None) -> dict[str, Any]:
     from .talkback import walk as tbwalk
 
     record = _tb_call(lambda: tbwalk.run_walk(
         session, start=opts["start"], direction=opts["direction"], max_steps=opts["max_steps"],
         until=opts["until"], expect=None, step_timeout_ms=opts["step_timeout_ms"],
         settle_ms=opts["settle_ms"], recapture=opts["recapture"], utterance=opts["utterance"],
-        injector=opts["injector"], leave_on=opts["leave_on"], save=False, hook=hook, full=True))
+        injector=opts["injector"], leave_on=opts["leave_on"], save=False, hook=hook, full=True,
+        relaunch=opts.get("relaunch", False),
+        attach=_tb_reattach(ctx, hook) if opts.get("relaunch") else None))
     record["id"] = record.get("walk") or tbwalk._walk_id()
     # the engine's own note predates the capture store: say which captures were added
     record["recapture"] = ", ".join(f"step {at}: {lc.id}" for at, lc in hook.taken[1:]) or None
     exp = hook.resolve_expect(list(expect) if expect else None)
     walks.bind_walk(record, hook.binding(), expect=exp)
+    tbwalk.mark_unverified(record)  # the binding re-analysed the walk
     if expect:
         record["expect_given"] = list(expect)
-    record["notes"] = list(record.get("notes") or []) + hook.notes
+    record["notes"] = list(record.get("notes") or []) + _tb_capture_notes(record, hook)
     record.pop("saved", None)
     record.pop("dump", None)
     try:
@@ -1841,16 +1946,44 @@ def _tb_walk_record(ctx: OpContext, hook: _TbCaptures, session: Any, opts: dict[
     except OSError as exc:
         record["notes"].append(f"could not store the walk: {exc}")
         record["id"] = None
-    return walks.walk_result(record, max_lines=n_lines, max_bytes=budget, listed=ctx.listed)
+    return walks.walk_result(record, max_lines=n_lines, max_bytes=budget, listed=ctx.listed,
+                             **(page or {}))
+
+
+def _tb_capture_notes(record: dict[str, Any], hook: _TbCaptures) -> list[str]:
+    """The hook's notes for a walk record: on a walk TalkBack started after the app, the
+    capture's long "rows bound before TalkBack started" diagnostic becomes the short note
+    that names relaunch (once)."""
+    from .talkback import walk as tbwalk
+
+    notes = list(hook.notes)
+    if record.get("talkback_started") != "after_app" or not hook.taken:
+        return notes
+    lc = hook.taken[0][1]
+    try:
+        tbc = _tb_capture(lc.index(), lc)
+        diags = [d for d in (tbc.tree.diagnostics if tbc is not None else [])
+                 if d.get("kind") == "recycler_bound_before_service"]
+    except Exception:  # noqa: BLE001 - the long note stays
+        return notes
+    if not diags:
+        return notes
+    long = {str(d.get("message")) for d in diags}
+    notes = [n for n in notes if n not in long]
+    note = tbwalk.bound_before_note(tbwalk.deep_screen(record))
+    if note not in (record.get("notes") or []):
+        notes.append(note)
+    return notes
 
 
 def tb_scenario(ctx: OpContext, kind: Any = None, serial: Any = None, package: Any = None,
                 target: Any = None, action: Any = None, mutate: Any = None,
                 wait_ms: Any = None, injector: Any = None, leave_on: Any = None,
                 step_timeout_ms: Any = None, settle_ms: Any = None,
-                max_bytes: Any = None) -> dict[str, Any]:
+                max_bytes: Any = None, relaunch: Any = None) -> dict[str, Any]:
     """``tb_scenario``: where the real TalkBack's focus goes (DEVICE-WIDE), recorded
-    against a capture before and one after; at most ``max_bytes`` (1 KB)."""
+    against a capture before and one after; at most ``max_bytes`` (1 KB). ``relaunch``:
+    TalkBack on, then the app restarted from its launcher, as for tb_walk."""
     if kind is None:
         raise _bad("tb_scenario needs kind: focus_after, restore or survive",
                    hint='tb_scenario(kind="survive",target="n47",mutate="tap:n49")')
@@ -1867,16 +2000,24 @@ def tb_scenario(ctx: OpContext, kind: Any = None, serial: Any = None, package: A
         "step_timeout_ms": _int("step_timeout_ms", step_timeout_ms, TB_STEP_TIMEOUT_MS, 100,
                                 10000),
         "settle_ms": _int("settle_ms", settle_ms, TB_SETTLE_MS, 10, 2000),
+        "relaunch": _bool("relaunch", relaunch, False),
     }
     budget = query.resolve_max_bytes(max_bytes, TB_SCENARIO_MAX_BYTES)
-    lineage, session, note = _tb_session(ctx, serial, package)
+    if opts["relaunch"]:
+        lineage, note = _tb_relaunch_target(ctx, serial, package)
+        session: Any = _Relaunching(*lineage)
+    else:
+        lineage, session, note = _tb_session(ctx, serial, package)
     _tb_check_refs(ctx, lineage, opts["target"], opts["action"], opts["mutate"])
     budget -= _tb_mark_bytes(lineage, note)
     hook = _TbCaptures(ctx, lineage, session, "tb_scenario")
     if note:
         hook.notes.append(note)
+    if opts["relaunch"]:
+        opts["attach"] = _tb_reattach(ctx, hook)
     try:
-        out = _tb_scenario_record(ctx, hook, session, k, opts, budget)
+        out = _tb_relaunched_refs(opts["relaunch"], lambda: _tb_scenario_record(
+            ctx, hook, session, k, opts, budget))
     finally:
         hook.release()
     return _tb_session_mark(out, lineage, note)
@@ -1931,7 +2072,7 @@ def _tb_scenario_record(ctx: OpContext, hook: _TbCaptures, session: Any, k: str,
         session, k, target=opts["target"], action=opts["action"], mutate=opts["mutate"],
         wait_ms=opts["wait_ms"], injector=opts["injector"], leave_on=opts["leave_on"],
         step_timeout_ms=opts["step_timeout_ms"], settle_ms=opts["settle_ms"], save=False,
-        hook=hook))
+        hook=hook, relaunch=opts.get("relaunch", False), attach=opts.get("attach")))
     rec = dict(out, id="t" + tbwalk._walk_id()[1:])
     taken = [at for at, _lc in hook.taken]
     before_at = 1 if 1 in taken else 0

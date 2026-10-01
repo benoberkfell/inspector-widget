@@ -75,6 +75,30 @@ Tools (18): `list_devices`, `list_processes`, `attach`, `dump_tree`, `get_proper
 `a11y_overlay`, `inspect`, `inspect_node`, `component_image`, `detach`, and the device-wide
 TalkBack tools `talkback`, `tb_walk`, `tb_scenario`.
 
+TalkBack, the way its users have it (CLI; the MCP tools take the same arguments):
+```bash
+iw() { PYTHONPATH=host host/.venv/bin/python host/cli.py "$@"; }
+# TalkBack on first, the app restarted from its launcher, one lap read with TalkBack's
+# own words; TalkBack and its settings are restored afterwards
+iw tb-walk --serial emulator-5554 --package com.example.app --relaunch --start first
+# page the stored walk: steps 17-42 with every word TalkBack said (no device)
+iw tb-walk --show w3f9ak1 --steps 17-42 --speech full
+# several walks in a row: TalkBack on once (log level VERBOSE), then restore
+iw talkback on --serial emulator-5554
+iw tb-walk --serial emulator-5554 --package com.example.app --leave-on
+iw talkback restore --serial emulator-5554
+# start an app by hand as a launcher does (works for activity-alias launchers too):
+# its launcher component (cmd package query-activities ... LAUNCHER <pkg>), with the
+# launcher intent's action and category
+adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n <pkg>/<launcher activity>
+```
+Every walk says `talkback_started`: `before_app` is what a TalkBack user gets, and so is
+`before_screen` (TalkBack came on after the app started but before the screen walked was
+built: its activity opened later, or its list rows carry their positions). On `after_app`
+(TalkBack turned on over the running app and screen) list positions and page stops can
+differ, and stuck or trapped findings are marked unverified until a `--relaunch` walk
+confirms them.
+
 Compose (CLI):
 ```bash
 PYTHONPATH=host host/.venv/bin/python host/cli.py compose \

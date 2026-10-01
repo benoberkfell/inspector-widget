@@ -40,6 +40,18 @@ from .model import OpError
 WALKS_DIR = "walks"
 #: ``w3f9ak1`` (a walk) or ``t3f9ak1`` (a scenario): a letter and 6 more.
 ID_RE = re.compile(r"^[wt][0-9a-z]{6}$")
+#: What TalkBack appends to a stop's words that a cut line keeps (G2): its position and the
+#: collection it is in or leaves ("2 of 6. In list. 6 items", "Out of list", "Row 2").
+TAIL_RE = re.compile(r"\b\d+ of \d+\b|\b(?:In|Out of) (?:list|grid|table|pager)\b|"
+                     r"\b(?:Row|Column|Page) \d+\b|\b(?:List|Grid) with \d+", re.I)
+#: The shortest head a cut keeps before its tail.
+HEAD_MIN = 6
+#: ``speech``: cut (head and tail, SPEAK_LEN) or full (every word); ``findings``: compact
+#: (repeats of a code merged under byte pressure), all (each one, full text), none.
+SPEECH = ("cut", "full")
+FINDINGS = ("compact", "all", "none")
+#: A step range: "17-42", "8", "3-5,9".
+STEPS_RE = re.compile(r"^\s*\d+\s*(?:-\s*\d+\s*)?(?:,\s*\d+\s*(?:-\s*\d+\s*)?)*$")
 #: Newest records kept; older ones are deleted when a new one is saved.
 KEEP = 100
 KEEP_S = 7 * 86400
@@ -729,20 +741,77 @@ def classify(record: Mapping[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # The tb_walk result
 # --------------------------------------------------------------------------- #
-def _speak(s: Mapping[str, Any], n: int) -> str:
+def cut_speech(text: Any, n: int) -> str:
+    """``text`` in at most ``n`` characters, keeping its head AND its tail (G2): TalkBack
+    puts the position and the collection last ("Localpart of em… 2 of 6. In list. 6
+    items"), and placeholder ids and states sit there too. The tail is what TAIL_RE finds
+    in the last 60 characters, else the last two fifths; the head gives way first. A tail
+    too long for the room keeps its position ("2 of 6", what tb.wrong_announcement is
+    about) and the count after it ("2 of 6… 6 items"), else the position alone."""
+    sp = str(text or "").replace("\n", " ")
+    if len(sp) <= n:
+        return sp
+    if n < HEAD_MIN + 8:
+        return sp[: n - 1] + "…"
+    room = n - 2  # "…" and a space
+    m = TAIL_RE.search(sp, max(0, len(sp) - 60))
+    tail = sp[m.start():].strip() if m is not None else _last_words(sp, max(4, n * 2 // 5))
+    if len(tail) > room - HEAD_MIN:
+        tail = _short_tail(tail, room - HEAD_MIN)
+    head = sp[: min(room - len(tail), m.start() if m is not None else len(sp))].rstrip(" .,")
+    return f"{head}… {tail}"
+
+
+#: TalkBack's position in a collection ("2 of 6") and its count ("6 items").
+POSITION_RE = re.compile(r"\b\d+ of \d+\b")
+COUNT_RE = re.compile(r"\b\d+ items?\b", re.I)
+
+
+def _short_tail(tail: str, k: int) -> str:
+    """A tail in at most ``k`` characters: from its position to the end, else the position
+    and the count ("2 of 6… 6 items"), else the position; with no position, its last
+    words."""
+    p = POSITION_RE.search(tail)
+    if p is None:
+        return _last_words(tail, k)
+    c = COUNT_RE.search(tail, p.end())
+    for cand in (tail[p.start():].strip(), f"{p.group(0)}… {c.group(0)}" if c else None,
+                 p.group(0)):
+        if cand and len(cand) <= k:
+            return cand
+    return _last_words(tail, k)
+
+
+def _last_words(text: str, k: int) -> str:
+    """The end of ``text`` in at most ``k`` characters, from a word's start when one is
+    near (a word cut in two only when no space is)."""
+    if len(text) <= k:
+        return text.strip()
+    cut = len(text) - k
+    if text[cut - 1] != " ":
+        sp_at = text.find(" ", cut)
+        if 0 <= sp_at <= cut + k // 2:
+            cut = sp_at + 1
+    return text[cut:].strip()
+
+
+def _speak(s: Mapping[str, Any], n: int | None) -> str:
     sp = str(s.get("speak") or s.get("label") or "").replace("\n", " ")
-    return sp if len(sp) <= n else sp[: n - 1] + "…"
+    return sp if n is None else cut_speech(sp, n)
 
 
-def step_line(s: Mapping[str, Any], speak_len: int = SPEAK_LEN) -> str:
-    """``3. n14 "Add to favorites, Button" via=autoscroll(n10) !double_stop``."""
+def step_line(s: Mapping[str, Any], speak_len: int | None = SPEAK_LEN) -> str:
+    """``3. n14 "Add to favorites, Button" via=autoscroll(n10) !double_stop``.
+    ``speak_len`` None: the whole utterance."""
     i = s.get("i")
     if s.get("via") == "start" and not s.get("key"):
         return f"{i}. (no accessibility focus)"
     if s.get("edge"):
-        return f"{i}. — edge"
+        return f"{i}. — edge" + (" (keyboard proven)" if s.get("proof") else "")
     if s.get("via") == "left_app":
         return f"{i}. — left the app (top: {s.get('top') or '?'})"
+    if s.get("via") == "ime":
+        return f"{i}. — focus left the app into the keyboard ({s.get('ime_window') or 'IME'})"
     if s.get("via") == "lost":
         return f"{i}. — focus lost" + (f" after {s['scrolled']} scrolled" if s.get("scrolled")
                                        else "")
@@ -771,17 +840,181 @@ def _tags(record: Mapping[str, Any]) -> dict[int, list[str]]:
     return tags
 
 
-def _compact_findings(record: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Findings without keys/steps; a fix is given once per code."""
+def parse_steps(spec: Any) -> list[tuple[int, int]] | None:
+    """A step range (``"17-42"``, ``"8"``, ``"3-5,9"``) as inclusive pairs; None for none."""
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        return None
+    if not isinstance(spec, str) or not STEPS_RE.match(spec):
+        raise OpError("bad_args", f"steps must be a step range like \"17-42\" or \"3-5,9\"; "
+                                  f"got {spec!r}")
     out = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b) if b.strip() else int(a)
+        out.append((min(lo, hi), max(lo, hi)))
+    return out
+
+
+def _in_steps(i: Any, ranges: Sequence[tuple[int, int]] | None) -> bool:
+    return ranges is None or (isinstance(i, int) and any(a <= i <= b for a, b in ranges))
+
+
+def steps_text(steps: Sequence[Any], limit: int = 12) -> str:
+    """``"5-6,8-9,11"``: runs of consecutive step numbers, at most ``limit`` runs."""
+    nums = sorted({int(i) for i in steps if isinstance(i, int)})
+    runs: list[list[int]] = []
+    for i in nums:
+        if runs and i == runs[-1][1] + 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    text = ",".join(f"{a}" if a == b else f"{a}-{b}" for a, b in runs[:limit])
+    return text + (f",+{len(runs) - limit}" if len(runs) > limit else "")
+
+
+_COLLAPSED = re.compile(r"^\d+ [^;]*?, the same pattern; first: (.*?)(?:; also .*)?$", re.S)
+
+
+def _first_msg(f: Mapping[str, Any]) -> str:
+    """A finding's message; a collapsed one's (diff: "6 double stops, the same pattern;
+    first: ...; also steps ...") as its first instance, its steps being listed apart."""
+    msg = str(f.get("msg") or "")
+    if f.get("count"):
+        m = _COLLAPSED.match(msg)
+        if m:
+            return m.group(1)
+    return msg
+
+
+def _finding_docs(record: Mapping[str, Any], mode: str = "compact",
+                  ranges: Sequence[tuple[int, int]] | None = None
+                  ) -> tuple[list[dict[str, Any]], int]:
+    """The findings a walk result lists (``mode`` compact or all) and how many others lie
+    outside ``ranges`` (a page of steps lists only those touching it, unless all). A
+    finding standing for several (``count``) says how many (``n``) and where (``steps``),
+    once; compact gives each fix once per code; all keeps every text and the keys."""
+    out: list[dict[str, Any]] = []
     fixed: set[str] = set()
+    elsewhere = 0
     for f in record.get("findings") or []:
-        d = {k: f[k] for k in ("code", "sev", "refs", "basis", "msg") if f.get(k) not in (None, [])}
-        if f.get("fix") and f["code"] not in fixed:
+        st = [i for i in f.get("steps") or [] if isinstance(i, int)]
+        if mode != "all" and ranges is not None and not any(_in_steps(i, ranges) for i in st):
+            elsewhere += 1
+            continue
+        d = {k: f[k] for k in ("code", "sev", "refs", "basis") if f.get(k) not in (None, [])}
+        if f.get("count"):
+            d["n"] = f["count"]
+        if st and (f.get("count") or mode == "all"):
+            d["steps"] = steps_text(st, 50 if mode == "all" else 12)
+        d["msg"] = _first_msg(f) if mode != "all" else str(f.get("msg") or "")
+        if mode == "all" and f.get("keys"):
+            d["keys"] = list(f["keys"])
+        if f.get("fix") and (mode == "all" or f["code"] not in fixed):
             d["fix"] = f["fix"]
             fixed.add(f["code"])
+        d["_st"] = st  # for merging; dropped from the result
         out.append(d)
+    return out, elsewhere
+
+
+def _merge_repeats(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One entry per code (G3): ``{"code", "n", "steps": "0-1,2-3,...", "refs", "msg": the
+    first one's}``, so no distinct code is dropped for its repeats' bytes."""
+    by_code: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    rank = {"error": 0, "warn": 1, "info": 2}
+    for d in docs:
+        code = str(d.get("code"))
+        if code not in by_code:
+            by_code[code] = dict(d, _steps=list(d.get("_st") or []), _n=d.get("n", 1))
+            order.append(code)
+            continue
+        m = by_code[code]
+        m["_n"] += d.get("n", 1)
+        m["_steps"] += list(d.get("_st") or [])
+        if rank.get(d.get("sev"), 3) < rank.get(m.get("sev"), 3):
+            m["sev"] = d.get("sev")
+        m["refs"] = list(dict.fromkeys((m.get("refs") or []) + (d.get("refs") or [])))[:MAX_REFS]
+        if not m.get("fix") and d.get("fix"):
+            m["fix"] = d["fix"]
+    out = []
+    for code in order:
+        m = by_code[code]
+        n, st = m.pop("_n"), m.pop("_steps")
+        m["_st"] = st
+        if n > 1:
+            m["n"] = n
+            if st:
+                m["steps"] = steps_text(st)
+        out.append(m)
     return out
+
+
+def _cut_text(d: dict[str, Any], key: str, n: int) -> None:
+    v = d.get(key)
+    if isinstance(v, str) and len(v) > n:
+        if n <= 0:
+            d.pop(key)
+        else:
+            d[key] = v[: n - 1] + "…"
+
+
+#: Steps a cut walk keeps before the others: what a finding marks, and where the walk
+#: turned (edges, wraps, focus lost or taken, the keyboard, auto-scroll ...).
+_MARKED_VIA = frozenset({"edge", "wrap", "lost", "left_app", "ime", "stolen", "autoscroll",
+                         "window", "late", "screen", "initial"})
+
+
+def _marked(s: Mapping[str, Any]) -> bool:
+    return bool(s.get("tags")) or bool(s.get("edge")) or s.get("via") in _MARKED_VIA
+
+
+def _pick_lines(steps: Sequence[Mapping[str, Any]], limit: int) -> list[int | tuple[int, int]]:
+    """Which of ``steps`` a cut walk prints (indices) and the runs it leaves out
+    (``(first, last)`` indices), ``limit`` lines in all, a run's marker line included:
+    the start, the end and every marked step first (no step that a finding marks is
+    dropped for a plain one), then plain ones from both ends."""
+    n = len(steps)
+    if n <= limit:
+        return list(range(n))
+    must = sorted({0, n - 1, n - 2} | {j for j, s in enumerate(steps) if _marked(s)})
+    plain = [j for j in range(1, n - 2) if j not in must]
+    order = []  # plain steps by preference: alternately from the start and from the end
+    lo, hi = 0, len(plain) - 1
+    while lo <= hi:
+        order.append(plain[lo])
+        lo += 1
+        if lo <= hi:
+            order.append(plain[hi])
+            hi -= 1
+
+    def layout(keep: set[int]) -> list[int | tuple[int, int]]:
+        out: list[int | tuple[int, int]] = []
+        gap: list[int] = []
+        for j in range(n):
+            if j in keep:
+                if gap:
+                    out.append((gap[0], gap[-1]))
+                    gap = []
+                out.append(j)
+            else:
+                gap.append(j)
+        if gap:
+            out.append((gap[0], gap[-1]))
+        return out
+
+    if len(must) + 1 > limit:  # marked steps alone overflow: their first and last halves
+        k = max(1, limit - 1)
+        keep = set(must[: k // 2] + must[len(must) - (k - k // 2):])
+    else:
+        keep = set(must)
+        for j in order:
+            if len(layout(keep | {j})) > limit:
+                break
+            keep.add(j)
+    # a run of one step costs a line either way: print the step, not the marker
+    keep |= {x[0] for x in layout(keep) if isinstance(x, tuple) and x[0] == x[1]}
+    return layout(keep)
 
 
 def listed_hints(hints: Sequence[str], listed: Any = None,
@@ -823,6 +1056,18 @@ def walk_hints(record: Mapping[str, Any], listed: Any = None) -> list[str]:
         if ref:
             hints.append(call("node", ref, facets="tb"))
             break
+    if record.get("talkback_started") == "after_app" and not record.get("relaunch") and (
+            any(str(f.get("basis") or "") == "unverified: after_app"
+                for f in record.get("findings") or [])
+            or any("relaunch=true" in str(n) for n in record.get("notes") or [])):
+        # what a TalkBack user gets: TalkBack on before the app started; a relaunch
+        # restarts at the launcher, so a screen opened from another one is reopened
+        if int((record.get("screen") or {}).get("task_size") or 1) > 1:
+            hints.append(call("tb_scenario", kind="focus_after", relaunch=True,
+                              target="<its opener>", leave_on=True))
+        else:
+            hints.append(call("tb_walk", relaunch=True,
+                              **({"start": "first"} if record.get("start") == "first" else {})))
     if record.get("id"):
         hints.append(call("image", overlay="walk", walk=record["id"]))
     if str(record.get("restore") or "").startswith("left on"):
@@ -865,29 +1110,53 @@ def _keys_shown(out: Mapping[str, Any], keys: Mapping[str, str]) -> dict[str, st
 
 
 def walk_result(record: Mapping[str, Any], *, max_lines: int = WALK_MAX_LINES,
-                max_bytes: int = WALK_MAX_BYTES, listed: Any = None) -> dict[str, Any]:
+                max_bytes: int = WALK_MAX_BYTES, listed: Any = None, steps: Any = None,
+                speech: str = "cut", findings: str = "compact") -> dict[str, Any]:
     """The tb_walk response for a bound record, within ``max_bytes`` of compact JSON:
     one line per step (``i. ref "speak" via=... !finding``), the classified ``diff``,
     the findings (fix once per code) and ``next``. ``listed``: the tool names the caller
     sees (None: all); without ``node`` among them, ``keys`` maps each ref shown to its
-    node key (what inspect_node takes) and the hints name only listed tools."""
+    node key (what inspect_node takes) and the hints name only listed tools.
+
+    ``steps`` (``"17-42"``): only those steps' lines, and the findings touching them (a
+    page of a stored walk, ``tb_walk(show=...)``); ``speech`` full: every word of each
+    utterance (else head and tail, :func:`cut_speech`); ``findings`` all: each finding with
+    its full text and steps, none: no findings.
+
+    Under byte pressure (G3) repeats of a code merge first (``"n": 5, "steps":
+    "0-1,2-3,..."``), then messages shorten, then the diff's ref lists go, then speech
+    (heads before tails), then lines (plain ones before those a finding marks); a
+    distinct finding code is never dropped."""
+    ranges = parse_steps(steps) if not isinstance(steps, list) else steps
+    if speech not in SPEECH:
+        raise OpError("bad_args", f"speech must be one of {', '.join(SPEECH)}; got {speech!r}")
+    if findings not in FINDINGS:
+        raise OpError("bad_args", f"findings must be one of {', '.join(FINDINGS)}; "
+                                  f"got {findings!r}")
     tags = _tags(record)
-    steps = [dict(s, tags=sorted(tags.get(s.get("i"), []))) for s in record.get("steps") or []]
+    all_steps = [dict(s, tags=sorted(tags.get(s.get("i"), []))) for s in record.get("steps") or []]
+    shown = [s for s in all_steps if _in_steps(s.get("i"), ranges)]
     caps = list(record.get("captures") or [])
-    first = steps[0] if steps else {}
+    first = all_steps[0] if all_steps else {}
     head: dict[str, Any] = {"capture": caps[0] if caps else None, "walk": record.get("id")}
     if len(caps) > 1:
         head["recaptured"] = caps[1:]
     head["talkback"] = record.get("talkback")
+    if record.get("talkback_started"):
+        head["talkback_started"] = record["talkback_started"]
+    if record.get("injector_proven") is False:
+        head["injector_proven"] = False
     head["start"] = (first.get("ref") if first.get("key") else "(no focus)") if first else None
-    head["steps"] = sum(1 for s in steps if (s.get("i") or 0) > 0)
+    head["steps"] = sum(1 for s in all_steps if (s.get("i") or 0) > 0)
     head["ended"] = record.get("ended")
     ms = record.get("ms") or {}
     head["ms"] = {k: ms[k] for k in ("p50", "p95", "total") if ms.get(k) is not None}
     if str(record.get("utterance") or "model") != "model":
         head["utterance"] = record["utterance"]
+    if ranges is not None:
+        head["shown"] = f"steps {steps_text([s.get('i') for s in shown], 6) or 'none'}"
     diff = classify(record)
-    findings = _compact_findings(record)
+    docs, elsewhere = _finding_docs(record, findings, ranges) if findings != "none" else ([], 0)
     tail: dict[str, Any] = {}
     if record.get("expect") is not None:
         tail["expect"] = record["expect"]
@@ -898,43 +1167,101 @@ def walk_result(record: Mapping[str, Any], *, max_lines: int = WALK_MAX_LINES,
     # inspect_node takes node keys: map the refs shown when it is the way to a node
     keys = record.get("ref_keys") or {} if listed is not None and "node" not in listed \
         and "inspect_node" in listed else {}
-    # the stored walk holds every line: say how to read it only to a caller who can
-    show = (f'captures(action="show",id="{record.get("id")}")'
-            if listed is None or "captures" in listed else "raise max_lines / max_bytes")
+    wid = record.get("id")
+
+    def show_hint(a: Any, b: Any) -> str:
+        # a stored walk pages by step range (tb_walk) or shows whole (captures)
+        if wid and (listed is None or "tb_walk" in listed):
+            return f'tb_walk(show="{wid}",steps="{a}-{b}")'
+        if wid and "captures" in listed:
+            return f'captures(action="show",id="{wid}")'
+        return "raise max_lines / max_bytes"
+
     # max_lines counts the steps; the start line (step 0) comes on top
-    speak_len, n_findings, n_lines = SPEAK_LEN, len(findings), max(5, int(max_lines)) + 1
-    while True:
-        lines = [step_line(s, speak_len) for s in steps]
-        if len(lines) > n_lines:
-            keep = n_lines - 1
-            half = keep // 2
-            lines = lines[:half] + [f"… {len(lines) - keep} steps omitted: {show} …"] \
-                + lines[len(lines) - (keep - half):]
-        out = dict(head, lines=lines, diff=diff, findings=findings[:n_findings])
-        if len(findings) > n_findings:
-            out["findings_omitted"] = len(findings) - n_findings
-        out.update(tail)
+    state = {"speak": None if speech == "full" else SPEAK_LEN, "msg": None, "fix": None,
+             "merged": False, "diff_lists": True, "notes": None,
+             "lines": None if ranges is not None else max(5, int(max_lines)) + 1,
+             "hints": True, "refs": None}
+
+    def build() -> dict[str, Any]:
+        sp = state["speak"]
+        if ranges is None:
+            picked = _pick_lines(shown, state["lines"])
+        else:
+            limit = state["lines"]
+            picked = list(range(len(shown))) if limit is None or len(shown) <= limit else \
+                list(range(limit)) + [(shown[limit].get("i"), shown[-1].get("i"))]
+        lines: list[str] = []
+        first_gap = True
+        for x in picked:
+            if isinstance(x, tuple):
+                if ranges is None:
+                    a, b = shown[x[0]].get("i"), shown[x[1]].get("i")
+                    k = x[1] - x[0] + 1
+                    what = f"{k} step{'s' if k != 1 else ''} omitted"
+                    lines.append(f"… {what}: {show_hint(a, b)} …" if first_gap
+                                 else f"… {what} ({a}-{b}) …")
+                else:
+                    lines.append(f"… steps {x[0]}-{x[1]} not shown: {show_hint(x[0], x[1])} …")
+                first_gap = False
+            else:
+                lines.append(step_line(shown[x], sp))
+        fds = [dict(d) for d in docs]
+        if state["merged"]:
+            fds = _merge_repeats(fds)
+        for d in fds:
+            d.pop("_st", None)
+            if state["msg"] is not None:
+                _cut_text(d, "msg", state["msg"])
+            if state["fix"] is not None:
+                _cut_text(d, "fix", state["fix"])
+            if state["refs"] is not None and isinstance(d.get("refs"), list):
+                d["refs"] = d["refs"][: state["refs"]]
+        dd = diff if state["diff_lists"] else {k: v for k, v in diff.items()
+                                               if not isinstance(v, list) or k == "unvisited"}
+        out = dict(head, lines=lines, diff=dd)
+        if findings != "none":
+            out["findings"] = fds
+        if elsewhere:
+            out["findings_elsewhere"] = elsewhere
+        t = dict(tail)
+        if state["notes"] is not None and t.get("notes"):
+            t["notes"] = [n[: state["notes"]] for n in t["notes"]] if state["notes"] else None
+        out.update(t)
         if keys:
             out["keys"] = _keys_shown(out, keys) or None
-        if hints:
+        if hints and state["hints"]:
             out["next"] = hints
-        out = {k: v for k, v in out.items() if v is not None}
+        return {k: v for k, v in out.items() if v is not None}
+
+    stages: list[Callable[[], None]] = [
+        lambda: state.update(merged=True),
+        lambda: state.update(msg=200, fix=160),
+        lambda: state.update(msg=120, fix=100),
+        lambda: state.update(diff_lists=False),
+    ]
+    if speech != "full":
+        stages += [lambda: state.update(speak=40), lambda: state.update(speak=32)]
+    stages.append(lambda: state.update(notes=100))
+    if speech != "full":
+        stages.append(lambda: state.update(speak=24))
+    if ranges is None:
+        n0 = state["lines"]
+        stages += [lambda k=k: state.update(lines=max(13, n0 - 4 * k)) for k in range(1, 75)
+                   if n0 - 4 * (k - 1) > 13]
+    else:
+        stages += [lambda k=k: state.update(lines=max(1, len(shown) - 2 * k))
+                   for k in range(1, (len(shown) + 1) // 2 + 1)]
+    stages += [lambda: state.update(notes=0), lambda: state.update(hints=False),
+               lambda: state.update(msg=90, fix=60), lambda: state.update(msg=60, fix=0),
+               lambda: state.update(refs=2)]
+    out = build()
+    for stage in stages:
         if utf8_len(dumps(out)) <= max_bytes:
-            return out
-        if speak_len > 24:
-            speak_len -= 8
-        elif n_findings > 3:
-            n_findings -= 1
-        elif tail.get("notes"):
-            tail.pop("notes")
-        elif n_lines > 13:
-            n_lines = max(13, n_lines - 8)
-        elif hints:
-            hints = hints[:-1]
-        elif n_findings > 1:
-            n_findings -= 1
-        else:
-            return out
+            break
+        stage()
+        out = build()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1059,7 +1386,8 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
     tgt = rec.get("target") if isinstance(rec.get("target"), dict) else None
     foc = rec.get("focus") if isinstance(rec.get("focus"), dict) else None
     out: dict[str, Any] = {"scenario": rec.get("id"), "kind": rec.get("kind"),
-                           "capture": caps[0] if caps else None}
+                           "capture": caps[0] if caps else None,
+                           "talkback_started": rec.get("talkback_started")}
     if len(caps) > 1:
         out["after"] = caps[-1]
     out["target"] = _named(tgt.get("ref"), tgt) if tgt else None
@@ -1142,15 +1470,16 @@ def _trim_text(d: Any, key: str, n: int) -> bool:
 
 
 def stored_result(rec: Mapping[str, Any], max_bytes: int | None = None,
-                  listed: Any = None) -> dict[str, Any]:
-    """``captures(action="show", id=<walk id>)``: the stored record as its tool
-    returned it (a walk's lines are not cut by count, only by ``max_bytes``); ``listed``:
-    as :func:`walk_result` (hints to listed tools only)."""
+                  listed: Any = None, page: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """``captures(action="show", id=<walk id>)`` / ``tb_walk(show=<walk id>)``: the stored
+    record as its tool returned it (a walk's lines are not cut by count, only by
+    ``max_bytes``); ``listed``: as :func:`walk_result` (hints to listed tools only);
+    ``page``: walk_result's ``steps`` / ``speech`` / ``findings``."""
     if str(rec.get("id") or "").startswith("t"):
         return scenario_result(rec, max_bytes=max_bytes or 2000, listed=listed)
     n = sum(1 for _ in rec.get("steps") or [])
     return walk_result(rec, max_lines=max(WALK_MAX_LINES, n + 1),
-                       max_bytes=max_bytes or 16000, listed=listed)
+                       max_bytes=max_bytes or 16000, listed=listed, **(page or {}))
 
 
 __all__ = [

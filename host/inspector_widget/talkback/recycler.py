@@ -274,3 +274,28 @@ def apply_item_info(tree: Any) -> None:
                         "dump taken with no service on: their items' positions (\"N of M\") "
                         "are not in the dump, so the model says none."),
         })
+
+
+def rows_bound(tree: Any) -> Optional[str]:
+    """When a service-on dump's RecyclerView rows were bound, relative to the service:
+    ``"before"`` it started (a list with CollectionInfo with a row that has no item info:
+    bound before, or not rebound since), ``"after"`` (every row of every such list has
+    it: the screen's lists were bound with TalkBack running, as a TalkBack user gets
+    them), or None (no such list with rows, or a dump with no service on, whose item
+    info the model adds itself)."""
+    if tree.services == "off":
+        return None
+    before = after = False
+    for n in tree.nodes:
+        if n.facet not in ("view", "interop") or _simple(n.class_name) not in ITEM_PARENTS:
+            continue
+        if not n.get("collection_info"):
+            continue
+        kids = [c for c in n.children if c.facet in ("view", "interop")]
+        if not kids:
+            continue
+        if all(c.get("collection_item_info") for c in kids):
+            after = True
+        else:
+            before = True
+    return "before" if before else "after" if after else None

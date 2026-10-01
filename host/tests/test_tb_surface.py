@@ -648,3 +648,77 @@ def test_error_hints_name_only_listed_tools(tb, monkeypatch):
                      "hint": "Retry later. Or find(text=\"x\") in a capture."}}
     assert surface.listed_hint(env, {"tb_walk"})["error"]["hint"] == "Retry later."
     assert surface.listed_hint(env, None) is env
+
+
+# --------------------------------------------------------------------------- #
+# Paging a stored walk (G3) and TalkBack first (G1): both surfaces, the same call
+# --------------------------------------------------------------------------- #
+def test_a_stored_walk_is_paged_with_no_device_on_both_surfaces(tb, run_cli):
+    res = ok("tb_walk", serial=SERIAL, **FAST)
+    wid = res["walk"]
+    tb.clear_logs()
+    page = ok("tb_walk", show=wid, steps="2-4", speech="full")
+    assert page["walk"] == wid and page["shown"] == "steps 2-4"
+    assert [ln.split(".", 1)[0] for ln in page["lines"]] == ["2", "3", "4"]
+    assert page["lines"][0] == '2. n6 "Item 0. Button"'
+    latest = ok("tb_walk", show="latest", serial=SERIAL, package=PKG, steps="2-4",
+                speech="full")
+    assert latest == page
+    r = run_cli("tb-walk", "--show", wid, "--steps", "2-4", "--speech", "full", "--json")
+    assert r.rc == 0 and r.out.rstrip("\n") == dumps(page)
+    r = run_cli("tb-walk", "--show", wid, "--steps", "2-4")
+    assert r.rc == 0 and '  2. n6 "Item 0. Button"' in r.out
+    # no device I/O: no adb command (the CLI's exit only drops this process's forwards),
+    # no agent request, TalkBack untouched
+    assert [a for a in tb.adb_log if a[0] != "forward"] == [] and tb.wire == []
+    assert not tb.talkback.running
+    bad, is_error = call("tb_walk", show=wid, steps="2..4")
+    assert is_error and bad["error"]["code"] == "bad_args"
+    gone, is_error = call("tb_walk", show="wzzzzzz")
+    assert is_error and gone["error"]["code"] == "walk_not_found"
+
+
+def test_relaunch_is_one_argument_on_both_surfaces(tb, run_cli):
+    doc = ok("tb_walk", serial=SERIAL, package=PKG, relaunch=True, **FAST)
+    r = run_cli("tb-walk", "--serial", SERIAL, "--package", PKG, "--relaunch",
+                "--step-timeout-ms", 250, "--settle-ms", 20, "--json")
+    assert r.rc == 0, r.err
+    cli = json.loads(r.out)
+    assert doc["talkback_started"] == cli["talkback_started"] == "before_app"
+    assert len(tb.force_stops) == 2
+    sc = ok("tb_scenario", kind="restore", serial=SERIAL, package=PKG, relaunch=True,
+            target="Item 1", wait_ms=400, **FAST)
+    assert sc["talkback_started"] == "before_app" and len(tb.force_stops) == 3
+
+
+def test_verbose_log_given_on_the_cli_is_required_as_over_mcp(tb, run_cli, monkeypatch):
+    """`talkback on --verbose-log` equals the default, so the CLI dropped it and a level
+    that could not be set was a soft {"failed": ...}; MCP verbose_log=true makes it an
+    error. The flag given is now the explicit true on both surfaces."""
+    import argparse
+
+    from inspector_widget.talkback import device as tbdevice
+
+    parser = argparse.ArgumentParser()
+    surface.add_cli(parser.add_subparsers())
+    spec = next(t for t in surface.SPECS if t.name == "talkback")
+    args = {argv: surface.cli_args(spec, parser.parse_args(["talkback", "on", *argv]))
+            for argv in ((), ("--verbose-log",), ("--no-verbose-log",))}
+    assert args[()] == {"action": "on"}
+    assert args[("--verbose-log",)] == {"action": "on", "verbose_log": True}
+    assert args[("--no-verbose-log",)] == {"action": "on", "verbose_log": False}
+
+    def broken(serial, level, record=False):
+        raise tbdevice.TalkBackError("log_level_failed", "no Log output level row")
+
+    monkeypatch.setattr(tbdevice, "set_log_level", broken)
+    doc, is_error = call("talkback", action="on", serial=SERIAL, package=PKG, verbose_log=True)
+    assert is_error and doc["error"]["code"] == "log_level_failed"
+    r = run_cli("talkback", "on", "--serial", SERIAL, "--package", PKG, "--verbose-log",
+                "--json")
+    assert r.rc != 0 and "log_level_failed" in r.out + r.err, r
+    assert not tb.talkback.running
+    # not given: TalkBack comes on without the level, as over MCP with no verbose_log
+    r = run_cli("talkback", "on", "--serial", SERIAL, "--package", PKG, "--json")
+    assert r.rc == 0 and "failed" in json.loads(r.out)["log_level"], r
+    assert run_cli("talkback", "restore", "--serial", SERIAL).rc == 0
