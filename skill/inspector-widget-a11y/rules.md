@@ -376,9 +376,11 @@ model and TalkBack disagreed.
 - **Static:** a stop with another stop inside it that says the same thing, or
   both clickable (a clickable row and its own Switch / IconButton).
 - **Walk:** consecutive stops, one inside the other (`diff.double`). Not a text
-  field and its clear button; `info` when both are clickable and the inner one
-  says something else (a row with its own Play or Download button: a custom action
-  on the row is better, but nothing is said twice).
+  field and its clear button; `warn` for a clickable row or card with its own
+  Checkbox / Switch / RadioButton inside (as the lint says); `info` when both are
+  clickable and the inner one does something else (a row with its own Play or
+  Download button: a custom action on the row is better, but nothing is said
+  twice).
 - **Fix:** Compose `Modifier.toggleable(role = Role.Switch)` / `clickable` on the
   row and `onCheckedChange = null` on the child; View: the child
   `clickable` / `focusable = false`; secondary actions as `customActions`.
@@ -423,13 +425,19 @@ model and TalkBack disagreed.
   then child order; without properties, an elevated kind of View (a FAB, an
   AppBarLayout, a CardView) drawn earlier is not counted under a later scrim.
   An overlay covers only where it draws: its whole box when it has a background
-  (View properties), takes touches over most of the window or is a surface (most
-  of the window, holding content of its own: a bottom sheet, a fragment over
-  another), else only where its children show something. An empty full-screen
-  `FrameLayout` drawn last (a loading frame whose child is `GONE`) covers nothing.
-  Every node under an overlay carries `!covered` (`render.covered`, `node(ref,
-  facets="tb")` says `covered_by`), and the a11y findings on them are counted
-  apart, as under a dialog window (`summary.covered`).
+  (View properties); without View properties, also when it takes clicks over most
+  of the window (a scrim; a focusable or scrollable list is none) or is a surface
+  (most of the window, holding content of its own: a bottom sheet, a fragment over
+  another); else, and whenever the View properties say it paints nothing, only
+  where its children show something. An empty full-screen `FrameLayout` drawn last
+  (a loading frame whose child is `GONE`) covers nothing, nor does a transparent
+  column of controls over a full-screen image, or a full-screen list over the
+  toolbar its rows start below. Every node under an overlay carries `!covered`
+  (`render.covered`, `node(ref, facets="tb")` says `covered_by`), and the capture's
+  `lint()` counts the a11y findings on them apart, under the overlay's name
+  (`+2 under n236 (bar)`, `covered`; `find(issue="render.covered")` lists them).
+  The legacy `a11y_lint` / `dump_accessibility` count apart only the findings on a
+  window under a dialog window.
 - **Walk:** focus leaves the overlay for nodes behind it, or reaches a window
   under a modal one (`diff.escape`): one finding per run of steps ("steps 3-11:
   ... read 9 stops behind it"). What is behind the overlay comes from the walk's
@@ -532,8 +540,10 @@ model and TalkBack disagreed.
   vertical list), or a traversal group with `traversalIndex = index` per item.
 - **A window of another app on top** (a permission request, the 16 KB
   compatibility dialog): a capture says so in its diagnostics and has no stop of
-  the app; `tb_walk` / `tb_scenario` fail at once naming it. Dismiss it (BACK, or
-  answer it), then retry.
+  the app; `tb_walk` / `tb_scenario` fail at once naming it, also when TalkBack was
+  already on. Dismiss it (BACK for an activity with input focus; the 16 KB dialog
+  with its OK button), then retry. A window beside the app (the other half of a
+  split screen) covers nothing of it, focused or not.
 - **`tb.focus_lost`** — no node holds focus after a press (the focused item was
   disposed while scrolling). Fix: stable keys / `LazyListState`.
 - **`tb_scenario` verdicts:** `tb.initial_focus` (after an action focus lands on a
