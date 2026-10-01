@@ -449,3 +449,16 @@ def test_the_loop_is_in_the_instructions_and_tb_walk():
 ])
 def test_what_resolves_in_the_capture(sel, is_sel):
     assert ops._looks_like_selector(sel) is is_sel
+
+
+def test_a_busy_device_says_what_to_do(tb):
+    """Live, emulator-5556: a second walk while a CLI walk drove TalkBack got
+    {"code": "busy", ..., "hint": null}. A TalkBack error without its own hint now carries
+    its code's default one."""
+    from inspector_widget.capture.model import ERROR_CODES
+    from inspector_widget.talkback import device as tbdevice
+
+    with tbdevice.device_lock(SERIAL, "tb_walk"):
+        doc, is_error = call("tb_walk", serial=SERIAL, **FAST)
+    assert is_error and doc["error"]["code"] == "busy"
+    assert doc["error"]["hint"] == ERROR_CODES["busy"]

@@ -1471,7 +1471,8 @@ def _tb_error(exc: BaseException) -> OpError | None:
             code = "agent_error"
         tried = list(getattr(exc, "tried", None) or [])
         hint = getattr(exc, "hint", None)
-        return OpError(code, str(exc), hint=hint if isinstance(hint, str) and hint else None,
+        return OpError(code, str(exc),
+                       hint=hint if isinstance(hint, str) and hint else ERROR_CODES.get(code),
                        candidates=tried or None)
     if isinstance(exc, ValueError) and not isinstance(exc, OpError):
         return _bad(str(exc))
