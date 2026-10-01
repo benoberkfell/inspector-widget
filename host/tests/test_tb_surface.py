@@ -205,13 +205,11 @@ def _views(scene):
     return out
 
 
-def test_focus_on_a_node_no_capture_holds_recaptures(tb_env):
-    """TalkBack scrolls Item 6 in: the walk recaptures (carry-over keeps the refs)
-    and names the new item by a ref of its own."""
+def _scroll_item6_in(tb_env) -> None:
+    """A list of 6 whose next swipe past Item 5 scrolls Item 6 in (a recapture)."""
     tb_env.scene_factory = lambda: fakeagent.talkback_scene(n_items=6, visible=4,
                                                             scroll_forward=True)
     tb_env.talkback.order = [TB_TITLE] + [tb_item(i) for i in range(7)]
-    original = dict(tb_env.secure)
 
     def scroll(t, action):
         if action == "next" and t.focus == tb_item(5):
@@ -232,6 +230,13 @@ def test_focus_on_a_node_no_capture_holds_recaptures(tb_env):
         return False
 
     tb_env.talkback.on_press = scroll
+
+
+def test_focus_on_a_node_no_capture_holds_recaptures(tb_env):
+    """TalkBack scrolls Item 6 in: the walk recaptures (carry-over keeps the refs)
+    and names the new item by a ref of its own."""
+    _scroll_item6_in(tb_env)
+    original = dict(tb_env.secure)
     res = ok("tb_walk", serial=SERIAL, until="edge", **FAST)
     assert res["recaptured"] and len(res["recaptured"]) == 1
     rec = record(tb_env, res["walk"])
@@ -243,6 +248,30 @@ def test_focus_on_a_node_no_capture_holds_recaptures(tb_env):
     # recapture="never": the scrolled-in item has no ref, and says so
     res2 = ok("tb_walk", recapture="never", until="edge", **FAST)
     assert "recaptured" not in res2
+    assert fakeagent.settings_changes(tb_env, original) == {}
+
+
+def test_a_full_lineage_never_evicts_a_walks_captures_before_it_is_stored(tb_env):
+    """Live, emulator-5556: an app whose lineage held 50 labeled captures lost the walk's
+    start capture (unlabeled: evicted first) to the recapture's retention pass, and the
+    walk failed with capture_not_found. The walk now holds its captures until stored."""
+    _scroll_item6_in(tb_env)
+    original = dict(tb_env.secure)
+    ok("capture", serial=SERIAL, package=PKG, label="a")
+    ok("capture", label="b")
+    store = mcp_server._ops_context().store
+    store.lineage_cap = 2  # the lineage is full of labeled captures
+    res = ok("tb_walk", until="edge", **FAST)
+    assert res["recaptured"] and len(res["recaptured"]) == 1
+    assert store.held == set()  # released once the walk is stored
+    rec = record(tb_env, res["walk"])
+    assert rec["captures"] == [res["capture"]] + res["recaptured"]
+    assert next(s for s in rec["steps"] if s.get("key") == "view:1026")["cap"] == \
+        res["recaptured"][0]
+    assert store.exists(res["capture"])
+    # afterwards retention applies again: unlabeled captures go first
+    ok("capture", label="c")
+    assert not store.exists(res["capture"])
     assert fakeagent.settings_changes(tb_env, original) == {}
 
 

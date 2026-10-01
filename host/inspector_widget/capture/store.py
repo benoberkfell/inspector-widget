@@ -720,6 +720,9 @@ class CaptureStore:
         self._cache: OrderedDict[str, tuple[Index, int]] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._gc_pending: set[str] | None = None
+        #: Captures this process is still using (a TalkBack walk's, until it is bound and
+        #: stored): retention never evicts them, whatever the caps.
+        self.held: set[str] = set()
 
     # ------------------------------------------------------------------ paths
     def _p(self, *parts: str) -> str:
@@ -1321,8 +1324,8 @@ class CaptureStore:
         older than 1 h too; then expired captures, the per-lineage cap, the total
         count cap and the byte cap (heavy files first, then whole captures).
         Unlabeled captures go first, then the least recently used. Pinned
-        captures and ``keep`` are never evicted. ``all=True`` wipes everything,
-        including the ref counter.
+        captures, ``keep`` and :attr:`held` are never evicted. ``all=True`` wipes
+        everything, including the ref counter.
         """
         self._ensure_layout()
         if all:
@@ -1331,7 +1334,7 @@ class CaptureStore:
         if not glock.acquire(blocking=False):
             return {"skipped": "another gc is running"}
         try:
-            return self._gc(set(keep))
+            return self._gc(set(keep) | self.held)
         finally:
             glock.release()
 

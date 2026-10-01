@@ -1576,6 +1576,7 @@ class _TbCaptures:
             self.notes.append(lines.cut(f"capture at step {at} failed: {exc}", 140))
             return None
         self.taken.append((at, lc))
+        self.ctx.store.held.add(lc.id)  # until release(): a full lineage evicts unlabeled first
         self._last_at, self._pending = at, False
         return lc
 
@@ -1623,6 +1624,10 @@ class _TbCaptures:
 
     def binding(self) -> walks.Binding:
         return walks.Binding(self.taken)
+
+    def release(self) -> None:
+        """Let retention evict the captures again (the walk is bound and stored)."""
+        self.ctx.store.held.difference_update(lc.id for _at, lc in self.taken)
 
     def resolve_expect(self, expect: list[str] | None) -> list[str] | None:
         """``expect`` entries that are selectors become refs (the start capture's)."""
@@ -1703,8 +1708,6 @@ def tb_walk(ctx: OpContext, serial: Any = None, package: Any = None, start: Any 
     """``tb_walk``: walk the real TalkBack through the app (DEVICE-WIDE: turned on,
     then restored), record each stop as a capture ref, diff actual vs predicted vs
     visual, store ``<store>/walks/<id>.json``; at most ``max_bytes`` (5 KB)."""
-    from .talkback import walk as tbwalk
-
     opts = {
         "start": _explicit(start) or "current",
         "direction": _enum("direction", direction, TB_DIRECTIONS, "next"),
@@ -1727,6 +1730,16 @@ def tb_walk(ctx: OpContext, serial: Any = None, package: Any = None, start: Any 
     lineage, session = _tb_session(ctx, serial, package)
     hook = _TbCaptures(ctx, lineage, session, "tb_walk",
                        recapture=opts["recapture"] == "on_unknown")
+    try:
+        return _tb_walk_record(ctx, hook, session, opts, expect, n_lines, budget)
+    finally:
+        hook.release()
+
+
+def _tb_walk_record(ctx: OpContext, hook: _TbCaptures, session: Any, opts: dict[str, Any],
+                    expect: Any, n_lines: int, budget: int) -> dict[str, Any]:
+    from .talkback import walk as tbwalk
+
     record = _tb_call(lambda: tbwalk.run_walk(
         session, start=opts["start"], direction=opts["direction"], max_steps=opts["max_steps"],
         until=opts["until"], expect=None, step_timeout_ms=opts["step_timeout_ms"],
@@ -1755,9 +1768,6 @@ def tb_scenario(ctx: OpContext, kind: Any = None, serial: Any = None, package: A
                 max_bytes: Any = None) -> dict[str, Any]:
     """``tb_scenario``: where the real TalkBack's focus goes (DEVICE-WIDE), recorded
     against a capture before and one after; at most ``max_bytes`` (1 KB)."""
-    from .talkback import scenarios as tbscenarios
-    from .talkback import walk as tbwalk
-
     if kind is None:
         raise _bad("tb_scenario needs kind: focus_after, restore or survive",
                    hint='tb_scenario(kind="survive",target="n47",mutate="tap:n49")')
@@ -1778,6 +1788,17 @@ def tb_scenario(ctx: OpContext, kind: Any = None, serial: Any = None, package: A
     budget = query.resolve_max_bytes(max_bytes, TB_SCENARIO_MAX_BYTES)
     lineage, session = _tb_session(ctx, serial, package)
     hook = _TbCaptures(ctx, lineage, session, "tb_scenario")
+    try:
+        return _tb_scenario_record(ctx, hook, session, k, opts, budget)
+    finally:
+        hook.release()
+
+
+def _tb_scenario_record(ctx: OpContext, hook: _TbCaptures, session: Any, k: str,
+                        opts: dict[str, Any], budget: int) -> dict[str, Any]:
+    from .talkback import scenarios as tbscenarios
+    from .talkback import walk as tbwalk
+
     out = _tb_call(lambda: tbscenarios.run_scenario(
         session, k, target=opts["target"], action=opts["action"], mutate=opts["mutate"],
         wait_ms=opts["wait_ms"], injector=opts["injector"], leave_on=opts["leave_on"],
