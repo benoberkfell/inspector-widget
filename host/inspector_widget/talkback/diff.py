@@ -237,6 +237,14 @@ def _tokens(s: Optional[str]) -> set:
     return {t for t in re.findall(r"[\w$%]+", (s or "").lower()) if len(t) > 1}
 
 
+def with_abbreviations(spoken: set) -> set:
+    """``spoken`` (lower-case words) plus every prefix of 3 or more letters of each: a text
+    that abbreviates a word said was read ("Aug 5" under a row that says "August 5, 2026":
+    AntennaPod). The static orphan check (static._unspoken) and the walk's (walk.orphan_text)
+    share it, so the two agree."""
+    return spoken | {w[:k] for w in spoken for k in range(3, len(w))}
+
+
 # --------------------------------------------------------------------------- #
 # Checks
 # --------------------------------------------------------------------------- #

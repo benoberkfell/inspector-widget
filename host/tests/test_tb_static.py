@@ -287,3 +287,14 @@ def test_a_web_page_past_its_edge_is_not_stuck():
     for name in ("antennapod_player_expanded", "antennapod_player_expanded_tb_on"):
         fs = static.findings(tb.Navigator(_realapp(name)), density=480)
         assert "tb.edge_stuck" not in [f.code for f in fs], name
+
+
+def test_text_said_through_its_own_description_is_not_skipped():
+    # AntennaPod's position: the text "00:04:21" carries the description "Position: 4
+    # minutes", which TalkBack says in its place inside the row (walk wnq20pl, step 8)
+    row = n(4, cls="android.widget.LinearLayout", flags=FOCUS, actions=[CLICK],
+            b=(0, 0, 1080, 300), children=[
+                n(5, cls="android.widget.TextView", text="Episode title", b=(0, 0, 1080, 100)),
+                n(6, cls="android.widget.TextView", text="00:04:21", cd="Position: 4 minutes",
+                  b=(0, 150, 400, 100))])
+    assert "tb.skipped" not in [f.code for f in findings(root(row))]

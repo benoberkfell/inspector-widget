@@ -1154,3 +1154,25 @@ def test_a_webview_is_not_a_container_talkback_scrolls():
     page_root = node("android.webkit.WebView", node("android.webkit.WebView", pager), scrolls=True)
     text = node("android.widget.TextView", page_root)
     assert tbwalk.DumpIndex.scroll_container(None, text) is pager
+
+
+def test_orphan_text_reads_descriptions_and_abbreviations_as_the_static_rule_does():
+    # AntennaPod home (walk wjk7wrp): "Aug 5" under a row TalkBack reads as "August 5, 2026",
+    # and "00:04:21" whose description "Position: 4 minutes" is what TalkBack says
+    class Idx:
+        order = [SimpleNamespace(text="Aug 5", cd="", flags={"visible_to_user"}, window=1,
+                                 bounds=(16, 200, 120, 40), key="view:7"),
+                 SimpleNamespace(text="00:04:21", cd="Position: 4 minutes",
+                                 flags={"visible_to_user"}, window=1,
+                                 bounds=(16, 260, 120, 40), key="view:8"),
+                 SimpleNamespace(text="Unsaved changes", cd="", flags={"visible_to_user"},
+                                 window=1, bounds=(16, 320, 200, 40), key="view:9")]
+
+        def window_rect(self, win):
+            return (0, 0, 360, 640)
+
+        def obscured(self, win):
+            return []
+
+    lap = [{"window": 1, "speak": "Android AI Tools. August 5, 2026. Position: 4 minutes"}]
+    assert [o["text"] for o in tbwalk.orphan_text(Idx(), lap)] == ["Unsaved changes"]

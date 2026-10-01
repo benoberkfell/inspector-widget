@@ -1699,10 +1699,11 @@ def orphan_text(idx: DumpIndex, records: List[Dict[str, Any]], legacy: bool = Fa
     spoken: set = set()
     for r in records:
         spoken |= diff._tokens(f"{r.get('speak') or ''} {r.get('label') or ''}")
+    spoken = diff.with_abbreviations(spoken)
     windows = {r.get("window") for r in records}
     out: List[Dict[str, Any]] = []
     for n in idx.order:
-        words = n.text or n.cd
+        words = n.cd or n.text  # a contentDescription is said in place of the text
         if not words or "visible_to_user" not in n.flags or n.window not in windows:
             continue
         x, y, w, h = n.bounds

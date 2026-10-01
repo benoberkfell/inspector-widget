@@ -61,6 +61,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import rules as R
+from .diff import with_abbreviations
 from .explain import ghost_reasons
 from .order import Navigator
 from .speech import Announcement, SpeechState, announce
@@ -706,16 +707,18 @@ def _unspoken(cx: _Ctx) -> Iterator[Finding]:
     spoken: Set[str] = set()
     for st in cx.stops:
         spoken |= _words(cx.own(st).text)
-    prefixes = {w[:k] for w in spoken for k in range(3, len(w))}
+    spoken = with_abbreviations(spoken)
     for n in cx.tree.nodes:
         if not n.window.reported or not n.visible or id(n) in cx.stop_ids:
             continue
-        text = n.text or n.content_description
+        # what TalkBack says for it: a contentDescription replaces the text (AntennaPod's
+        # "00:04:21" is said as its description "Position: 4 minutes")
+        text = n.content_description or n.text
         r = n.rect
         if not text or r.is_empty() or not r.intersects(n.window.bounds):
             continue
         words = _words(text)
-        if not words or words & spoken or words & prefixes:
+        if not words or words & spoken:
             continue
         anc = cx.rules.focusable_ancestor(n)
         if anc is None or id(anc) not in cx.stop_ids:
