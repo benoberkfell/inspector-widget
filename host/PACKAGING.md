@@ -85,6 +85,15 @@ The entry points target the wrappers:
 > they no longer depend on the wrappers finding the loose scripts on disk. A
 > later rename pass will move the scripts into the package and drop the wrappers.
 
+## License files
+
+The wheel carries `LICENSE` and `NOTICE` in `.dist-info/licenses/` (Apache-2.0
+section 4(d) requires the NOTICE in a redistribution). Both live at the
+repository root; `host/LICENSE` and `host/NOTICE` are symlinks to them, and
+setuptools' default license-file patterns (`LICEN[CS]E*`, `NOTICE*`) pick them
+up. Do not add an explicit `license-files` list without naming both.
+`tests/test_wheel_packages.py` checks that they are there and match the root.
+
 ## Package data
 
 The build includes the generated bindings + stubs as package data so an install

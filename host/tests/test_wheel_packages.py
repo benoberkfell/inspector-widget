@@ -32,3 +32,20 @@ def test_every_subpackage_ships_in_the_wheel() -> None:
     missing = sorted(_source_packages() - declared)
     assert not missing, (
         f"not in [tool.setuptools] packages, so not in the wheel: {missing}")
+
+
+def test_the_wheel_ships_the_license_and_notice() -> None:
+    """Apache-2.0 section 4(d): a redistributed wheel carries NOTICE (and the
+    LICENSE). They live at the repository root; host/LICENSE and host/NOTICE
+    link to them, and setuptools' default license-file patterns (LICEN[CS]E*,
+    NOTICE*) put them in the wheel's .dist-info/licenses/."""
+    root = os.path.dirname(_HOST_DIR)
+    for name in ("LICENSE", "NOTICE"):
+        shipped = os.path.join(_HOST_DIR, name)
+        assert os.path.isfile(shipped), f"host/{name} is missing: the wheel would lack it"
+        with open(shipped, "rb") as a, open(os.path.join(root, name), "rb") as b:
+            assert a.read() == b.read(), f"host/{name} differs from the repository's"
+    with open(os.path.join(_HOST_DIR, "pyproject.toml"), "rb") as f:
+        tool = tomllib.load(f)["tool"]["setuptools"]
+    # an explicit license-files list would replace the default patterns
+    assert "license-files" not in tool or {"LICENSE", "NOTICE"} <= set(tool["license-files"])
