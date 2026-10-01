@@ -398,16 +398,20 @@ def test_an_issue_that_left_with_its_node_is_not_resolved():
     assert "gone_with_node" not in out2["issues"] and out2["issues"]["new"] == []
 
 
-def test_a_rebound_cells_issue_is_not_new():
+def test_a_recycled_cells_issues_left_and_arrived_with_their_items():
+    """S1 live: after a fling, an unlabelled button's cell is recycled for an item
+    whose button has a label. That is not a fix: the old item's issue left with
+    it (gone_with_node) and the new item's arrived with it (on_new_nodes)."""
     chain = Chain()
     role = "a11y.role.missing_on_clickable"
     rows_a = [(100, "Item 0"), (200, "Item 1"), (300, "Item 2")]
     rows_b = [(200, "Item 1"), (300, "Item 2"), (100, "Item 3")]
-    a = chain.publish(feed(rows_a, cid="c00001", issues={100: [role], 200: [role]}))
-    b = chain.publish(feed(rows_b, cid="c00002", dy=-100, issues={100: [role], 200: [role]}))
+    a = chain.publish(feed(rows_a, cid="c00001", issues={100: [role]}))
+    b = chain.publish(feed(rows_b, cid="c00002", dy=-100, issues={100: [role]}))
     out = d.diff(a, b, max_bytes=0)
     assert out["summary"]["rebound"] == 3
-    assert out["issues"] == {"resolved": [], "new": []}
+    assert out["issues"] == {"resolved": [], "new": [], "gone_with_node": 1,
+                             "on_new_nodes": 1}
 
 
 def test_params_are_compared_when_both_captures_have_slots():

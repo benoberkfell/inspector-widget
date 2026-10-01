@@ -354,3 +354,23 @@ def test_find_max_dp_measures_the_touch_area(tmp_path):
         visual_small = [n for n in ix.nodes.values() if "click" in n.flags and n.b
                         and min(n.b[2], n.b[3]) / 3 <= 47]
         assert len(visual_small) > 20  # what the visual bounds would have listed
+
+
+def test_a_fling_resolves_no_issue(tmp_path):
+    """S1 before and after a fling (review: diff): the unlabelled delete button,
+    the unexposed state and the small target scrolled away or into recycled
+    cells; none of that is "resolved". A resolved issue's ref must still be in
+    the new capture."""
+    with Replay("a11yprobe_s1_a", str(tmp_path)) as r:
+        r.capture()
+        r.dev.behaviour = ch._with_build_id(cr.scene("a11yprobe_s1_b"),
+                                            r.dev.default_build_id)
+        for agent in r.dev.agents:
+            agent.behaviour = r.dev.behaviour
+        doc = r.capture(diff_from="prev")
+        issues = run(r.ctx, "diff", include=["issues"], max_bytes=0)["issues"]
+        ib = r.index(doc["capture"])
+        resolved_refs = [ref for ln in issues["resolved"] for ref in ln.split(": ", 1)[1].split()
+                         if ref.startswith("n")]
+        assert all(ref in ib.nodes for ref in resolved_refs), issues
+        assert issues.get("gone_with_node", 0) >= 3, issues
