@@ -389,6 +389,8 @@ class TbCapture:
                         items.append(item)
                 if len(items) >= limit:
                     break
+            if include_skipped:
+                items.extend(self._unreported_windows())
             meta["ended"] = "edge"
             return items, meta
         x = self.node(start)
@@ -473,6 +475,24 @@ class TbCapture:
         if ref:
             return ReadItem(nid=nid, ref_key=kind, ref=ref)
         return ReadItem(nid=nid, why=kind)
+
+    def _unreported_windows(self) -> list[ReadItem]:
+        """One ``- `` line per window TalkBack never gets: its root, with the modal window
+        that covers it (``covered_by=<ref>``) or why it is dropped."""
+        out: list[ReadItem] = []
+        for w in self.tree.windows:
+            if w.root is None or w.reported:
+                continue
+            nid = self.window_ref(w.root_view_id) or self.nid(w.root)
+            if nid is None:
+                continue
+            dropped = w.dropped or "skipped"
+            if dropped.startswith("covered_by:"):
+                by = self.window_ref(dropped.split(":", 1)[1])
+                out.append(ReadItem(nid=nid, ref_key="covered_by", ref=by or "?"))
+            else:
+                out.append(ReadItem(nid=nid, why=dropped))
+        return out
 
     def _traversal_all(self, forward: bool) -> list[TbNode | Excluded]:
         """Every node TalkBack's traversal passes, window by window, with the dump nodes it

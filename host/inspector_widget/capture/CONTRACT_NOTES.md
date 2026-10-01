@@ -478,7 +478,8 @@ with every consumer.
   - `include_skipped`: `- ` lines, in TalkBack's traversal order, for the nodes with
     content or actions it passes over: `merged_into=<ref>`, `hidden_by=<ref>`,
     `covered_by=<ref>`, or `why=` silent_container, offscreen, zero_size,
-    invisible, not_important, under_system_bar, window_wrapper ...;
+    invisible, not_important, under_system_bar, window_wrapper ...; and one line per
+    window TalkBack never gets (its root, `covered_by=<the modal window's ref>`);
   - every reading line shows all `tb.*` issue codes;
   - without an a11y facet the stored order is sliced, reversed and filtered by
     flags instead, and the header says `model: "stored order ..."`;

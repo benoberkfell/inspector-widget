@@ -90,10 +90,12 @@ def test_include_skipped_says_why_a_node_is_not_a_stop():
     hidden = reading("tb_h1-bad-walk", include_skipped=True, max_lines=3)
     assert hidden["lines"][2] == ('- view:13 ComposeView [0,260 2076x137] !skipped '
                                   'hidden_by=view:13')
+    covered = reading("nia_settings", include_skipped=True)["lines"]
+    assert covered[-1] == "- view:1 DecorView [0,0 1280x2856] covered_by=view:76"
     silent = reading("tb_v9-bad-walk", include_skipped=True)["lines"]
     assert ('- view:4 LinearLayout click [0,380 2076x117] !label_missing !touch_target '
             'why=silent_container') in silent
-    assert all(L.is_line(x) for x in merged + hidden["lines"] + silent)
+    assert all(L.is_line(x) for x in merged + hidden["lines"] + silent + covered)
 
 
 def test_reading_pages_carry_the_reading_arguments():
