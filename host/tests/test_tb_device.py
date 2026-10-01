@@ -389,3 +389,19 @@ def test_verbose_already_set_is_left_as_it_was(tb_env):
     assert out["log_level"] == {"before": "VERBOSE", "after": "VERBOSE"}
     tbdevice.action(SERIAL, "restore")
     assert tb_env.talkback.log_level == "VERBOSE"
+
+
+def test_another_app_on_screen_is_named_as_the_one_to_walk(tb_env):
+    # "this screen": the agent's default app was a11yprobe while Thunderbird was in front;
+    # the error names the app on screen and the call that walks it
+    tb_env.talkback.training_on_start = True
+    tb_env.activity_stack.append("net.thunderbird.android.debug/.MainActivity")
+    with pytest.raises(tbdevice.TalkBackError) as err:
+        tbdevice.enable(SERIAL, fakeagent.DEFAULT_PACKAGE)
+    assert err.value.code == "app_left_foreground"
+    assert 'tb_walk(package="net.thunderbird.android.debug")' in err.value.hint
+    # the system's own screens are not offered
+    tb_env.activity_stack[-1] = "com.android.settings/.Settings"
+    with pytest.raises(tbdevice.TalkBackError) as err:
+        tbdevice.enable(SERIAL, fakeagent.DEFAULT_PACKAGE)
+    assert err.value.hint.startswith("Open ")

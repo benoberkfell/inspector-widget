@@ -465,9 +465,15 @@ def ensure_foreground(serial: str, package: str, top_before: Optional[str] = Non
             return {"refronted": top_before,
                     "warning_foreground": f"{package} was covered; brought {top_before} "
                                           f"back to the front"}
+    other = top.split("/", 1)[0] if top else None
+    hint = f"Open {package} on the device, then retry."
+    if other and other != package and not other.startswith(("com.android.", "android")):
+        # "this screen" may mean the app that is on it (list_processes marks it foreground)
+        hint = (f"The app on screen is {other}: tb_walk(package=\"{other}\") walks it (if "
+                f"it is debuggable). Or open {package} on the device, then retry.")
     raise TalkBackError("app_left_foreground", f"{package} is not in the foreground on "
                                                f"{serial} (top: {top or 'unknown'})",
-                        hint=f"Open {package} on the device, then retry.")
+                        hint=hint)
 
 
 def restore(serial: str, wait_s: Optional[float] = None) -> Dict[str, Any]:

@@ -106,6 +106,8 @@ LEGACY_DELTAS: dict[tuple[str, str], str] = {
     ("cli", "component_image"): "component-image prints the MCP component_image document "
                                 "(serial, package and node_key added), as the other "
                                 "always-JSON subcommands do",
+    ("mcp", "list_processes"): "the app on screen (the resumed activity's package) is "
+                               "marked foreground: true, so \"this screen\" names one app",
     ("mcp", "a11y_lint"): _LINT_ACCURACY,
     ("mcp", "a11y_overlay"): _LINT_ACCURACY,
     ("cli", "a11y_lint"): _LINT_ACCURACY,

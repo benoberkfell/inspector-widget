@@ -713,7 +713,8 @@ def test_mcp_list_devices(mcp, fake_device):
 def test_mcp_list_processes(mcp, fake_device):
     res = mcp("list_processes")
     assert res["processes"] == [
-        {"package": PKG, "pid": PID, "running": True},
+        # the app on screen is marked: what an agent asked about "this screen" picks
+        {"package": PKG, "pid": PID, "running": True, "foreground": True},
         {"package": "com.example.idle", "pid": None, "running": False},
     ]
     assert fake_device.wire == []

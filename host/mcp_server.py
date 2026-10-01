@@ -509,7 +509,20 @@ def tool_list_processes(serial: Optional[str] = None) -> Dict[str, Any]:
     serial = _serial(serial)
     procs = [_process_to_json(p) for p in HOST.list_processes(serial)]
     procs.sort(key=lambda p: (not p["running"], p["package"] or ""))
+    top = _foreground_package(serial)
+    for p in procs:
+        if top and p["package"] == top:
+            p["foreground"] = True  # the app on screen: what "this screen" means
     return {"serial": serial, "processes": procs, "count": len(procs)}
+
+
+def _foreground_package(serial: str) -> Optional[str]:
+    """The package of the resumed activity on top, or None when it cannot be read."""
+    try:
+        from inspector_widget.talkback import device as tbdevice
+        return tbdevice.top_package(serial)
+    except Exception:  # noqa: BLE001 - an extra, never a failure
+        return None
 
 
 def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dict[str, Any]:
