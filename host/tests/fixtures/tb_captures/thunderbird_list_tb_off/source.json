@@ -1,0 +1,5 @@
+{
+ "app": "net.thunderbird.android.debug (thunderbird-fossDebug.apk)",
+ "how": "fresh install, onboarding with demo@example.com (offline demo mailbox), app restarted with TalkBack off; capture()",
+ "screen": "Inbox message list (RecyclerView, 7 items incl. an empty header scrolled off the top), TalkBack off: no CollectionItemInfo in the dump"
+}

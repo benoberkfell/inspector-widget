@@ -10,8 +10,9 @@
 - **`mcp_server.py`** — an [MCP](https://modelcontextprotocol.io) server that
   exposes Inspector Widget to an LLM agent as 26 tools (18 listed by default:
   the 15 inspection tools and the 3 TalkBack tools; the 8 capture-and-walk
-  tools with `INSPECTOR_WIDGET_TOOLSET=capture` or `all`), built on top of
-  `inspector_widget`.
+  tools with `INSPECTOR_WIDGET_TOOLSET=capture` or `all`; the TalkBack tools in
+  their capture shape with `capture,talkback`, `talkback` or `all`), built on
+  top of `inspector_widget`.
 
 The wire protocol, packages, socket names, and screenshot encoding are fixed by
 [`../CONTRACT.md`](../CONTRACT.md). The MCP server only orchestrates the driver,
@@ -255,9 +256,7 @@ The CLI takes the same parameters as kebab-case flags with the same defaults
 | `inspect` | `serial`, `package`, `include_properties=false`, `include_overlay=false` | whole-screen merged view+compose+a11y model with per-node correlation and `summary.generation`; can render the integrated overlay (all windows; green exact, amber overlap, grey none) |
 | `inspect_node` | `serial`, `package`, one of `node_key` (`view:<id>` \| `compose:<acvId>:<semanticsId>` \| `composeview:<acvId>`) \| `view_id` \| `semantics_id` \| `bounds`, `include_image=true` | dossier `{node_key, bounds, correlation_confidence, generation, where, context, view?, compose?, a11y?, list_item?, a11y_only?, a11y_parent?, resolved_from?, key_note?, component_image{path}, lint[], lint_summary, lint_diagnostics}` — `compose` carries the semantics attrs (`source` is null: `file:line` needs `dump_compose` with the slot table), `view` typed properties, `lint` exactly the `a11y_lint` findings for the element and the nodes merged into it |
 | `component_image` | `serial`, `package`, one of `node_key` \| `view_id` \| `semantics_id` \| `bounds` | `{path, source, window?, serial, package, node_key}` — cropped PNG of one element, cut from its own window (`source`: `skp` \| `bitmap_crop`); `component-image` prints the same document |
-| `talkback` | `serial?`, `action` (`status` \| `on` \| `off` \| `restore`), `package?`, `verbose_log=false` | TalkBack state, or what `on`/`off`/`restore` changed — **device-wide**: the accessibility settings are snapshotted and restored afterwards, at exit, or by `restore` |
-| `tb_walk` | `serial?`, `package`, `start=current`, `direction=next`, `max_steps=60`, `until=wrap`, `expect?`, `step_timeout_ms=1500`, `settle_ms=120`, `recapture=on_unknown`, `utterance=auto`, `injector=auto`, `leave_on=false`, `max_lines=60`, `max_bytes=5000` | presses the real TalkBack's next/previous (uinput keyboard, touch fallback), records where focus lands and diffs that order with the model's (`dump_accessibility`'s `focus_order`) and a visual order: `{lines, findings, next, ...}`; device-wide, never retried |
-| `tb_scenario` | `serial?`, `package`, `kind` (`focus_after` \| `restore` \| `survive`), `target?`, `action=activate`, `mutate?`, `wait_ms=2000`, `injector=auto`, `leave_on=false`, `step_timeout_ms=1500`, `settle_ms=120` | where the real TalkBack focus goes after an action, after back, or after a list update, classified (`tb.initial_focus`, `tb.restore_failed`, ...); device-wide, never retried |
+| `talkback`, `tb_walk`, `tb_scenario` | see [TalkBack](#talkback-toolset-talkback) below | the default listing shows them in this pre-capture shape (`package` required, node keys or labels as `start` / `target`); the calls run the capture surface's implementation, so results name capture refs |
 | `detach` | `serial?`, `package`, `shutdown=true` | `{detached, agent_stopped, note?}` — `shutdown=true` sends SHUTDOWN, stopping the agent for every client (also one this server didn't attach, or one in the app's new process after a restart; never injects one to stop it); `agent_stopped` is true only once nothing listens on the agent's socket; `shutdown=false` only drops this server's cached connection |
 
 ### Capture and walk (toolset `capture`)
@@ -266,8 +265,11 @@ The CLI takes the same parameters as kebab-case flags with the same defaults
 inspection tools), `talkback` (the 4 session tools and the 3 TalkBack tools),
 `capture` (the 4 session tools and the 8 below), `all`, or a comma list. The
 default is `legacy,talkback` (18) until the deliberate flip; every tool stays
-callable by name. The MCP `instructions` name only listed tools. The same 8
-tools are CLI subcommands generated from one registry
+callable by name. The MCP `instructions` name only listed tools. Compact
+`tools/list` sizes: default 18,479 B, `capture` 11,994 (at most 12,000),
+`talkback` 4,957, `capture,talkback` 15,522, `all` 27,256 (no listing averages
+more than 1,300 B a tool). The same 8 tools (and the 3 TalkBack tools) are CLI
+subcommands generated from one registry
 (`inspector_widget/surface.py`: same names, kebab-case flags, same defaults;
 `--json` prints the MCP text, the human output prints `next` hints as
 `inspector-widget ...` commands; a flag value starting with `-`, as in
@@ -284,11 +286,11 @@ was last seen and its `sel` (a durable selector such as `@cell_1 > @delete`).
 | Tool | Arguments (defaults) | Returns |
 |------|-----------|---------|
 | `capture` | `serial?`, `package?`, `label?`, `props=true`, `resolution_stack=false`, `slots=if_available` (`enable` hot-reloads the app first: destructive), `screenshot=true`, `screenshot_scale=1.0`, `skp=false`, `a11y_rendering=false`, `lint=tree` (`full` adds contrast), `settle_ms=0`, `diff_from?`, `if_changed_since?`, `outline_lines=20`, `on_screen=true`, `pin=false`, `max_bytes=3000` | `{capture, session, pid, device, took_ms, consistency, facets, windows, lint, issues, diagnostics?, note?, diff?, outline, on_screen, next}`; `facets.compose` says `obfuscated: ...` (or the `semantics_failed` reason) instead of a count when Compose cannot be read; `diagnostics` leads with the agent's own cuts (`views: depth-truncated=N`, `compose: semantics_failed: ...`) |
-| `captures` | `action=list` (`show`, `pin`, `unpin`, `label`, `drop`, `export`, `gc`), `id?`, `label?`, `what=nodes`, `format=jsonl`, `all=false`, `limit=20`, `max_bytes=2000`, `serial?`, `package?` | list lines, one capture's details, or the paths `export` wrote; `gc(all=true)` wipes the store |
+| `captures` | `action=list` (`show`, `pin`, `unpin`, `label`, `drop`, `export`, `gc`), `id?`, `label?`, `what=nodes` (`walks` lists the stored TalkBack walks), `format=jsonl`, `all=false`, `limit=20`, `max_bytes=2000`, `serial?`, `package?` | list lines, one capture's details, or the paths `export` wrote; `show` / `export` / `drop` also take a walk id (`w3f9ak1`, `t...` for a scenario); `gc(all=true)` wipes the store, walks included |
 | `outline` | `capture=latest`, `root?`, `view=ui` (`views`, `compose`, `slots`, `a11y`, `reading`), `depth=3`, `detail=semantic`, `origin=app`, `max_children=12`, `max_lines=80`, `fields?`, `cursor?`, `format=lines`, `max_bytes=6000` | one grammar-v1 line per node, `+N` hidden counts, a cursor; the expand hint follows the biggest cut |
 | `find` | `capture=latest`, `text`, `text_re`, `type`, `rid`, `tag`, `src`, `role` (globs), `flags`, `any_flags`, `has`, `missing`, `issue`, `within`, `at`, `overlaps`, `min_dp`/`max_dp` (on the touch (a11y) bounds), `kind`, `window` (selector or z index), `in=ui`, `sort=tree`, `limit=20`, `fields?`, `cursor?`, `count_only=false`, `format=lines`, `max_bytes=3000` | matching lines (filters ANDed), `total`; flags include `truncated` (children the agent did not send) and `redacted` (masked password text) |
 | `node` | `ref` or `refs` (≤10), `capture=latest`, `facets?`, `props=none`, `params=brief`, `ancestors=false`, `children=false`, `image=false`, `max_bytes?` | everything about one node: ids, bounds, `tap_xy`, layout/clip, a11y, compose (slots with `file:line`), issues, props |
-| `image` | `ref?`, `capture=latest`, `window?`, `overlay=none` (`marks`, `lint`, `reading`, `bounds`, `compose`), `marks=auto`, `pad=16`, `source=auto`, `max_side=1024`, `inline=false` (MCP only), `max_bytes=600` | `{path, ...}` of a crop from the node's own window, or an overlay |
+| `image` | `ref?`, `capture=latest`, `window?`, `overlay=none` (`marks`, `lint`, `reading`, `bounds`, `compose`, `walk`), `marks=auto`, `pad=16`, `source=auto`, `max_side=1024`, `inline=false` (MCP only), `max_bytes=600`, `walk?` | `{path, ...}` of a crop from the node's own window, or an overlay; `overlay="walk"` (or `walk=<id>`) draws a stored TalkBack walk on the capture it started from (below) |
 | `lint` | `capture=latest`, `rules?`, `severity=info`, `within?`, `contrast=false`, `wcag=false`, `group=rule`, `per_rule=3`, `limit=30`, `cursor?`, `max_bytes=4000` | findings grouped by rule with fixes; one bug repeated in list cells collapses to `×N in <list> cells (...)`; `+N more` hints keep the call's scope |
 | `diff` | `a=prev`, `b=latest`, `within?`, `include?`, `min_move_px=4`, `limit=40`, `image=false`, `cursor?`, `max_bytes=4000` | changed / moved / added / removed / rebound lines; `issues: {resolved, new, gone_with_node?, on_new_nodes?}` compared on the nodes both captures hold (a scroll resolves nothing) |
 
@@ -304,6 +306,48 @@ store holds other apps, carries `session` naming the app it read. Each capture
 reads the device's dpi and font scale at that moment. `capture` and `captures`
 carry `destructiveHint` (a hot reload, deleting captures); a
 `capture(slots="enable")` that loses its session is never retried.
+
+### TalkBack (toolset `talkback`)
+
+The three TalkBack tools are in the same registry (`inspector_widget/surface.py`
+over `ops.talkback` / `ops.tb_walk` / `ops.tb_scenario`), listed with
+`INSPECTOR_WIDGET_TOOLSET=talkback`, `capture,talkback` or `all`, and in the
+default listing in their pre-capture shape. They are **device-wide**: TalkBack
+runs for every app while it is on; the accessibility settings are snapshotted
+first and restored afterwards, at the server's exit, or by
+`talkback(action="restore")`. They carry `destructiveHint` and are never
+retried. Failures are the usual error envelope with a TalkBack code:
+`talkback_unavailable`, `enable_failed`, `restore_failed`, `busy` (another walk
+holds the device), `app_left_foreground`, `injector_failed` (the injectors
+tried are the `candidates`), `keymap_unknown`, `start_not_found`.
+
+The loop the MCP instructions give: `capture -> lint(rules=["tb"]) ->
+outline(view="reading",explain=true) -> node(ref,facets="tb") ->
+tb_walk(start=ref) -> image(overlay="walk")`. The static side (the `tb.*`
+rules, the reading view's `explain`, the node `tb` facet) predicts TalkBack
+from a stored capture; `tb_walk` confirms it with the real one.
+
+| Tool | Arguments (defaults) | Returns |
+|------|-----------|---------|
+| `talkback` | `action=status` (`on`, `off`, `restore`), `serial?`, `package?` (on: the app kept in front), `verbose_log=false` | the TalkBack state (installed, enabled, touch exploration, services, a pending restore, injectors), or what `on` / `off` / `restore` changed; `next` points at `tb_walk()` and the restore |
+| `tb_walk` | `serial?`, `package?`, `start=current` (`first`, a ref, a selector, or a label as spoken), `direction=next`, `max_steps=60`, `until=wrap` (`edge`, `loop`, `steps`), `expect?` (refs, selectors or labels), `step_timeout_ms=1500`, `settle_ms=120`, `recapture=on_unknown`, `utterance=auto`, `injector=auto`, `leave_on=false`, `max_lines=60`, `max_bytes=5000` | `{capture, walk, recaptured?, talkback, start, steps, ended, ms, lines, diff, findings, expect?, notes?, restore, next}` (at most 5 KB at 60 steps): one line per step, `3. n14 "Add to favorites, Button" via=autoscroll(n10) !double_stop`; `diff` classifies the walk against the model by ref (`model: "13 agree, 1 differ: step 7 ..."`, `skip`, `double`, `out_of_order`, `loop`, `trap`, `escape`, `stuck`, `left_app`, `unvisited` ...); `findings` give `tb.*` codes, refs, basis `walk` and the fix (once per code) |
+| `tb_scenario` | `kind` (`focus_after`, `restore`, `survive`), `serial?`, `package?`, `target?` (a ref, selector or label; default: the current focus), `action=activate` (`back`, `tap:<ref>`, `key:<combo>`), `mutate?` (survive: `tap:<ref>`, `activate`, `key:`, `broadcast:<am args>`, `probe:<action>`), `wait_ms=2000`, `injector=auto`, `leave_on=false`, `step_timeout_ms=1500`, `settle_ms=120`, `max_bytes=1000` | `{scenario, kind, capture, after, target, did, windows?, timeline, focus, verdict, finding?, cause?, restore, next}` (at most 1 KB): verdicts `initial_ok` / `on_close_or_unlabeled` / `behind_overlay` / `stayed_on_opener`, `restored` / `near` / `top`, `kept` / `drifted` / `restored` / `reset_top` / `lost`; findings `tb.initial_focus`, `tb.restore_failed`, `tb.focus_reset` / `focus_lost` / `focus_drift`; `cause` comes from the before / after captures (`n47 rebound as n103 ...; 12 removed, 12 added`) |
+
+A walk captures the screen once TalkBack has settled (`props` off; its
+diagnostics say `taken with TalkBack on`), so `start`, `expect` and
+`tap:<ref>` resolve as refs there, and every step names its node by ref. When
+focus lands on a node no capture holds (TalkBack scrolled it in), the walk
+recaptures, at most once per three steps (`recapture="never"` turns that off:
+those steps show `?<key>`); refs carry over, so a node keeps its ref. The
+record (every step with its key, ref, capture, speech and bounds; the predicted
+order; the findings) is stored as `<store>/walks/<id>.json` with the capture
+ids: `captures(what="walks")` lists walks and scenarios, `captures(action=
+"show", id=...)` shows one (every step), `export` gives the JSON path. The
+newest 100 are kept. `image(overlay="walk", walk=<id>)` draws a walk on the
+capture it started from (or `capture=`): stops numbered by step, arcs in
+TalkBack's order, the model's next stop dashed amber where it differs,
+mismatches red, predicted stops never reached dashed red; `window=` draws one
+window, steps on other captures or windows are counted in `omitted`.
 
 ### Node keys and reading order
 

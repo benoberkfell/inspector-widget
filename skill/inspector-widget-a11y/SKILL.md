@@ -6,7 +6,10 @@ description: >-
   improve TalkBack / screen reader support, add or correct contentDescription,
   enlarge touch targets, fix color contrast, set semantics roles / headings /
   state descriptions, or check reading (focus) order on an Android app — for both
-  Jetpack Compose and classic View UIs. Drives a live device/emulator via the
+  Jetpack Compose and classic View UIs. Also for TalkBack navigation bugs (skips,
+  double stops, out-of-order jumps, traps, focus escaping a dialog or sheet,
+  Compose/View boundary jumps, focus lost after a list update): predict them from
+  a capture, then confirm with a real TalkBack walk. Drives a live device/emulator via the
   Inspector Widget MCP server (codename viewspector): dump the accessibility tree,
   run the a11y lint, render an annotated overlay, open a per-element dossier
   (a11y node + View/Compose facets + where it lives + its findings + component
@@ -37,11 +40,12 @@ Trigger this for any request to **debug or fix accessibility on an Android app**
 "TalkBack reads this wrong", "this button has no label", "the tap target is too
 small", "contrast is failing", "add contentDescription", "fix the reading order",
 "make this screen accessible", "run an a11y audit". It works for Compose and for
-View-based UIs.
+View-based UIs. For "TalkBack skips / jumps / gets stuck / leaves the dialog /
+loses its place" go straight to §5 (TalkBack navigation).
 
 You need: a connected device/emulator (`adb devices`), the target app **running**
 and **debuggable** (`android:debuggable="true"`, i.e. a debug build), and the
-Inspector Widget MCP registered (see §7). If the MCP is not registered, register
+Inspector Widget MCP registered (see §8). If the MCP is not registered, register
 it first — the whole playbook depends on it.
 
 ---
@@ -205,7 +209,7 @@ overlay / a11y dump:
   ContentDescription, …). Its `source` is **null** in the dossier: `file:line`
   only exists in the slot table, which `inspect_node` does not fetch. To find the
   line, run `dump_compose(include_slot_table=true, enable_inspection=true)` (see
-  §5 for the cost) and match the composable to the node by `testTag` or bounds.
+  §6 for the cost) and match the composable to the node by `testTag` or bounds.
 - **`view`** — full View attributes + `properties` (typed: colors as
   `#AARRGGBB`, resources resolved, `is_layout` marked) for classic Views.
 - **`a11y`** — the element's full `AccessibilityNodeInfo` (label, role, state,
@@ -425,7 +429,159 @@ same names (`capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`,
 
 ---
 
-## 5. Tips, gotchas, hygiene
+## 5. TalkBack navigation bugs: predict, walk, confirm
+
+Use this when the complaint is about **moving through the screen with TalkBack**,
+not about one element's label: it skips something, stops twice on one row, jumps
+out of order, gets stuck at the end of a list, walks out of a dialog or bottom
+sheet, jumps between the Compose part and the View part, loses its place after a
+list updates, or lands on the wrong control after a screen opens or closes.
+
+Set `INSPECTOR_WIDGET_TOOLSET=capture,talkback` (or `all`) so the capture tools
+and the TalkBack tools are listed together. The loop:
+
+```
+capture()                                    one snapshot; every node gets a ref (n23)
+lint(rules=["tb"])                           static tb.* findings (the TalkBack model), basis "model"
+outline(view="reading", explain=true)        TalkBack's stops in swipe order: what it says, why= it stops
+   include_skipped=true                      ... plus "- " lines: what it passes over and why
+   from="n14", direction="prev"              ... from one stop, backwards
+node("n14", facets="tb")                     one node: stop / why / why_not, speech parts by ref, prev/next
+tb_walk(start="n14")                         the REAL TalkBack, step by step, by ref; diff vs the model
+image(overlay="walk")                        the walk drawn: numbered arcs, model dashed, mismatches red
+tb_scenario(kind="survive", target="n47", mutate="tap:n49")   focus after a list update (or focus_after / restore)
+```
+
+After `capture()`, the next three calls never touch the device and cost about
+1-2 KB each. Start there: the model (TalkBack 16.2's traversal rules, calibrated against TalkBack
+17) is right far more often than not, and it explains *why*. Then confirm with
+`tb_walk` (about 0.2-0.4 s a step on an emulator, at most 5 KB for 60 steps).
+
+**`tb_walk` and `tb_scenario` are device-wide.** They turn TalkBack on for the
+whole device (the accessibility settings are snapshotted first and restored
+afterwards, at the server's exit, or by `talkback(action="restore")`; with
+`leave_on=true` it stays on), press its own keyboard shortcuts through a virtual
+keyboard, and need the app in the foreground. Do not run them while someone else
+uses the device, and do not run `uiautomator dump` meanwhile (it suppresses
+TalkBack).
+
+### Reading the model's codes
+
+`outline(view="reading", explain=true)` and `node(ref, facets="tb")` say why each
+node is or is not a stop, and how focus gets there:
+
+- **`why=`** (a stop): `click`, `longclick`, `focusable` (actionable), `srf`
+  (screen-reader-focusable: `Modifier.semantics { }` / `focusable`), `scroll_item`
+  (a speaking child of a list), `text_orphan` (text with no focusable ancestor: it
+  is its own stop), `leaf` (focusable, no children, nothing to say: "Unlabelled"),
+  `web` (inside a WebView). `ghost=unlabelled|tiny|clipped:<ref>|invisible_children_only`:
+  a stop with nothing useful to hear or see.
+- **`why_not`** / `- ` lines (not a stop): `merged_into=<ref>` (that stop reads it),
+  `silenced_by=<ref>` (that stop's contentDescription replaces its text: never
+  said), `inside_silent=<ref>` (under a focusable container that is no stop and
+  reads nothing), `hidden_by=<ref>` (`noHideDescendants` there), `covered_by=<ref>` (its
+  window is under a modal one), `not_important`, `silent_container` (focusable,
+  but its focusable children are the stops), `window_wrapper`, `offscreen` (outside
+  its window or scrolled out of its scroller; `reachable: scroll` when TalkBack
+  auto-scrolls to it), `zero_size`, `invisible`, `no_speech`.
+- **`edge_in`** (how a forward swipe arrives): `tree` (the tree order), `chain`
+  (Compose's traversal order), `bounds_swap` (re-sorted by position),
+  `before:<ref>` / `after:<ref>` (an app's traversalBefore/After link),
+  `window:<ref>` (the first stop of another window), `first`. `via=` on a reading
+  line shows it when a link or a reorder placed the stop.
+
+### Reading a walk
+
+```json
+{"capture":"cqwa9g","walk":"wbz8enj","talkback":"17.0.0 uinput/enhanced","start":"n5",
+ "steps":5,"ended":"wrap","ms":{"p50":210,"p95":470,"total":4300},
+ "lines":["0. n5 \"Wi-Fi. Switch\"","1. n6 \"Done. Button\"","2. — edge",
+          "3. n3 \"Settings\" via=wrap","4. n4 \"Wi-Fi\" !double_stop","5. n5 \"Wi-Fi. Switch\" !double_stop"],
+ "diff":{"ended":"wrap","model":"1 agree, 0 differ","double":["n4","n5"]},
+ "findings":[{"code":"tb.double_stop","sev":"warn","refs":["n4","n5"],"basis":"walk",
+              "msg":"steps 4-5: n4 'Wi-Fi' and n5 'Wi-Fi' inside it are both stops ...",
+              "fix":"Make one of the two the stop: ..."}],
+ "restore":"restored","next":["node(\"n4\",facets=\"tb\")","image(overlay=\"walk\",walk=\"wbz8enj\")"]}
+```
+
+- Each line is one press: `i. ref "what TalkBack says" via=... !finding`.
+  `via=autoscroll(n10)` (TalkBack scrolled n10 to get there), `via=window` (it
+  moved to another window), `via=wrap` (past the edge, back at the top),
+  `via=stolen` (the app moved focus between presses), `via=screen` (the screen
+  was replaced under the walk: another activity or window took its place; the
+  model is compared with the steps before it only). `— edge` is a press that
+  moved nothing; `?view:123 Button` is a node no capture holds.
+- RecyclerView items bound before TalkBack started carry no "N of M": a walk that
+  turns TalkBack on over a list already on screen hears no positions, while a
+  user who had TalkBack on before the app does (the walk's `notes` say so, and
+  the capture's model speaks what the user hears). To walk what they hear:
+  `talkback(action="on")`, restart the app, `tb_walk`, then
+  `talkback(action="restore")`.
+- `ended`: `wrap` (one full lap), `edge`, `loop` (a cycle that never reaches an
+  edge), `stuck` (two presses that move nothing), `lost` (no node holds focus),
+  `left_app`, `max_steps`.
+- `diff` sorts what differs by class, by ref: `model` (how many moves the
+  prediction got right, and the first it did not), `skip`, `unvisited`,
+  `double`, `out_of_order`, `loop`, `trap`, `escape`, `stuck`, `ghost`,
+  `revisit`, `speech`, `window_order`, `left_app`.
+- Findings have basis `walk` (TalkBack did it), `model` (`lint`), or `expect`
+  (you passed the order you want: `tb_walk(expect=["n3","n9","@total"])`).
+  `model.mismatch` is calibration data, not an app bug: the walk is ground truth.
+- The walk captured the screen with TalkBack on (`capture`), and again when
+  TalkBack scrolled in nodes no capture held (`recaptured`); refs carry over, so
+  every ref in the walk works with `node`, `outline`, `find` and `image`. Where
+  those tools are not listed (the default listing), `keys` maps each ref to its
+  node key for `inspect_node(node_key=...)`, and `next` names only listed tools.
+- A walk on a device or app you did not name says which it drove (`session`).
+- For the backward lap, `next` suggests `tb_walk(direction="prev", start=<the last
+  stop>)`; a backward walk from the first stop meets the edge at once and compares
+  the lap after the wrap.
+- The full record is stored: `captures(what="walks")` lists walks and
+  scenarios, `captures(action="show", id="wbz8enj")` shows every step.
+
+### Bug → what shows it → the fix
+
+| Symptom | Static (no device) | Walk / scenario | Typical fix |
+|---|---|---|---|
+| Something is never read | `tb.skipped`; `outline(view="reading", include_skipped=true)` says `hidden_by=` / `why=not_important` | `diff.skip`, `unvisited`, text on screen no stop read | drop `noHideDescendants` / `hideFromAccessibility`, fold it into a label |
+| One row takes two swipes | `tb.double_stop` (opt-in: `rules=["tb"]`) | `diff.double` | `Modifier.toggleable` on the row, child `onCheckedChange = null`; View: child not clickable |
+| Reads out of visual order | `tb.out_of_order` | `diff.out_of_order`, `tb_walk(expect=[...])` | `isTraversalGroup = true` per column / card (+ `traversalIndex`); View: `accessibilityTraversalBefore/After` |
+| Focus leaves a dialog or sheet | `tb.escape` | `diff.escape` | a real `Dialog` / `ModalBottomSheet`, or hide what it covers; a `paneTitle` |
+| Jumps between Compose and Views | `tb.boundary_jump` | `diff.out_of_order` across the boundary | put the overlay View in the layout flow; `isTraversalGroup` around the `AndroidView` |
+| Stuck at a list end / pager | `tb.edge_stuck` | `ended:"stuck"`, `diff.stuck` | scroll semantics and actions; page buttons or custom actions for a pager |
+| Popup read last | `tb.window_order` | `diff.window_order` | focusable / modal popup |
+| Says it wrong | `tb.wrong_announcement`, `node(ref, facets="tb")` parts | `diff.speech` | compose texts in reading order, `clearAndSetSemantics { contentDescription = ... }` |
+| Trapped / loops | (cycles show in `outline` as a repeat) | `ended:"loop"`, `diff.loop`, `diff.trap` | request focus once; break `traversalBefore/After` cycles |
+| Lost after a list update | (`diff` of two captures: `rebound`) | `tb_scenario(kind="survive", target=..., mutate=...)`: `kept` / `drifted` / `reset_top` / `lost`, `cause` | stable keys (`items(key = { it.id })`), DiffUtil with stable ids, `supportsChangeAnimations = false` |
+| Wrong focus after opening / closing | | `tb_scenario(kind="focus_after" \| "restore")` | content first, a window / pane title, no stray `requestFocus()` |
+| Gesture-only action | `tb.custom_action_missing` (needs `capture(slots="enable")`) | | `customActions` / `ViewCompat.addAccessibilityAction` |
+
+Each `tb.*` rule, with its fix, is in **[rules.md](rules.md#talkback-navigation-rules-tb)**.
+
+### A worked example: the filter sheet TalkBack walks out of
+
+```
+1. capture()                                   → c7h2kq, 1 window
+2. lint(rules=["tb"])                          → tb.escape ×23 under n60 @filter_sheet (58%)
+3. outline(view="reading", explain=true, from="@filter_sheet_title")
+                                               → the sheet's stops in swipe order, then
+                                                 n14 ... behind it
+4. node("n60", facets="tb,compose")            → a BottomSheetScaffold sheet, Filters.kt:77
+5. tb_walk(start="@filter_sheet_title", max_steps=12)
+                                               → step 6: n14 !escape (behind the sheet)
+6. image(overlay="walk")                       → arcs leave the sheet at step 6 (red)
+7. FIX: ModalBottomSheet (its own window), or hideFromAccessibility on the content
+   while the sheet is expanded, plus a paneTitle on the sheet
+   (developer rebuilds and redeploys)
+8. tb_walk(start="@filter_sheet_title")         → ended "wrap" inside the sheet, no findings
+```
+
+The CLI has the same tools: `inspector-widget tb-walk --start n14 --json`,
+`inspector-widget captures --what walks`, `inspector-widget image --overlay walk`.
+
+---
+
+## 6. Tips, gotchas, hygiene
 
 - **App must be running and debuggable.** Release builds and non-running apps
   cannot be attached. If `attach` fails, launch the app and confirm it is a
@@ -488,7 +644,7 @@ same names (`capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`,
 
 ---
 
-## 6. Tool quick reference
+## 7. Tool quick reference
 
 The accessibility-focused tools (full list + the View/Compose tools in
 **[tools.md](tools.md)**):
@@ -505,11 +661,17 @@ The accessibility-focused tools (full list + the View/Compose tools in
 | `component_image` | just the cropped image of one element |
 | `inspect` | whole-screen merged view+compose+a11y model |
 | `compose_overlay` | see on-screen Compose text/role boxes |
+| `talkback` | TalkBack status / on / off / restore (device-wide) |
+| `tb_walk` | walk the REAL TalkBack, step by step, by capture ref; diff vs the model |
+| `tb_scenario` | where real focus goes after an action, back, or a list update |
 | `detach` | end the session |
+
+With `INSPECTOR_WIDGET_TOOLSET=capture,talkback` (or `all`): `capture`,
+`outline`, `find`, `node`, `lint`, `image`, `diff`, `captures` (§5).
 
 ---
 
-## 7. Register the Inspector Widget MCP
+## 8. Register the Inspector Widget MCP
 
 Register the server once so the tools above are available. Use the host venv
 python (so protobuf / the mcp SDK are on the path), or set `PYTHONPATH` to the
@@ -529,6 +691,14 @@ Or register manually, **from the repo root** so `$PWD` expands to your checkout
 
 ```
 claude mcp add inspector-widget -- env PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
+```
+
+The default listing is the legacy inspection tools plus the TalkBack tools. For
+the capture tools and the TalkBack loop of §5, register it with a toolset:
+
+```
+INSPECTOR_WIDGET_TOOLSET=capture,talkback ./scripts/register-mcp.sh
+# or: claude mcp add inspector-widget -- env INSPECTOR_WIDGET_TOOLSET=capture,talkback PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
 ```
 
 Verify the server and its tool surface without a device:

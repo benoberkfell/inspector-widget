@@ -185,8 +185,8 @@ _INJECTING = [
     ["component-image", "--view-id", "5"],
     ["screenshot", "--out", "unused.png"],
     ["get-properties", "--view-id", "5"],
-    ["tb-walk"],
-    ["tb-scenario", "survive"],
+    ["tb-walk", "--package", "p"],
+    ["tb-scenario", "survive", "--mutate", "activate", "--package", "p"],
     ["capture", "--package", "p"],
 ]
 

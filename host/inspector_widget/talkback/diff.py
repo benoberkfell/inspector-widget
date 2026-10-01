@@ -194,19 +194,39 @@ def _moves(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def first_lap(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Moves up to the first edge or wrap (the lap the order checks look at)."""
+    """Moves up to the first edge or wrap (the lap the order checks look at). A walk that
+    meets the edge before any move (backwards from the first stop) compares the lap after
+    it: from the stop the wrap lands on."""
     out: List[Dict[str, Any]] = []
     for s in steps:
-        if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost"):
+        if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost", "screen"):
+            if len(out) <= 1 and s.get("via") not in ("left_app", "lost", "screen"):
+                out = [s] if s.get("via") == "wrap" and s.get("moved") and s.get("key") else []
+                continue
             break
         if s.get("moved") and s.get("key") and (not out or out[-1]["key"] != s["key"]):
             out.append(s)
     return out
 
 
+def _first_screen(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The steps before the screen was replaced under the walk (``via="screen"``: another
+    activity or window took the place of the one it was in; capture/walks.py marks it).
+    What the model predicted is about that first screen only."""
+    out: List[Dict[str, Any]] = []
+    for s in steps:
+        if s.get("via") == "screen":
+            break
+        out.append(s)
+    return out
+
+
 def _lap_complete(walk: Dict[str, Any]) -> bool:
     """A full lap: the walk wrapped (past an edge and back onto a stop it had read)."""
-    return walk.get("ended") == "wrap" or any(s.get("via") == "wrap" for s in walk["steps"])
+    steps = _first_screen(walk["steps"])
+    if len(steps) < len(walk["steps"]):
+        return any(s.get("via") == "wrap" for s in steps)
+    return walk.get("ended") == "wrap" or any(s.get("via") == "wrap" for s in steps)
 
 
 def _dp(px: float, density: int) -> float:
@@ -231,6 +251,8 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
     pos: Optional[int] = P.index(_pk(lap[0])) if lap and _pk(lap[0]) in P else None
     for s in lap[1:]:
         k = _pk(s)
+        if s.get("via") == "screen":  # another screen: the prediction was for the first one
+            break
         if s.get("via") == "stolen":  # the app moved focus, not TalkBack: nothing to predict
             pos = P.index(k) if k in P else None
             continue
@@ -245,7 +267,7 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
                 first = (f"step {s['i']}: model " + (f"{exp['ref']} {_q(exp['label'])}" if exp else "(end)")
                          + f", actual {_name(s)}")
         pos = P.index(k) if k in P else None
-    visited = {_pk(s) for s in _moves(walk["steps"])}
+    visited = {_pk(s) for s in _moves(_first_screen(walk["steps"]))}
     unpredicted = [s for s in lap if _pk(s) not in P]
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     unvisited = _unvisited(walk, P, visited, covered)
@@ -283,7 +305,7 @@ def _coverage(walk: Dict[str, Any], P: List[str], visited: set) -> Tuple[int, in
         return 0, len(P) - 1, "in a full lap"
     first = next((_pk(s) for s in _moves(walk["steps"]) if _pk(s) in P), None)
     start = P.index(first) if first is not None else min(idx)
-    if any(s.get("edge") for s in walk["steps"]):
+    if any(s.get("edge") for s in _first_screen(walk["steps"])):
         if walk.get("direction", "next") == "next":
             return start, len(P) - 1, "from the start to the edge"
         return 0, start, "from the start back to the edge"
@@ -300,7 +322,7 @@ def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows
 def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     P = [p["key"] for p in walk.get("predicted") or []]
     pref = {p["key"]: p for p in walk.get("predicted") or []}
-    visited = {_pk(s) for s in _moves(walk["steps"])}
+    visited = {_pk(s) for s in _moves(_first_screen(walk["steps"]))}
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     miss = _unvisited(walk, P, visited, covered)
     if not miss:
@@ -396,28 +418,63 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
+    """tb.escape: a step in a window under a modal one, or behind a same-window overlay the
+    walk was inside before. Consecutive escaped steps out of the same overlay are one finding
+    (every step named, so a drawing marks them all)."""
+    runs: List[Tuple[Any, Dict[str, Any], List[Dict[str, Any]]]] = []  # (why, cover, steps)
     moves = _moves(walk["steps"])
     for j, s in enumerate(moves):
+        why: Any = None
         if s.get("window_covered_by") is not None:
-            s["_escape"] = True
-            out.append(_finding("tb.escape", "error",
-                                f"step {s['i']}: focus reached {_name(s)} in a window under the modal "
-                                f"window {s['window_covered_by']}", [s]))
+            why, first = ("window", s["window_covered_by"]), s
+        else:
+            cov = s.get("covered_by")
+            if not cov or not cov.get("rect"):
+                continue
+            orect = tuple(cov["rect"])
+            inside = [m for m in moves[:j] if not m.get("covered_by") and _rect(m)
+                      and _contains(orect, _rect(m))]  # type: ignore[arg-type]
+            if not inside:
+                continue
+            why, first = ("overlay", orect), inside[-1]
+        s["_escape"] = True
+        prev = moves[j - 1] if j else None
+        if runs and runs[-1][0] == why and prev is not None and prev is runs[-1][2][-1]:
+            runs[-1][2].append(s)
+        else:
+            runs.append((why, first, [s]))
+    out = []
+    for why, first, steps in runs:
+        a, b = steps[0], steps[-1]
+        at = f"step {a['i']}" if a is b else f"steps {a['i']}-{b['i']}"
+        n = f"{len(steps)} stops" if len(steps) > 1 else "1 stop"
+        if why[0] == "window":
+            msg = (f"{at}: focus read {n} in a window under the modal window {why[1]}, "
+                   f"first {_name(a)}")
+            out.append(_finding("tb.escape", "error", msg, steps))
             continue
-        cov = s.get("covered_by")
-        if not cov or not cov.get("rect"):
-            continue
-        orect = tuple(cov["rect"])
-        inside = [m for m in moves[:j] if not m.get("covered_by") and _rect(m)
-                  and _contains(orect, _rect(m))]  # type: ignore[arg-type]
-        if inside:
-            s["_escape"] = True
-            out.append(_finding("tb.escape", "error",
-                                f"step {s['i']}: focus left the overlay {cov.get('ref') or cov.get('overlay')} "
-                                f"({cov.get('cls')}, {int(100 * cov.get('area', 0))}% of the window) and "
-                                f"landed on {_name(s)} behind it", [inside[-1], s]))
+        cov = a["covered_by"]
+        msg = (f"{at}: focus left the overlay {cov.get('ref') or cov.get('overlay')} "
+               f"({cov.get('cls')}, {int(100 * cov.get('area', 0))}% of the window) and read "
+               f"{n} behind it, first {_name(a)}")
+        out.append(_finding("tb.escape", "error", msg, [first, *steps]))
     return out[:5]
+
+
+def _capture_order(seg: List[Dict[str, Any]], keys: set) -> Optional[Tuple[List[str], str]]:
+    """V from the walk's capture (``vrank``: capture/walks.py binds each step to the place
+    tb.out_of_order gives it, from the View tree and the semantics groups) when every stop
+    of the segment has one, in one capture, window and layer; else None (the XY-cut over
+    the steps' boxes decides)."""
+    ranks: Dict[str, Any] = {}
+    for s in seg:
+        if s["key"] in keys and s["key"] not in ranks:
+            ranks[s["key"]] = s.get("vrank")
+    if not ranks or any(r is None for r in ranks.values()):
+        return None
+    if len({tuple(r[:3]) for r in ranks.values()}) != 1:
+        return None
+    return sorted(ranks, key=lambda k: ranks[k][3]), "capture"
 
 
 def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -428,7 +485,8 @@ def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[
     segments: List[List[Dict[str, Any]]] = [[]]
     for s in lap:
         escaped = bool(s.get("_escape")) != bool(segments[-1] and segments[-1][-1].get("_escape"))
-        if (s.get("via") in ("autoscroll", "window", "stolen") or escaped) and segments[-1]:
+        if (s.get("via") in ("autoscroll", "window", "stolen", "screen") or escaped) \
+                and segments[-1]:
             segments.append([])
         segments[-1].append(s)
     out = []
@@ -442,7 +500,8 @@ def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[
                  if not any(k2 != k and _contains(r, r2) for k2, r2 in items)]  # type: ignore[arg-type]
         if len(items) < 3:
             continue
-        v, src = visual_order(items)  # type: ignore[arg-type]
+        v, src = _capture_order(seg, {k for k, _r in items}) or \
+            visual_order(items)  # type: ignore[arg-type]
         sources.add(src)
         rank = {k: i for i, k in enumerate(v)}
         seq_steps = [s for s in seg if s["key"] in rank]
@@ -689,7 +748,8 @@ def _check_window_order(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
             if below:
                 out.append(_finding(
                     "tb.window_order", "warn",
-                    f"step {s['i']}: window {s.get('window')} (from y={top}) is read only after "
+                    f"step {s['i']}: window {s.get('window_ref') or s.get('window')} (from "
+                    f"y={top}) is read only after "
                     f"{len(below)} stop(s) of the window under it that sit lower on screen, e.g. "
                     f"{_name(below[0])}", [below[0], s]))
                 break

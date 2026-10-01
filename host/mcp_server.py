@@ -1516,62 +1516,29 @@ TOOLS.update({
 # --------------------------------------------------------------------------- #
 # TalkBack navigation (inspector_widget.talkback). DEVICE-WIDE: these turn the
 # system screen reader on (snapshotting the settings first) and restore it.
+#
+# One implementation: ops.talkback / ops.tb_walk / ops.tb_scenario, registered in
+# inspector_widget.surface (which also generates the CLI subcommands). The entries
+# below are only how the DEFAULT listing (legacy + talkback) presents them, byte for
+# byte as before the capture tools existed (surface.legacy_talkback); the surface
+# entries replace the handlers and schemas when the capture section registers them.
 # --------------------------------------------------------------------------- #
 _DEVICE_WIDE = (
     "DEVICE-WIDE: TalkBack runs for every app; settings are snapshotted and restored "
     "afterwards, at exit, or by talkback(action='restore'). ")
 _TB_ANNOTATIONS = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
                    "openWorldHint": False}
-_TB_WALK_ARGS = ("start", "direction", "max_steps", "until", "expect", "step_timeout_ms",
-                 "settle_ms", "recapture", "utterance", "injector", "leave_on", "max_lines",
-                 "max_bytes")
-_TB_SCENARIO_ARGS = ("target", "action", "mutate", "wait_ms", "injector", "leave_on",
-                     "step_timeout_ms", "settle_ms")
 
 
-def _tb_errors(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
-    """TalkBack failures carry a code (busy, talkback_unavailable, injector_failed,
-    keymap_unknown, start_not_found, app_left_foreground, restore_failed...)."""
-    from inspector_widget.talkback import device as tbdevice, inject as tbinject, walk as tbwalk
-    try:
-        return fn()
-    except (tbdevice.TalkBackError, tbwalk.WalkError, tbinject.InjectorError) as exc:
-        out: Dict[str, Any] = {"error": str(exc), "code": getattr(exc, "code", "error")}
-        if getattr(exc, "hint", None):
-            out["hint"] = exc.hint
-        if getattr(exc, "tried", None):
-            out["tried"] = exc.tried
-        return out
+def _tb_unavailable(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Replaced by the surface's handler; reached only when the host package
+    (inspector_widget.surface) does not import."""
+    raise ToolError("the TalkBack tools need the inspector_widget host package")
 
 
-def _h_talkback(args: Dict[str, Any]) -> Dict[str, Any]:
-    from inspector_widget.talkback import device as tbdevice
-    serial = _serial(args.get("serial"))
-    return _tb_errors(lambda: tbdevice.action(serial, args["action"], package=args.get("package"),
-                                              verbose_log=bool(args.get("verbose_log"))))
-
-
-def _h_tb_walk(args: Dict[str, Any]) -> Dict[str, Any]:
-    from inspector_widget.talkback import walk as tbwalk
-    _require(args.get("package"), "package")
-    serial = _serial(args.get("serial"))
-    session = SESSIONS.get_or_attach(serial, args["package"])
-    opts = {k: args[k] for k in _TB_WALK_ARGS if k in args}
-    return _tb_errors(lambda: tbwalk.run_walk(session, **opts))
-
-
-def _h_tb_scenario(args: Dict[str, Any]) -> Dict[str, Any]:
-    from inspector_widget.talkback import scenarios as tbscenarios
-    _require(args.get("package"), "package")
-    serial = _serial(args.get("serial"))
-    session = SESSIONS.get_or_attach(serial, args["package"])
-    opts = {k: args[k] for k in _TB_SCENARIO_ARGS if k in args}
-    return _tb_errors(lambda: tbscenarios.run_scenario(session, args["kind"], **opts))
-
-
-TOOLS.update({
+_TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
     "talkback": {
-        "handler": _h_talkback,
+        "handler": _tb_unavailable,
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack status / on / off / restore",
                             idempotentHint=True),
         "description": (
@@ -1595,13 +1562,14 @@ TOOLS.update({
         },
     },
     "tb_walk": {
-        "handler": _h_tb_walk,
+        "handler": _tb_unavailable,
         "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus"),
         "description": (
             _DEVICE_WIDE + "Presses REAL TalkBack's next/previous (uinput keyboard, touch "
             "fallback), records where focus lands and diffs that order with the model's and a "
-            "visual order. Returns one line per step, how it ended (wrap, edge, loop, stuck, "
-            "left_app, max_steps), vs_model and tb.* findings with fixes; the full walk is saved. "
+            "visual order. Returns one line per step (a ref; keys maps refs to node keys for "
+            "inspect_node), how it ended (wrap, edge, loop, stuck, left_app, max_steps), the "
+            "diff with the model and tb.* findings with fixes; the full walk is saved. "
             "~0.1-0.4s per step."
         ),
         "schema": {
@@ -1646,7 +1614,7 @@ TOOLS.update({
         },
     },
     "tb_scenario": {
-        "handler": _h_tb_scenario,
+        "handler": _tb_unavailable,
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack focus scenarios"),
         "description": (
             _DEVICE_WIDE + "Where REAL TalkBack focus goes. focus_after: do action, classify "
@@ -1680,7 +1648,14 @@ TOOLS.update({
             "additionalProperties": False,
         },
     },
-})
+}
+
+
+TOOLS.update(_TB_LEGACY_ENTRIES)  # in place: the listing order is the default's
+#: How the default listing presents the TalkBack tools (no handler: the surface's runs).
+_TB_LEGACY_LISTING: Dict[str, Dict[str, Any]] = {
+    name: {k: entry[k] for k in ("description", "schema", "annotations")}
+    for name, entry in _TB_LEGACY_ENTRIES.items()}
 
 
 # Phase-0 output parameters (detail, max_bytes, max_depth, root, user_code_only,
@@ -1920,6 +1895,9 @@ def _ops_context() -> Any:
     with _OPS_LOCK:
         if _OPS is None or _OPS.store.configured_root != root or _OPS.store.persist != persist:
             _OPS = ops.OpContext(CaptureStore(), _McpSessions(), "mcp")
+        # what an agent of this server can call: TalkBack results hint only listed tools
+        # (and name node keys where the capture tools are not listed)
+        _OPS.listed = frozenset(_listed_tools())
         return _OPS
 
 
@@ -1951,7 +1929,10 @@ if surface is not None:
 
 def _listed_tools() -> Dict[str, Dict[str, Any]]:
     """The TOOLS entries tools/list shows: the INSPECTOR_WIDGET_TOOLSET toolset
-    (default: the 15 legacy tools and the TalkBack tools), in TOOLS order."""
+    (default: the 15 legacy tools and the TalkBack tools), in TOOLS order. Beside
+    the legacy tools (and without the capture tools) the TalkBack tools keep
+    their pre-capture description and schema (surface.legacy_talkback); every
+    call runs the surface's implementation."""
     if surface is None:
         return dict(TOOLS)
     try:
@@ -1959,7 +1940,15 @@ def _listed_tools() -> Dict[str, Dict[str, Any]]:
     except ValueError as exc:
         log.warning("%s; listing the default toolset", exc)
         names = set(surface.toolset_names(surface.DEFAULT_TOOLSET))
-    return {name: entry for name, entry in TOOLS.items() if name in names}
+    listed = {name: entry for name, entry in TOOLS.items() if name in names}
+    if surface.legacy_talkback(names):
+        for name, shape in _TB_LEGACY_LISTING.items():
+            if name in listed:
+                listed[name] = dict(listed[name], **shape)
+    elif "tb_walk" in listed and "outline" not in names:
+        # the TalkBack tools alone: no capture loop to point at
+        listed["tb_walk"] = dict(listed["tb_walk"], description=surface.D_TB_WALK_ALONE)
+    return listed
 
 
 def _instructions() -> Optional[str]:

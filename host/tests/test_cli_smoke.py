@@ -31,9 +31,6 @@ _SUBCOMMANDS = [
     (["screenshot", "--out", "/tmp/out.png"], "cmd_screenshot"),
     (["get-properties", "--view-id", "5"], "cmd_get_properties"),
     (["detach"], "cmd_detach"),
-    (["talkback", "status"], "cmd_talkback"),
-    (["tb-walk"], "cmd_tb_walk"),
-    (["tb-scenario", "focus-after"], "cmd_tb_scenario"),
 ]
 
 # Subcommands introduced in this contract pass that MUST be present.
@@ -73,6 +70,9 @@ _GENERATED = [
     (["image", "n1"], "image"),
     (["lint", "--rule", "R1"], "lint"),
     (["diff", "before"], "diff"),
+    (["talkback", "status"], "talkback"),
+    (["tb-walk", "--prev", "--expect", "n3", "--expect", "n4,n5"], "tb_walk"),
+    (["tb-scenario", "focus-after"], "tb_scenario"),
 ]
 
 

@@ -42,9 +42,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .capture import analyzers, fetch, images, index, lines, query, refs
+from .capture import analyzers, fetch, images, index, lines, query, refs, walks
 from .capture import diff as cdiff
 from .capture.model import (
+    ERROR_CODES,
+    REF_RE,
     CaptureOptions,
     Index,
     OpError,
@@ -56,6 +58,9 @@ from .capture.store import RESERVED_LABELS, CaptureStore, LoadedCapture
 from .output import dumps, utf8_len
 
 TOOL_NAMES = ("capture", "captures", "outline", "find", "node", "image", "lint", "diff")
+#: The TalkBack tools (docs/design/talkback-navigation.md part 4 B): they drive the
+#: real TalkBack, device-wide, and record against captures.
+TB_TOOL_NAMES = ("talkback", "tb_walk", "tb_scenario")
 
 # --------------------------------------------------------------------------- #
 # Budgets and defaults (spec section 7)
@@ -76,6 +81,8 @@ STALE_AGE_S = 120
 CAPTURES_LIMIT = 20
 CAPTURE_ACTIONS = ("list", "show", "pin", "unpin", "label", "drop", "export", "gc")
 EXPORT_WHAT = ("nodes", "views", "compose", "slots", "a11y", "props", "lint", "raw", "all")
+#: captures(what=...): what export writes, or "walks" to list the stored TalkBack walks.
+CAPTURES_WHAT = EXPORT_WHAT + ("walks",)
 EXPORT_FORMATS = ("jsonl", "json", "legacy", "raw")
 IMAGE_SOURCES = ("auto", "screenshot", "skp")
 MEMORY_ONLY_NOTE = ("memory-only store (INSPECTOR_WIDGET_CAPTURE_PERSIST=0): this capture "
@@ -160,6 +167,10 @@ class OpContext:
     #: This caller's own default session: its last attach or capture. Wins over
     #: the store's shared default (which every caller of the store rewrites).
     session: tuple[str, str] | None = None
+    #: The tool names this caller can see (an MCP listing), None for every tool (the
+    #: CLI): a TalkBack result then hints only listed tools and, without ``node``,
+    #: names each ref's node key (what the legacy inspect_node takes).
+    listed: frozenset[str] | None = None
 
     def bump_generation(self, serial: str, package: str, pid: int | None) -> None:
         """Record a hot reload that did not go through capture(): semantics ids
@@ -601,42 +612,8 @@ def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any 
         if same is not None:
             return same
 
-    prev = _latest(ctx, lineage)
-    pid = getattr(session, "pid", None)
-    gen = 0
-    if prev is not None and pid is not None and prev.meta.pid == pid:
-        gen = int(prev.meta.compose_generation or 0)
-    if pid is not None:
-        gen = max(gen, ctx.generations.get((lineage[0], lineage[1], int(pid)), 0))
-    raw = fetch.fetch(session, opts, compose_generation=gen, device=ctx.device(lineage[0]),
-                      wall_clock=store.clock)
-    if pid is not None:
-        ctx.generations[(lineage[0], lineage[1], int(pid))] = int(raw.meta.compose_generation)
-    ix = index.build_index(raw)
-    # Outside the store lock (CONTRACT_NOTES "Capture order"): analyze the
-    # key-space index (lint="full" spends seconds on contrast) and hydrate the
-    # previous capture's index.
-    analyzers.analyze(ix, raw, lint=opts.lint)
-    pix = prev.index() if prev is not None else None
-    moved_from = None
-    with store.refs_lock():  # assign + apply_refs + publish only: milliseconds
-        st = store.lineage_state(*lineage)
-        if st.latest != (prev.id if prev is not None else None):
-            prev = _latest(ctx, lineage)  # another process published meanwhile
-            pix = prev.index() if prev is not None else None
-            st = store.lineage_state(*lineage)
-        if name:
-            moved_from = st.labels.get(name)
-        same_pid, same_gen = refs.identity_flags(raw.meta, pix.meta if pix else None)
-        refmap, tomb = refs.assign(ix, pix, same_pid=same_pid, same_generation=same_gen,
-                                   alloc=store.next_refs)
-        ix = index.apply_refs(ix, refmap)
-        raw.meta.label = name
-        raw.meta.pinned = want_pin
-        cid = store.publish(raw, ix, refmap, tomb=tomb)
-    lc = store.load(cid)
+    lc, moved_from = publish_capture(ctx, lineage, session, opts, label=name, pin=want_pin)
     ix = lc.index()
-    ctx.session = (lineage[0], lineage[1])  # this caller's default from now on
 
     diff_doc = None
     diff_next: list[str] = []
@@ -651,6 +628,56 @@ def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any 
                     diff_doc=diff_doc, diff_next=diff_next,
                     moved_from=moved_from if moved_from and moved_from != lc.id else None,
                     note="; ".join(notes) or None)
+
+
+def publish_capture(ctx: OpContext, lineage: tuple[str, str], session: Any,
+                    opts: CaptureOptions, *, label: str | None = None, pin: bool = False,
+                    diagnostics: Iterable[str] = ()) -> tuple[LoadedCapture, str | None]:
+    """Fetch, index, analyze and publish one capture of ``session``'s app (the
+    capture pipeline in ``CONTRACT_NOTES.md`` order); ``(loaded capture, the
+    capture ``label`` moved from)``. ``diagnostics`` are added to the capture's
+    own (a TalkBack walk says it was on). The app becomes the caller's default
+    session. capture() and the TalkBack tools' captures both come through here."""
+    store = ctx.store
+    prev = _latest(ctx, lineage)
+    pid = getattr(session, "pid", None)
+    gen = 0
+    if prev is not None and pid is not None and prev.meta.pid == pid:
+        gen = int(prev.meta.compose_generation or 0)
+    if pid is not None:
+        gen = max(gen, ctx.generations.get((lineage[0], lineage[1], int(pid)), 0))
+    raw = fetch.fetch(session, opts, compose_generation=gen, device=ctx.device(lineage[0]),
+                      wall_clock=store.clock)
+    if pid is not None:
+        ctx.generations[(lineage[0], lineage[1], int(pid))] = int(raw.meta.compose_generation)
+    for d in diagnostics:
+        if d not in raw.meta.diagnostics:
+            raw.meta.diagnostics.append(d)
+    ix = index.build_index(raw)
+    # Outside the store lock (CONTRACT_NOTES "Capture order"): analyze the
+    # key-space index (lint="full" spends seconds on contrast) and hydrate the
+    # previous capture's index.
+    analyzers.analyze(ix, raw, lint=opts.lint)
+    pix = prev.index() if prev is not None else None
+    moved_from = None
+    with store.refs_lock():  # assign + apply_refs + publish only: milliseconds
+        st = store.lineage_state(*lineage)
+        if st.latest != (prev.id if prev is not None else None):
+            prev = _latest(ctx, lineage)  # another process published meanwhile
+            pix = prev.index() if prev is not None else None
+            st = store.lineage_state(*lineage)
+        if label:
+            moved_from = st.labels.get(label)
+        same_pid, same_gen = refs.identity_flags(raw.meta, pix.meta if pix else None)
+        refmap, tomb = refs.assign(ix, pix, same_pid=same_pid, same_generation=same_gen,
+                                   alloc=store.next_refs)
+        ix = index.apply_refs(ix, refmap)
+        raw.meta.label = label
+        raw.meta.pinned = pin
+        cid = store.publish(raw, ix, refmap, tomb=tomb)
+    lc = store.load(cid)
+    ctx.session = (lineage[0], lineage[1])  # this caller's default from now on
+    return lc, moved_from
 
 
 def _diff_base(ctx: OpContext, spec: Any, lineage: tuple[str, str]) -> str:
@@ -930,12 +957,19 @@ def lint(ctx: OpContext, **p: Any) -> dict[str, Any]:
 
 def image(ctx: OpContext, ref: Any = None, window: Any = None, overlay: Any = None,
           marks: Any = None, pad: Any = None, source: Any = None, max_side: Any = None,
-          max_bytes: Any = None, **p: Any) -> dict[str, Any]:
+          max_bytes: Any = None, walk: Any = None, **p: Any) -> dict[str, Any]:
     """``image`` (spec 5.8): a node's crop from its own window's screenshot, or
-    an overlay (marks, lint, reading, bounds, compose) of a window or the screen.
-    Returns the PNG's path; the MCP surface can add the pixels (inline)."""
+    an overlay (marks, lint, reading, bounds, compose, walk) of a window or the
+    screen. Returns the PNG's path; the MCP surface can add the pixels (inline)."""
     p = _clean(p)
     kind = _enum("overlay", overlay, images.OVERLAY_KINDS, "none")
+    if kind == "walk" or _explicit(walk) is not None:
+        if kind not in ("walk", "none"):
+            raise _bad(f"walk draws overlay=\"walk\", not {kind!r}")
+        if _explicit(ref) is not None:
+            raise _bad("overlay=\"walk\" draws a window or the screen, not a node's crop",
+                       hint="Pass window (a window ref) to draw one window.")
+        return _walk_image(ctx, walk, window, max_side, max_bytes, p)
     src = _enum("source", source, IMAGE_SOURCES, "auto")
     pad_px = _int("pad", pad, images.DEFAULT_PAD, 0, 2000)
     side = _int("max_side", max_side, images.DEFAULT_MAX_SIDE, 64, 4096)
@@ -964,6 +998,44 @@ def image(ctx: OpContext, ref: Any = None, window: Any = None, overlay: Any = No
                              ref=target.id if target else None, pad=pad_px, max_side=side)
     out = _stamp(dict(out), {**mark, **staleness(ctx, lc)})
     for key in ("rect", "note", "omitted", "scale"):
+        if _cost(out) <= budget:
+            break
+        out.pop(key, None)
+    return out
+
+
+def _walk_image(ctx: OpContext, walk: Any, window: Any, max_side: Any, max_bytes: Any,
+                p: dict[str, Any]) -> dict[str, Any]:
+    """image(overlay="walk", walk=...): a stored walk drawn on the capture it started
+    from (or ``capture``): TalkBack's order as numbered arrows, the model's prediction
+    dashed where it differs, mismatches in red."""
+    side = _int("max_side", max_side, images.DEFAULT_MAX_SIDE, 64, 4096)
+    budget = query.resolve_max_bytes(max_bytes, IMAGE_MAX_BYTES)
+    unknown = sorted(set(p) - {"capture", "serial", "package"})
+    if unknown:
+        raise _bad(f"unknown argument(s) for image: {', '.join(unknown)}")
+    spec = _explicit(p.get("capture"))
+    if spec == "latest":
+        spec = None  # the schema default: the walk is drawn on its own capture
+    lineage, shared = _query_lineage(ctx, p.get("serial"), p.get("package"),
+                                     [spec] if spec else [])
+    store = ctx.store
+    wid = walks.resolve(store, walk, lineage)
+    rec = walks.load(store, wid)
+    caps = [c for c in rec.get("captures") or [] if isinstance(c, str)]
+    if spec is None:
+        if not caps:
+            raise OpError("facet_unavailable", f"walk {wid} was recorded without a capture",
+                          hint="tb_walk() again: it captures the screen it walks.")
+        lc = store.load(caps[0])
+    else:
+        lc = _load(ctx, spec, lineage)
+    ix = lc.index()
+    win = query.resolve_selector(ix, window, tomb=_tomb(ctx, lc)) if _explicit(window) else None
+    out = images.walk_overlay(lc, ix, rec, window=win.id if win else None, max_side=side)
+    mark = _session_mark(ctx, tuple(lc.meta.lineage), shared)  # type: ignore[arg-type]
+    out = _stamp(dict(out), mark)
+    for key in ("legend", "note", "omitted"):
         if _cost(out) <= budget:
             break
         out.pop(key, None)
@@ -1064,9 +1136,15 @@ def captures(ctx: OpContext, action: Any = None, id: Any = None, label: Any = No
     store = ctx.store
     if act == "list":
         n = _int("limit", limit, CAPTURES_LIMIT, 1, 200)
+        if what == "walks":
+            return _walks_list(ctx, n, every, serial, package, budget)
         return _captures_list(ctx, n, every, serial, package, budget)
     if act == "gc":
         return _gc(store, every)
+    if what == "walks" or _stored_walk(store, _explicit(id)):
+        # what="walks" never falls through to a capture: drop id="latest" drops a walk
+        return _walk_action(ctx, act, _explicit(id), serial, package,
+                            None if max_bytes is None else budget)
     spec = _explicit(id) or ("latest" if act in ("show", "export") else None)
     if spec is None:
         raise _bad(f"captures(action=\"{act}\") needs id (a capture id, label, latest or prev)")
@@ -1089,6 +1167,56 @@ def captures(ctx: OpContext, action: Any = None, id: Any = None, label: Any = No
         return {"dropped": cid}
     return _export(ctx, store.load(cid), _enum("what", what, EXPORT_WHAT, "nodes"),
                    _enum("format", format, EXPORT_FORMATS, "jsonl"))
+
+
+def _stored_walk(store: CaptureStore, ident: str | None) -> bool:
+    """An id that names a stored walk (a capture label may look like one)."""
+    return walks.is_walk_id(ident) and os.path.exists(
+        os.path.join(walks.walks_dir(store), f"{ident}.json"))
+
+
+def _walks_list(ctx: OpContext, limit: int, every: bool, serial: Any, package: Any,
+                budget: int) -> dict[str, Any]:
+    """captures(what="walks"): the stored TalkBack walks and scenarios, newest first."""
+    lineage = None if every else query_lineage(ctx, serial, package)
+    rows, total = walks.listing(ctx.store, lineage, limit)
+    out: dict[str, Any] = {"lines": rows}
+    if total > len(rows):
+        out["more"] = f"{total - len(rows)} older: captures(what=\"walks\",limit={min(200, total)})"
+    if rows:
+        out["next"] = [query.call("captures", action="show", id=rows[0].split(" ", 1)[0])]
+    else:
+        out["hint"] = "tb_walk() and tb_scenario() store one each."
+    while _cost(out) > budget and out["lines"]:
+        out["lines"].pop()
+        out["more"] = f"{total - len(out['lines'])} more: captures(what=\"walks\",limit=" \
+                      f"{max(1, len(out['lines']))},max_bytes={min(32000, budget * 2)})"
+    return out
+
+
+def _walk_action(ctx: OpContext, act: str, wid: str | None, serial: Any, package: Any,
+                 budget: int | None) -> dict[str, Any]:
+    """captures(action=show|export|drop, id=<walk id>): a stored walk or scenario."""
+    store = ctx.store
+    if act not in ("show", "export", "drop"):
+        raise _bad(f"captures(action=\"{act}\") is for captures; a walk can be shown, "
+                   f"exported or dropped")
+    if wid is None or wid == "latest":
+        wid = walks.resolve(store, None, query_lineage(ctx, serial, package), kind=None)
+    else:
+        wid = walks.resolve(store, wid, kind=None)  # bad_args / walk_not_found otherwise
+    rec = walks.load(store, wid)
+    if act == "drop":
+        walks.drop(store, wid)
+        return {"dropped": wid}
+    if act == "export":
+        path = os.path.join(walks.walks_dir(store), f"{wid}.json")
+        out = {"walk": wid, "path": path, "bytes": os.path.getsize(path),
+               "captures": rec.get("captures") or []}
+        out["hint"] = ("JSON: steps (key, ref, cap, speak, via, bounds ...), predicted, findings "
+                       "(talkback/diff.py); read with jq.")
+        return out
+    return walks.stored_result(rec, budget)
 
 
 def _captures_list(ctx: OpContext, limit: int, every: bool, serial: Any, package: Any,
@@ -1169,7 +1297,11 @@ def _fit_doc(out: dict[str, Any], budget: int) -> dict[str, Any]:
 def _gc(store: CaptureStore, every: bool) -> dict[str, Any]:
     res = store.gc(all=every)
     if every:
-        return {k: res[k] for k in ("all", "removed", "note") if k in res}
+        out = {k: res[k] for k in ("all", "removed", "note") if k in res}
+        n_walks = walks.wipe(store)
+        if n_walks:
+            out["walks_removed"] = n_walks
+        return out
     if "skipped" in res:
         return {"skipped": res["skipped"]}
     removed = res.get("removed") or []
@@ -1310,11 +1442,509 @@ def _count_nodes(doc: Any) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# TalkBack: talkback, tb_walk, tb_scenario (talkback-navigation.md part 4 B)
+# --------------------------------------------------------------------------- #
+TALKBACK_ACTIONS = ("status", "on", "off", "restore")
+TB_DIRECTIONS = ("next", "prev")
+TB_UNTIL = ("wrap", "edge", "loop", "steps")
+TB_RECAPTURE = ("on_unknown", "never")
+TB_UTTERANCE = ("auto", "model", "logcat")
+TB_INJECTORS = ("auto", "uinput", "touch")
+TB_KINDS = ("focus_after", "restore", "survive")
+TB_MAX_STEPS = 60
+TB_STEP_TIMEOUT_MS = 1500
+TB_SETTLE_MS = 120
+TB_WAIT_MS = 2000
+TB_WALK_MAX_BYTES = walks.WALK_MAX_BYTES
+TB_WALK_HARD_MAX = 100000
+TB_SCENARIO_MAX_BYTES = walks.SCENARIO_MAX_BYTES
+#: What a walk captures: the screen TalkBack walks (refs, a11y, pixels for the walk
+#: overlay), without View properties (node(props=...) asks for a fresh capture).
+TB_CAPTURE = CaptureOptions(props=False)
+
+
+def _tb_error(exc: BaseException) -> OpError | None:
+    """A TalkBack failure as an envelope code: busy, talkback_unavailable,
+    enable_failed, restore_failed, app_left_foreground, injector_failed (the
+    injectors tried are the candidates), keymap_unknown, start_not_found ...
+    A ValueError from the engine's own argument checks is bad_args."""
+    from .talkback import device as tbdevice
+    from .talkback import inject as tbinject
+    from .talkback import walk as tbwalk
+
+    if isinstance(exc, (tbdevice.TalkBackError, tbwalk.WalkError, tbinject.InjectorError)):
+        code = str(getattr(exc, "code", "") or "talkback_error")
+        if code not in ERROR_CODES:
+            code = "talkback_error"  # a TalkBack failure, not the agent's: no ViewSpector log
+        tried = list(getattr(exc, "tried", None) or [])
+        hint = getattr(exc, "hint", None)
+        return OpError(code, str(exc),
+                       hint=hint if isinstance(hint, str) and hint else ERROR_CODES.get(code),
+                       candidates=tried or None)
+    if isinstance(exc, ValueError) and not isinstance(exc, OpError):
+        return _bad(str(exc))
+    return None
+
+
+def _tb_call(fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    try:
+        return fn()
+    except OpError:
+        raise
+    except Exception as exc:
+        err = _tb_error(exc)
+        if err is None:
+            raise
+        raise err from None
+
+
+def _tb_default(ctx: OpContext, serial: str | None, package: str | None
+                ) -> tuple[str, str] | None:
+    """The default session a DEVICE-WIDE TalkBack tool may act on: the caller's own
+    (its last attach or capture, or ``$INSPECTOR_WIDGET_SESSION``). The store's shared
+    default (the last attach or capture of ANY caller: another agent's server, another
+    checkout) only completes a serial or package the caller named, and never against
+    ``$ANDROID_SERIAL``: TalkBack must not turn on on someone else's device."""
+    default, shared = default_session(ctx)
+    if default is None:
+        return None
+    if shared:
+        if serial is None and package is None:
+            return None
+        env = os.environ.get("ANDROID_SERIAL")
+        if serial is None and env and env != default[0]:
+            return None
+    if serial in (None, default[0]) and package in (None, default[1]):
+        return default
+    return None
+
+
+def _tb_device(ctx: OpContext, serial: Any, package: Any) -> tuple[str, str | None]:
+    """(serial, package) for the talkback tool: explicit, else the caller's own default
+    session's (:func:`_tb_default`), else ``$ANDROID_SERIAL`` or the only device."""
+    s, p = _explicit(serial), _explicit(package)
+    if s is None:
+        default = _tb_default(ctx, s, p)
+        if default is not None:
+            s, p = default[0], p or default[1]
+    if s is None:
+        from . import adb
+        try:
+            s = adb.resolve_serial(None)
+        except adb.DeviceError as exc:
+            raise OpError("no_session", str(exc), hint="Pass serial (see list_devices).") from None
+    return s, p
+
+
+def _tb_session(ctx: OpContext, serial: Any, package: Any
+                ) -> tuple[tuple[str, str], Any, str | None]:
+    """The app a TalkBack walk or scenario drives, its live session, and a note when the
+    caller did not name it: explicit, else the caller's own default session
+    (:func:`_tb_default`), else the single running debuggable app on ``$ANDROID_SERIAL``
+    or the only device."""
+    if ctx.sessions is None:
+        raise OpError("unsupported", "this surface cannot reach a device")
+    s, p = _explicit(serial), _explicit(package)
+    note = None
+    if s and p:
+        lineage, implicit = (s, p), False
+    else:
+        default = _tb_default(ctx, s, p)
+        if default is not None:
+            lineage, implicit = default, s is None and p is None
+        else:
+            lineage, implicit = _running_app(s, p), False
+    try:
+        session = ctx.sessions.get(*lineage)
+    except Exception as exc:
+        if not implicit or not _not_running(exc):
+            raise
+        gone = lineage[1]
+        lineage = _running_app(lineage[0], gone=gone)
+        session = ctx.sessions.get(*lineage)
+        note = (f"{gone} (the default session) is not running; drove {lineage[1]}, the only "
+                f"running debuggable app")
+    if note is None and not (s and p):
+        note = ""  # say which app it was: the caller did not name both
+    return lineage, session, note
+
+
+def _looks_like_selector(sel: str) -> bool:
+    """A ref, #rid, @tag, Type"label", a key or a chain: resolved in the capture.
+    Anything else is the label as spoken, which the walk matches itself."""
+    if sel.startswith(("compose:", "virtual:", "legacy:")):
+        return False  # the walk's own node keys
+    return bool(REF_RE.match(sel)) or sel[:1] in ("#", "@", '"') or '"' in sel \
+        or " > " in sel or bool(re.match(r"^(view|sem|a11y|w):", sel))
+
+
+class _TbCaptures:
+    """The captures a TalkBack walk or scenario records against (its ``hook``).
+
+    The first is taken once TalkBack has settled (the screen as TalkBack walks it;
+    a ref given as ``start`` / ``target`` resolves there). A walk recaptures when
+    focus lands on a node no capture holds (scrolled-in items), at most once per
+    ``walks.RECAPTURE_EVERY`` steps, and once more at the end if steps since were
+    unknown. A scenario captures before its action (again after keys moved focus to
+    the target) and after it. A failed capture is a note, never a failed walk."""
+
+    def __init__(self, ctx: OpContext, lineage: tuple[str, str], session: Any, what: str,
+                 recapture: bool = False) -> None:
+        self.ctx, self.lineage, self.session, self.what = ctx, lineage, session, what
+        self.recapture = recapture
+        self.taken: list[tuple[int, LoadedCapture]] = []
+        self.notes: list[str] = []
+        self._known: set[str] = set()
+        self._last_at = 0
+        self._last_i = 0
+        self._pending = False
+        self._failed = 0
+
+    def _take(self, at: int) -> LoadedCapture | None:
+        if self._failed >= 2:
+            return None
+        from .talkback import device as tbdevice
+        try:
+            top = tbdevice.top_package(self.lineage[0])
+        except Exception:  # noqa: BLE001 - unknown: try the capture
+            top = None
+        if top and top != self.lineage[1]:
+            # A backgrounded app may be frozen: its agent would only time out.
+            self.notes.append(f"no capture at step {at}: {top} is in front, not "
+                              f"{self.lineage[1]}")
+            return None
+        try:
+            lc, _moved = publish_capture(self.ctx, self.lineage, self.session, TB_CAPTURE,
+                                         diagnostics=[f"taken with TalkBack on ({self.what})"])
+            self._known |= walks.keys_of(lc)
+        except Exception as exc:  # noqa: BLE001 - the walk goes on without it
+            self._failed += 1
+            self.notes.append(lines.cut(f"capture at step {at} failed: {exc}", 140))
+            return None
+        self.taken.append((at, lc))
+        self.ctx.store.held.add(lc.id)  # until release(): a full lineage evicts unlabeled first
+        self._last_at, self._pending = at, False
+        for d in lc.index().diagnostics:  # the model's warnings (talkback/recycler.py)
+            if d.startswith("tb: ") and "not mapped" not in d and d[4:] not in self.notes:
+                self.notes.append(d[4:])
+        return lc
+
+    # ---- the engine's hook (talkback.walk.run_walk / scenarios.run_scenario)
+    def start(self, snap: Any) -> None:
+        self._take(0)
+
+    def resolve(self, sel: Any, stop: bool = True) -> Any:
+        """A ref or selector as the node key the engine matches: the stop TalkBack
+        focuses for it (``stop``), else the node itself. Labels pass through, and so does
+        a label that only looks like a selector ("@alice", "#general", 'Say "Hi"',
+        "Settings > Display"): only a ref that does not resolve is an error."""
+        if not isinstance(sel, str) or sel in ("current", "first") or not self.taken:
+            return sel
+        if not _looks_like_selector(sel):
+            return sel
+        lc = self.taken[-1][1]
+        ix = lc.index()
+        try:
+            node = query.resolve_selector(ix, sel, tomb=_tomb(self.ctx, lc))
+        except OpError:
+            if REF_RE.match(sel):
+                raise
+            return sel  # the label as spoken: the walk matches it itself
+        return _stop_key(ix, lc, node, stop=stop) or sel
+
+    def resolve_action(self, action: Any) -> Any:
+        """``tap:<ref or selector>`` taps that node (its key); other actions as given."""
+        if isinstance(action, str) and action.startswith("tap:"):
+            return "tap:" + str(self.resolve(action[4:], stop=False))
+        return action
+
+    def step(self, st: Any, snap: Any) -> None:
+        self._last_i = int(getattr(st, "i", 0) or 0)
+        key = getattr(st, "key", None)
+        if not self.recapture or not key or key in self._known or key.startswith("legacy:"):
+            return  # an agent without per-node ids: bound by label and box instead
+        if self._last_i - self._last_at < walks.RECAPTURE_EVERY:
+            self._pending = True
+            return
+        self._take(self._last_i)
+
+    def ready(self, snap: Any, pressed: bool) -> None:
+        if pressed:  # keys moved focus to the target and may have scrolled
+            self._take(1)
+
+    def finish(self, snap: Any, ended: str | None = None) -> None:
+        if self.what == "tb_scenario":
+            self._take(2)
+        elif self._pending and self.recapture and ended not in ("left_app", "timeout"):
+            self._take(self._last_i)
+
+    def binding(self) -> walks.Binding:
+        return walks.Binding(self.taken)
+
+    def release(self) -> None:
+        """Let retention evict the captures again (the walk is bound and stored)."""
+        self.ctx.store.held.difference_update(lc.id for _at, lc in self.taken)
+
+    def resolve_expect(self, expect: list[str] | None) -> list[str] | None:
+        """``expect`` entries that are selectors become refs (the start capture's)."""
+        if not expect or not self.taken:
+            return expect
+        lc = self.taken[0][1]
+        ix = lc.index()
+        out = []
+        for e in expect:
+            if isinstance(e, str) and _looks_like_selector(e) and not REF_RE.match(e):
+                try:
+                    hits = query.select(ix, e)
+                except OpError:
+                    hits = []  # a label that looks like a selector: matched as spoken
+                if len(hits) == 1:
+                    tbc = _tb_capture(ix, lc)
+                    nid = hits[0].id
+                    if tbc is not None:
+                        info = tbc.explain(nid)
+                        merged = str(info.get("why_not") or "")
+                        if merged.startswith("merged_into:"):
+                            nid = merged.split(":", 1)[1]
+                    out.append(nid)
+                    continue
+            out.append(e)
+        return out
+
+
+def _tb_capture(ix: Index, lc: LoadedCapture) -> Any:
+    from .capture.tb import TbCapture
+    return TbCapture.of(ix, lc)
+
+
+def _stop_key(ix: Index, lc: LoadedCapture, node: UNode, stop: bool = True) -> str | None:
+    """The accessibility node key TalkBack focuses for ``node``: its own when it is a
+    stop, else the stop it is merged into, else its own (A11yAct can focus any node).
+    ``stop=False``: the node's own key."""
+    tbc = _tb_capture(ix, lc)
+    if tbc is None:
+        return None
+    x = tbc.node(node.id)
+    if x is None:
+        return None
+    why_not = str(tbc.explain(node.id).get("why_not") or "") if stop else ""
+    if why_not.startswith("merged_into:"):
+        other = tbc.node(why_not.split(":", 1)[1])
+        key = getattr(other, "key", None)
+        if key:
+            return str(key)
+    key = getattr(x, "key", None) or (getattr(x, "raw", None) or {}).get("node_key")
+    return str(key) if key else None
+
+
+def talkback(ctx: OpContext, action: Any = None, serial: Any = None, package: Any = None,
+             verbose_log: Any = None) -> dict[str, Any]:
+    """``talkback``: status (read-only) | on | off | restore, DEVICE-WIDE. ``on``
+    snapshots the accessibility settings first; restore writes them back."""
+    from .talkback import device as tbdevice
+
+    act = _enum("action", action, TALKBACK_ACTIONS, "status")
+    verbose = _bool("verbose_log", verbose_log, False)
+    s, _p = _tb_device(ctx, serial, package)
+    # "on" keeps in front only an app the caller named (the default session's app may
+    # be in the background by now: that is no reason to refuse)
+    keep = _explicit(package) if act == "on" else None
+    out = dict(_tb_call(lambda: tbdevice.action(s, act, package=keep, verbose_log=verbose)))
+    if _explicit(serial) is None:
+        out["serial"] = s  # device-wide: say which device it was
+    hints = []
+    installed = isinstance(out.get("talkback"), dict) and out["talkback"].get("installed")
+    if act in ("status", "on") and (installed or act == "on"):
+        hints.append(query.call("tb_walk"))
+    if out.get("restore_pending"):
+        hints.append(query.call("talkback", action="restore"))
+    if hints:
+        out["next"] = hints[:3]
+    return out
+
+
+def tb_walk(ctx: OpContext, serial: Any = None, package: Any = None, start: Any = None,
+            direction: Any = None, max_steps: Any = None, until: Any = None, expect: Any = None,
+            step_timeout_ms: Any = None, settle_ms: Any = None, recapture: Any = None,
+            utterance: Any = None, injector: Any = None, leave_on: Any = None,
+            max_lines: Any = None, max_bytes: Any = None) -> dict[str, Any]:
+    """``tb_walk``: walk the real TalkBack through the app (DEVICE-WIDE: turned on,
+    then restored), record each stop as a capture ref, diff actual vs predicted vs
+    visual, store ``<store>/walks/<id>.json``; at most ``max_bytes`` (5 KB)."""
+    opts = {
+        "start": _explicit(start) or "current",
+        "direction": _enum("direction", direction, TB_DIRECTIONS, "next"),
+        "max_steps": _int("max_steps", max_steps, TB_MAX_STEPS, 1, 300),
+        "until": _enum("until", until, TB_UNTIL, "wrap"),
+        "step_timeout_ms": _int("step_timeout_ms", step_timeout_ms, TB_STEP_TIMEOUT_MS, 100,
+                                10000),
+        "settle_ms": _int("settle_ms", settle_ms, TB_SETTLE_MS, 10, 2000),
+        "recapture": _enum("recapture", recapture, TB_RECAPTURE, "on_unknown"),
+        "utterance": _enum("utterance", utterance, TB_UTTERANCE, "auto"),
+        "injector": _enum("injector", injector, TB_INJECTORS, "auto"),
+        "leave_on": _bool("leave_on", leave_on, False),
+    }
+    if expect is not None and (not isinstance(expect, list)
+                               or not all(isinstance(e, str) for e in expect)):
+        raise _bad("expect must be a list of refs, selectors or labels")
+    n_lines = _int("max_lines", max_lines, walks.WALK_MAX_LINES, 5, 300)
+    budget = _int("max_bytes", max_bytes, TB_WALK_MAX_BYTES, -(1 << 30), TB_WALK_HARD_MAX)
+    budget = query.MAX_BYTES_CEILING if budget <= 0 else max(1000, budget)
+    lineage, session, note = _tb_session(ctx, serial, package)
+    _tb_check_refs(ctx, lineage, opts["start"], expect)
+    budget -= _tb_mark_bytes(lineage, note)
+    hook = _TbCaptures(ctx, lineage, session, "tb_walk",
+                       recapture=opts["recapture"] == "on_unknown")
+    if note:
+        hook.notes.append(note)
+    try:
+        out = _tb_walk_record(ctx, hook, session, opts, expect, n_lines, budget)
+    finally:
+        hook.release()
+    return _tb_session_mark(out, lineage, note)
+
+
+def _tb_walk_record(ctx: OpContext, hook: _TbCaptures, session: Any, opts: dict[str, Any],
+                    expect: Any, n_lines: int, budget: int) -> dict[str, Any]:
+    from .talkback import walk as tbwalk
+
+    record = _tb_call(lambda: tbwalk.run_walk(
+        session, start=opts["start"], direction=opts["direction"], max_steps=opts["max_steps"],
+        until=opts["until"], expect=None, step_timeout_ms=opts["step_timeout_ms"],
+        settle_ms=opts["settle_ms"], recapture=opts["recapture"], utterance=opts["utterance"],
+        injector=opts["injector"], leave_on=opts["leave_on"], save=False, hook=hook, full=True))
+    record["id"] = record.get("walk") or tbwalk._walk_id()
+    # the engine's own note predates the capture store: say which captures were added
+    record["recapture"] = ", ".join(f"step {at}: {lc.id}" for at, lc in hook.taken[1:]) or None
+    exp = hook.resolve_expect(list(expect) if expect else None)
+    walks.bind_walk(record, hook.binding(), expect=exp)
+    if expect:
+        record["expect_given"] = list(expect)
+    record["notes"] = list(record.get("notes") or []) + hook.notes
+    record.pop("saved", None)
+    record.pop("dump", None)
+    try:
+        walks.save(ctx.store, record)
+    except OSError as exc:
+        record["notes"].append(f"could not store the walk: {exc}")
+        record["id"] = None
+    return walks.walk_result(record, max_lines=n_lines, max_bytes=budget, listed=ctx.listed)
+
+
+def tb_scenario(ctx: OpContext, kind: Any = None, serial: Any = None, package: Any = None,
+                target: Any = None, action: Any = None, mutate: Any = None,
+                wait_ms: Any = None, injector: Any = None, leave_on: Any = None,
+                step_timeout_ms: Any = None, settle_ms: Any = None,
+                max_bytes: Any = None) -> dict[str, Any]:
+    """``tb_scenario``: where the real TalkBack's focus goes (DEVICE-WIDE), recorded
+    against a capture before and one after; at most ``max_bytes`` (1 KB)."""
+    if kind is None:
+        raise _bad("tb_scenario needs kind: focus_after, restore or survive",
+                   hint='tb_scenario(kind="survive",target="n47",mutate="tap:n49")')
+    k = _enum("kind", kind, TB_KINDS, "focus_after")
+    if k == "survive" and not _explicit(mutate):
+        raise _bad("survive needs mutate: tap:<selector> | activate | key:<combo> | "
+                   "broadcast:<am args> | probe:<action>")
+    opts = {
+        "target": _explicit(target), "action": _explicit(action) or "activate",
+        "mutate": _explicit(mutate),
+        "wait_ms": _int("wait_ms", wait_ms, TB_WAIT_MS, 300, 20000),
+        "injector": _enum("injector", injector, TB_INJECTORS, "auto"),
+        "leave_on": _bool("leave_on", leave_on, False),
+        "step_timeout_ms": _int("step_timeout_ms", step_timeout_ms, TB_STEP_TIMEOUT_MS, 100,
+                                10000),
+        "settle_ms": _int("settle_ms", settle_ms, TB_SETTLE_MS, 10, 2000),
+    }
+    budget = query.resolve_max_bytes(max_bytes, TB_SCENARIO_MAX_BYTES)
+    lineage, session, note = _tb_session(ctx, serial, package)
+    _tb_check_refs(ctx, lineage, opts["target"], opts["action"], opts["mutate"])
+    budget -= _tb_mark_bytes(lineage, note)
+    hook = _TbCaptures(ctx, lineage, session, "tb_scenario")
+    if note:
+        hook.notes.append(note)
+    try:
+        out = _tb_scenario_record(ctx, hook, session, k, opts, budget)
+    finally:
+        hook.release()
+    return _tb_session_mark(out, lineage, note)
+
+
+def _tb_check_refs(ctx: OpContext, lineage: tuple[str, str], *sels: Any) -> None:
+    """Fail before TalkBack is touched when a ref (``n12``, or ``tap:n12``) names no node
+    of the app's latest capture: the walk's own capture carries refs over from it, so a
+    ref it lacks would only fail later, with the device already driven."""
+    wanted: list[str] = []
+    for x in sels:
+        for v in (x if isinstance(x, list) else [x]):
+            if isinstance(v, str):
+                v = v[4:] if v.startswith("tap:") else v
+                if REF_RE.match(v):
+                    wanted.append(v)
+    if not wanted:
+        return
+    try:
+        lc = _load(ctx, "latest", lineage)
+    except OpError:
+        raise OpError("capture_not_found", f"{wanted[0]} is a capture ref, but no capture of "
+                                           f"{lineage[1]} is stored",
+                      hint="capture() first, or pass the label as spoken.") from None
+    ix = lc.index()
+    for r in wanted:
+        query.resolve_selector(ix, r, tomb=_tomb(ctx, lc))  # ref_not_in_capture & co
+
+
+def _tb_mark_bytes(lineage: tuple[str, str], note: str | None) -> int:
+    """What :func:`_tb_session_mark` adds to a response (its budget makes room)."""
+    if note is None:
+        return 0
+    return len(dumps({"session": f"{lineage[0]}/{lineage[1]}"}).encode("utf-8")) - 1
+
+
+def _tb_session_mark(out: dict[str, Any], lineage: tuple[str, str], note: str | None
+                     ) -> dict[str, Any]:
+    """``session: serial/package`` first in a walk or scenario the caller did not name
+    the app of (``note`` is not None): it acted device-wide, on that device."""
+    if note is None:
+        return out
+    return {"session": f"{lineage[0]}/{lineage[1]}", **out}
+
+
+def _tb_scenario_record(ctx: OpContext, hook: _TbCaptures, session: Any, k: str,
+                        opts: dict[str, Any], budget: int) -> dict[str, Any]:
+    from .talkback import scenarios as tbscenarios
+    from .talkback import walk as tbwalk
+
+    out = _tb_call(lambda: tbscenarios.run_scenario(
+        session, k, target=opts["target"], action=opts["action"], mutate=opts["mutate"],
+        wait_ms=opts["wait_ms"], injector=opts["injector"], leave_on=opts["leave_on"],
+        step_timeout_ms=opts["step_timeout_ms"], settle_ms=opts["settle_ms"], save=False,
+        hook=hook))
+    rec = dict(out, id="t" + tbwalk._walk_id()[1:])
+    taken = [at for at, _lc in hook.taken]
+    before_at = 1 if 1 in taken else 0
+    walks.bind_scenario(rec, hook.binding(), before_at=before_at, after_at=2)
+    if k == "survive":
+        before = next((lc for at, lc in reversed(hook.taken) if at <= 1), None)
+        after = next((lc for at, lc in hook.taken if at == 2), None)
+        tgt = (rec.get("target") or {}).get("ref") if isinstance(rec.get("target"), dict) else None
+        rec["cause_text"] = walks.survive_cause(before, after, tgt)
+    rec["notes"] = list(rec.get("notes") or []) + hook.notes
+    rec.pop("saved", None)
+    try:
+        walks.save(ctx.store, rec)
+    except OSError as exc:
+        rec["notes"].append(f"could not store the scenario: {exc}")
+        rec["id"] = None
+    return walks.scenario_result(rec, max_bytes=budget, listed=ctx.listed)
+
+
+# --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
 TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "capture": capture, "captures": captures, "outline": outline, "find": find, "node": node,
     "image": image, "lint": lint, "diff": diff,
+    "talkback": talkback, "tb_walk": tb_walk, "tb_scenario": tb_scenario,
 }
 
 
@@ -1338,6 +1968,7 @@ __all__ = [
     "AttachProvider",
     "OpContext",
     "SessionProvider",
+    "TB_TOOL_NAMES",
     "TOOLS",
     "TOOL_NAMES",
     "call",
@@ -1353,8 +1984,12 @@ __all__ = [
     "lint",
     "node",
     "outline",
+    "publish_capture",
     "query_lineage",
     "remember_session",
     "run",
     "staleness",
+    "talkback",
+    "tb_scenario",
+    "tb_walk",
 ]

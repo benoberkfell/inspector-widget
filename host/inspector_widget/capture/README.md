@@ -27,7 +27,9 @@ tools since P0-2.
 | `query.py`, `lines.py` | C6 | selectors, `outline`, `find`, `node`; line grammar v1, field projection, cursors, `next` hints, `resolve_max_bytes` |
 | `analyzers.py`, `rules.py` | C7 | `analyze` (render signals, lint adapter, reading order), `lint_view`, `lint_summary`; the rule catalog |
 | `diff.py` | C8 | `diff(a, b)` by ref: changed, moved, added, removed, rebound; "new screen" verdict |
-| `images.py` | C9 | per-window crops, Set-of-Mark/lint/reading overlays, inline images, pixel diff |
+| `images.py` | C9 | per-window crops, Set-of-Mark/lint/reading/walk overlays, inline images, pixel diff |
+| `tb.py` | T5 | the TalkBack model (`..talkback`) over the stored a11y tree, bound to refs: stop speech for the index (`speakable`, `speak_src`), explanations, reading walks (granularity, from, direction, skipped nodes), the node `tb` facet, the `tb.*` rules |
+| `walks.py` | T5 | stored TalkBack walks and scenarios (`<store>/walks/<id>.json`, with their capture ids): node keys bound to capture refs (`Binding`), the walk re-analysed on refs, actual-vs-model `classify`, the compact `tb_walk` (<= 5 KB at 60 steps) and `tb_scenario` (<= 1 KB) results, listing, show, drop |
 | `../output.py`, `../normalize*.py` | P0-1 | compact JSON, `Budget`, spill envelope, brief slimming, value normalization |
 
 Importing the package root loads only `model`: no protobuf, no Pillow.
@@ -147,3 +149,8 @@ toolsets, instructions) and `test_e2e_capture.py` (MCP and CLI on one store).
 `test_capture_replay.py` replays real captures recorded live (A11yProbe,
 Thunderbird, Now in Android; `tests/fixtures/captures`, `tests/capture_replay.py`)
 through the same pipeline and budgets.
+`test_capture_walks.py` covers the walk store and the compact TalkBack results
+device-free; `test_tb_surface.py` runs `talkback`, `tb_walk` and `tb_scenario`
+through the MCP server and the CLI against the fake agent and the fake TalkBack
+(captures and recaptures, refs per step, the classified diff, budgets, the walk
+overlay, the default listing's pre-capture shape).

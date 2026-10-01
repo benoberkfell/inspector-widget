@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from types import SimpleNamespace
 
@@ -725,29 +726,35 @@ def test_mcp_tb_walk_and_scenario(probe, mcp):
 def test_mcp_tb_errors_carry_a_code(probe, mcp):
     probe.talkback.installed = False
     res = mcp("tb_walk", **FAST)
-    assert res["code"] == "talkback_unavailable" and "hint" in res
+    assert res["error"]["code"] == "talkback_unavailable" and res["error"]["hint"]
 
 
-def test_mcp_tools_say_they_are_device_wide():
+def test_mcp_tools_say_they_are_device_wide(monkeypatch):
     for name in ("talkback", "tb_walk", "tb_scenario"):
         entry = mcp_server.TOOLS[name]
         assert entry["description"].startswith("DEVICE-WIDE")
         assert entry["annotations"]["destructiveHint"] is True
         assert entry["annotations"]["readOnlyHint"] is False
-    listed = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-    tools = {t["name"]: t for t in listed["result"]["tools"]}
-    assert tools["tb_walk"]["annotations"]["destructiveHint"] is True
+    for toolset in (None, "capture,talkback", "talkback"):  # the legacy and surface shapes
+        if toolset:
+            monkeypatch.setenv("INSPECTOR_WIDGET_TOOLSET", toolset)
+        listed = mcp_server._fallback_handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = {t["name"]: t for t in listed["result"]["tools"]}
+        assert tools["tb_walk"]["annotations"]["destructiveHint"] is True
+        assert tools["tb_walk"]["description"].startswith("DEVICE-WIDE")
 
 
 def test_cli_talkback_round_trip(tb_env, run_cli):
     original = dict(tb_env.secure)
-    r = run_cli("talkback", "status", "--serial", SERIAL)
+    r = run_cli("talkback", "status", "--serial", SERIAL, "--json")
     assert r.rc == 0 and r.json()["restore_pending"] is False
-    r = run_cli("talkback", "on", "--serial", SERIAL)
+    r = run_cli("talkback", "on", "--serial", SERIAL, "--json")
     assert r.rc == 0 and r.json()["changed"] is True and "stays on" in r.err
-    r = run_cli("talkback", "restore", "--serial", SERIAL)
+    r = run_cli("talkback", "restore", "--serial", SERIAL, "--json")
     assert r.rc == 0 and r.json()["restored"] is True
     assert fakeagent.settings_changes(tb_env, original) == {}
+    r = run_cli("talkback", "--serial", SERIAL)  # status, for humans
+    assert r.rc == 0 and '"restore_pending": false' in r.out
 
 
 def test_cli_tb_walk_and_scenario(probe, run_cli):
@@ -757,7 +764,7 @@ def test_cli_tb_walk_and_scenario(probe, run_cli):
     assert r.json()["ended"] == "wrap"
     r = run_cli("tb-walk", "--serial", SERIAL, "--step-timeout-ms", 250, "--settle-ms", 20,
                 "--until", "edge")
-    assert r.rc == 0 and '  1. view:1003 TextView "Title"' in r.out
+    assert r.rc == 0 and '  1. n3 "Title"' in r.out
     r = run_cli("tb-scenario", "survive", "--serial", SERIAL, "--target", "Item 1",
                 "--mutate", "broadcast:-a x", "--wait-ms", 400, "--step-timeout-ms", 250,
                 "--settle-ms", 20, "--json", "-")
@@ -767,24 +774,34 @@ def test_cli_tb_walk_and_scenario(probe, run_cli):
 def test_cli_reports_talkback_errors(tb_env, run_cli):
     tb_env.talkback.installed = False
     r = run_cli("talkback", "on", "--serial", SERIAL)
-    assert r.rc == 1 and "not installed" in r.err and "hint:" in r.err
+    err = json.loads(r.err)["error"]
+    assert r.rc == 1 and err["code"] == "talkback_unavailable"
+    assert "not installed" in err["message"] and err["hint"]
 
 
 def test_cli_and_mcp_expose_the_same_options():
+    """One registry (inspector_widget.surface) makes both surfaces; the default
+    listing still shows the pre-capture schema, and everything that schema offers
+    is accepted by the one implementation (and has a CLI flag)."""
     import cli
+    from inspector_widget import surface
     parser = cli.build_parser()
-    sub = next(a for a in parser._actions if a.dest == "command" or hasattr(a, "choices") and
+    sub = next(a for a in parser._actions if hasattr(a, "choices") and
                isinstance(a.choices, dict) and "tb-walk" in a.choices)
-    cli_opts = {}
-    for name in ("talkback", "tb-walk", "tb-scenario"):
-        sp = sub.choices[name]
-        cli_opts[name] = {a.dest for a in sp._actions}
-    mapping = {"direction": "prev"}
-    for tool, sub_name in (("tb_walk", "tb-walk"), ("tb_scenario", "tb-scenario"),
-                           ("talkback", "talkback")):
-        props = set(mcp_server.TOOLS[tool]["schema"]["properties"])
-        missing = {p for p in props if mapping.get(p, p) not in cli_opts[sub_name]}
-        assert not missing, f"{tool} options without a CLI flag: {missing}"
+    for tool in ("talkback", "tb_walk", "tb_scenario"):
+        ts = surface.spec(tool)
+        assert mcp_server.TOOLS[tool]["surface"] is ts
+        dests = {a.dest for a in sub.choices[ts.cli_name]._actions}
+        legacy = mcp_server._TB_LEGACY_LISTING[tool]["schema"]["properties"]
+        accepted = {p.name for p in ts.params_for("mcp")}
+        assert set(legacy) <= accepted, f"{tool}: {set(legacy) - accepted}"
+        assert set(legacy) <= dests, f"{tool} options without a CLI flag: {set(legacy) - dests}"
+        for name, prop in legacy.items():  # the legacy enums and defaults still hold
+            p = ts.param(name)
+            if "enum" in prop:
+                assert set(prop["enum"]) <= set(p.enum), (tool, name)
+            if "default" in prop:
+                assert prop["default"] == p.default, (tool, name)
 
 
 # --------------------------------------------------------------------------- #
@@ -805,7 +822,8 @@ def test_stdio_talkback_tools_and_restore_at_exit(tmp_path, monkeypatch, transpo
     status, walked, on = (e2e._payload(results[i]) for i in (2, 3, 4))
     assert status["talkback"]["enabled"] is False and results[2]["isError"] is False
     assert walked["ended"] == "wrap" and walked["restore"] == "restored", walked
-    assert walked["lines"][1] == '1. view:1003 TextView "Hello world"'
+    assert re.match(r'^1\. n\d+ "Hello world"$', walked["lines"][1]), walked["lines"]
+    assert walked["capture"] and walked["walk"]
     assert on["changed"] is True
     [exit_record] = exits
     # `talkback on` left it on; the server's exit hook restored the snapshot.

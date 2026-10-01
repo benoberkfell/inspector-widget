@@ -72,6 +72,23 @@ ERROR_CODES: dict[str, str] = {
     "bad_args": "Check the argument names and values.",
     "facet_unavailable": "That facet was not captured; capture again with it enabled.",
     "unsupported": "Not supported on this device or agent.",
+    # TalkBack (tb_walk, tb_scenario, talkback): docs/design/talkback-navigation.md part 4
+    "walk_not_found": "The walk expired or never existed; captures(what=\"walks\") lists them.",
+    "talkback_unavailable": "TalkBack is not installed or cannot be turned on on this device.",
+    "enable_failed": "TalkBack did not start; check talkback(action=\"status\").",
+    "restore_failed": "The accessibility settings were not restored; run talkback(action=\"restore\").",
+    "busy": "Another TalkBack walk or scenario holds this device; wait for it.",
+    "app_left_foreground": "The app is not in the foreground; open it and retry.",
+    "injector_failed": "No key injector reached TalkBack (candidates: what was tried).",
+    "keymap_unknown": "TalkBack did not react to its keyboard shortcuts.",
+    "focus_unreadable": "The agent could not read accessibility focus.",
+    "start_not_found": "No focus stop matches start / target; pass a ref or the label as spoken.",
+    "talkback_on": "TalkBack is on and this needs it off: talkback(action=\"off\") first, or "
+                   "walk with utterance=\"auto\".",
+    "log_level_failed": "TalkBack's developer settings could not be driven to set its log "
+                        "level; retry with utterance=\"auto\" (the model's speech).",
+    "talkback_error": "TalkBack could not be driven; talkback(action=\"status\") says its state, "
+                      "talkback(action=\"restore\") puts the settings back.",
 }
 
 

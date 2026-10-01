@@ -172,9 +172,14 @@ def short_code(rule_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", code) or "issue"
 
 
-def issue_codes(n: UNode) -> list[str]:
-    """The node's distinct issue short codes, sorted."""
-    return sorted({short_code(i.id) for i in n.issues})
+def issue_codes(n: UNode, all_tb: bool = False) -> list[str]:
+    """The node's distinct issue short codes, sorted. TalkBack rules outside the default
+    lint (``rules.DEFAULT_TB``: the heuristic or design-call ones, such as double_stop) are
+    left out unless ``all_tb``: the reading view shows them, a tree view does not."""
+    from .rules import DEFAULT_TB
+
+    return sorted({short_code(i.id) for i in n.issues
+                   if all_tb or not i.id.startswith("tb.") or i.id in DEFAULT_TB})
 
 
 def display_type(n: UNode) -> str | None:
@@ -455,13 +460,14 @@ def seg_row(n: UNode, fields: Fields) -> dict[str, Any]:
 def node_row(ix: Index, n: UNode, fields: Fields | Any = None, *, chain: Sequence[UNode] | None = None,
              hidden: int = 0, depth: int | None = None, order: int | None = None,
              crumbs: Sequence[str] | None = None, props_fn: PropsFn | None = None,
-             mark: str | None = None) -> dict[str, Any]:
+             mark: str | None = None, all_tb: bool = False) -> dict[str, Any]:
     """One row: the ``format="json"`` twin of a line (see :func:`format_line`).
 
     ``n`` is the node (the last member of a chain). ``chain`` lists every member of
     a chain line, top to bottom. ``hidden`` is the ``+N`` count,
     ``depth`` the indent, ``order`` the reading-view prefix, ``crumbs`` the find
-    breadcrumb and ``mark`` a diff prefix."""
+    breadcrumb and ``mark`` a diff prefix. ``all_tb``: every TalkBack issue code (see
+    :func:`issue_codes`)."""
     if not isinstance(fields, Fields):
         fields = parse_fields(fields)
     row: dict[str, Any] = {}
@@ -477,7 +483,7 @@ def node_row(ix: Index, n: UNode, fields: Fields | Any = None, *, chain: Sequenc
     if "bounds" in fields.line and n.b:
         row["bounds"] = [int(v) for v in n.b]
     if "issues" in fields.line:
-        codes = issue_codes(n)
+        codes = issue_codes(n, all_tb)
         if codes:
             row["issues"] = codes
     if hidden:

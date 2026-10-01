@@ -309,7 +309,8 @@ with every consumer.
   under 18,500 B. With the three TalkBack tools that took trimming (P0-2): shorter
   tool and parameter descriptions, `package` without one, a shared `scale`, and
   `a11y_lint.rules` without its 47-id enum (the handler checks the ids first and
-  names the valid ones). It is 18,337 B with all 18 tools.
+  names the valid ones). It was 18,337 B with all 18 tools; 18,479 B since the
+  a11y_lint and tb_walk descriptions say what their results now hold.
   - `max_bytes` defaults to the environment value both in the schema and on the
     CLI, so the two stay equal.
   - The CLI adds `--pretty` everywhere. `add_cli_flags` skips flags a subparser
@@ -437,7 +438,7 @@ with every consumer.
   | 259-view | `dump_tree(max_depth=1)` | 169,658 | 297 | 2,000 |
   | 259-view | `dump_tree` / `dump_accessibility` / `inspect` / `+props` | 170 KB-3.85 MB | envelopes of 766-866 | 3,000 |
 
-  `tools/list` is 18,337 B compact (18 tools).
+  `tools/list` is 18,479 B compact (18 tools).
 
 ## Query engine and line grammar (C6, `capture/query.py`, `capture/lines.py`)
 
@@ -460,6 +461,35 @@ with every consumer.
   `LoadedCapture.props(udid)`.** Results are cached per call. `nondefault` also
   reads the same-class views, because `normalize.nondefault_props` needs the
   class majority.
+- **TalkBack's walk (`outline(view="reading")`, `capture/tb.py`).** With no reading
+  argument the view is the stored order (`Index.reading`), lines as before. Any of
+  `explain`, `granularity` (default|heading|control), `from` (a selector),
+  `direction` (next|prev) or `include_skipped` runs the TalkBack model over the
+  stored a11y tree (`TbCapture.of(ix, loaded)`, cached on the index object):
+  - the prefix is the stop's number in the default forward order (`UNode.stop`), so
+    a heading-only or backward walk keeps the numbers;
+  - `explain`: the quoted text is what TalkBack says on arrival (collection and
+    window transitions included; for a sliver at a list edge TalkBack scrolls in
+    first, the label with `speak=after_scroll`), plus `why=` (click, longclick,
+    focusable, srf, scroll_item, leaf, text_orphan, web), `via=` when the order
+    comes from a link or a reorder (`before:<ref>`, `after:<ref>`, `bounds_swap`,
+    `window:<ref>`), `ghost=`, `show_on_screen=`, `autoscroll=`;
+  - `from`: the stops a swipe reaches from that node to the edge (the node first
+    when it is a stop); the header says `from`, `direction`, `ended`;
+  - `include_skipped`: `- ` lines, in TalkBack's traversal order, for the nodes with
+    content or actions it passes over: `merged_into=<ref>`, `hidden_by=<ref>`,
+    `covered_by=<ref>`, or `why=` silent_container, offscreen, zero_size,
+    invisible, not_important, under_system_bar, window_wrapper ...; and one line per
+    window TalkBack never gets (its root, `covered_by=<the modal window's ref>`);
+  - every reading line shows all `tb.*` issue codes;
+  - without an a11y facet the stored order is sliced, reversed and filtered by
+    flags instead, and the header says `model: "stored order ..."`;
+  - the reading arguments are part of the cursor hash and the next hints; on any
+    other view they are `bad_args`.
+- **node()'s `tb` facet** (`facets="tb"`, and in `all` when the model can run):
+  `{stop, why | why_not ("code[: detail]"), ghost?, speak, parts [{t, from (ref),
+  k}], prev, next, edge_in, reachable (swipe|scroll|not)}`; a merged node adds
+  `speak_in` (what it contributes). About 400 B.
 - **Facet statuses read.** `meta.facet_status("slots")` and
   `meta.facet_status("a11y")`. `outline(view="slots")` on a capture that has
   Compose nodes but no slot groups is `facet_unavailable` (hint:
@@ -767,11 +797,23 @@ with every consumer.
     `ROLE_BY_A11Y_CLASS[a11y class]`; then the primary app slot name; then the View
     class; then the a11y class simple name unless it is `View`. `role` holds the
     first step's value.
-  - `label`: a11y speakable (contentDescription > text > stateDescription; a node
-    that is screen-reader-focusable, clickable or long-clickable and has none
-    speaks its non-focusable descendants, joined by ", "); then Compose
-    ContentDescription > Text > EditableText > StateDescription; then View text.
-    `label`, `text`, `desc`, `state` and `hint` are capped at 1,000 chars.
+  - `label`: for a TalkBack stop, the name inside what the TalkBack model says
+    (`capture/tb.py`: the parts of the announcement that name the node, joined by
+    ", ": "Default" in "Selected. Default. Radio button"); otherwise, and for a stop
+    whose announcement names nothing ("Button"), the a11y speakable rule RO1
+    (contentDescription > text > stateDescription; a node that is
+    screen-reader-focusable, clickable or long-clickable and has none speaks its
+    non-focusable descendants, joined by ", "); then Compose ContentDescription >
+    Text > EditableText > StateDescription; then View text. `label`, `text`, `desc`,
+    `state` and `hint` are capped at 1,000 chars.
+  - `a11y.speakable`: for a TalkBack stop, the model's announcement on a first focus
+    (TalkBack 17.0 wording, no collection or window transition: what `tb_walk`'s
+    model column shows) with `a11y.speak_src: "tb"`; for any other node its RO1
+    text. When the model cannot run, every node gets its RO1 text, focusable ones
+    `speak_src: "ro1"`, and the index a `speech:` diagnostic. `node()` leaves
+    `speak_src` out when it is "tb". A capture diff reports a speakable change only
+    when the state, label, text, description or hint changes it does not already
+    report do not explain it.
   - `flags`: the union of a11y, Compose attr and View property flags, in `FLAGS`
     order. `focus` is dropped when `click` or `longclick` is set (clickable implies
     focusable), matching the spec's outline examples. Two flags say what the
@@ -977,11 +1019,12 @@ with every consumer.
 - **`analyze(ix, loaded, lint=, density=, font_scale=)`** accepts a
   `LoadedCapture`, a `RawCapture` (at capture time, before publish) or None
   (render signals only).
-  - It owns every `render.*` and `a11y.*` issue and replaces them on each run, so
-    it is idempotent. Issues with other ids are kept.
+  - It owns every `render.*`, `a11y.*` and `tb.*` issue and replaces them on each
+    run, so it is idempotent. Issues with other ids are kept. `lint="none"` writes
+    no `a11y.*` or `tb.*` issue.
   - It sets `UNode.stop` and `Index.reading` only when the capture has an a11y
     facet.
-  - Diagnostics use the prefixes `lint:`, `contrast:` and `reading:`. After a
+  - Diagnostics use the prefixes `lint:`, `contrast:`, `reading:` and `tb:`. After a
     contrast run, `contrast: sampled N windows` is also how `lint_view` and
     `lint_summary` know contrast ran.
   - Run it on the ref-space index (after `apply_refs`). Links in evidence
@@ -1044,22 +1087,43 @@ with every consumer.
 - **False positives at a scroll edge.** A touch-target finding on a node clipped
   at a scroll edge gets `note: "likely false positive: clipped at scroll edge"`.
   A contrast finding there gets a low-confidence note and conf inferred.
+- **TalkBack rules (`tb.*`, `capture/tb.py` over `talkback/static.py`).** The
+  TalkBack model's static findings (basis "model"): `tb.double_stop`,
+  `tb.ghost_stop`, `tb.out_of_order`, `tb.boundary_jump`, `tb.escape`,
+  `tb.window_order`, `tb.wrong_announcement`, `tb.edge_stuck`, `tb.skipped`, and
+  `tb.custom_action_missing` (from the slot table). Each is an issue on the node it
+  is about, its other nodes in `node_ids`; `tb.out_of_order`/`tb.boundary_jump`
+  (a heuristic visual order) and `tb.custom_action_missing` (slot links) are
+  `conf: inferred`. What is drawn above what (`tb.escape`, and the layers a reading
+  order is judged in) and the containers a visual order keeps together come from
+  the capture's View tree (`tb.drawn_above`, `tb.view_chain`): the a11y dump leaves
+  out the Views TalkBack never gets. The per-scenario expectations on the TalkBack
+  corpus, and the precision bar (no finding on any GOOD variant), are in
+  `tests/test_capture_tb_rules.py`.
 - **Rule catalog (`rules.py`).**
   - It holds R1..R12 plus R13..R18 (the unified lint's rules). `lint_view` reports
     a rule the installed lint cannot produce under `unavailable`.
   - It also holds the four render rules, plus the reserved `render.text_overflow`,
-    `render.covered` and `render.drawn_mismatch` (`planned`).
-  - `resolve()` accepts ids, aliases, ATF check names, short codes and family
-    prefixes (`a11y.`, `render.`), all case-insensitive. Anything else raises
-    `OpError("bad_args")`.
+    `render.covered` and `render.drawn_mismatch` (`planned`), and the `tb.*` rules
+    (short code `x` of `tb.x`).
+  - `resolve()` accepts ids, aliases, ATF check names, short codes, family
+    prefixes (`a11y.`, `render.`, `tb.`) and bare families (`tb`), all
+    case-insensitive. Anything else raises `OpError("bad_args")`.
   - Short codes are unique: a group with one rule keeps the group (`role`), a
     group with several gets `group_x` (`label_missing`, `label_redundant`,
     `text_fixed_scaling`, `text_too_small`). The bare group still selects all of
     them (`resolve("label")`, `find(issue="label")`).
   - An issue id the catalog does not know is still shown, with a generic entry.
 - **`lint_view()`.**
-  - By default it reports `a11y.*` rules. `render.*` issues appear with
-    `rules=["render."]`, and `next` points at `find(issue="render.")`.
+  - By default it reports `a11y.*` rules and the precise TalkBack rules
+    (`rules.DEFAULT_TB`: escape, window_order, wrong_announcement, edge_stuck,
+    skipped: none fires on a GOOD corpus variant or a recorded real capture, none
+    repeats an a11y rule). `rules=["tb"]` lists every `tb.*` rule. `render.*`
+    issues appear with `rules=["render."]`, and `next` points at
+    `find(issue="render.")`. `lint_summary` counts the default ones.
+  - Outline, find and diff lines show a `tb.*` code only for a default rule; the
+    reading view (`outline(view="reading")`) shows them all
+    (`lines.issue_codes(all_tb=True)`).
   - `contrast=True` and `wcag=True` results are cached as `lint.<hash8>.json`,
     stored by canonical key.
   - Cursors are `<capture>:l:<hash8 of args>:<offset>`. A cursor from other
@@ -1075,8 +1139,10 @@ with every consumer.
     with every collection index `[i]` and every label from the item segment down
     to (not including) the node's own segment wildcarded: a Compose row's merged
     label (an email subject) differs per row, the unlabelled button in it does
-    not. A rule's `+N more: lint(rules=[...],group="node",...)` repeats the
-    caller's `within`, `severity`, `contrast` and `wcag`.
+    not. A `tb.*` finding wildcards the node's own label too (it is about every
+    row: "×6 in #message_list cells"). A rule's `+N more: lint(rules=[...],
+    group="node",...)` repeats the caller's `within`, `severity`, `contrast` and
+    `wcag`.
 - **Outline expand hint.** `outline(root=<ref>)` (or `max_children`) follows the
   cut that hides the most descendants on the page (ties in tree order), not the
   first cut.
@@ -1323,17 +1389,53 @@ what now holds:
   server skips its own jsonschema check for these tools.
 - **Toolsets.** `INSPECTOR_WIDGET_TOOLSET` is a name or a comma list: `legacy`
   (the 15), `capture` (the 4 session tools + the 8 = 12), `talkback` (4 + 3),
-  `all` (26). The default is `legacy,talkback`: exactly the 18 tools (and the
-  18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
+  `all` (26). The default is `legacy,talkback`: exactly the 18 tools of before
+  (18,479 B; two descriptions grew), until the deliberate flip (S4). An unknown name
   logs a warning and lists the default. Every tool stays callable by name.
-  Measured tools/list (compact): default 18,337 B, capture 11,634 (12,000),
-  legacy 13,247, capture,talkback 16,724, all 28,385 (the capture tools spend each
-  parameter description once; the instructions carry the rest). Instructions:
-  764 B (capture), 875 B (capture,talkback), 714 B (the default).
+  Measured tools/list (compact): default 18,479 B, capture 11,994 (12,000),
+  legacy 13,320, talkback 4,957, capture,talkback 15,522, all 27,256 (the capture
+  tools spend each parameter description once; the instructions carry the rest;
+  no listing averages over 1,300 B a tool). Instructions: 739 B (capture), 892 B
+  (capture,talkback and all), 718 B (the default).
+- **The TalkBack tools** (`talkback`, `tb_walk`, `tb_scenario`) are specs too
+  (toolset `talkback`), over `ops.talkback` / `ops.tb_walk` / `ops.tb_scenario`.
+  While the legacy tools are listed without the capture tools
+  (`surface.legacy_talkback`: the default), tools/list shows them in their
+  pre-capture shape (`mcp_server._TB_LEGACY_LISTING`), byte for byte; every
+  call validates against the surface spec (a superset) and runs the one
+  implementation. `cli_set` gives `tb-walk --prev`, `repeat` a repeatable
+  `--expect`. They are `destructiveHint` (and not idempotent), never retried.
+- **Walks** (`capture/walks.py`): `ops._TbCaptures` is the engine's hook
+  (`talkback.walk.run_walk(hook=, full=True)`, `scenarios.run_scenario(hook=)`):
+  a capture once TalkBack has settled (`props` off, diagnostic `taken with
+  TalkBack on (tb_walk)`; refs and selectors in `start`, `expect`, `target`,
+  `tap:` resolve there to node keys), a recapture when focus lands on a node no
+  capture holds (at most one per 3 steps, plus one at the end if needed), and a
+  scenario's before / after captures. `walks.Binding` maps each step's a11y node
+  key to the capture's ref (the latest capture taken at or before the step
+  first; a re-minted Compose id by class + label + IoU >= 0.8);
+  `walks.bind_walk` re-runs `talkback.diff.analyze` on the refs. Records are
+  `<store>/walks/<id>.json` (`w` + 6: a walk, `t` + 6: a scenario; the newest
+  100 kept, `gc(all=true)` wipes them), each with its `captures`. The store
+  holds a walk's captures (`CaptureStore.held`) until its record is stored, so a
+  lineage full of labeled captures cannot evict them mid-walk.
+- **What a bound walk takes from its captures** (live stage, emulator-5556): a
+  step's `covered_by` (what a same-window overlay covers: `static.covered`, the
+  View tree's drawing order) replaces the engine's guess; a step whose node sits
+  where its capture has it gets `vrank` (its place in tb.out_of_order's visual
+  order, `static.visual_ranks`), and a segment whose stops all have one in one
+  capture, window and layer is ordered by them; a step that reached a new window
+  while its capture no longer holds the previous step's window becomes
+  `via="screen"` (the screen was replaced under the walk: the model is compared
+  with the steps before it); the engine's notes name nodes by ref. Consecutive
+  escaped steps out of one overlay are one tb.escape finding.
 - **Instructions** (`instructions(listed)`, at most 900 B): the spec 5.13 text when
   `capture` is listed, else a legacy text naming the toolset variable; plus a
-  TalkBack sentence when `tb_walk` is listed. Sent in initialize by the SDK 1.x
-  and 2.x servers (a Server without the parameter gets none) and the fallback.
+  TalkBack sentence when `tb_walk` is listed (with the capture tools: the loop
+  `capture -> lint(rules=["tb"]) -> outline(view="reading",explain=true) ->
+  node(ref,facets="tb") -> tb_walk(start=ref) -> image(overlay="walk")`, also in
+  tb_walk's description). Sent in initialize by the SDK 1.x and 2.x servers (a
+  Server without the parameter gets none) and the fallback.
 - **Running.** `execute(name, args, ctx, surface=, passthrough=)` returns a
   `Result` (a dict, plus `images` and `is_error`); `run()` gives `(text, images,
   is_error)`. `image(inline=true)` adds `inline_tokens` to the text and the PNG

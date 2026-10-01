@@ -22,8 +22,9 @@ request that flag (res/xml-v33/accessibilityservice.xml), so the platform serves
   (AndroidComposeView.addAndroidView: ``info.isVisibleToUser = false`` when the delegate
   ``isEnabled``). A dump taken with no service on shows the holder visible; the projection
   applies the correction so the model sees what TalkBack would (``services``). The spike
-  compared dumps with TalkBack on and off on eight screens: this is the ONLY difference (links,
-  structure, bounds, text and importance are identical), so it is the only correction.
+  compared dumps with TalkBack on and off on eight screens: this was the only difference (links,
+  structure, bounds, text and importance are identical) until a RecyclerView screen showed
+  another: the item info RecyclerView adds only while a service is on (:mod:`.recycler`).
 * A node wholly outside its window's interactive region (the part of the window not covered by
   other windows, e.g. under the status bar of an edge-to-edge window) is served with
   isVisibleToUser=false (AOSP AccessibilityInteractionController.adjustIsVisibleToUserIfNeeded,
@@ -496,6 +497,9 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
                             "AndroidView holder(s) are shown invisible, as Compose reports them "
                             "while TalkBack runs."),
             })
+    from .recycler import apply_item_info  # RecyclerView item info (service on/off)
+
+    apply_item_info(tree)
     return tree
 
 

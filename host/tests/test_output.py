@@ -642,7 +642,7 @@ def test_cli_subcommand_map_matches_the_real_cli_and_mcp():
 
     from inspector_widget import surface
 
-    assert set(out.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS) - set(surface.CAPTURE_TOOLS)
+    assert set(out.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS) - {s.name for s in surface.SPECS}
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     assert set(out.CLI_SUBCOMMANDS.values()) <= set(sub.choices)
@@ -792,4 +792,4 @@ def test_the_spill_hint_names_max_bytes_only_where_the_tool_takes_it():
 
 def surface_tools():
     from inspector_widget import surface
-    return set(surface.CAPTURE_TOOLS)
+    return {s.name for s in surface.SPECS}  # the capture and TalkBack tools

@@ -52,7 +52,9 @@ ENV_MAX_BYTES = "INSPECTOR_WIDGET_MAX_BYTES"
 #: Tools whose result is a tree (they accept max_depth and root).
 TREE_TOOLS = ("dump_tree", "dump_compose", "dump_accessibility", "inspect")
 
-#: MCP tool -> the CLI subcommand that exposes it (AGENTS.md section 5).
+#: MCP tool -> the CLI subcommand that exposes it (AGENTS.md section 5). The
+#: capture-and-walk and TalkBack tools are not here: inspector_widget.surface
+#: generates both their MCP entries and their subcommands.
 CLI_SUBCOMMANDS: dict[str, str] = {
     "list_devices": "devices",
     "list_processes": "packages",
@@ -69,9 +71,6 @@ CLI_SUBCOMMANDS: dict[str, str] = {
     "inspect": "inspect",
     "inspect_node": "inspect-node",
     "component_image": "component-image",
-    "talkback": "talkback",
-    "tb_walk": "tb-walk",
-    "tb_scenario": "tb-scenario",
 }
 
 
@@ -450,9 +449,9 @@ def preview_lines(result: Any, max_lines: int = PREVIEW_MAX_LINES,
     return lines
 
 
-#: Tools with a max_bytes argument of their own beside OUTPUT_PARAMS' (tb_walk's
-#: walk budget, which finalize also applies).
-OWN_MAX_BYTES_TOOLS = frozenset({"tb_walk"})
+#: Legacy tools with a max_bytes argument of their own beside OUTPUT_PARAMS' (none
+#: now: tb_walk moved to the surface registry, which budgets its own responses).
+OWN_MAX_BYTES_TOOLS: frozenset[str] = frozenset()
 
 
 def takes_max_bytes(tool: str) -> bool:

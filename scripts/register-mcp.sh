@@ -7,6 +7,12 @@
 # Usage:
 #   ./scripts/register-mcp.sh [server-name]      # default name: inspector-widget
 #
+# The tools it lists: $INSPECTOR_WIDGET_TOOLSET when set (registered with the
+# server), else the default (the legacy inspection tools + TalkBack). For the
+# capture tools and the TalkBack debugging loop (capture -> lint -> outline ->
+# node -> tb_walk -> image):
+#   INSPECTOR_WIDGET_TOOLSET=capture,talkback ./scripts/register-mcp.sh
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,11 +32,15 @@ fi
 command -v claude >/dev/null  || { echo "error: the 'claude' CLI is not on PATH." >&2; exit 1; }
 
 # Replace any prior registration of this name, then add fresh.
+ENVS=("PYTHONPATH=$HOST")
+TOOLSET="${INSPECTOR_WIDGET_TOOLSET:-}"
+[ -z "$TOOLSET" ] || ENVS+=("INSPECTOR_WIDGET_TOOLSET=$TOOLSET")
 claude mcp remove "$NAME" >/dev/null 2>&1 || true
-claude mcp add "$NAME" -- env "PYTHONPATH=$HOST" "$PY" "$HOST/mcp_server.py"
+claude mcp add "$NAME" -- env "${ENVS[@]}" "$PY" "$HOST/mcp_server.py"
 
 echo "Registered MCP server '$NAME':"
 echo "    python : $PY"
 echo "    server : $HOST/mcp_server.py"
+echo "    tools  : ${TOOLSET:-default (legacy + TalkBack); INSPECTOR_WIDGET_TOOLSET=capture,talkback for the capture loop}"
 echo "Verify:  claude mcp list      (expect: $NAME ... ✓ Connected)"
 echo "Sanity:  $PY $HOST/mcp_server.py --self-check"

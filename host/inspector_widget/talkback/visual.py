@@ -93,6 +93,12 @@ def _order(rules: Rules, stops: List[TbNode]) -> List[TbNode]:
     return [n for _, ns in _cut(items) for n in ns]
 
 
+def cut_order(boxes: Sequence[Tuple[Rect, Any]]) -> List[Any]:
+    """The XY-cut reading order of ``(rect, payload)`` boxes (the cut :func:`visual_order`
+    makes), returning the payloads: for callers that group the boxes themselves."""
+    return [p for _r, ps in _cut([(r, [p]) for r, p in boxes]) for p in ps]
+
+
 def visual_order(tree: Any, stops: Optional[Sequence[Any]] = None,
                  expect: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """The heuristic reading-intent order of the stops.

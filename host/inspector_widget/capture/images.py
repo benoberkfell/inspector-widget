@@ -11,6 +11,9 @@ match the tree they were captured with:
   (``marks``), issues coloured by severity (``lint``), TalkBack stops numbered in
   order (``reading``), every box (``bounds``) or Compose semantics (``compose``)
   over a window, or over the whole screen composited from every window in z order.
+* ``walk_overlay(loaded, ix, record)`` draws a stored TalkBack walk (``tb_walk``):
+  its stops numbered by step with arrows in the order TalkBack went, the model's
+  next stop dashed where it differs, and mismatches in red.
   Drawing is delegated to ``overlay.render_items``; it needs Pillow and raises
   ``OpError("unsupported")`` without it.
 * ``inline(path, max_side)`` returns ``(mime, base64, estimated tokens)`` for an
@@ -34,7 +37,7 @@ import os
 import struct
 import zlib
 from array import array
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from . import rules as R
@@ -46,7 +49,7 @@ MAX_MARKS = 60
 DEFAULT_PAD = 16
 DEFAULT_MAX_SIDE = 1024
 TOKENS_PER_PX = 1 / 750
-OVERLAY_KINDS = ("none", "marks", "lint", "reading", "bounds", "compose")
+OVERLAY_KINDS = ("none", "marks", "lint", "reading", "bounds", "compose", "walk")
 DIFF_THRESHOLD = 24
 
 # overlay._PALETTE indices: 0 blue, 1 red, 2 green, 3 amber
@@ -614,6 +617,203 @@ def overlay(loaded: Any, ix: Index, kind: str = "marks", marks: Any = "auto", *,
         out["omitted"] = omitted
     if kind in ("lint", "reading"):
         out["legend"] = "red error, amber warn, blue info, green no issue"
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# walk overlay
+# --------------------------------------------------------------------------- #
+WALK_OK, WALK_BAD, WALK_MODEL = 0, 1, 3  # overlay._PALETTE: blue, red, amber
+WALK_LEGEND = ("numbers: TalkBack's steps; blue arrows: the order it went; red: a finding "
+               "or the model disagrees; dashed amber: the model's next stop; dashed red: "
+               "predicted, never reached")
+
+
+def _walk_moves(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The steps TalkBack moved to, bound to a ref, in walk order."""
+    return [s for s in record.get("steps") or []
+            if s.get("moved") and s.get("key") and not s.get("edge")
+            and s.get("via") not in ("left_app", "lost") and not s.get("unbound")]
+
+
+def walk_expected(record: Mapping[str, Any]) -> dict[int, str | None]:
+    """The model's next stop (a ref) before each step of the walk, where it predicted
+    one (the walk's first lap; talkback.diff's model check, by ref)."""
+    pred = [p.get("ref") for p in record.get("predicted") or [] if p.get("ref")]
+    step = 1 if record.get("direction", "next") == "next" else -1
+    out: dict[int, str | None] = {}
+    moves = _walk_moves(record)
+    pos = pred.index(moves[0]["ref"]) if moves and moves[0]["ref"] in pred else None
+    for s in moves[1:]:
+        if s.get("via") == "stolen":
+            pos = pred.index(s["ref"]) if s["ref"] in pred else None
+            continue
+        i = pos + step if pos is not None else None
+        out[int(s["i"])] = pred[i] if i is not None and 0 <= i < len(pred) else None
+        pos = pred.index(s["ref"]) if s["ref"] in pred else None
+    return out
+
+
+def _walk_bad_steps(record: Mapping[str, Any], expected: Mapping[int, str | None]) -> set[int]:
+    bad = {int(i) for f in record.get("findings") or [] if f.get("code") != "model.mismatch"
+           for i in f.get("steps") or []}
+    for i, exp in expected.items():
+        s = next((x for x in record.get("steps") or [] if x.get("i") == i), None)
+        if s is not None and exp is not None and exp != s.get("ref"):
+            bad.add(i)
+    return bad
+
+
+def _arrow_png(base: str, out: str, arrows: list[tuple], width: int) -> None:
+    """Draw ``arrows`` (``((x0,y0), (x1,y1), colour index, dashed)``) over ``base`` as
+    arcs that bulge to the left of their direction, so a move down a column and the
+    move back up it do not lie on one line, with an arrowhead at the end."""
+    from .. import overlay as ov
+
+    Image = _require_pil("Overlays")
+    from PIL import ImageDraw
+
+    img = Image.open(base).convert("RGBA")
+    d = ImageDraw.Draw(img)
+    head = max(8, width * 4)
+    side = max(img.size) / 5
+    for (x0, y0), (x1, y1), color, dashed in arrows:
+        rgb = tuple(ov._PALETTE[color % len(ov._PALETTE)])
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length < 2:
+            continue
+        bulge = min(0.35 * length, side)
+        cx, cy = (x0 + x1) / 2 - dy / length * bulge, (y0 + y1) / 2 + dx / length * bulge
+        n = max(8, int(length / 6))
+        pts = [((1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t * t * x1,
+                (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t * t * y1)
+               for t in (k / n for k in range(n + 1))]
+        for k in range(n):
+            if not dashed or (k // 2) % 2 == 0:
+                d.line([pts[k], pts[k + 1]], fill=rgb, width=width)
+        ang = math.atan2(y1 - cy, x1 - cx)  # the curve's direction where it arrives
+        for sgn in (1, -1):
+            a = ang + math.pi + sgn * 0.45
+            d.line([(x1, y1), (x1 + head * math.cos(a), y1 + head * math.sin(a))], fill=rgb,
+                   width=width)
+    img.save(out, "PNG")
+
+
+def walk_overlay(loaded: Any, ix: Index, record: Mapping[str, Any], *, window: str | None = None,
+                 max_side: int = DEFAULT_MAX_SIDE) -> dict[str, Any]:
+    """A stored walk drawn on capture ``loaded`` (a window, or the screen composited
+    from every window): each stop boxed and labelled with its step numbers and ref,
+    arrows between consecutive steps, the model's next stop dashed where it differs,
+    predicted stops the walk never reached dashed red. Steps whose node is not in
+    this capture (or window) are counted in ``omitted``."""
+    _require_pil("Overlays")
+    max_side = max(64, int(max_side)) if max_side else 4096
+    if window:
+        wn = _node(ix, window)
+        win_nodes = [wn if wn.is_window else _window_of(ix, wn)]
+    else:
+        win_nodes = ix.windows()
+    if not win_nodes:
+        raise OpError("facet_unavailable", "this capture has no windows")
+    wins = []
+    for wn in win_nodes:
+        try:
+            wins.append(_Win(loaded, wn))
+        except OpError:
+            if len(win_nodes) == 1:
+                raise
+    if not wins:
+        raise OpError("facet_unavailable", "no window of this capture has a screenshot",
+                      hint="capture(screenshot=true)")
+    base, bw, bh, f, (ox, oy) = _base(loaded, ix, wins, max_side)
+    ids = {w.node.id for w in wins}
+
+    def box(ref: str | None) -> tuple[int, int, int, int] | None:
+        n = ix.get(ref) if ref else None
+        r = _rect(n.b) if n is not None else None
+        if n is None or r is None or n.window not in ids or r[2] <= 0 or r[3] <= 0:
+            return None
+        return (round((r[0] - ox) * f), round((r[1] - oy) * f), max(1, round(r[2] * f)),
+                max(1, round(r[3] * f)))
+
+    def centre(b: tuple[int, int, int, int]) -> tuple[float, float]:
+        return b[0] + b[2] / 2, b[1] + b[3] / 2
+
+    moves = _walk_moves(record)
+    expected = walk_expected(record)
+    bad = _walk_bad_steps(record, expected)
+    order: dict[str, list[int]] = {}
+    for s in moves:
+        order.setdefault(s["ref"], []).append(int(s["i"]))
+    items: list[dict[str, Any]] = []
+    drawn: set[str] = set()
+    omitted = 0
+    for ref, steps in order.items():
+        b = box(ref)
+        if b is None:
+            omitted += len(steps)
+            continue
+        nums = ",".join(str(i) for i in steps[:3]) + ("+" if len(steps) > 3 else "")
+        color = WALK_BAD if any(i in bad for i in steps) else WALK_OK
+        items.append({"x": b[0], "y": b[1], "w": b[2], "h": b[3], "label": f"{nums} {ref}",
+                      "color_idx": color})
+        drawn.add(ref)
+    vs = record.get("vs_model") or {}
+    unvisited = [r for r in vs.get("unvisited") or [] if r not in drawn]
+    for f_ in record.get("findings") or []:
+        if f_.get("code") == "tb.skipped":
+            unvisited += [r for r in f_.get("refs") or [] if r not in drawn and r not in unvisited]
+    for ref in unvisited[:MAX_MARKS]:
+        b = box(ref)
+        if b is not None:
+            items.append({"x": b[0], "y": b[1], "w": b[2], "h": b[3], "label": f"skip {ref}",
+                          "color_idx": WALK_BAD, "dashed": True})
+    width = max(2, round(max(bw, bh) / 400))
+    arrows: list[tuple] = []
+    for a, s in zip(moves, moves[1:]):
+        ba, bs = box(a["ref"]), box(s["ref"])
+        if ba is not None and bs is not None and a["ref"] != s["ref"] and s.get("via") != "wrap":
+            arrows.append((centre(ba), centre(bs), WALK_BAD if int(s["i"]) in bad else WALK_OK,
+                           False))
+        exp = expected.get(int(s["i"]))
+        be = box(exp)
+        if exp and exp != s["ref"] and ba is not None and be is not None and exp != a["ref"]:
+            arrows.append((centre(ba), centre(be), WALK_MODEL, True))
+    font_px = max(11, min(22, round(max(bw, bh) / 55)))
+    params = {"kind": "walk", "walk": record.get("id"), "w": sorted(ids), "m": max_side,
+              "items": [(it["label"], it["color_idx"], it.get("dashed", False)) for it in items],
+              "arrows": [(a[2], a[3]) for a in arrows], "v": IMG_VERSION}
+    name = f"img/ov-walk-{_hash(params)}.png"
+
+    def make() -> bytes:
+        from .. import overlay as ov
+
+        tmp_dir = os.path.dirname(os.path.abspath(base))
+        tmp = os.path.join(tmp_dir, f".walk-{os.getpid()}-{_hash({'n': name})}.png")
+        try:
+            ov.render_items(base, items, tmp, font_size=font_px, scale=1.0)
+            _arrow_png(tmp, tmp, arrows, width)
+            with open(tmp, "rb") as fh:
+                return fh.read()
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    path, _cached = _artifact(loaded, name, make)
+    pw, ph = png_size(path)
+    out: dict[str, Any] = {"capture": _capture_id(loaded, ix), "walk": record.get("id"),
+                           "kind": "overlay", "overlay": "walk", "path": path, "px": [pw, ph],
+                           "window": _ref(wins[0].node) if len(wins) == 1 else "screen",
+                           "steps": sum(len(v) for r, v in order.items() if r in drawn),
+                           "arrows": len(arrows)}
+    if omitted:
+        out["omitted"] = omitted
+        others = [c for c in record.get("captures") or [] if c != out["capture"]]
+        out["note"] = (f"{omitted} step(s) not on this capture"
+                       + (f"; try capture=\"{others[-1]}\"" if others else "")
+                       + (" or the screen (no window)" if window else ""))
+    out["legend"] = WALK_LEGEND
     return out
 
 

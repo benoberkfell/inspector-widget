@@ -1,0 +1,88 @@
+{
+ "abi": "arm64-v8a",
+ "agent_version": "viewspector-0.1",
+ "api": 37,
+ "compose_generation": 0,
+ "consistency": "settled",
+ "created_at": 1790827323.322287,
+ "device": {
+  "dpi": 390,
+  "font_scale": 1.0,
+  "orientation": "portrait",
+  "screen": [
+   2076,
+   2152
+  ]
+ },
+ "diagnostics": [],
+ "facets": {
+  "a11y": {
+   "bytes": 14655,
+   "ms": 46,
+   "status": "ok"
+  },
+  "compose": {
+   "bytes": 2029,
+   "ms": 7,
+   "status": "ok"
+  },
+  "fingerprint": {
+   "bytes": 0,
+   "ms": 24,
+   "status": "ok"
+  },
+  "props": {
+   "bytes": 147190,
+   "ms": 0,
+   "status": "ok"
+  },
+  "shots": {
+   "bytes": 274013,
+   "ms": 0,
+   "status": "ok"
+  },
+  "skp": {
+   "bytes": 0,
+   "ms": 0,
+   "reason": "skp=false",
+   "status": "off"
+  },
+  "slots": {
+   "bytes": 0,
+   "ms": 2,
+   "reason": "not populated (slots=\"enable\" is destructive: resets remember{} state)",
+   "status": "unavailable"
+  },
+  "views": {
+   "bytes": 163430,
+   "ms": 253,
+   "status": "ok"
+  },
+  "windows": {
+   "bytes": 5,
+   "ms": 3,
+   "status": "ok"
+  }
+ },
+ "fingerprint": "cad60c6feb1edc1b2915f7c9c4600030",
+ "id": "cqf52f",
+ "label": "mvr-thunderbird-list",
+ "lineage": {
+  "package": "net.thunderbird.android.debug",
+  "serial": "emulator-5556"
+ },
+ "options": {
+  "a11y_rendering": false,
+  "lint": "tree",
+  "props": true,
+  "resolution_stack": false,
+  "screenshot": true,
+  "screenshot_scale": 1.0,
+  "settle_ms": 0,
+  "skp": false,
+  "slots": "if_available"
+ },
+ "pid": 7376,
+ "schema": 1,
+ "took_ms": 335
+}
