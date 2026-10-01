@@ -249,11 +249,14 @@ TB_LOOP = ('capture -> lint(rules=["tb"]) -> outline(view="reading",explain=true
            'node(ref,facets="tb") -> tb_walk(start=ref) -> image(overlay="walk")')
 _DEVICE_WIDE = "DEVICE-WIDE: "
 D_TALKBACK = (_DEVICE_WIDE + "TalkBack status (read-only) | on | off | restore. on snapshots "
-              "the accessibility settings first; restore (also at exit) writes them back.")
+              "the accessibility settings first and sets its log level VERBOSE (walks chained "
+              "with leave_on read its words); restore (also at exit) writes them back.")
 _TB_WALK_CORE = (_DEVICE_WIDE + "drives the REAL TalkBack (on, then restored) with "
-                 "next/prev from start ({start}). Each step is a capture ref + what it says; "
-                 "diff: actual vs model (skip, double, out_of_order, loop, trap, escape, stuck, "
-                 "left_app) by ref; findings with fixes.")
+                 "next/prev from start ({start}). Each step is a capture ref + what TalkBack "
+                 "said; diff: actual vs model (skip, double, out_of_order, loop, trap, escape, "
+                 "stuck, left_app) by ref; findings with fixes. relaunch=true: TalkBack first, "
+                 "app restarted (what its users get). show=<walk id>: page a stored walk "
+                 "(steps, speech=full), no device.")
 #: tb_walk with no capture tools listed: only what that listing can follow (refs come from
 #: an earlier walk's lines; nothing there reads a stored walk or issues a selector)
 D_TB_WALK_ALONE = _TB_WALK_CORE.format(
@@ -264,7 +267,8 @@ D_TB_WALK = (_TB_WALK_CORE.format(start="current, first, a ref or selector")
 D_TB_SCENARIO = (_DEVICE_WIDE + "where real TalkBack focus goes, by ref. focus_after: do "
                  "action (activate|back|tap:<ref>|key:<combo>); restore: activate target, go "
                  "back; survive: focus target, apply mutate (tap:<ref>|activate|key:|broadcast:"
-                 "|probe:), watch wait_ms. Verdict, timeline, cause (capture diff).")
+                 "|probe:), watch wait_ms. Verdict, timeline, cause (capture diff). "
+                 "relaunch=true: TalkBack first, app restarted.")
 
 INSTRUCTIONS = (
     "Inspector Widget reads the live UI of a debuggable Android app. Workflow: capture() takes "
@@ -466,7 +470,7 @@ def _specs() -> list[ToolSpec]:
             Param("action", "string", "status", enum=ops.TALKBACK_ACTIONS, positional=True,
                   nargs="?"),
             _serial(), _package(),
-            Param("verbose_log", "boolean", False,
+            Param("verbose_log", "boolean", True,
                   help="on: TalkBack log level VERBOSE (walks read its exact words)"),
         ], ops.talkback, False, {"talkback"}, D_TALKBACK, _render_json),
         ToolSpec("tb_walk", "tb-walk", "drive the real TalkBack (DEVICE-WIDE) through the app "
@@ -488,6 +492,12 @@ def _specs() -> list[ToolSpec]:
             Param("leave_on", "boolean", False),
             Param("max_lines", "integer", 60, minimum=5, maximum=300),
             Param("max_bytes", "integer", ops.TB_WALK_MAX_BYTES, maximum=ops.TB_WALK_HARD_MAX),
+            Param("relaunch", "boolean", False,
+                  help="TalkBack on, then restart the app from its launcher"),
+            Param("show", "string", help="A walk id or latest: page it, no device"),
+            Param("steps", "string", help="Steps to list, e.g. 17-42"),
+            Param("speech", "string", "cut", enum=ops.TB_SPEECH),
+            Param("findings", "string", "compact", enum=ops.TB_FINDINGS),
             _build_out(),
         ], ops.tb_walk, False, {"talkback"}, D_TB_WALK, _render_tb),
         ToolSpec("tb_scenario", "tb-scenario", "where real TalkBack focus goes after an action, "
@@ -505,6 +515,7 @@ def _specs() -> list[ToolSpec]:
                   maximum=10000),
             Param("settle_ms", "integer", ops.TB_SETTLE_MS, minimum=10, maximum=2000),
             _max_bytes(ops.TB_SCENARIO_MAX_BYTES),
+            Param("relaunch", "boolean", False),
             _build_out(),
         ], ops.tb_scenario, False, {"talkback"}, D_TB_SCENARIO, _render_tb),
     ]
