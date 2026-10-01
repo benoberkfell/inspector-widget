@@ -453,6 +453,9 @@ class _Builder:
         self.webviews: set[int] = set()
         self.window_of_root: dict[int, str] = {}
         self.cut_views = 0  # Views with CHILDREN_TRUNCATED
+        #: the TalkBack model spoke the stops (build_a11y): every other a11y node is then
+        #: a non-stop, labelled by its name (cd > text), its state kept apart (G6)
+        self.speech_ran = False
 
     # ------------------------------------------------------------------ views
     def build_views(self) -> None:
@@ -848,6 +851,7 @@ class _Builder:
             root_view = int(w.root_view_id)
             self.a11y_roots.append(self._flatten(w.root, None, (0,), root_view, res))
         speech = self._model_speech(msg)
+        self.speech_ran = speech is not None
         for a in self.a11y:
             said = speech.get((a.root_view, a.path)) if speech else None
             if said is not None and said.text:
@@ -888,6 +892,29 @@ class _Builder:
     def _own(a: _A) -> str | None:
         return a.txt.get("content_description") or a.txt.get("text") or \
             a.txt.get("state_description")
+
+    def _named(self, a: _A) -> str | None:
+        """The node's name without its state (G6): contentDescription > text, and a
+        focusable node without one is named by its non-focusable descendants' names. A
+        chip whose state is "Not selected" and whose Text child says "NOT FOLLOWING" is
+        named "NOT FOLLOWING"; a bare switch has no name (its "On" is its state)."""
+        own = a.txt.get("content_description") or a.txt.get("text")
+        if own or not a.focusable:
+            return own
+        parts: list[str] = []
+
+        def collect(i: int) -> None:
+            for c in self.a11y[i].children:
+                child = self.a11y[c]
+                if child.focusable:
+                    continue
+                o = child.txt.get("content_description") or child.txt.get("text")
+                if o:
+                    parts.append(o)
+                else:
+                    collect(c)
+        collect(a.idx)
+        return ", ".join(parts) or None
 
     def _spoken(self, a: _A) -> str | None:
         """What TalkBack speaks (RO1): contentDescription > text > stateDescription,
@@ -1425,12 +1452,18 @@ class _Builder:
             rid = ax.get("view_id_resource_name")
             node.rid = rid.rsplit("/", 1)[-1] if rid else None
         # a stop's name in what TalkBack says ("Default" in "Selected. Default. Radio
-        # button"), else the node's own text (RO1)
-        label = (a.name or self._spoken(a)) if a is not None and a.speak_src == "tb" else (
-            a.spoken if a is not None else None)
+        # button"); a node the model did not stop on, its name without its state (G6);
+        # without the model, the node's own text (RO1)
+        named = a is not None and a.speak_src != "tb" and self.speech_ran
+        if a is not None and a.speak_src == "tb":
+            label = a.name or self._spoken(a)
+        elif named:
+            label = self._named(a)
+        else:
+            label = a.spoken if a is not None else None
         if not label:
             label = at.get("ContentDescription") or at.get("Text") or at.get("EditableText") \
-                or at.get("StateDescription")
+                or (None if named else at.get("StateDescription"))
         if not label:
             label = vt
         node.label = _cap(label)
