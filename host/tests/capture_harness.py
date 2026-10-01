@@ -77,7 +77,7 @@ def harness(scene: str | fakescenes.SceneData, tmp: str, *, toolset: str | None 
         mp.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", os.path.join(tmp, "store"))
         for var in ("INSPECTOR_WIDGET_MAX_BYTES", "ANDROID_SERIAL", "INSPECTOR_WIDGET_LOG",
                     "VIEWSPECTOR_LOG", "INSPECTOR_WIDGET_CAPTURE_PERSIST",
-                    "INSPECTOR_WIDGET_TOOLSET"):
+                    "INSPECTOR_WIDGET_TOOLSET", "INSPECTOR_WIDGET_SESSION"):
             mp.delenv(var, raising=False)
         if toolset:
             mp.setenv("INSPECTOR_WIDGET_TOOLSET", toolset)

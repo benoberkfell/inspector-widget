@@ -72,10 +72,11 @@ class StringTableBuilder:
 def _private_capture_store(monkeypatch, tmp_path):
     """Every test gets its own capture store (INSPECTOR_WIDGET_CAPTURE_DIR), so
     nothing ever reads or writes the user's cache (captures, the default session,
-    spill files), and the default MCP toolset (not the developer's)."""
+    spill files), and the default MCP toolset and session (not the developer's)."""
     monkeypatch.setenv("INSPECTOR_WIDGET_CAPTURE_DIR", str(tmp_path / "capture-store"))
     monkeypatch.delenv("INSPECTOR_WIDGET_TOOLSET", raising=False)
     monkeypatch.delenv("INSPECTOR_WIDGET_CAPTURE_PERSIST", raising=False)
+    monkeypatch.delenv("INSPECTOR_WIDGET_SESSION", raising=False)
 
 
 @pytest.fixture

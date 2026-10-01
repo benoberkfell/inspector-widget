@@ -408,3 +408,83 @@ def test_export_format_picks_the_form(tmp_path):
         bad = run(ctx, "captures", action="export", id=cid, what="props", format="legacy")
         assert bad["error"]["code"] == "bad_args"
         ctx.sessions.close_all()
+
+
+# --------------------------------------------------------------------------- #
+# Per-caller default sessions (review: concurrent agents on one store)
+# --------------------------------------------------------------------------- #
+OTHER = "com.example.other"
+
+
+def test_each_caller_keeps_its_own_default_session(tmp_path):
+    """Two agents share the store: agent 1 captures the probe app, agent 2 another
+    app. Agent 1's arg-less queries and capture() stay on its own app; a caller
+    with no session of its own follows the shared default and is told which app
+    it read."""
+    with ch.harness("launcher", str(tmp_path)) as (dev, _scene):
+        dev.add_app(OTHER, 777)
+        agent1, agent2 = ch.ops_context("mcp"), ch.ops_context("mcp", CaptureStore())
+        a = capture(agent1)["capture"]
+        b = capture(agent2, package=OTHER)["capture"]
+        assert agent1.store.default_session() == (SERIAL, OTHER)  # the shared file moved
+        out = ok(run(agent1, "outline"))
+        assert out["capture"] == a and "session" not in out
+        assert ok(run(agent1, "find", text="state"))["capture"] == a
+        assert ok(run(agent1, "lint"))["capture"] == a
+        shown = ok(run(agent1, "captures", action="show"))
+        assert shown["capture"] == a and shown["session"] == f"{SERIAL}/{PACKAGE}"
+        # a fresh caller (a CLI run): the shared default, and it says which app that is
+        cli = ch.ops_context("cli", CaptureStore())
+        doc = ok(run(cli, "outline"))
+        assert doc["capture"] == b and doc["session"] == f"{SERIAL}/{OTHER}"
+        assert ok(run(cli, "lint"))["session"] == f"{SERIAL}/{OTHER}"
+        # and agent 1's arg-less capture attaches to its own app, not agent 2's
+        again = ok(run(agent1, "capture", diff_from="prev"))
+        assert again["session"] == f"{SERIAL}/{PACKAGE}" and again["diff"]["a"].startswith(a)
+        assert ok(run(agent2, "outline"))["capture"] == b
+        for ctx in (agent1, agent2, cli):
+            ctx.sessions.close_all()
+
+
+def test_inspector_widget_session_is_a_callers_own_default(tmp_path, monkeypatch):
+    with ch.harness("launcher", str(tmp_path)) as (dev, _scene):
+        dev.add_app(OTHER, 777)
+        first = ch.ops_context()
+        a = capture(first)["capture"]
+        capture(first, package=OTHER)  # the shared default is OTHER now
+        monkeypatch.setenv(ops.ENV_SESSION, f"{SERIAL}/{PACKAGE}")
+        cli = ch.ops_context()
+        out = ok(run(cli, "outline"))
+        assert out["capture"] == a and "session" not in out
+        monkeypatch.setenv(ops.ENV_SESSION, "no-slash")
+        err = run(ch.ops_context(), "outline")["error"]
+        assert err["code"] == "bad_args" and ops.ENV_SESSION in err["message"]
+        first.sessions.close_all()
+        cli.sessions.close_all()
+
+
+def test_a_gone_default_app_falls_through_to_the_running_one(tmp_path):
+    """Yesterday's default app is not running: an arg-less capture takes the
+    single running debuggable app and says so (spec 5.1 step 4)."""
+    with ch.harness("launcher", str(tmp_path)) as (dev, _scene):
+        dev.add_app("com.example.gone", None)
+        ctx = ch.ops_context()
+        ctx.store.set_default_session(SERIAL, "com.example.gone")
+        doc = ok(run(ctx, "capture"))
+        assert doc["session"] == f"{SERIAL}/{PACKAGE}"
+        assert "com.example.gone (the default session) is not running" in doc["note"]
+        # an explicit package is never swapped for another app
+        err = run(ch.ops_context(), "capture", package="com.example.gone")["error"]
+        assert err["code"] == "no_session"
+        ctx.sessions.close_all()
+
+
+def test_a_gone_default_app_names_the_running_candidates(tmp_path):
+    with ch.harness("launcher", str(tmp_path)) as (dev, _scene):
+        dev.add_app("com.example.gone", None)
+        dev.add_app(OTHER, 777)  # two running now
+        ctx = ch.ops_context()
+        ctx.store.set_default_session(SERIAL, "com.example.gone")
+        err = run(ctx, "capture")["error"]
+        assert err["code"] == "no_session" and "com.example.gone" in err["message"]
+        assert set(err["candidates"]) == {PACKAGE, OTHER}

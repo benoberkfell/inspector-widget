@@ -19,9 +19,16 @@ the store lock; ``refs.assign``, ``apply_refs`` and ``publish`` happen under it,
 which serializes every publish of every process for milliseconds only.
 
 Session defaulting (spec 5.1): explicit ``serial``/``package``, then the lineage
-of a capture argument, then the store's default session (the last attach or
-capture from either surface), then the single running debuggable app on the
-single device. Query tools stop before the last step: they never call adb.
+of a capture argument, then the caller's default session, then the single
+running debuggable app on the single device. The default session is the
+caller's own first (``OpContext.session``: its last attach or capture, kept in
+memory by an MCP server; else ``$INSPECTOR_WIDGET_SESSION``), and only then the
+store's shared one (the last attach or capture of any caller), so concurrent
+agents on one store do not read or capture each other's apps. A query that the
+shared default resolved, while the store also holds other apps, says which app
+it read (``session``). An arg-less capture whose default app is not running
+falls through to the single running debuggable app. Query tools stop before
+the device steps: they never call adb.
 """
 
 from __future__ import annotations
@@ -150,6 +157,9 @@ class OpContext:
     #: Compose generation per (serial, package, pid): bumped by a hot reload
     #: (capture(slots="enable") or the legacy dump_compose(enable_inspection)).
     generations: dict[tuple[str, str, int], int] = field(default_factory=dict)
+    #: This caller's own default session: its last attach or capture. Wins over
+    #: the store's shared default (which every caller of the store rewrites).
+    session: tuple[str, str] | None = None
     _metrics: dict[str, dict] = field(default_factory=dict)
 
     def bump_generation(self, serial: str, package: str, pid: int | None) -> None:
@@ -237,27 +247,53 @@ def _spec_lineage(store: CaptureStore, spec: Any) -> tuple[str, str] | None:
         return None
 
 
-def query_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
-                  specs: Iterable[Any] = ()) -> tuple[str, str] | None:
-    """The lineage a query resolves ``latest``/``prev`` in (no device I/O):
-    explicit serial and package, then the lineage of a capture argument that
-    names one capture, then the store's default session. A lone serial or
-    package picks the one lineage of the store that matches it. None: resolve
-    across the whole store."""
+ENV_SESSION = "INSPECTOR_WIDGET_SESSION"
+
+
+def _env_session() -> tuple[str, str] | None:
+    """``$INSPECTOR_WIDGET_SESSION`` (``serial/package``): a caller's own default
+    session when it keeps none in memory (a CLI in one terminal or agent)."""
+    raw = (os.environ.get(ENV_SESSION) or "").strip()
+    if not raw:
+        return None
+    serial, sep, package = raw.partition("/")
+    if not sep or not serial.strip() or not package.strip():
+        raise _bad(f"{ENV_SESSION} must be serial/package; got {raw!r}",
+                   hint=f"e.g. {ENV_SESSION}=emulator-5554/com.example.app, or unset it")
+    return serial.strip(), package.strip()
+
+
+def default_session(ctx: OpContext) -> tuple[tuple[str, str] | None, bool]:
+    """``(lineage, shared)``: the caller's own default session (``ctx.session``,
+    else ``$INSPECTOR_WIDGET_SESSION``), else the store's shared default
+    (``shared`` True: the last attach or capture of ANY caller of the store)."""
+    own = ctx.session or _env_session()
+    if own is not None:
+        return tuple(own), False  # type: ignore[return-value]
+    return ctx.store.default_session(), True
+
+
+def _query_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
+                   specs: Iterable[Any] = ()) -> tuple[tuple[str, str] | None, bool]:
+    """:func:`query_lineage`, plus whether the store's SHARED default chose it
+    (no serial, package or capture argument said which app)."""
     store = ctx.store
     serial, package = _explicit(serial), _explicit(package)
     if serial and package:
-        return serial, package
+        return (serial, package), False
     named = next((lin for lin in (_spec_lineage(store, s) for s in specs) if lin), None)
+    default, shared = default_session(ctx)
     if not serial and not package:
-        return named or store.default_session()
-    for cand in (named, store.default_session()):
+        if named:
+            return named, False
+        return default, shared and default is not None
+    for cand in (named, default):
         if cand and serial in (None, cand[0]) and package in (None, cand[1]):
-            return cand
+            return cand, False
     hits = [lin for lin in store.lineages()
             if serial in (None, lin[0]) and package in (None, lin[1])]
     if len(hits) == 1:
-        return hits[0]
+        return hits[0], False
     if not hits:
         what = package if package else f"any app on {serial}"
         raise OpError("capture_not_found", f"no captures of {what} yet",
@@ -267,23 +303,63 @@ def query_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
                   candidates=[f"{s}/{p}" for s, p in hits])
 
 
+def query_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
+                  specs: Iterable[Any] = ()) -> tuple[str, str] | None:
+    """The lineage a query resolves ``latest``/``prev`` in (no device I/O):
+    explicit serial and package, then the lineage of a capture argument that
+    names one capture, then the default session (the caller's own, else the
+    store's shared one). A lone serial or package picks the one lineage of the
+    store that matches it. None: resolve across the whole store."""
+    return _query_lineage(ctx, serial, package, specs)[0]
+
+
+def _session_mark(ctx: OpContext, lineage: tuple[str, str] | None, shared: bool
+                  ) -> dict[str, Any]:
+    """``{"session": "serial/package"}`` when the store's shared default chose
+    the app a query read and the store also holds other apps: another caller
+    may have moved the shared default, so the response says which app it is."""
+    if not shared or lineage is None:
+        return {}
+    try:
+        others = any(tuple(lin) != tuple(lineage) for lin in ctx.store.lineages())
+    except Exception:  # noqa: BLE001 - a nicety
+        others = False
+    return {"session": f"{lineage[0]}/{lineage[1]}"} if others else {}
+
+
+def _device_target(ctx: OpContext, serial: Any = None, package: Any = None,
+                   specs: Iterable[Any] = ()) -> tuple[tuple[str, str], bool]:
+    """:func:`device_lineage`, plus whether a default session chose the app (no
+    serial, package or capture argument), so a capture may fall through to the
+    single running app when the default's app is gone."""
+    store = ctx.store
+    serial, package = _explicit(serial), _explicit(package)
+    if serial and package:
+        return (serial, package), False
+    if not serial and not package:
+        for spec in specs:
+            lin = _spec_lineage(store, spec)
+            if lin is not None:
+                return lin, False
+    default, _shared = default_session(ctx)
+    if default and serial in (None, default[0]) and package in (None, default[1]):
+        return default, not serial and not package
+    return _running_app(serial, package), False
+
+
 def device_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
                    specs: Iterable[Any] = ()) -> tuple[str, str]:
     """The app a device tool (capture) targets: :func:`query_lineage`'s chain,
     then the single running debuggable app on the single device (honouring
     ``$ANDROID_SERIAL``). ``no_session`` with candidates otherwise."""
-    store = ctx.store
-    serial, package = _explicit(serial), _explicit(package)
-    if serial and package:
-        return serial, package
-    if not serial and not package:
-        for spec in specs:
-            lin = _spec_lineage(store, spec)
-            if lin is not None:
-                return lin
-    default = store.default_session()
-    if default and serial in (None, default[0]) and package in (None, default[1]):
-        return default
+    return _device_target(ctx, serial, package, specs)[0]
+
+
+def _running_app(serial: str | None, package: str | None = None,
+                 gone: str | None = None) -> tuple[str, str]:
+    """The single running debuggable app on ``serial`` (else the only device);
+    ``no_session`` naming the candidates otherwise. ``gone``: the default
+    session's app, which is not running (said in the error)."""
     from . import adb
     try:
         serial = adb.resolve_serial(serial)
@@ -297,17 +373,32 @@ def device_lineage(ctx: OpContext, serial: Any = None, package: Any = None,
     running = [p["package"] for p in procs if p.get("running")]
     if len(running) == 1:
         return serial, running[0]
+    lead = f"{gone} (the default session) is not running, and " if gone else ""
     if running:
-        raise OpError("no_session", f"{len(running)} debuggable apps are running on {serial}",
+        raise OpError("no_session", f"{lead}{len(running)} debuggable apps are running on "
+                                    f"{serial}",
                       hint="Pass package (or attach() first).", candidates=sorted(running))
-    raise OpError("no_session", f"no debuggable app is running on {serial}",
-                  hint="Start the app, then pass package (or attach() first).",
-                  candidates=sorted(p["package"] for p in procs))
+    launch = (f"Launch it (adb -s {serial} shell monkey -p {gone} -c "
+              f"android.intent.category.LAUNCHER 1), or pass package." if gone
+              else "Start the app, then pass package (or attach() first).")
+    raise OpError("no_session", f"{lead}no debuggable app is running on {serial}",
+                  hint=launch, candidates=sorted(p["package"] for p in procs))
+
+
+def _not_running(exc: BaseException) -> bool:
+    """Whether an attach failed because the app is not there to inspect."""
+    from .inject import InjectionError
+    if isinstance(exc, OpError):
+        return exc.code == "no_session"
+    return isinstance(exc, InjectionError) and bool(
+        re.search(r"is not (running|debuggable)", str(exc)))
 
 
 def remember_session(ctx: OpContext, serial: str, package: str) -> None:
-    """Make (serial, package) the default session (after an attach)."""
-    with contextlib.suppress(Exception):  # the default is a convenience, never a failure
+    """Make (serial, package) the caller's default session and the store's
+    shared one (after an attach or a capture)."""
+    ctx.session = (str(serial), str(package))
+    with contextlib.suppress(Exception):  # the shared default is a convenience
         ctx.store.set_default_session(serial, package)
 
 
@@ -316,15 +407,17 @@ def _load(ctx: OpContext, spec: Any, lineage: tuple[str, str] | None) -> LoadedC
 
 
 def _loaded_for_query(ctx: OpContext, p: dict[str, Any], cursor_key: str = "cursor"
-                      ) -> LoadedCapture:
+                      ) -> tuple[LoadedCapture, dict[str, Any]]:
     """Pop ``capture``/``serial``/``package`` from ``p`` and load the capture a
-    query reads (a cursor names its own capture)."""
+    query reads (a cursor names its own capture); plus the ``session`` mark
+    (:func:`_session_mark`) to stamp on the response."""
     spec = p.pop("capture", None)
     serial, package = p.pop("serial", None), p.pop("package", None)
     if _explicit(spec) in (None, "latest"):  # the default: a cursor's own capture wins
         spec = query.cursor_capture(p.get(cursor_key)) or spec
-    lineage = query_lineage(ctx, serial, package, [spec])
-    return _load(ctx, spec, lineage)
+    lineage, shared = _query_lineage(ctx, serial, package, [spec])
+    lc = _load(ctx, spec, lineage)
+    return lc, _session_mark(ctx, tuple(lc.meta.lineage), shared)  # type: ignore[arg-type]
 
 
 def _tomb(ctx: OpContext, lc: LoadedCapture) -> dict:
@@ -467,9 +560,23 @@ def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any 
         raise OpError("unsupported", "this surface cannot reach a device")
 
     store = ctx.store
-    lineage = device_lineage(ctx, serial, package, [diff_from, if_changed_since])
+    lineage, implicit = _device_target(ctx, serial, package, [diff_from, if_changed_since])
     base_id = _diff_base(ctx, diff_from, lineage) if diff_from is not None else None
-    session = ctx.sessions.get(*lineage)
+    fell_through = None
+    try:
+        session = ctx.sessions.get(*lineage)
+    except Exception as exc:
+        if not implicit or not _not_running(exc):
+            raise
+        # The default session's app is gone (spec 5.1): the single running
+        # debuggable app, or no_session naming the running ones.
+        gone = lineage[1]
+        lineage = _running_app(lineage[0], gone=gone)
+        fell_through = (f"{gone} (the default session) is not running; captured "
+                        f"{lineage[1]}, the only running debuggable app")
+        if diff_from is not None:
+            base_id = _diff_base(ctx, diff_from, lineage)
+        session = ctx.sessions.get(*lineage)
     if if_changed_since is not None:
         try:
             since: LoadedCapture | None = _load(ctx, if_changed_since, lineage)
@@ -516,6 +623,7 @@ def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any 
         cid = store.publish(raw, ix, refmap, tomb=tomb)
     lc = store.load(cid)
     ix = lc.index()
+    ctx.session = (lineage[0], lineage[1])  # this caller's default from now on
 
     diff_doc = None
     diff_next: list[str] = []
@@ -525,10 +633,11 @@ def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any 
         except OpError as e:  # the capture is published: report the diff's failure in it
             diff_doc = {"a": base_id, "error": e.message}
     note = getattr(session, "note", None)
+    notes = [n for n in (fell_through, note) if isinstance(n, str) and n]
     return _summary(ctx, lc, ix, budget=budget, n_lines=n_lines, on_screen=want_on_screen,
                     diff_doc=diff_doc, diff_next=diff_next,
                     moved_from=moved_from if moved_from and moved_from != lc.id else None,
-                    note=note if isinstance(note, str) and note else None)
+                    note="; ".join(notes) or None)
 
 
 def _diff_base(ctx: OpContext, spec: Any, lineage: tuple[str, str]) -> str:
@@ -750,10 +859,10 @@ def _props_ok(lc: LoadedCapture) -> bool:
 def outline(ctx: OpContext, **p: Any) -> dict[str, Any]:
     """``outline`` (spec 5.5) over a stored capture."""
     p = _clean(p)
-    lc = _loaded_for_query(ctx, p)
+    lc, mark = _loaded_for_query(ctx, p)
     ix = lc.index()
     out = query.outline(ix, loaded=lc, tomb=_tomb(ctx, lc), **p)
-    return _stamp(out, staleness(ctx, lc))
+    return _stamp(out, {**mark, **staleness(ctx, lc)})
 
 
 def find(ctx: OpContext, **p: Any) -> dict[str, Any]:
@@ -761,10 +870,10 @@ def find(ctx: OpContext, **p: Any) -> dict[str, Any]:
     p = _clean(p)
     if "in_" in p:
         p["in"] = p.pop("in_")
-    lc = _loaded_for_query(ctx, p)
+    lc, mark = _loaded_for_query(ctx, p)
     ix = lc.index()
     out = query.find(ix, loaded=lc, tomb=_tomb(ctx, lc), **p)
-    return _stamp(out, staleness(ctx, lc))
+    return _stamp(out, {**mark, **staleness(ctx, lc)})
 
 
 def node(ctx: OpContext, ref: Any = None, refs: Any = None, **p: Any) -> dict[str, Any]:
@@ -778,7 +887,7 @@ def node(ctx: OpContext, ref: Any = None, refs: Any = None, **p: Any) -> dict[st
                    hint='node(ref="n23"), node(ref="#badSwitch"), node(refs=["n1","n2"])')
     if isinstance(sels, list) and len(sels) == 1:
         sels = sels[0]
-    lc = _loaded_for_query(ctx, p)
+    lc, mark = _loaded_for_query(ctx, p)
     ix = lc.index()
 
     def image_fn(n: UNode) -> Any:
@@ -789,13 +898,13 @@ def node(ctx: OpContext, ref: Any = None, refs: Any = None, **p: Any) -> dict[st
         return {"path": crop["path"], "px": crop["px"]}
 
     out = query.node(ix, lc, sels, tomb=_tomb(ctx, lc), image_fn=image_fn, **p)
-    return _stamp(out, staleness(ctx, lc))
+    return _stamp(out, {**mark, **staleness(ctx, lc)})
 
 
 def lint(ctx: OpContext, **p: Any) -> dict[str, Any]:
     """``lint`` (spec 5.9) over a stored capture; contrast on request (cached)."""
     p = _clean(p)
-    lc = _loaded_for_query(ctx, p)
+    lc, mark = _loaded_for_query(ctx, p)
     ix = lc.index()
     kw = {k: p[k] for k in ("rules", "severity", "within", "contrast", "wcag", "group",
                             "per_rule", "limit", "cursor", "max_bytes") if k in p}
@@ -803,7 +912,7 @@ def lint(ctx: OpContext, **p: Any) -> dict[str, Any]:
     if unknown:
         raise _bad(f"unknown argument(s) for lint: {', '.join(unknown)}")
     out = analyzers.lint_view(ix, lc, **kw)
-    return _stamp(out, staleness(ctx, lc))
+    return _stamp(out, {**mark, **staleness(ctx, lc)})
 
 
 def image(ctx: OpContext, ref: Any = None, window: Any = None, overlay: Any = None,
@@ -822,7 +931,7 @@ def image(ctx: OpContext, ref: Any = None, window: Any = None, overlay: Any = No
     unknown = sorted(set(p) - {"capture", "serial", "package"})
     if unknown:
         raise _bad(f"unknown argument(s) for image: {', '.join(unknown)}")
-    lc = _loaded_for_query(ctx, p)
+    lc, mark = _loaded_for_query(ctx, p)
     ix = lc.index()
     if src == "skp":
         if not lc.skp_roots():
@@ -840,7 +949,7 @@ def image(ctx: OpContext, ref: Any = None, window: Any = None, overlay: Any = No
     else:
         out = images.overlay(lc, ix, kind, mk, window=win.id if win else None,
                              ref=target.id if target else None, pad=pad_px, max_side=side)
-    out = _stamp(dict(out), staleness(ctx, lc))
+    out = _stamp(dict(out), {**mark, **staleness(ctx, lc)})
     for key in ("rect", "note", "omitted", "scale"):
         if _cost(out) <= budget:
             break
@@ -880,7 +989,7 @@ def diff(ctx: OpContext, a: Any = None, b: Any = None, **p: Any) -> dict[str, An
     b_spec = _explicit(b)
     if b_spec in (None, "latest"):
         b_spec = query.cursor_capture(p.get("cursor")) or "latest"
-    lineage = query_lineage(ctx, serial, package, [b_spec, a_spec])
+    lineage, shared = _query_lineage(ctx, serial, package, [b_spec, a_spec])
     lb = _load(ctx, b_spec, lineage)
     if a_spec == "prev":
         prev_id = lb.meta.prev
@@ -891,7 +1000,8 @@ def diff(ctx: OpContext, a: Any = None, b: Any = None, **p: Any) -> dict[str, An
     else:
         la = _load(ctx, a_spec, tuple(lb.meta.lineage))  # type: ignore[arg-type]
     out = _diff(la, lb, **p)
-    return _stamp(out, staleness(ctx, lb), after="b")
+    mark = _session_mark(ctx, tuple(lb.meta.lineage), shared)  # type: ignore[arg-type]
+    return _stamp(out, {**mark, **staleness(ctx, lb)}, after="b")
 
 
 def _clean(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -1220,6 +1330,7 @@ __all__ = [
     "call",
     "capture",
     "captures",
+    "default_session",
     "device_lineage",
     "diff",
     "error_envelope",
