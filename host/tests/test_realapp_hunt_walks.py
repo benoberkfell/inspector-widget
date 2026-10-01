@@ -369,3 +369,45 @@ def test_g9_tb_walk_fails_fast_naming_the_dialog(monkeypatch):
     # an activity of another app on top of the app's window (it is on top): no overlay
     cover["window"] = "com.example/.Other"
     assert device.ensure_foreground("emulator-5554", NIA) == {}
+
+
+# ------------------------------------------------- the round's live walks (emulator-5554)
+def test_live_tb4_walk_tags_the_covered_toolbar_and_explains_the_bar():
+    rec = H.record("wv2tq6m")
+    cov = _codes(rec, "tb.covered_stop")
+    assert len(cov) == 1 and cov[0]["steps"] == [0, 1, 2, 3, 4]
+    order = _codes(rec, "tb.out_of_order")
+    assert "the overlay over the stops read first, added last" in order[0]["msg"]
+
+
+def test_live_drawer_lap_skips_nothing_and_the_sheet_walk_escapes():
+    assert _codes(H.record("wp73dl7"), "tb.skipped") == []
+    esc = _codes(H.record("wf5aizc"), "tb.escape")
+    assert len(esc) == 1 and esc[0]["steps"] == [1, 2, 3, 4, 5, 6]
+
+
+def test_live_ap4_walk_names_the_webview_it_cannot_enter():
+    rec = H.record("wumcrfa")
+    assert [f["code"] for f in rec["findings"] if f["sev"] == "error"] == ["tb.webview_block"]
+    assert _codes(rec, "tb.escape") == [] and _codes(rec, "tb.covered_stop") == []
+
+
+def test_live_nia1_names_every_item_the_bottom_row_scroll_passed_over():
+    # this walk started on Compose (column 0, the bottom row) and auto-scrolled straight to
+    # Testing, so the rows above it in column 1 (Architecture, Android Studio & Tools) were
+    # passed over too; stops the re-models added count wherever the model put them
+    f = _codes(H.record("w68v048"), "tb.autoscroll_row_skip")
+    assert len(f) == 1 and f[0]["missed"] == [
+        "Architecture", "Performance", "Android Studio & Tools", "Kotlin",
+        "New APIs & Libraries", "Platform & Releases", "Privacy & Security", "Accessibility"]
+
+
+def test_live_nia3_two_column_feed_is_interleaved():
+    assert len(_codes(H.record("w5k5fwg"), "tb.interleaved")) == 1
+
+
+def test_live_nia13_a_lap_through_the_whole_list_counts_the_spacer():
+    f = _codes(H.record("wwv5qru"), "tb.wrong_announcement")
+    assert len(f) == 1 and '"In list. 20 items"' in f[0]["msg"] and "reached 19" in f[0]["msg"]
+    # the same list scrolled to its middle: the lap starts there and cannot tell
+    assert _codes(H.record("wdz81d8"), "tb.wrong_announcement") == []

@@ -275,6 +275,7 @@ class _CaptureKeys:
         self.windows: dict[int, str] = {}
         self._covered: dict[str, dict[str, Any]] | None | bool = False
         self._unseen: set[str] | None = None
+        self._items: dict[str, int] | None = None
         self._ranks: dict[str, list[Any]] | None = None
         from .tb import TbCapture, _iter_paths, props_of
 
@@ -361,6 +362,22 @@ class _CaptureKeys:
                                     "rect": list(r) if r else None}
                     self._covered = out
         return self._covered  # type: ignore[return-value]
+
+    def items(self, key: str | None) -> int | None:
+        """How many children (a list's attached items) the node ``key`` has in this
+        capture's dump, or None when it holds no such node."""
+        if self._items is None:
+            self._items = {}
+            if self._tbc is not None:
+                for w in self._tbc.dump.data.get("windows") or []:
+                    stack = [w.get("root")] if w.get("root") else []
+                    while stack:
+                        raw = stack.pop()
+                        kids = raw.get("children") or []
+                        if raw.get("node_key") and raw.get("collection_info"):
+                            self._items[str(raw["node_key"])] = len(kids)
+                        stack.extend(kids)
+        return self._items.get(key) if key else None
 
     def unseen(self) -> set[str]:
         """The node keys of this capture TalkBack's user cannot see or reach the text of:
@@ -475,6 +492,14 @@ class Binding:
                 return c.covered()
         return None
 
+    def items(self, key: str | None, at: int | None = None) -> int | None:
+        """The attached items of the list ``key`` in the capture nearest step ``at``."""
+        for c in self._order(at):
+            n = c.items(key)
+            if n is not None:
+                return n
+        return None
+
     def unseen(self, key: str | None) -> bool:
         """Whether the latest capture holding ``key`` has it hidden or under an overlay."""
         if not key:
@@ -572,6 +597,10 @@ def bind_walk(record: dict[str, Any], binding: Binding,
                 s.pop("unbound", None)
             else:
                 s["ref"], s["unbound"] = key, True
+        if s.get("container") and "container_items" not in s:
+            held = binding.items(s["container"], at)
+            if held is not None:
+                s["container_items"] = held  # what a "N items" count is checked against
         for k in ("scrolled", "container"):
             if s.get(k):
                 s[k] = _bind_key(binding, s[k], at)

@@ -750,11 +750,19 @@ def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[
         bad = [s for i, s in enumerate(seq_steps) if i not in keep]
         if bad:
             first = bad[0]
+            why = ""
+            overlays = {(x.get("covered_by") or {}).get("ref") or (x.get("covered_by") or {}).get(
+                "overlay") for x in walk["steps"] if x.get("covered_by")}
+            inside = next((o for o in overlays if o and o in (first.get("ancestors") or [])), None)
+            if inside is not None:
+                # the overlay drawn over the stops read first (an action-mode bar over the
+                # toolbar) is added at the end of the View tree: its own stops come last
+                why = f": inside {inside}, the overlay over the stops read first, added last"
             out.append(_finding(
                 "tb.out_of_order", "warn",
                 f"{len(bad)} of {len(seq_steps)} stops are read out of visual order; first: step "
-                f"{first['i']} {_name(first)} (visual position {rank[first['key']] + 1} of {len(v)})",
-                bad))
+                f"{first['i']} {_name(first)} (visual position {rank[first['key']] + 1} of "
+                f"{len(v)}){why}", bad))
     return out, {"visual": "+".join(sorted(sources)) or None}
 
 
@@ -1066,6 +1074,14 @@ def _item_of(s: Dict[str, Any], container: str) -> str:
     return s.get("ref") or s.get("key") or ""
 
 
+def _item_instance(s: Dict[str, Any], c: str) -> Tuple[str, str]:
+    """The item of list ``c`` a step's stop sits in, told apart from another item a list
+    rebinds the same item View to as it scrolls (the model's "#n" stop says which)."""
+    it = _item_of(s, c)
+    pk = str(_pk(s) or "")
+    return it, (pk.split("#", 1)[1] if it.startswith("view:") and "#" in pk else "")
+
+
 def _check_list_count(walk: Dict[str, Any], skip: Sequence[str] = ()) -> List[Dict[str, Any]]:
     """TalkBack's "In list. N items" (CollectionInfo) against the items a walk that went
     all the way through the list reached: an empty header or a spacer item counts, though
@@ -1079,6 +1095,8 @@ def _check_list_count(walk: Dict[str, Any], skip: Sequence[str] = ()) -> List[Di
     full = _lap_complete(walk)
     out = []
     done: set = set(skip)
+    back = {"backward", "up", "left", "page_up", "page_left"}
+    fwd = {"forward", "down", "right", "page_down", "page_right"}
     for j, s in enumerate(lap):
         m = _IN_LIST.search(s.get("speak") or "") if s.get("utt") == "logcat" else None
         c = s.get("container")
@@ -1090,14 +1108,19 @@ def _check_list_count(walk: Dict[str, Any], skip: Sequence[str] = ()) -> List[Di
         before = [x for x in lap[:j] if x.get("container") != c]
         if not full and not (before and after):
             continue  # the lap did not go all the way through it
+        n = int(m.group(2))
+        held = s.get("container_items")  # the items the capture shows attached
+        if held is None or held < n:
+            # some items are not attached: only a lap from the list's start to its end
+            # reached them all (a list scrolled to its middle starts the lap there)
+            if set(run[0].get("container_can") or ()) & back \
+                    or set(run[-1].get("container_can") or ()) & fwd:
+                continue
         items: List[Any] = []
-        auto = any(x.get("via") == "autoscroll" for x in run)
         for x in run:
-            it = _item_of(x, c)
-            key = (it, x.get("label")) if auto and it == (x.get("ref") or x.get("key")) else it
+            key = _item_instance(x, c)
             if key not in items:
                 items.append(key)
-        n = int(m.group(2))
         if n > len(items):
             out.append(_finding(
                 "tb.wrong_announcement", "warn",
@@ -1118,13 +1141,7 @@ def _check_interleaved(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> List[
     for s in lap:
         if s.get("container"):
             by_c.setdefault(s["container"], []).append(s)
-    def inst(s: Dict[str, Any], c: str) -> Tuple[str, str]:
-        # a list rebinds an item View (a ComposeView cell too) to other items as it scrolls:
-        # the model's "#n" stop says which item it shows now
-        it = _item_of(s, c)
-        pk = str(_pk(s) or "")
-        return it, (pk.split("#", 1)[1] if it.startswith("view:") and "#" in pk else "")
-
+    inst = _item_instance
     for c, run in by_c.items():
         last_of: Dict[Tuple[str, str], int] = {}  # item -> its last step's index in run
         read: List[Dict[str, Any]] = []
@@ -1201,7 +1218,7 @@ def _check_row_skip(walk: Dict[str, Any], lap: List[Dict[str, Any]]
         for i, p in enumerate(pred):
             r = p.get("bounds")
             lab = (p.get("label") or "").strip()
-            if i < start or p["key"] in visited or not r or not box \
+            if (i < start and not p.get("added")) or p["key"] in visited or not r or not box \
                     or not _contains(box, tuple(r), 0.5):  # type: ignore[arg-type]
                 continue
             if abs((r[1] + r[3] / 2) - bottom) <= 60:

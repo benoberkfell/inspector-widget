@@ -12,7 +12,8 @@ Two kinds of evidence live under ``tests/data/realapps/``:
   :func:`talkback.diff.analyze` classifies it exactly as it would the live walk.
 * ``talkback17_hunt_records.json.gz``: the walk records the hunt itself saved (``tb-walk``
   on emulator-5558, ``~/Library/Caches/inspector-widget/walks/<id>.json``), trimmed of
-  their findings and timings. Every step carries the box and container it had when it
+  their findings and timings; ``talkback17_occlusion_walks.json.gz`` the same for the
+  walks the occlusion-model round took live on emulator-5554 (each with a ``note``). Every step carries the box and container it had when it
   was read, recaptures included, so the checks that need the scrolled-in screen
   (auto-scroll along a grid row, interleaved cards) run on them: :func:`record`.
 
@@ -144,6 +145,10 @@ def replay(name: str, *, analyze: bool = True) -> Dict[str, Any]:
             tts[i] = said
         prev_node = node if node is not None else prev_node
     records = walk._build_records(steps, model, tts, lambda k: k if k is not None else "-")
+    held = _list_items(d)
+    for s in records:  # as capture/walks.bind_walk adds them
+        if s.get("container") in held:
+            s["container_items"] = held[s["container"]]
     for s in records:
         if s.get("scrolled") == "?":
             s["scrolled"] = s.get("container") or "?"
@@ -172,6 +177,19 @@ def replay(name: str, *, analyze: bool = True) -> Dict[str, Any]:
     return rec
 
 
+def _list_items(d: Mapping[str, Any]) -> Dict[str, int]:
+    """``{list node key: its children}`` for every node of the dump with a CollectionInfo."""
+    out: Dict[str, int] = {}
+    stack = [w["root"] for w in d.get("windows") or [] if w.get("root")]
+    while stack:
+        n = stack.pop()
+        kids = n.get("children") or []
+        if n.get("node_key") and n.get("collection_info"):
+            out[n["node_key"]] = len(kids)
+        stack.extend(kids)
+    return out
+
+
 def _ended(steps: List[Any]) -> str:
     """How an entry without ``ended`` ended: a wrap when a move after an edge reads a stop
     read before, else at its last press."""
@@ -190,10 +208,17 @@ def _records() -> Dict[str, Any]:
     return json.loads(gzip.decompress((DATA / "talkback17_hunt_records.json.gz").read_bytes()))
 
 
+@lru_cache(maxsize=None)
+def _live() -> Dict[str, Any]:
+    return json.loads(gzip.decompress((DATA / "talkback17_occlusion_walks.json.gz").read_bytes()))
+
+
 def record(walk_id: str, *, analyze: bool = True) -> Dict[str, Any]:
-    """A walk record the hunt saved (``talkback17_hunt_records``), re-analysed by this
-    tree's :func:`diff.analyze` unless ``analyze`` is False."""
-    rec = copy.deepcopy(_records()[walk_id])
+    """A walk record the hunt saved (``talkback17_hunt_records``, emulator-5558), or one the
+    occlusion-model round recorded live on emulator-5554 (``talkback17_occlusion_walks``,
+    each with a ``note``), re-analysed by this tree's :func:`diff.analyze` unless
+    ``analyze`` is False."""
+    rec = copy.deepcopy(_records()[walk_id] if walk_id in _records() else _live()[walk_id])
     if analyze:
         res = diff.analyze(rec)
         rec["findings"], rec["vs_model"] = res["findings"], res["vs_model"]
