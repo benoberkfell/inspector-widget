@@ -51,8 +51,10 @@ FIXES = {
                      "View importantForAccessibility=no or GONE, not alpha 0), or keep partly "
                      "scrolled-off rows out of the focus order.",
     "tb.double_stop": "Make one of the two the stop: merge the child into the container "
-                      "(Modifier.toggleable/clickable on the row, child onClick=null) or make the "
-                      "container not focusable.",
+                      "(Compose: Modifier.toggleable/clickable on the row, child onClick=null; "
+                      "View: the inner control as an AccessibilityAction on the row, "
+                      "ViewCompat.addAccessibilityAction, with importantForAccessibility=no on "
+                      "it) or make the container not focusable.",
     "tb.focus_lost": "Keep the focused item alive while it scrolls (stable keys / "
                      "LazyListState, no key churn); TalkBack re-focuses only after a scroll "
                      "event from the container.",
@@ -72,6 +74,19 @@ FIXES = {
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
 }
+# tb.double_stop where both stops are Views / Compose nodes (FIXES names both).
+FIX_DOUBLE_VIEW = ("Make one of the two the stop: expose the inner control as an "
+                   "AccessibilityAction on the row (ViewCompat.addAccessibilityAction) and set "
+                   "importantForAccessibility=no on it, or make the row not focusable.")
+FIX_DOUBLE_COMPOSE = ("Make one of the two the stop: merge the child into the container "
+                      "(Modifier.toggleable/clickable on the row, child onClick=null; secondary "
+                      "actions as customActions) or make the container not focusable.")
+# tb.loop driven by TalkBack's own auto-scroll (FIXES has the traversal-cycle one).
+FIX_AUTOSCROLL_LOOP = ("Make each item one stop: its inner controls as custom actions (Compose: "
+                       "customActions on the item + clearAndSetSemantics {} on the child; Views: "
+                       "ViewCompat.addAccessibilityAction on the row + importantForAccessibility=no "
+                       "on the child), so TalkBack never scrolls back to show a control of a "
+                       "partly visible item.")
 # tb.trap for a WebView on an off-screen page (FIXES has the focus-stealing one).
 FIX_WEB_TRAP = ("Keep pages that are not on screen out of the accessibility tree: "
                 "importantForAccessibility=noHideDescendants on the pager pages that are not "
@@ -127,7 +142,32 @@ def _q(s: Optional[str], n: int = 32) -> str:
 
 
 def _name(s: Dict[str, Any]) -> str:
-    return f"{s.get('ref')} {_q(s.get('label') or s.get('speak'))}"
+    return f"{s.get('ref')} {_q((s.get('label') or '').strip() or s.get('speak'))}"
+
+
+COLLAPSE_AT = 3  # more findings of one pattern than this are reported as one
+
+
+def _collapse(found: List[Dict[str, Any]], what: str) -> List[Dict[str, Any]]:
+    """Repeats of one pattern (a double stop on every row) as one finding: the first one's
+    message, how many there are and where the others are; every step is kept, so each line
+    of the walk is tagged (no row looks fine because a cap dropped its finding)."""
+    if len(found) <= COLLAPSE_AT:
+        return found
+    f = dict(found[0])
+
+    def at(x: Dict[str, Any]) -> str:
+        st = x.get("steps") or []
+        return f"step {st[0]}" if len(st) == 1 else f"steps {st[0]}-{st[-1]}"
+
+    rest = found[1:]
+    also = ", ".join(at(x) for x in rest[:5]) + (f" +{len(rest) - 5}" if len(rest) > 5 else "")
+    f["msg"] = f"{len(found)} {what}, the same pattern; first: {f['msg']}; also {also}"
+    f["count"] = len(found)
+    f["refs"] = _uniq([r for x in found for r in x.get("refs") or []])[:MAX_REFS]
+    f["keys"] = _uniq([k for x in found for k in x.get("keys") or []])[:MAX_REFS]
+    f["steps"] = sorted({i for x in found for i in x.get("steps") or []})
+    return [f]
 
 
 # --------------------------------------------------------------------------- #
@@ -375,16 +415,21 @@ def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
 def _check_ghosts(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     density = int(walk.get("density") or 420)
     out = []
+    seen: set = set()  # a stop read again (the lap wrapped back to it) is reported once
     for s in _moves(walk["steps"]):
+        k = _pk(s)
+        if k in seen:
+            continue
         reasons = _ghost_reasons(s, density)
         if reasons:
+            seen.add(k)
             r = _rect(s) or (0, 0, 0, 0)
             out.append(_finding("tb.ghost_stop", "warn",
                                 f"step {s['i']}: {_name(s)} is a stop but is "
                                 + " + ".join(reasons) + f" ({r[2]}x{r[3]}px"
                                 + (f", said {_q(s.get('speak'), 40)}" if s.get("utt") == "logcat" else "")
                                 + ")", [s]))
-    return out[:5]
+    return _collapse(out, "ghost stops")
 
 
 def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -394,7 +439,7 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not s.get("moved") or s.get("edge") or not s.get("key"):
             prev = None
             continue
-        if prev is not None and s.get("via") in ("next", "autoscroll", "start"):
+        if prev is not None and s.get("via") in ("next", "autoscroll", "start", "late"):
             a, b = _rect(prev), _rect(s)
             if a and b and a != b and (_contains(a, b) or _contains(b, a)):
                 outer, inner = (prev, s) if _contains(a, b) else (s, prev)
@@ -409,20 +454,28 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                 overlap = len(ti & to) / len(ti) if ti else 0.0
                 both = "clickable" in (outer.get("flags") or []) and \
                     "clickable" in (inner.get("flags") or [])
+                f = None
                 if overlap >= DOUBLE_STOP_OVERLAP:
-                    out.append(_finding(
+                    f = _finding(
                         "tb.double_stop", "warn",
                         f"steps {prev['i']}-{s['i']}: {_name(outer)} and {_name(inner)} inside it are "
                         f"both stops, and {int(overlap * 100)}% of the inner one's words are already "
-                        f"spoken at the outer one", [prev, s]))
+                        f"spoken at the outer one", [prev, s])
                 elif both:
-                    out.append(_finding(
+                    f = _finding(
                         "tb.double_stop", "warn",
                         f"steps {prev['i']}-{s['i']}: {_name(outer)} and {_name(inner)} inside it are "
                         f"both clickable stops: one item takes two swipes, and activating the outer "
-                        f"one may not do what the inner control does", [prev, s]))
+                        f"one may not do what the inner control does", [prev, s])
+                if f is not None:
+                    kinds = {str(x.get("key") or "").split(":", 1)[0] for x in (outer, inner)}
+                    if kinds == {"view"}:
+                        f["fix"] = FIX_DOUBLE_VIEW
+                    elif kinds == {"compose"}:
+                        f["fix"] = FIX_DOUBLE_COMPOSE
+                    out.append(f)
         prev = s
-    return out[:5]
+    return _collapse(out, "double stops")
 
 
 def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -459,13 +512,19 @@ def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         if why[0] == "window":
             msg = (f"{at}: focus read {n} in a window under the modal window {why[1]}, "
                    f"first {_name(a)}")
-            out.append(_finding("tb.escape", "error", msg, steps))
+            f = _finding("tb.escape", "error", msg, steps)
+            f["overlay"] = str(why[1])
+            out.append(f)
             continue
         cov = a["covered_by"]
         msg = (f"{at}: focus left the overlay {cov.get('ref') or cov.get('overlay')} "
-               f"({cov.get('cls')}, {int(100 * cov.get('area', 0))}% of the window) and read "
-               f"{n} behind it, first {_name(a)}")
-        out.append(_finding("tb.escape", "error", msg, [first, *steps]))
+               f"({cov.get('cls')}, {int(100 * cov.get('area', 0))}% of the window) after "
+               f"{_name(first)} and read {n} behind it, first {_name(a)}")
+        # the escaped stops only: the last stop read inside the overlay did nothing wrong
+        f = _finding("tb.escape", "error", msg, steps)
+        f["overlay"] = cov.get("ref") or cov.get("overlay")
+        f["from"] = first.get("ref")
+        out.append(f)
     return out[:5]
 
 
@@ -533,11 +592,31 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps = walk["steps"]
     if walk.get("ended") == "loop" and walk.get("cycle"):
         cyc = walk["cycle"]
-        out.append(_finding("tb.loop", "error",
-                            f"focus cycles through {len(cyc)} stops without reaching an edge: "
-                            + " > ".join(cyc[:8]) + (" > …" if len(cyc) > 8 else ""),
-                            [s for s in steps if s.get("ref") in cyc][:MAX_REFS], refs=cyc))
+        in_cycle = [s for s in steps if s.get("ref") in cyc]
+        path = " > ".join(cyc[:8]) + (" > …" if len(cyc) > 8 else "")
+        auto = next((s for s in in_cycle if s.get("via") == "autoscroll"), None)
+        if auto is not None:
+            # TalkBack's own auto-scroll drives the cycle (C15, NiA's For you grid): it scrolls
+            # back to show a control of a partly visible item, then forward again
+            box = auto.get("scrolled") or auto.get("container") or "its list"
+            f = _finding("tb.loop", "error",
+                         f"TalkBack auto-scrolls {box} back to show a control of a partly "
+                         f"visible item, then forward again: focus cycles through {len(cyc)} "
+                         f"stops without reaching an edge: {path}",
+                         in_cycle[:MAX_REFS], refs=cyc)
+            f["fix"] = FIX_AUTOSCROLL_LOOP
+            out.append(f)
+        else:
+            out.append(_finding("tb.loop", "error",
+                                f"focus cycles through {len(cyc)} stops without reaching an "
+                                f"edge: {path}", in_cycle[:MAX_REFS], refs=cyc))
     last = next((s for s in reversed(steps) if s.get("moved") and s.get("key")), None)
+    # where the first edge was hit (walk["edge"] describes it): the stop focus sat on, not
+    # where it went after a wrap
+    edge_i = next((j for j, s in enumerate(steps) if s.get("edge")), None)
+    at_edge = None if edge_i is None else next(
+        (s for s in reversed(steps[:edge_i]) if s.get("moved") and s.get("key")), None)
+    at_edge = at_edge or last
     if walk.get("ended") == "stuck" and last is not None:
         # Stuck right before (or on) a WebView whose page is off screen: that is why.
         trap = next((t for t in walk.get("web_traps") or ()
@@ -558,18 +637,20 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                 + (f" ({s['scrolled']} scrolled: the focused item was disposed)" if s.get("scrolled")
                    else "") + "; the next swipe starts over from the top", [prev] if prev else []))
     edge = walk.get("edge") or {}
-    if edge.get("hidden_after") and last is not None and not edge.get("can_scroll"):
+    where = (f" (step {edge_i})" if edge_i is not None else "")
+    if edge.get("hidden_after") and at_edge is not None and not edge.get("can_scroll"):
         out.append(_finding("tb.edge_stuck", "warn",
-                            f"TalkBack hit the edge at {_name(last)} with {edge['hidden_after']} "
-                            f"hidden item(s) after it ({_q(edge.get('hidden_first'))}…): they are "
-                            f"clipped, and nothing TalkBack can scroll brings them in", [last]))
-    if edge.get("can_scroll") and last is not None:
+                            f"TalkBack hit the edge{where} at {_name(at_edge)} with "
+                            f"{edge['hidden_after']} hidden item(s) after it "
+                            f"({_q(edge.get('hidden_first'))}…): they are clipped, and nothing "
+                            f"TalkBack can scroll brings them in", [at_edge]))
+    if edge.get("can_scroll") and at_edge is not None:
         out.append(_finding("tb.edge_stuck", "warn",
-                            f"TalkBack hit the edge at {_name(last)} while its container "
+                            f"TalkBack hit the edge{where} at {_name(at_edge)} while its container "
                             f"{edge.get('container_ref') or edge.get('container')} "
                             f"({edge.get('container_cls')}) can still scroll "
                             f"{'/'.join(edge['can_scroll'])}: the rest is unreachable by swipe/keys",
-                            [last]))
+                            [at_edge]))
     return out
 
 
@@ -635,7 +716,7 @@ def _check_revisit(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> List[Dict
                                 f"step {s['i']}: {_name(s)} was already read at step {seen[k]['i']} "
                                 f"in this lap", [seen[k], s]))
         seen.setdefault(k, s)
-    return out[:3]
+    return _collapse(out, "stops read again")
 
 
 _FORWARD = {"forward", "down", "right", "page_down", "page_right"}
@@ -652,7 +733,8 @@ def _check_leave_scrollable(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not s.get("moved") or not s.get("key") or s.get("edge"):
             prev = None if s.get("via") == "left_app" else prev
             continue
-        if prev is not None and s.get("via") in ("next", "autoscroll", "window") and prev.get("container") \
+        if prev is not None and s.get("via") in ("next", "autoscroll", "window", "late") \
+                and prev.get("container") \
                 and s.get("container") != prev.get("container") \
                 and set(prev.get("container_can") or []) & want:
             inside = s.get("container_rect") and prev.get("container_rect") and _rect(s) and \
@@ -714,7 +796,7 @@ def _check_speech_order(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                          f"child order: {' / '.join(_q(t) for t in spoken[:4])})", [s])
             f["fix"] = _FIX_SPEECH_ORDER
             out.append(f)
-    return out[:3]
+    return _collapse(out, "rows read out of screen order")
 
 
 def _check_cut_off_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:

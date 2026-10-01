@@ -255,7 +255,7 @@ def test_consecutive_steps_behind_an_overlay_are_one_escape():
     esc = [f for f in found if f["code"] == "tb.escape"]
     assert len(esc) == 1 and esc[0]["msg"].startswith("steps 2-10: focus left the overlay")
     assert "read 9 stops behind it" in esc[0]["msg"]
-    assert esc[0]["steps"] == list(range(1, 11))
+    assert esc[0]["steps"] == list(range(2, 11))  # the nine behind it, not the dialog's own
 
 
 def test_a_bound_walk_takes_what_an_overlay_covers_from_its_capture():
@@ -273,9 +273,9 @@ def test_a_bound_walk_takes_what_an_overlay_covers_from_its_capture():
     from inspector_widget.talkback import diff
 
     unbound["findings"] = diff.analyze(unbound)["findings"]
-    assert _escapes(unbound) == [("step 5", [4, 5]), ("step 14", [13, 14])]
+    assert _escapes(unbound) == [("step 5", [5]), ("step 14", [14])]
     bound = W.bind_walk(copy.deepcopy(rec), W.Binding([(0, _Loaded(ix, raw))]))
-    assert _escapes(bound) == [("steps 5-13", [4, 5, 6, 7, 8, 9, 10, 11, 12, 13])]
+    assert _escapes(bound) == [("steps 5-13", [5, 6, 7, 8, 9, 10, 11, 12, 13])]
     covered = [s["i"] for s in bound["steps"] if s.get("covered_by")]
     assert covered == list(range(5, 14))
     assert all(s["covered_by"]["overlay"] == "view:12" for s in bound["steps"]
@@ -390,3 +390,4 @@ def test_a_navigation_rail_is_in_order_as_the_capture_reads_it():
         "tb.double_stop": ["n2551", "n2552"]}  # the topic chip and its checkbox: real
     assert bound["vs_model"]["agree"] == 9
     assert [s["vrank"][3] for s in bound["steps"][:4]] == [0, 1, 2, 3]
+

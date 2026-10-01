@@ -472,8 +472,9 @@ def test_leaving_a_same_window_overlay_is_an_escape(tb_env):
     tb_env.talkback.order = [(1071, -1), (1072, -1), (1061, -1)]
     res = walk(tb_env, until="edge")
     esc = [f for f in res["findings"] if f["code"] == "tb.escape"]
-    assert esc and esc[0]["refs"] == ["view:1072", "view:1061"]
-    assert "view:1070" in esc[0]["msg"]
+    # the escaped stop only (the last one read inside the overlay did nothing wrong)
+    assert esc and esc[0]["refs"] == ["view:1061"]
+    assert "view:1070" in esc[0]["msg"] and "after view:1072" in esc[0]["msg"]
 
 
 def test_a_compose_host_with_a_scrim_over_views_is_an_overlay(tb_env):
@@ -490,7 +491,7 @@ def test_a_compose_host_with_a_scrim_over_views_is_an_overlay(tb_env):
     tb_env.talkback.order = [(1072, -1), (1060, -1)]
     res = walk(tb_env, until="edge")
     esc = [f for f in res["findings"] if f["code"] == "tb.escape"]
-    assert esc and esc[0]["refs"] == ["view:1072", "view:1060"]
+    assert esc and esc[0]["refs"] == ["view:1060"]
     # Without the scrim the host is plain content drawn under the Views: no overlay.
     scrim.a11y["clickable"] = False
     res = walk(tb_env, until="edge")

@@ -213,7 +213,9 @@ def test_escape_from_an_overlay_and_from_a_modal_window():
              step(2, "view:61", (20, 250, 320, 60), "Behind", covered_by=overlay)]
     res = diff.analyze(record(steps, ended="max_steps"))
     esc = next(f for f in res["findings"] if f["code"] == "tb.escape")
-    assert esc["refs"] == ["view:72", "view:61"]
+    # the step behind the overlay; the last one inside it is where focus left from
+    assert esc["refs"] == ["view:61"] and esc["steps"] == [2]
+    assert esc["overlay"] == "view:70" and esc["from"] == "view:72"
     assert "tb.ghost_stop" not in codes(res)  # an escape is not also reported as occluded
     # Covered but never inside the overlay: an occluded ghost stop instead.
     res = diff.analyze(record([step(0, "view:61", (20, 250, 320, 60), "Behind", via="start",
@@ -347,6 +349,77 @@ def test_a_model_stop_talkback_scrolls_into_view_first_is_not_judged_a_ghost():
     assert "tb.ghost_stop" in codes(diff.analyze(record([head, clipped], ended="autoscroll")))
     clipped["show_on_screen"] = True  # static_walk: TalkBack shows it (and its clipped text) first
     assert "tb.ghost_stop" not in codes(diff.analyze(record([head, clipped], ended="autoscroll")))
+
+
+# --------------------------------------------------------------------------- #
+# Findings that name what an agent can act on
+# --------------------------------------------------------------------------- #
+def test_a_loop_talkback_auto_scroll_drives_names_that_cause_and_fix():
+    # C15 BAD / NiA's For you grid: TalkBack scrolls back to show a card's bookmark, then on
+    a, b, c = _column(3)
+    steps = [step(0, a[0], a[1], a[2], via="start"), step(1, b[0], b[1], b[2]),
+             step(2, c[0], c[1], c[2], via="autoscroll", scrolled="view:30"),
+             step(3, b[0], b[1], b[2], via="autoscroll", scrolled="view:30"),
+             step(4, c[0], c[1], c[2], via="autoscroll", scrolled="view:30")]
+    res = diff.analyze(record(steps, ended="loop", cycle=[b[0], c[0]]))
+    loop = next(f for f in res["findings"] if f["code"] == "tb.loop")
+    assert "auto-scrolls view:30 back" in loop["msg"]
+    assert loop["fix"] == diff.FIX_AUTOSCROLL_LOOP and "custom action" in loop["fix"]
+    # a cycle of plain moves keeps the traversal fix
+    plain = [dict(s, via="next" if s["i"] else "start") for s in steps]
+    loop = next(f for f in diff.analyze(record(plain, ended="loop", cycle=[b[0], c[0]]))[
+        "findings"] if f["code"] == "tb.loop")
+    assert loop["fix"] == diff.FIXES["tb.loop"]
+
+
+def _row_and_button(i, kind="view"):
+    y = 300 + 200 * i
+    k = (lambda n: f"view:{n}") if kind == "view" else (lambda n: f"compose:7:{n}")
+    row = step(2 * i, k(100 + i), (0, y, 1280, 190), f"Mail {i}", speak=f"Mail {i}",
+               via="start" if i == 0 else "next", flags=["clickable", "focusable"])
+    sel = step(2 * i + 1, k(200 + i), (0, y, 176, 190), "Select", speak="Select. Button",
+               flags=["clickable", "focusable"], ancestors=[k(100 + i)])
+    return [row, sel]
+
+
+def test_double_stops_repeated_on_every_row_are_one_finding_tagging_every_row():
+    # Thunderbird's message list: every row and its avatar's "Select" are two stops. The
+    # cap once kept five, and the sixth row looked fine.
+    steps = [s for i in range(6) for s in _row_and_button(i)]
+    res = diff.analyze(record(steps, ended="max_steps"))
+    ds = [f for f in res["findings"] if f["code"] == "tb.double_stop"]
+    assert len(ds) == 1 and ds[0]["count"] == 6
+    assert ds[0]["msg"].startswith("6 double stops, the same pattern; first: steps 0-1")
+    assert ds[0]["steps"] == list(range(12))  # every row's lines are tagged
+    # Views get the View fix (Modifier.* means nothing to a RecyclerView row) ...
+    assert ds[0]["fix"] == diff.FIX_DOUBLE_VIEW and "addAccessibilityAction" in ds[0]["fix"]
+    # ... and Compose nodes the Compose one
+    steps = [s for i in range(2) for s in _row_and_button(i, "compose")]
+    ds = [f for f in diff.analyze(record(steps, ended="max_steps"))["findings"]
+          if f["code"] == "tb.double_stop"]
+    assert len(ds) == 2 and ds[0]["fix"] == diff.FIX_DOUBLE_COMPOSE
+
+
+def test_a_ghost_stop_read_again_after_the_wrap_is_reported_once():
+    ghost = step(0, "view:19", (0, 0, 1280, 2856), "", speak="Unlabelled", via="start")
+    ok = step(1, "view:20", (100, 400, 300, 100), "OK", speak="OK. Button")
+    steps = [ghost, ok, edge(2, "view:20"), dict(ghost, i=3, via="wrap")]
+    res = diff.analyze(record(steps))
+    assert [f["steps"] for f in res["findings"] if f["code"] == "tb.ghost_stop"] == [[0]]
+
+
+def test_the_edge_finding_names_the_stop_at_the_edge_not_the_one_after_the_wrap():
+    # Thunderbird "Message details demo": the body's last text at the edge, then the wrap to
+    # the toolbar's Navigate up (outside the list)
+    up = step(0, "view:554", (0, 156, 168, 168), "Navigate up", via="start")
+    body = step(1, "view:1800", (0, 900, 1280, 300), "This message contains")
+    steps = [up, body, edge(2, "view:1800"), dict(up, i=3, via="wrap")]
+    res = diff.analyze(record(steps, edge={"container": "view:1713", "container_ref": "view:1713",
+                                           "container_cls": "RecyclerView",
+                                           "can_scroll": ["forward"]}))
+    f = next(f for f in res["findings"] if f["code"] == "tb.edge_stuck")
+    assert "edge (step 2) at view:1800" in f["msg"] and f["steps"] == [1]
+    assert "view:554" not in f["msg"]
 
 
 def test_alike_nodes_of_different_list_items_are_not_the_same_node():
