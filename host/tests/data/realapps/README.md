@@ -16,3 +16,28 @@ otherwise (the toolbar menu was re-created in between, or the dump came from ano
 
 Used by test_realapp_accuracy.py (lint false positives, the TalkBack model's order and speech,
 WebView content).
+
+## Real-app hunt evidence (emulator-5558)
+
+`talkback17_hunt_walks.json.gz` and the dumps it names come from the real-app findings run
+(`docs/realapp-findings.md`, host at fcff905): emulator-5558, API 37, 1280x2856, TalkBack 17.0,
+uinput keyboard, verbose ttsOutput. Each dump is the one its walk started from (`a11y_to_dict`,
+`windows` and `diagnostics` only), except `nia_onboarding_grid_backward`, whose walk started
+from the same dump as `nia_onboarding_grid` (`"dump"`). Each entry has the same `start` and
+`steps` as above, plus:
+
+- `walk`: the tb-walk id that `docs/realapp-findings.md` cites.
+- `talkback_started`: `before_app` means TalkBack was on before the app process started, which
+  is what a TalkBack user gets. `after_app` means the walk turned TalkBack on with the app
+  already running. `before_walk` means TalkBack was already on and the order is not recorded.
+  RecyclerView rows bound before TalkBack started have no CollectionItemInfo, so the `_tb_first`
+  and `_tb_later` pairs show the same screen both ways.
+- `density`: lint at this dpi. `nia_feed_two_column` was taken at `wm density 280`.
+- `autoscroll`: indices into `steps` where TalkBack auto-scrolled. The model does not
+  auto-scroll, so stop a press-for-press comparison there.
+- `note`: what the walk shows. Its step numbers are the walk's: step 0 is `start`, so walk step
+  n is `steps[n-1]`.
+- `said` is null where TalkBack's speech was not logged or focus did not move.
+
+No test uses these yet. They pin the app bugs and the tool gaps in `docs/realapp-findings.md`,
+and are inputs for the next round's tests.
