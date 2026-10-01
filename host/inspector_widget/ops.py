@@ -1592,8 +1592,8 @@ class _TbCaptures:
     def step(self, st: Any, snap: Any) -> None:
         self._last_i = int(getattr(st, "i", 0) or 0)
         key = getattr(st, "key", None)
-        if not self.recapture or not key or key in self._known:
-            return
+        if not self.recapture or not key or key in self._known or key.startswith("legacy:"):
+            return  # an agent without per-node ids: bound by label and box instead
         if self._last_i - self._last_at < walks.RECAPTURE_EVERY:
             self._pending = True
             return

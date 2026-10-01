@@ -360,6 +360,16 @@ class Binding:
     def has(self, key: str | None) -> bool:
         return bool(key) and any(key in c.keys for _a, c in self._caps)
 
+    def speakable(self, ref: str | None, cid: str | None) -> str | None:
+        """What the capture's TalkBack model says at ``ref`` (its a11y facet)."""
+        for _a, c in self._caps:
+            if c.id == cid and ref:
+                n = c.ix.get(ref)
+                a11y = (n.facets.get("a11y") or {}) if n is not None else {}
+                sp = a11y.get("speakable")
+                return str(sp) if sp else None
+        return None
+
     def window_ref(self, root_view_id: Any) -> str | None:
         with contextlib.suppress(TypeError, ValueError):
             for _a, c in reversed(self._caps):
@@ -645,10 +655,12 @@ def bind_scenario(out: dict[str, Any], binding: Binding, before_at: int,
     for key, at in (("target", before_at), ("focus", after_at)):
         d = out.get(key)
         if isinstance(d, dict) and d.get("ref"):
-            ref, _cid = binding.ref(d["ref"], at=at, sig=signature(d.get("cls"), d.get("speak")),
-                                    bounds=d.get("bounds"))
+            ref, cid = binding.ref(d["ref"], at=at, sig=signature(d.get("cls"), d.get("speak")),
+                                   bounds=d.get("bounds"))
             d["key"] = d["ref"]
             d["ref"] = ref or d["ref"]
+            # the capture's calibrated speech, as outline and tb_walk show it
+            d["speak"] = binding.speakable(ref, cid) or d.get("speak")
     for ev in out.get("timeline") or []:
         if ev.get("focus"):
             ev["focus"] = _bind_key(binding, ev["focus"], after_at)
