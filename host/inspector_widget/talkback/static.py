@@ -39,10 +39,12 @@ Codes, with what each looks at:
 ``tb.edge_stuck``
     Content past a container's edge that nothing TalkBack can scroll brings in (no scroll
     action), or a pager with more pages and no page controls (TalkBack never auto-scrolls a
-    pager, FILTER_AUTO_SCROLL, UT:458).
+    pager, FILTER_AUTO_SCROLL, UT:458): no tabs or selected page indicator, no page button
+    ("Next", "Previous page"), no labelled custom action.
 ``tb.skipped``
     Visible text TalkBack never gets because an ancestor hides it
-    (importantForAccessibility=noHideDescendants), when no overlay covers it.
+    (importantForAccessibility=noHideDescendants), when no overlay covers it, no open panel
+    is why (an open drawer or modal sheet hides its siblings) and no stop says it.
 
 ``tb.custom_action_missing`` needs the composables (the capture's slot table) and is
 computed on the capture side (``capture/tb.py``).
@@ -199,9 +201,10 @@ def show_on_screen(nav: Navigator, n: TbNode, forward: bool = True) -> Optional[
 
 def ghost(nav: Navigator, n: TbNode, density: int = 420) -> List[str]:
     """Ghost reasons of a stop: ``unlabelled``, ``invisible_children_only``, ``tiny`` (under
-    4dp across), ``clipped:<scrollable key>`` (a sliver TalkBack cannot scroll into view). A
-    clipped item at the edge of a list TalkBack auto-scrolls is not a ghost: TalkBack
-    scrolls it fully into view first (ensureOnScreen) and speaks what it then shows."""
+    4dp across at ``density`` dpi), ``clipped:<scrollable key>`` (a sliver TalkBack cannot
+    scroll into view). A clipped item at the edge of a list TalkBack auto-scrolls is not a
+    ghost, not even a tiny one: TalkBack scrolls it fully into view first (ensureOnScreen)
+    and speaks what it then shows."""
     shown_first = show_on_screen(nav, n) is not None
     out: List[str] = []
     for g in ghost_reasons(nav.rules, n):
@@ -210,8 +213,9 @@ def ghost(nav: Navigator, n: TbNode, density: int = 420) -> List[str]:
             continue  # what it says once scrolled in is not in this dump
         out.append(g)
     r = n.rect
-    if not r.is_empty() and min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
-        out.append("tiny")
+    if not shown_first and not r.is_empty() \
+            and min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
+        out.append("tiny")  # a sliver TalkBack scrolls in first is not tiny once shown
     return out
 
 
@@ -589,12 +593,61 @@ def covered(nav: Navigator, drawn_above: Optional[DrawnAbove]) -> Optional[Dict[
     return out
 
 
+def _hides(cx: _Ctx, raw: Dict[str, Any]) -> bool:
+    """Whether dump node ``raw`` is the top of a noHideDescendants subtree."""
+    ex = cx.tree.excluded_by_raw.get(id(raw))
+    return ex is not None and ex.reason == "hidden" and ex.hidden_by is raw
+
+
+def _holds_stop(cx: _Ctx, raw: Dict[str, Any]) -> bool:
+    stack = [raw]
+    while stack:
+        x = stack.pop()
+        n = cx.tree.by_raw.get(id(x))
+        if n is not None and id(n) in cx.stop_ids:
+            return True
+        stack.extend(x.get("children") or ())
+    return False
+
+
+def _modal_panel(cx: _Ctx, top: Dict[str, Any]) -> bool:
+    """Whether the hidden subtree ``top`` is hidden for a panel over it: a sibling under the
+    same dump parent that is visible, not hidden, holds stops and overlaps one of the
+    parent's hidden children. DrawerLayout hides its content child while a drawer is open
+    (updateChildrenImportantForAccessibility) and paints its scrim itself (no scrim node);
+    BottomSheetBehavior and SideSheetBehavior (updateImportantForAccessibilityOnSiblings) hide
+    a modal sheet's siblings. That hiding is what keeps focus in the panel (the fix tb.escape
+    asks for), not text lost."""
+    parent = cx._raw_parent.get(id(top))
+    if parent is None:
+        return False
+    kids = list(parent.get("children") or ())
+    hidden = [k for k in kids if _hides(cx, k)]
+    for k in kids:
+        if any(k is h for h in hidden) or "visible_to_user" not in (k.get("flags") or ()):
+            continue
+        r = _rect_of(k)
+        if r.is_empty() or not any(_area(r.intersect(_rect_of(h))) > 0 for h in hidden):
+            continue
+        if _holds_stop(cx, k):
+            return True
+    return False
+
+
+def _said(text: str, spoken: str) -> bool:
+    """Whether ``text`` is said, as a whole phrase, in ``spoken`` (lower-cased)."""
+    t = text.strip().lower()
+    return bool(t) and re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", spoken) is not None
+
+
 def _skipped(cx: _Ctx) -> Iterator[Finding]:
     """Visible text an ancestor hides from TalkBack (noHideDescendants), one finding per
-    hiding node. Hidden content under a scrim of its window is left alone: hiding what an
-    overlay covers is the fix for tb.escape (when what is drawn above what is unknown, any
-    scrim over it counts)."""
+    hiding node. Left alone: hidden content under a scrim of its window, or hidden for a
+    panel open over it (:func:`_modal_panel`), since hiding what an overlay covers is the
+    fix for tb.escape (when what is drawn above what is unknown, any scrim over it counts);
+    and hidden text some stop already says (no orphan speech, design part 2)."""
     groups: Dict[int, Tuple[Any, List[Dict[str, Any]]]] = {}
+    spoken: Optional[str] = None
     for ex in cx.tree.excluded:
         if ex.reason != "hidden" or not ex.window.reported:
             continue
@@ -605,6 +658,10 @@ def _skipped(cx: _Ctx) -> Iterator[Finding]:
         r = _rect_of(raw)
         if r.is_empty() or not r.intersects(ex.window.bounds):
             continue
+        if spoken is None:
+            spoken = "\n".join(cx.own(s).text.lower() for s in cx.stops)
+        if _said(text, spoken):
+            continue  # a stop says it: not lost
         groups.setdefault(id(ex.hidden_by), (ex, []))[1].append(raw)
     scrims: Dict[int, List[Dict[str, Any]]] = {}
     for _top, (ex, raws) in groups.items():
@@ -612,8 +669,8 @@ def _skipped(cx: _Ctx) -> Iterator[Finding]:
         if w.index not in scrims:
             scrims[w.index] = _scrims(cx, w)
         top = ex.hidden_by
-        covered = False
-        for sc in scrims[w.index]:
+        covered = _modal_panel(cx, top)
+        for sc in () if covered else scrims[w.index]:
             if not _center_in(_rect_of(top), _rect_of(sc)) or id(top) in _subtree_ids(sc):
                 continue
             above = cx.drawn_above(sc, top) if cx.drawn_above is not None else None
@@ -625,7 +682,8 @@ def _skipped(cx: _Ctx) -> Iterator[Finding]:
         node = cx.tree.excluded_by_raw.get(id(top))
         if node is None:
             continue
-        first = raws[0].get("text") or raws[0].get("content_description") or ""
+        top_left = min(raws, key=lambda r: (_rect_of(r).top, _rect_of(r).left))  # as seen
+        first = top_left.get("text") or top_left.get("content_description") or ""
         yield Finding("tb.skipped", "warn", node, [],
                       {"texts": len(raws), "first": first[:40], "why": "noHideDescendants"})
 
@@ -676,6 +734,9 @@ def _speech_order(cx: _Ctx) -> Iterator[Finding]:
                            "why": "speech_order"})
 
 
+_POSITION = re.compile(r"\d+ of \d+")
+
+
 def _actionable(n: TbNode) -> bool:
     return any(n.has(f) for f in ("clickable", "long_clickable", "focusable",
                                   "screen_reader_focusable"))
@@ -699,10 +760,16 @@ def _positions(cx: _Ctx) -> Iterator[Finding]:
         if not silent:
             continue
         first = stops[0]
-        said = cx.walk(first).text
-        yield Finding("tb.wrong_announcement", "warn", first, silent[:MAX_OTHERS],
-                      {"said": said[:60], "silent_items": len(silent),
-                       "why": "position_counts_silent_item"})
+        ann = cx.walk(first)
+        # the "N of M" part on its own: it sits at the end, past what a cut ``said`` keeps
+        pos = next((p["text"] for p in ann.parts if p.get("kind") == "collection"
+                    and p.get("from") == first.key and _POSITION.search(p["text"] or "")),
+                   None)
+        ev: Dict[str, Any] = {"said": ann.text[:60], "silent_items": len(silent),
+                              "why": "position_counts_silent_item"}
+        if pos:
+            ev["said_pos"] = pos
+        yield Finding("tb.wrong_announcement", "warn", first, silent[:MAX_OTHERS], ev)
 
 
 # ------------------------------------------------------------------------------------------
@@ -733,6 +800,37 @@ def _past_edge(cx: _Ctx) -> Iterator[Finding]:
             "why": "no_scroll_action"})
 
 
+#: what a page button or a paging custom action says ("Next", "Previous page", "›")
+_PAGING = re.compile(r"(?<!\w)(next|previous|prev|page)(?!\w)|[›‹→←»«]", re.I)
+
+
+def _labelled_actions(n: TbNode) -> List[str]:
+    return [str(a.get("label")) for a in n.raw.get("actions") or ()
+            if isinstance(a, dict) and a.get("label")]
+
+
+def _page_controls(cx: _Ctx, p: TbNode) -> bool:
+    """Whether something TalkBack reaches turns ``p``'s pages: tabs or a selected page
+    indicator, a page button ("Next", "Previous page"), a labelled custom action on the
+    pager or a node above it, or a paging custom action on a stop inside it."""
+    if any(_labelled_actions(a) for a in [p, *p.ancestors()]):
+        return True
+    inside = {id(x) for x in p.iter()}
+    for s in cx.stops:
+        if s.window is not p.window:
+            continue
+        if id(s) in inside:
+            if any(_PAGING.search(lab) for lab in _labelled_actions(s)):
+                return True
+            continue
+        if s.has("selected") or cx.rules.role(s) == R.ROLE_TAB_BAR \
+                or any(a.has("selected") for a in s.ancestors()):
+            return True
+        if cx.rules.is_clickable(s) and _PAGING.search(cx.own(s).text):
+            return True
+    return False
+
+
 def _pagers(cx: _Ctx) -> Iterator[Finding]:
     for p in cx.tree.nodes:
         if not p.window.reported or not p.visible or cx.rules.role(p) != R.ROLE_PAGER:
@@ -740,11 +838,8 @@ def _pagers(cx: _Ctx) -> Iterator[Finding]:
         if not p.supports(*_FORWARD_ACTIONS):
             continue  # nothing further to page to (or the app pages it some other way)
         inside = {id(x) for x in p.iter()}
-        controls = [s for s in cx.stops if s.window is p.window and id(s) not in inside
-                    and (s.has("selected") or cx.rules.role(s) == R.ROLE_TAB_BAR
-                         or any(a.has("selected") for a in s.ancestors()))]
-        if controls:
-            continue  # tabs or page buttons reach the other pages
+        if _page_controls(cx, p):
+            continue  # tabs, page buttons or custom actions reach the other pages
         last = [s for s in cx.stops if id(s) in inside]
         yield Finding("tb.edge_stuck", "warn", p, last[-1:], {"why": "pager"})
 

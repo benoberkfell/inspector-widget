@@ -180,8 +180,10 @@ def test_finding_details_name_the_other_nodes():
                                '"$5. Socks", shown "Socks … $5"')
     ix, raw = F.corpus_capture("tb_v12-bad-walk")
     line = analyzers.lint_view(ix, raw, rules=["tb"], group="none")["lines"][0]
-    assert line.startswith('view:13 "Message 1" tb.wrong_announcement warn says '
-                           '"Message 1. 2 of 21. In …": 1 silent item(s) counted')
+    # the wrong "N of M" itself (it ends the speech, past what a cut quote keeps) and the
+    # silent item it counts
+    assert line == ('view:13 "Message 1" tb.wrong_announcement warn says "2 of 21": counts '
+                    '1 silent item(s), e.g. view:12')
     ix, raw = F.corpus_capture("tb_c2-bad-walk")
     lines = analyzers.lint_view(ix, raw, rules=["tb"], group="none")["lines"]
     assert lines[0] == ('a11y:7:17 "Product B1" tb.out_of_order warn read 3 after a11y:7:7, '
@@ -257,3 +259,30 @@ def test_a_capture_never_fails_on_the_tb_rules(monkeypatch):
     ix = F.build(F.raw_from_a11y(resp))
     assert _tb(ix) == {} and ix.reading
     assert "tb: not run (RuntimeError: model)" in ix.diagnostics
+
+
+def test_a_sliver_talkback_scrolls_in_first_is_no_ghost_not_even_tiny():
+    # V12 GOOD with its last attached row scrolled to a 6 px sliver at the list's bottom
+    # edge: TalkBack scrolls it fully into view before speaking it (ensureOnScreen)
+    from inspector_widget.capture.model import RawCapture
+    from inspector_widget.proto import view_inspection_pb2 as pb
+
+    _ix, raw = F.live_capture("tb_v12_good")
+    resp = pb.DumpA11yResponse.FromString(raw.a11y)
+
+    def walk(x):
+        yield x
+        for k in x.children:
+            yield from walk(k)
+
+    last = next(x for w in resp.windows if w.HasField("root") for x in walk(w.root)
+                if x.bounds.layout.y == 2037 and x.bounds.layout.h == 37)
+    last.bounds.layout.y, last.bounds.layout.h = 2068, 6
+    mod = RawCapture(meta=raw.meta, windows=raw.windows, views=raw.views,
+                     compose_sem=raw.compose_sem, a11y=resp.SerializeToString())
+    ix = F.build(mod)
+    tbc = T.TbCapture.of(ix, mod)
+    sliver = next(x for x in tbc.linear() if x.rect.height == 6)
+    assert static.show_on_screen(tbc.nav, sliver) is not None
+    assert static.ghost(tbc.nav, sliver, 390) == [] and tbc.ghost(sliver) == []
+    assert not [n for n in ix.nodes.values() for i in n.issues if i.id == "tb.ghost_stop"]

@@ -15,7 +15,8 @@ def findings(*roots, **kw):
 
 
 def codes(fs):
-    return [(f.code, f.node.key) for f in fs]
+    # an excluded dump node (tb.skipped's hiding node) has no TalkBack key: its dump key
+    return [(f.code, getattr(f.node, "key", None) or f.node.raw.get("node_key")) for f in fs]
 
 
 def test_a_view_overlay_read_after_the_compose_content_under_it_is_a_boundary_jump():
@@ -110,3 +111,81 @@ def test_a_pager_with_page_tabs_is_not_stuck():
     tabs = [c(5, 10 + i, text=f"Tab {i}", flags=FOCUS + (("selected",) if i == 0 else ()),
               actions=[CLICK], b=(360 * i, 100, 360, 150)) for i in range(3)]
     assert findings(root(compose_host(5, *tabs, pages))) == []
+
+
+def test_a_pager_with_page_buttons_or_custom_actions_is_not_stuck():
+    def pager(**kw):
+        return c(5, 2, b=(0, 300, 1080, 600), flags=("visible_to_user", "enabled", "scrollable"),
+                 actions=[{"id": R.ACTION_SCROLL_FORWARD}, {"id": R.ACTION_PAGE_RIGHT},
+                          *kw.pop("actions", ())],
+                 children=[c(5, 3, cls="android.widget.TextView", text="Page 1", flags=SRF,
+                             b=(0, 300, 1080, 100))], **kw)
+
+    def button(sid, text):
+        return c(5, sid, cls="android.widget.Button", text=text, flags=FOCUS, actions=[CLICK],
+                 b=(0, 1000, 1080, 150))
+
+    # a "Done" button turns no page: still stuck (A11yProbe C8 BAD)
+    assert codes(findings(root(compose_host(5, pager(), button(9, "Done"))))) == [
+        ("tb.edge_stuck", "compose:5:2")]
+    # the fixes the rule names: a page button, or labelled custom actions on the pager
+    assert findings(root(compose_host(5, pager(), button(9, "Next page")))) == []
+    assert findings(root(compose_host(5, pager(), button(9, "›")))) == []
+    paged = pager(actions=[{"id": 0x7f0a0001, "label": "Next page"},
+                           {"id": 0x7f0a0002, "label": "Previous page"}])
+    assert findings(root(compose_host(5, paged, button(9, "Done")))) == []
+
+
+def _drawer(panel: bool):
+    """DrawerLayout with its drawer open: updateChildrenImportantForAccessibility marks the
+    content child noHideDescendants; the scrim is painted, not a node."""
+    content = n(3, cls="android.widget.RelativeLayout", b=(0, 0, 1080, 2400),
+                important_for_accessibility="NO_HIDE_DESCENDANTS", children=[
+                    n(4, cls="android.widget.TextView", text="Inbox", b=(0, 100, 600, 100)),
+                    n(5, cls="android.widget.Button", text="Compose", flags=FOCUS,
+                      actions=[CLICK], b=(800, 2200, 200, 150))])
+    drawer = n(6, cls="android.widget.LinearLayout", b=(0, 0, 800, 2400), children=[
+        n(7, cls="android.widget.TextView", text="Folders", b=(0, 100, 800, 100)),
+        n(8, cls="android.widget.Button", text="Archive", flags=FOCUS, actions=[CLICK],
+          b=(0, 300, 800, 150))])
+    kids = [content, drawer] if panel else [content]
+    return root(n(2, cls="androidx.drawerlayout.widget.DrawerLayout", b=(0, 0, 1080, 2400),
+                  children=kids))
+
+
+def test_content_hidden_for_an_open_drawer_is_not_skipped():
+    # Thunderbird's message list under its open navigation drawer: the hiding keeps focus
+    # in the drawer (what tb.escape asks for), not text lost
+    assert [f.code for f in findings(_drawer(panel=True))] == []
+    # the same content hidden with no panel over it: TalkBack never reads it
+    fs = findings(_drawer(panel=False))
+    assert codes(fs) == [("tb.skipped", "view:3")]
+    assert fs[0].evidence == {"texts": 2, "first": "Inbox", "why": "noHideDescendants"}
+
+
+def test_siblings_hidden_for_a_modal_sheet_are_not_skipped():
+    # BottomSheetBehavior(updateImportantForAccessibilityOnSiblings): every sibling of the
+    # expanded sheet is hidden, also the app bar the sheet does not overlap
+    hide = {"important_for_accessibility": "NO_HIDE_DESCENDANTS"}
+    bar = n(3, cls="com.google.android.material.appbar.AppBarLayout", b=(0, 0, 1080, 200),
+            children=[n(4, cls="android.widget.TextView", text="Library", b=(0, 50, 600, 100))],
+            **hide)
+    body = n(5, cls="android.widget.FrameLayout", b=(0, 200, 1080, 2200), children=[
+        n(6, cls="android.widget.TextView", text="Episode 1", b=(0, 300, 1080, 100))], **hide)
+    sheet = n(7, cls="android.widget.FrameLayout", b=(0, 1200, 1080, 1200), children=[
+        n(8, cls="android.widget.Button", text="Play", flags=FOCUS, actions=[CLICK],
+          b=(0, 1300, 1080, 150))])
+    coord = n(2, cls="androidx.coordinatorlayout.widget.CoordinatorLayout",
+              b=(0, 0, 1080, 2400), children=[bar, body, sheet])
+    assert [f.code for f in findings(root(coord))] == []
+
+
+def test_hidden_text_a_stop_already_says_is_not_skipped():
+    # a decorative copy hidden from TalkBack while the button's description says it
+    label = n(3, cls="android.widget.TextView", text="Delete", b=(0, 100, 600, 100),
+              important_for_accessibility="NO_HIDE_DESCENDANTS")
+    btn = n(4, cls="android.widget.ImageButton", cd="Delete message", flags=FOCUS,
+            actions=[CLICK], b=(600, 100, 200, 200))
+    assert findings(root(label, btn)) == []
+    label["text"] = "Archive"
+    assert codes(findings(root(label, btn))) == [("tb.skipped", "view:3")]

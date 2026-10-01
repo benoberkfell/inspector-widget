@@ -1129,8 +1129,11 @@ def _tb_detail(iss: Issue) -> str:
         if ev.get("why") == "speech_order":
             return (f"says {_quote(ev.get('said') or '', 24)}, "
                     f"shown {_quote(ev.get('shown') or '', 24)}")
-        return (f"says {_quote(ev.get('said') or '', 24)}: {ev.get('silent_items')} silent "
-                f"item(s) counted")
+        k = ev.get("silent_items")
+        eg = f", e.g. {others[0]}" if others else ""
+        if ev.get("said_pos"):  # the wrong "N of M" itself, not the cut head of the speech
+            return f"says {_quote(ev['said_pos'], 24)}: counts {k} silent item(s){eg}"
+        return f"says {_quote(ev.get('said') or '', 24)}: {k} silent item(s) counted{eg}"
     if rid == "tb.edge_stuck":
         if ev.get("why") == "pager":
             return "a pager: TalkBack never scrolls to the next page"
