@@ -87,11 +87,11 @@ def test_recorded_walk_still_classifies_the_same(entry):
 @pytest.mark.parametrize("entry", [e for e in WALK_ENTRIES if e.get("static_findings") is not None],
                          ids=_id)
 def test_the_model_alone_sees_the_defect(entry):
+    # Exactly the pinned codes, BAD variants included: a model change that adds or drops a
+    # finding shows here (tb_v13-bad's tb.out_of_order once went unnoticed under a subset check).
     _rec, resp = _load(entry)
     found = _codes(walk.static_walk(resp, expect=_expect(entry))["findings"])
-    assert set(entry["static_findings"]) <= found, (entry["static_findings"], found)
-    if entry["variant"] == "good" and not entry["static_findings"]:
-        assert found == set(), found
+    assert found == set(entry["static_findings"]), (entry["static_findings"], found)
 
 
 def _first_screen(steps):
