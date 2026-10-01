@@ -1070,8 +1070,9 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
     focus (:meth:`Navigator.traps`) ends the walk with a ``{"i", "stuck": True, "key",
     "web_root"}`` step (``ended`` "trap"): focus stays where it is.
 
-    ``diagnostics`` add a ``web_hidden_page`` for each such WebView and an ``autoscroll_ahead``
-    hint per container TalkBack auto-scrolls on the way (:func:`autoscroll_hint`).
+    ``diagnostics`` add a ``web_hidden_page`` for each such WebView the walk reaches, through
+    its root or (going back) straight into its elements, and an ``autoscroll_ahead`` hint per
+    container TalkBack auto-scrolls on the way (:func:`autoscroll_hint`).
     """
     from .explain import ghost_reasons, why_stop
     from .speech import SpeechState, announce
@@ -1183,6 +1184,14 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
             if id(target) not in hinted:
                 hinted.add(id(target))
                 hints.append(web_hidden_page(nav.rules, target, pivot, nav.traps(target)))
+        else:
+            # Entered past its root (going back, the root is never a stop): the walk reads the
+            # elements of a page nobody can see. Whether TalkBack traps on a backward entry has
+            # not been measured, so this predicts the reading, not a trap.
+            web = nav.rules.outer_web_root(target)
+            if web is not None and id(web) not in hinted and nav.hidden_page(web):
+                hinted.add(id(web))
+                hints.append(web_hidden_page(nav.rules, web, pivot, False))
         if res["show_on_screen"] is not None:
             step["show_on_screen"] = res["show_on_screen"].key
             if any(g.startswith("clipped:") for g in ghost_reasons(nav.rules, target)):

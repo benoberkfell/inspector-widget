@@ -260,6 +260,25 @@ def test_the_antennapod_player_trap_is_named_and_explained():
     assert codes[0] == "tb.trap"
 
 
+def test_going_back_into_a_page_nobody_can_see_says_so():
+    # Going back, a WebView's root is never a stop, so the walk enters an off-screen page through
+    # its last element and reads it. It now says so, as the forward walk does: a web_hidden_page
+    # (not a trap: nothing measured says TalkBack traps going back), so the model's walk is a
+    # tb.ghost_stop. AntennaPod's expanded player: forward, the show notes trap.
+    from inspector_widget.talkback import diff
+
+    tree = tb.build(dump("antennapod_player_expanded"))
+    back = tb.simulate(tree, direction="prev", keyboard=True)
+    read = [k for k in back.keys() if k.startswith("virtual:359:")]
+    assert read and "virtual:359:23" not in read
+    hidden = [h for h in back.hints if h["kind"] == "web_hidden_page"]
+    assert [(h["web_root"], h["trap"]) for h in hidden] == [("virtual:359:23", False)]
+    assert diff.web_trap_finding(hidden[0], basis="model")["code"] == "tb.ghost_stop"
+    fwd = tb.simulate(tree, keyboard=True)
+    assert fwd.ended == "trap"
+    assert [h["trap"] for h in fwd.hints if h["kind"] == "web_hidden_page"] == [True]
+
+
 # ---------------------------------------------------------------- auto-scroll ahead (item 4)
 def test_the_model_says_what_auto_scroll_reads_before_the_next_control():
     # Now in Android's For-you grid: TalkBack auto-scrolled through ~16 more topics and was
