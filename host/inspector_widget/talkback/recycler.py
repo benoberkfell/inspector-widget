@@ -20,6 +20,18 @@ index), which TalkBack speaks as "2 of 21". Measured on TalkBack 17.0 / API 37
   misses the "N of M" a TalkBack user hears, and how to see it (start the app with TalkBack
   on).
 
+The item delegate also makes an item root important for accessibility (an AUTO item root
+becomes YES), so an item bound before a service started stays what its own mode resolves to:
+a plain FrameLayout page root that is not important is left out of what TalkBack gets and its
+children are read in its place (talkback/tree.py: AntennaPod's episode pager with TalkBack
+turned on after the app, where the page is no "Page" stop and its texts are stops of their own).
+
+ViewPager2 holds its pages in a RecyclerView that is itself not important for accessibility:
+TalkBack gets the pages as children of the ViewPager2 (whose node reports the pager's class
+and the RecyclerView's CollectionInfo). The lists are found in the dump, not in the TalkBack
+view, so such a RecyclerView is modelled like any other: its pages get the item info a service
+adds, and a service-on dump whose pages have none says so.
+
 Positions count from the first child. They are exact when the list is at its start (it
 offers no backward scroll) or holds every item as a child (as many as its count); any other
 list scrolled away from its start gets no item info and a diagnostic instead (the adapter
@@ -53,24 +65,69 @@ def _simple(cls: str) -> str:
     return (cls or "").rsplit(".", 1)[-1]
 
 
+class _Raw:
+    """A dump node TalkBack may not get (a RecyclerView that is not important, ViewPager2's),
+    read like a TalkBack-view node: ``get``, ``rect``, ``supports``, ``key``."""
+
+    __slots__ = ("raw", "rect", "key", "_actions")
+
+    def __init__(self, raw: Dict[str, Any]) -> None:
+        from .tree import Rect, _action_ids
+
+        self.raw = raw
+        self.rect = Rect.of(raw.get("bounds"))
+        self._actions = _action_ids(raw)
+        self.key = raw.get("node_key") or f"view:{int(raw.get('host_view_id') or 0)}"
+
+    def get(self, field: str, default: Any = None) -> Any:
+        return self.raw.get(field, default)
+
+    def supports(self, *action_ids: int) -> bool:
+        return any(a in self._actions for a in action_ids)
+
+
+def _view(raw: Dict[str, Any]) -> bool:
+    return int(raw.get("virtual_id", -1)) == -1
+
+
+def _raw_lists(tree: Any) -> List[Any]:
+    """``(RecyclerView, its item dump nodes)`` for every RecyclerView of the dump (important
+    or not: ViewPager2's is not) with a CollectionInfo, in a window TalkBack can get, whose
+    items carry no item info."""
+    out = []
+    for w in tree.windows:
+        if w.root is None:
+            continue
+        stack = [w.root.raw]
+        while stack:
+            raw = stack.pop()
+            kids = list(raw.get("children") or ())
+            stack.extend(reversed(kids))
+            if not _view(raw) or _simple(raw.get("class_name")) not in ITEM_PARENTS:
+                continue
+            if not raw.get("collection_info"):
+                continue
+            items = [c for c in kids if _view(c)]
+            if not items or any(c.get("collection_item_info") for c in items):
+                continue
+            rv = tree.by_raw.get(id(raw))
+            out.append((rv if rv is not None else _Raw(raw), items))
+    return out
+
+
 def _lists(tree: Any, unknown: Optional[List[str]] = None) -> List[Any]:
     """``(RecyclerView, its item nodes, their item info)`` for every RecyclerView whose
     layout is modelled (row and column counts known) and whose items carry no item info;
-    ``unknown`` collects the keys of grids whose layout is not one modelled."""
+    an item TalkBack does not get (hidden) has no node: None. ``unknown`` collects the keys
+    of grids whose layout is not one modelled."""
     out = []
-    for n in tree.nodes:
-        if n.facet not in ("view", "interop") or _simple(n.class_name) not in ITEM_PARENTS:
-            continue
-        if not n.get("collection_info"):
-            continue
-        kids = [c for c in n.children if c.facet in ("view", "interop")]
-        if not kids or any(c.get("collection_item_info") for c in kids):
-            continue
-        infos = _infos(n, kids)
+    for rv, items in _raw_lists(tree):
+        boxes = [_Raw(c) for c in items]
+        infos = _infos(rv, boxes)
         if infos is not None:
-            out.append((n, kids, infos))
-        elif unknown is not None and _is_grid(n):
-            unknown.append(n.key)
+            out.append((rv, [tree.by_raw.get(id(c)) for c in items], infos))
+        elif unknown is not None and _is_grid(rv):
+            unknown.append(rv.key)
     return out
 
 
@@ -198,6 +255,8 @@ def apply_item_info(tree: Any) -> None:
             scrolled.append(rv.key)
             continue
         for k, inf in zip(kids, infos):
+            if k is None:
+                continue  # an item TalkBack never gets (hidden): it still counts
             k.extra["collection_item_info"] = inf
             k.corrections.append(CORRECTION)
             added += 1
