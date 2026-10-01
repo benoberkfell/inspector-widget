@@ -10,13 +10,16 @@
 # Pipeline (testapps.md §6):
 #   1. select a JDK 17-23 (scripts/lib/select-jdk.sh, same as scripts/build.sh)
 #   2. ensure the Gradle wrapper exists in testapps/a11yprobe (copy from root)
-#   3. ./gradlew -p testapps/a11yprobe :app:installDebug
+#   3. ./gradlew -p testapps/a11yprobe :app:installDebug   (:app:installR8 with --r8)
 #   4. am start the launcher MainActivity (or one scenario, with --scenario)
 #
-# Usage: scripts/install-a11yprobe.sh [SERIAL] [--no-launch] [--scenario ID] [--compose-bom V]
+# Usage: scripts/install-a11yprobe.sh [SERIAL] [--no-launch] [--scenario ID] [--compose-bom V] [--r8]
 #   SERIAL defaults to $SERIAL, then $ANDROID_SERIAL, then emulator-5554.
 #   --compose-bom V builds against Compose BOM V instead of 2024.09.00 (ui 1.7.0), e.g.
 #   2025.06.00 (ui 1.8.2) to exercise the agent's Compose 1.8+ traversal-order path.
+#   --r8 installs the r8 build type instead: R8-minified and obfuscated like a release app
+#   (Compose's classes renamed), still debuggable, as com.oberkfell.a11yprobe.r8 next to the
+#   debug build. host/tests/test_device_redaction.py checks that the agent fails closed on it.
 #   --scenario ID launches that scenario directly: a Compose id (icon_button, ...,
 #   or "all"), view_xml, or an interop id S1..S6 / D1 / D2. See the top of
 #   testapps/a11yprobe/app/src/main/kotlin/com/oberkfell/a11yprobe/MainActivity.kt.
@@ -36,6 +39,7 @@ ADB="$ANDROID_HOME/platform-tools/adb"
 
 PACKAGE="com.oberkfell.a11yprobe"
 LAUNCH=1
+INSTALL_TASK=":app:installDebug"
 
 log()  { printf '\033[1;34m[a11yprobe]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
@@ -51,6 +55,7 @@ while [ $# -gt 0 ]; do
         --scenario)  [ $# -ge 2 ] || die "--scenario needs an id"; SCENARIO="$2"; shift ;;
         --compose-bom) [ $# -ge 2 ] || die "--compose-bom needs a version"
                      GRADLE_PROPS+=("-Pa11yprobe.composeBom=$2"); shift ;;
+        --r8)        INSTALL_TASK=":app:installR8"; PACKAGE="com.oberkfell.a11yprobe.r8" ;;
         -*)          die "Unknown flag: $1" ;;
         *)           SERIAL="$1" ;;
     esac
@@ -90,20 +95,22 @@ fi
 GRADLEW="$APP_DIR/gradlew"
 
 # --------------------------------------------------------------------- build+install
-log "Building & installing :app:installDebug to $SERIAL ..."
-ANDROID_SERIAL="$SERIAL" "$GRADLEW" -p "$APP_DIR" --no-daemon ${GRADLE_PROPS[@]+"${GRADLE_PROPS[@]}"} :app:installDebug \
-    || die "Gradle :app:installDebug failed."
+log "Building & installing $INSTALL_TASK to $SERIAL ..."
+ANDROID_SERIAL="$SERIAL" "$GRADLEW" -p "$APP_DIR" --no-daemon ${GRADLE_PROPS[@]+"${GRADLE_PROPS[@]}"} "$INSTALL_TASK" \
+    || die "Gradle $INSTALL_TASK failed."
 ok "Installed $PACKAGE on $SERIAL."
 
 # --------------------------------------------------------------------- launch
+# The activity classes keep their names in every build type; only the r8 package has a suffix.
+MAIN_ACTIVITY="com.oberkfell.a11yprobe.MainActivity"
 if [ "$LAUNCH" -eq 1 ]; then
     if [ -n "$SCENARIO" ]; then
         log "Launching scenario $SCENARIO ..."
-        "$ADB" -s "$SERIAL" shell am start -S -W -n "$PACKAGE/.MainActivity" --es scenario "$SCENARIO" \
+        "$ADB" -s "$SERIAL" shell am start -S -W -n "$PACKAGE/$MAIN_ACTIVITY" --es scenario "$SCENARIO" \
             || die "Failed to launch scenario $SCENARIO."
     else
         log "Launching $PACKAGE/.MainActivity ..."
-        "$ADB" -s "$SERIAL" shell am start -n "$PACKAGE/.MainActivity" \
+        "$ADB" -s "$SERIAL" shell am start -n "$PACKAGE/$MAIN_ACTIVITY" \
             || die "Failed to launch MainActivity."
     fi
     ok "Launched. Attach Inspector Widget with: scripts/run.sh $SERIAL $PACKAGE"
