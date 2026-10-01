@@ -671,7 +671,9 @@ def cut_speech(text: Any, n: int) -> str:
     """``text`` in at most ``n`` characters, keeping its head AND its tail (G2): TalkBack
     puts the position and the collection last ("Localpart of em… 2 of 6. In list. 6
     items"), and placeholder ids and states sit there too. The tail is what TAIL_RE finds
-    in the last 60 characters, else the last two fifths; the head gives way first."""
+    in the last 60 characters, else the last two fifths; the head gives way first. A tail
+    too long for the room keeps its position ("2 of 6", what tb.wrong_announcement is
+    about) and the count after it ("2 of 6… 6 items"), else the position alone."""
     sp = str(text or "").replace("\n", " ")
     if len(sp) <= n:
         return sp
@@ -681,9 +683,29 @@ def cut_speech(text: Any, n: int) -> str:
     m = TAIL_RE.search(sp, max(0, len(sp) - 60))
     tail = sp[m.start():].strip() if m is not None else _last_words(sp, max(4, n * 2 // 5))
     if len(tail) > room - HEAD_MIN:
-        tail = _last_words(tail, room - HEAD_MIN)
-    head = sp[: room - len(tail)].rstrip(" .,")
+        tail = _short_tail(tail, room - HEAD_MIN)
+    head = sp[: min(room - len(tail), m.start() if m is not None else len(sp))].rstrip(" .,")
     return f"{head}… {tail}"
+
+
+#: TalkBack's position in a collection ("2 of 6") and its count ("6 items").
+POSITION_RE = re.compile(r"\b\d+ of \d+\b")
+COUNT_RE = re.compile(r"\b\d+ items?\b", re.I)
+
+
+def _short_tail(tail: str, k: int) -> str:
+    """A tail in at most ``k`` characters: from its position to the end, else the position
+    and the count ("2 of 6… 6 items"), else the position; with no position, its last
+    words."""
+    p = POSITION_RE.search(tail)
+    if p is None:
+        return _last_words(tail, k)
+    c = COUNT_RE.search(tail, p.end())
+    for cand in (tail[p.start():].strip(), f"{p.group(0)}… {c.group(0)}" if c else None,
+                 p.group(0)):
+        if cand and len(cand) <= k:
+            return cand
+    return _last_words(tail, k)
 
 
 def _last_words(text: str, k: int) -> str:
@@ -964,9 +986,14 @@ def walk_hints(record: Mapping[str, Any], listed: Any = None) -> list[str]:
             any(str(f.get("basis") or "") == "unverified: after_app"
                 for f in record.get("findings") or [])
             or any("relaunch=true" in str(n) for n in record.get("notes") or [])):
-        # what a TalkBack user gets: TalkBack on before the app started
-        hints.append(call("tb_walk", relaunch=True,
-                          **({"start": "first"} if record.get("start") == "first" else {})))
+        # what a TalkBack user gets: TalkBack on before the app started; a relaunch
+        # restarts at the launcher, so a screen opened from another one is reopened
+        if int((record.get("screen") or {}).get("task_size") or 1) > 1:
+            hints.append(call("tb_scenario", kind="focus_after", relaunch=True,
+                              target="<its opener>", leave_on=True))
+        else:
+            hints.append(call("tb_walk", relaunch=True,
+                              **({"start": "first"} if record.get("start") == "first" else {})))
     if record.get("id"):
         hints.append(call("image", overlay="walk", walk=record["id"]))
     if str(record.get("restore") or "").startswith("left on"):

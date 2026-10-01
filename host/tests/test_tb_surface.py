@@ -689,3 +689,36 @@ def test_relaunch_is_one_argument_on_both_surfaces(tb, run_cli):
     sc = ok("tb_scenario", kind="restore", serial=SERIAL, package=PKG, relaunch=True,
             target="Item 1", wait_ms=400, **FAST)
     assert sc["talkback_started"] == "before_app" and len(tb.force_stops) == 3
+
+
+def test_verbose_log_given_on_the_cli_is_required_as_over_mcp(tb, run_cli, monkeypatch):
+    """`talkback on --verbose-log` equals the default, so the CLI dropped it and a level
+    that could not be set was a soft {"failed": ...}; MCP verbose_log=true makes it an
+    error. The flag given is now the explicit true on both surfaces."""
+    import argparse
+
+    from inspector_widget.talkback import device as tbdevice
+
+    parser = argparse.ArgumentParser()
+    surface.add_cli(parser.add_subparsers())
+    spec = next(t for t in surface.SPECS if t.name == "talkback")
+    args = {argv: surface.cli_args(spec, parser.parse_args(["talkback", "on", *argv]))
+            for argv in ((), ("--verbose-log",), ("--no-verbose-log",))}
+    assert args[()] == {"action": "on"}
+    assert args[("--verbose-log",)] == {"action": "on", "verbose_log": True}
+    assert args[("--no-verbose-log",)] == {"action": "on", "verbose_log": False}
+
+    def broken(serial, level, record=False):
+        raise tbdevice.TalkBackError("log_level_failed", "no Log output level row")
+
+    monkeypatch.setattr(tbdevice, "set_log_level", broken)
+    doc, is_error = call("talkback", action="on", serial=SERIAL, package=PKG, verbose_log=True)
+    assert is_error and doc["error"]["code"] == "log_level_failed"
+    r = run_cli("talkback", "on", "--serial", SERIAL, "--package", PKG, "--verbose-log",
+                "--json")
+    assert r.rc != 0 and "log_level_failed" in r.out + r.err, r
+    assert not tb.talkback.running
+    # not given: TalkBack comes on without the level, as over MCP with no verbose_log
+    r = run_cli("talkback", "on", "--serial", SERIAL, "--package", PKG, "--json")
+    assert r.rc == 0 and "failed" in json.loads(r.out)["log_level"], r
+    assert run_cli("talkback", "restore", "--serial", SERIAL).rc == 0

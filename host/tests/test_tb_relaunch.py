@@ -82,16 +82,16 @@ def test_relaunch_force_stops_and_starts_the_launcher_intent(tb_env):
     assert out["pid"] == app.pid != old_pid
     assert abs(out["started_at"] - tb_env.uptime()) < 2.0
     shell = " | ".join(tb_env.shell_log())
-    assert "cmd package resolve-activity --brief -a android.intent.action.MAIN -c " \
+    assert "cmd package query-activities --brief -a android.intent.action.MAIN -c " \
            "android.intent.category.LAUNCHER " + PKG in shell
     assert "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER " \
-           f"-p {PKG}" in shell
+           f"-n {comp}" in shell
 
 
 def test_an_alias_launcher_starts_by_its_intent(tb_env):
     """Thunderbird (emulator-5558): the launcher entry is an activity-alias;
-    resolve-activity names it, but am start -n with its name fails ("does not exist").
-    The launcher intent starts it."""
+    query-activities names it, but am start -n with its name alone fails ("does not
+    exist"). With the launcher intent's action and category it starts."""
     app = tb_env.apps[PKG]
     app.launcher_alias, app.launcher = True, "net.example.app.common.MainActivity"
     alias = f"{PKG}/net.example.app.common.MainActivity"
@@ -100,21 +100,40 @@ def test_an_alias_launcher_starts_by_its_intent(tb_env):
     assert "does not exist" in out and tbdevice._start_error(out).startswith("Error: Activity")
     res = tbdevice.relaunch(SERIAL, PKG)
     assert res["launcher"] == alias and tbdevice.top_package(SERIAL) == PKG
+    assert tb_env.starts[-1] == alias
 
 
-def test_the_resolved_component_is_the_fallback(tb_env, monkeypatch):
-    real = tb_env.shell
+LEAKS = "leakcanary.internal.activity.LeakLauncherActivity"
 
-    def no_intent(cmd):
-        if cmd.startswith("am start -W -a"):
-            tb_env.adb_log.append(["shell", cmd])
-            return 0, "Error: Activity not started, unable to resolve Intent\n", ""
-        return real(cmd)
 
-    monkeypatch.setattr(tb_env, "shell", no_intent)
-    tbdevice.relaunch(SERIAL, PKG)
-    assert tb_env.starts == [f"{PKG}/{PKG}.MainActivity"]
-    assert any(c.startswith("am start -W -n ") for c in tb_env.shell_log())
+def test_a_second_launcher_entry_opens_no_chooser(tb_env):
+    """A debug build with LeakCanary has two launcher entries (its "Leaks" icon first):
+    the implicit launcher start (-p) opened the system's "Open with" chooser
+    (ResolverActivity, "Status: ok", no error), and the relaunch waited 15 s for an app
+    that never came, then hinted the same command. The app's own entry, started by
+    component, comes up at once."""
+    tb_env.apps[PKG].extra_launchers = [LEAKS]
+    assert tbdevice.launcher_activities(SERIAL, PKG) == [f"{PKG}/{LEAKS}",
+                                                         f"{PKG}/{PKG}.MainActivity"]
+    assert tbdevice.launcher_activity(SERIAL, PKG) == f"{PKG}/{PKG}.MainActivity"
+    t0 = time.monotonic()
+    res = tbdevice.relaunch(SERIAL, PKG)
+    assert time.monotonic() - t0 < 5
+    assert res["launcher"] == f"{PKG}/{PKG}.MainActivity" and tbdevice.top_package(SERIAL) == PKG
+    assert not any(" -p " in c for c in tb_env.shell_log() if c.startswith("am start"))
+    assert "ResolverActivity" not in " ".join(tb_env.activity_stack)
+    # what the implicit start does on such an app (as on emulator-5558, an ambiguous
+    # MAIN intent for one package): the chooser, with no error line to catch
+    _rc, out, _err = tb_env.shell("am start -W -a android.intent.action.MAIN -c "
+                                  f"android.intent.category.LAUNCHER -p {PKG}")
+    assert tbdevice._start_error(out) is None
+    assert tbdevice.top_activity(SERIAL) == "android/com.android.internal.app.ResolverActivity"
+
+
+def test_an_app_with_no_launcher_fails_as_launch_failed(tb_env):
+    with pytest.raises(tbdevice.TalkBackError) as err:
+        tbdevice.relaunch(SERIAL, "com.example.absent")
+    assert err.value.code == "launch_failed" and "no launcher activity" in str(err.value)
 
 
 def test_an_app_that_cannot_start_fails_at_once(tb_env, monkeypatch):
@@ -129,6 +148,7 @@ def test_an_app_that_cannot_start_fails_at_once(tb_env, monkeypatch):
     with pytest.raises(tbdevice.TalkBackError) as err:
         tbdevice.relaunch(SERIAL, PKG)
     assert time.monotonic() - t0 < 5 and "does not exist" in str(err.value)
+    assert err.value.code == "launch_failed"
 
 
 def test_an_app_that_never_comes_to_the_front_is_an_error(tb_env, monkeypatch):
@@ -192,7 +212,7 @@ def test_one_relaunch_call_walks_what_a_talkback_user_gets(tb, run_cli):
     res = ok("tb_walk", serial=SERIAL, package=PKG, relaunch=True, start="first", **FAST)
     assert res["talkback_started"] == "before_app", res
     assert res["restore"] == "restored" and res["ended"] == "wrap"
-    assert res["utterance"] == "logcat 8/8"  # TalkBack's words, set VERBOSE and back
+    assert res["utterance"] == "logcat 7/7"  # TalkBack's words, set VERBOSE and back
     assert tb.talkback.log_level == "ERROR"
     assert tb.force_stops == [PKG] and tb.apps[PKG].pid != old_pid
     rec = record(tb, res["walk"])
@@ -444,3 +464,135 @@ def test_ap4_sticks_only_after_the_app_and_says_so():
     assert not any(s and s.startswith("Page.") for w in later for ok, _k, _l, s in w["steps"])
     stuck = [w for w in later if w["ended"] == "stuck"]
     assert len(stuck) == 1 and "tb.edge_stuck (unverified: after_app)" in stuck[0]["findings"]
+
+
+# --------------------------------------------------------------------------- #
+# Per screen: a screen built after TalkBack came on is what a TalkBack user gets
+# --------------------------------------------------------------------------- #
+#: ``dumpsys activity activities | grep -E ...`` on emulator-5558 (Thunderbird in front;
+#: TalkBack's own task holds two activities, the launcher's a nested task).
+DUMPSYS_TOP = """\
+  * Task{31a30a #580 type=standard A=10231:net.thunderbird.android.debug U=0 visible=true visibleRequested=true mode=fullscreen translucent=false sz=1}
+    topResumedActivity=ActivityRecord{249513246 u0 net.thunderbird.android.debug/com.fsck.k9.activity.MessageHomeActivity t580}
+    * Hist  #0: ActivityRecord{249513246 u0 net.thunderbird.android.debug/com.fsck.k9.activity.MessageHomeActivity t580}
+      launchFailed=false launchCount=0 lastLaunchTime=-31m37s479ms
+  * Task{ce64061 #75 type=standard A=10175:com.google.android.marvin.talkback U=0 visible=false visibleRequested=false mode=fullscreen translucent=true sz=2}
+    * Hist  #1: ActivityRecord{47306300 u0 com.google.android.permissioncontroller/com.android.permissioncontroller.permission.ui.GrantPermissionsActivity t75}
+      launchFailed=false launchCount=0 lastLaunchTime=-14h27m50s982ms
+  * Task{e3b823 #1 type=home U=0 visible=false visibleRequested=false mode=fullscreen translucent=true sz=1}
+    * Task{18f8a54 #3 type=home I=com.google.android.apps.nexuslauncher/.NexusLauncherActivity U=0 rootTaskId=1 visible=false visibleRequested=false mode=fullscreen translucent=true sz=2}
+      * Hist  #1: ActivityRecord{97566310 u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t3}
+        launchFailed=false launchCount=0 lastLaunchTime=-14h58m6s915ms
+"""
+
+
+def test_the_top_activity_its_task_and_when_it_was_created(monkeypatch):
+    def shell(serial, cmd, check=True, **kw):
+        return {"cat /proc/uptime": "53557.14 198000.00\n"}.get(cmd, DUMPSYS_TOP)
+
+    monkeypatch.setattr(tbdevice.adb, "shell", shell)
+    got = tbdevice.top_task("emulator-5558")
+    assert got == {"activity": "net.thunderbird.android.debug/com.fsck.k9.activity."
+                               "MessageHomeActivity",
+                   "task_size": 1, "launched_s": round(53557.14 - (31 * 60 + 37.479), 3)}
+    assert tbdevice.parse_duration("-14h58m6s915ms") == -(14 * 3600 + 58 * 60 + 6.915)
+    assert tbdevice.parse_duration("0") == 0 and tbdevice.parse_duration("-5ms") == -0.005
+    assert tbdevice.parse_duration("never") is None
+
+
+def _stuck_at_the_last_item(env):
+    def stuck(tb, action):
+        if action == "next" and tb.focus == tb_item(5):
+            tb.log("FocusProcessor-LogicalNav: Reach edge before wrap")
+            return True
+        return False
+
+    env.talkback.on_press = stuck
+
+
+def _stuck(doc):
+    return [f for f in doc["findings"] if f["code"] == "tb.edge_stuck"]
+
+
+def test_a_screen_whose_rows_were_bound_with_talkback_on_is_before_screen(tb):
+    """Review wgrxxsk: TalkBack on, then a scenario opened a thread list, then a walk:
+    its rows read "3 of 3" (bound with TalkBack running), yet the walk said after_app,
+    so its stuck findings were downgraded and the hint relaunched to the inbox."""
+    tb.scene_factory = lambda: fakeagent.talkback_scene(recycler=True)
+    tb.restart_app(PKG)  # the new scene's rows
+    _stuck_at_the_last_item(tb)
+    res = ok("tb_walk", serial=SERIAL, package=PKG, start="Item 5", max_steps=6, **FAST)
+    assert res["talkback_started"] == "before_screen", res
+    stuck = _stuck(res)
+    assert stuck and stuck[0]["sev"] == "error" and stuck[0]["basis"] == "walk", stuck
+    assert "relaunch" not in dumps(res.get("next") or []) + dumps(res.get("notes") or [])
+    assert record(tb, res["walk"])["screen_basis"] == "rows"
+
+
+def test_rows_bound_before_talkback_stay_after_app(tb):
+    tb.scene_factory = lambda: fakeagent.talkback_scene(recycler=False)
+    tb.restart_app(PKG)
+    _stuck_at_the_last_item(tb)
+    res = ok("tb_walk", serial=SERIAL, package=PKG, start="Item 5", max_steps=6, **FAST)
+    assert res["talkback_started"] == "after_app"
+    assert [f["basis"] for f in _stuck(res)] == ["unverified: after_app"]
+    assert any(h.startswith("tb_walk(relaunch=true") for h in res["next"]), res["next"]
+
+
+def test_rows_say_when_the_screen_was_bound_on_real_dumps():
+    from inspector_widget.talkback.recycler import rows_bound
+    from inspector_widget.talkback.tree import build
+
+    assert rows_bound(build(_dump("thunderbird_list_compose_tb_first"))) == "after"
+    assert rows_bound(build(_dump("thunderbird_list_compose_tb_later"))) == "before"
+    # one row rebound after a selection (wdvjrk4): the others still lack their positions
+    assert rows_bound(build(_dump("thunderbird_selection_mode"))) == "before"
+    assert rows_bound(build(_dump("antennapod_episode_details_tb_later"))) is None
+    walk = {"talkback_started": "after_app"}
+    tbwalk.screen_started(walk, {"rows_bound": "after", "web": True})
+    assert walk == {"talkback_started": "after_app"}  # a WebView may predate TalkBack
+    tbwalk.screen_started(walk, {"rows_bound": "after", "web": False})
+    assert walk == {"talkback_started": "before_screen", "screen_basis": "rows"}
+
+
+def test_an_activity_opened_after_talkback_came_on_is_before_screen(tb):
+    on = ok("talkback", action="on", serial=SERIAL, package=PKG)
+    assert on["changed"] is True
+    try:
+        time.sleep(0.05)
+        tb.push_activity(f"{PKG}/.DetailActivity")  # opened with TalkBack on
+        _stuck_at_the_last_item(tb)
+        res = ok("tb_walk", serial=SERIAL, package=PKG, start="Item 5", max_steps=6,
+                 leave_on=True, **FAST)
+        assert res["talkback_started"] == "before_screen", res
+        rec = record(tb, res["walk"])
+        assert rec["screen_basis"] == "activity"
+        assert rec["screen"]["activity"] == f"{PKG}/.DetailActivity"
+        assert rec["screen"]["task_size"] == 2
+        assert rec["screen"]["launched_s"] > rec["talkback_on_s"]
+        assert [f["sev"] for f in _stuck(res)] == ["error"]
+    finally:
+        ok("talkback", action="restore", serial=SERIAL)
+
+
+def test_a_screen_past_the_launchers_gets_the_scenario_recipe(tb):
+    """An after_app walk on an activity opened from another of the app's: a relaunch
+    restarts at the launcher, so tb_walk(relaunch=true) would walk another screen."""
+    tb.push_activity(f"{PKG}/.DetailActivity")  # opened before TalkBack came on
+    time.sleep(0.05)
+    _stuck_at_the_last_item(tb)
+    res = ok("tb_walk", serial=SERIAL, package=PKG, start="Item 5", max_steps=6, **FAST)
+    assert res["talkback_started"] == "after_app"
+    stuck = _stuck(res)
+    assert stuck[0]["basis"] == "unverified: after_app"
+    assert "tb_scenario(relaunch=true,leave_on=true)" in stuck[0]["msg"]
+    assert 'tb_scenario(kind="focus_after",relaunch=true,target="<its opener>",leave_on=true)' \
+        in res["next"], res["next"]
+    assert not any(h.startswith("tb_walk(relaunch") for h in res["next"])
+    assert record(tb, res["walk"])["screen"]["task_size"] == 2
+    # the legacy result says the same
+    rec = record(tb, res["walk"])
+    assert tbwalk.next_hints(rec)[0] == tbwalk.DEEP_RELAUNCH_CALL
+    assert tbwalk.start_notes("after_app", ["recycler_bound_before_service"], deep=True) == \
+        [tbwalk.BOUND_BEFORE_DEEP_NOTE]
+    assert len(tbwalk.BOUND_BEFORE_DEEP_NOTE.encode()) <= 200

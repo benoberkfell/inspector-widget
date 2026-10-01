@@ -464,9 +464,10 @@ rows their "N of M" (CollectionItemInfo) and makes ViewPager2 pages stops only
 for rows bound while accessibility is on, and WebViews behave differently. So
 "2 of 6" positions, list counts, page stops, WebView walls and traps can differ
 between the two start orders. `relaunch=true` turns TalkBack on, force-stops the
-app, starts it from its launcher (resolved with `cmd package resolve-activity`,
-so activity-alias launchers such as Thunderbird's work), waits for TalkBack's
-first focus, then walks. It takes one call:
+app, starts its launcher component with the launcher intent (`-a MAIN -c LAUNCHER
+-n <component>`, so activity-alias launchers such as Thunderbird's work, and a
+debug tool's second launcher entry such as LeakCanary's opens no chooser), waits
+for TalkBack's first focus, then walks. It takes one call:
 
 ```
 tb_walk(package="net.thunderbird.android.debug", relaunch=true, start="first")
@@ -474,27 +475,37 @@ tb_scenario(kind="focus_after", relaunch=true, target="n14")       scenarios too
 ```
 
 Every result says `talkback_started`: `before_app` (TalkBack was on before the
-app's process started, as for a user), `after_app` (the walk turned it on over the
-running app), or `before_walk` (TalkBack was already on, and nobody recorded
+app's process started, as for a user), `before_screen` (it came on after the
+process started but before the screen walked was built: its activity was opened
+after TalkBack came on, or its list rows carry their "N of M"; also what a user
+gets, so its findings stand), `after_app` (the walk turned it on over the running
+app and screen), or `before_walk` (TalkBack was already on, and nobody recorded
 when). On an `after_app` walk:
 
 - a note says `rows were bound before TalkBack started ...; rerun with
   relaunch=true` when the start screen has rows without item info;
 - `tb.trap`, `tb.edge_stuck` and `tb.webview_block` are `info`, basis
   `unverified: after_app`: a TalkBack user may never get stuck there. Rerun with
-  `relaunch=true` before you report them. `unverified: injector` means the
+  `relaunch=true` before you report them. A relaunch restarts at the launcher
+  screen: for a screen opened from another one, run
+  `tb_scenario(relaunch=true, target=<what opens it>, action="activate",
+  leave_on=true)`, then `tb_walk`, then `talkback(action="restore")` (the hint
+  says so when the screen's activity sits on another). `unverified: injector` means the
   keyboard never moved focus in that walk, so the presses may not have reached
   TalkBack at all.
 
-To start an app by hand the same way (alias launchers included):
-`adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p <pkg>`
-(`am start -n <pkg>/.MainActivity` fails where the launcher entry is an alias).
+To start an app by hand the same way (alias launchers included): find its
+launcher component with `adb shell cmd package query-activities --brief -a
+android.intent.action.MAIN -c android.intent.category.LAUNCHER <pkg>`, then
+`adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n <component>`
+(`am start -n <component>` alone fails where the launcher entry is an alias).
 
 **What TalkBack really said.** With `utterance="auto"` (the default) a walk or
 scenario that turns TalkBack on first sets its log level to VERBOSE (through
 TalkBack's own settings screen, about 10 s; restore puts it back), and every line
-is TalkBack's own words: `utterance: "logcat 22/22"` says how many moves were
-read from its log. When it falls back to the model, `notes` says why
+is TalkBack's own words: `utterance: "logcat 22/22"` says how many of the moves
+were read from its log (the start is no move); when some were not, `notes` names
+their steps. When it falls back to the model, `notes` says why
 (`speech is the model's: ...`) and how to fix it. For several walks in a row, set
 the level once: `talkback(action="on")` (VERBOSE by default), then walks and
 scenarios with `leave_on=true`, then `talkback(action="restore")`.

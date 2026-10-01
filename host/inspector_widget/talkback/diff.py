@@ -262,11 +262,19 @@ def _first_screen(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _lap_complete(walk: Dict[str, Any]) -> bool:
-    """A full lap: the walk wrapped (past an edge and back onto a stop it had read)."""
+    """A full lap: the walk wrapped, past an edge and back onto a stop it had read before
+    it (``ended`` wrap says so: :func:`.walk.run_walk` checks it). A walk that wrapped but
+    ended (max_steps, a screen change) before it came back to such a stop did not go over
+    the stops between the wrap and its start: no full lap."""
     steps = _first_screen(walk["steps"])
-    if len(steps) < len(walk["steps"]):
-        return any(s.get("via") == "wrap" for s in steps)
-    return walk.get("ended") == "wrap" or any(s.get("via") == "wrap" for s in steps)
+    if len(steps) == len(walk["steps"]) and walk.get("ended") == "wrap":
+        return True
+    wrap_i = next((j for j, s in enumerate(steps) if s.get("via") == "wrap"), None)
+    if wrap_i is None:
+        return False
+    edge_i = next((j for j, s in enumerate(steps) if s.get("edge")), wrap_i)
+    before = {_pk(s) for s in _moves(steps[:min(edge_i, wrap_i)])}
+    return any(_pk(s) in before for s in _moves(steps[wrap_i:]))
 
 
 def _dp(px: float, density: int) -> float:

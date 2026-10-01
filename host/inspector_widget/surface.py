@@ -819,6 +819,27 @@ CLI_OUTPUT_FLAGS = ("json", "pretty", "quiet", "json_out")
 JSON_DEST_SUBCOMMANDS = frozenset({"tb-walk", "tb-scenario"})
 
 
+#: Where a parsed namespace keeps the names of the default-true booleans given on the
+#: command line (``--verbose-log``), which :func:`cli_args` forwards like MCP's explicit
+#: ``true`` although it equals the default.
+GIVEN_ATTR = "_given_flags"
+
+
+class _GivenBooleanAction(argparse.BooleanOptionalAction):
+    """``--flag`` / ``--no-flag``, remembering that the flag was given."""
+
+    def __init__(self, option_strings: Any, dest: str, **kw: Any) -> None:
+        super().__init__(option_strings, dest, **kw)
+        self.param = dest
+
+    def __call__(self, parser: Any, namespace: argparse.Namespace, values: Any,
+                 option_string: str | None = None) -> None:
+        super().__call__(parser, namespace, values, option_string)
+        given = set(getattr(namespace, GIVEN_ATTR, None) or ())
+        given.add(self.param)
+        setattr(namespace, GIVEN_ATTR, given)
+
+
 def _cli_value(p: Param) -> Callable[[str], Any]:
     if p.type == "integer":
         return int
@@ -850,7 +871,7 @@ def add_cli(subparsers: Any, *, context: Callable[[argparse.Namespace], ops.OpCo
             if p.type == "boolean":
                 if p.default is True:
                     sp.add_argument(*names, dest=p.name, default=True,
-                                    action=argparse.BooleanOptionalAction, help=p.help or None)
+                                    action=_GivenBooleanAction, help=p.help or None)
                 else:
                     sp.add_argument(*names, dest=p.name, default=bool(p.default),
                                     action="store_true", help=p.help or None)
@@ -887,8 +908,11 @@ def add_cli(subparsers: Any, *, context: Callable[[argparse.Namespace], ops.OpCo
 
 def cli_args(ts: ToolSpec, ns: argparse.Namespace) -> dict[str, Any]:
     """The tool arguments of parsed CLI flags: values that differ from the
-    default only, with lists split on commas and CLI words mapped."""
+    default only, with lists split on commas and CLI words mapped; a default-true
+    boolean given as ``--flag`` is forwarded too (MCP's explicit ``true``: ``talkback on
+    --verbose-log`` requires the level as ``verbose_log=true`` does)."""
     out: dict[str, Any] = {}
+    given = getattr(ns, GIVEN_ATTR, None) or set()
     for p in ts.params_for("cli"):
         if p.surfaces == ("cli",):
             continue
@@ -916,6 +940,9 @@ def cli_args(ts: ToolSpec, ns: argparse.Namespace) -> dict[str, Any]:
         elif isinstance(v, str) and p.type == "string|array" and v not in p.keep_words \
                 and "," in v:
             v = _split(v)
+        if p.type == "boolean" and p.default is True and p.name in given:
+            out[p.name] = bool(v)
+            continue
         if v is None or v == p.default or (p.type == "boolean" and p.default is None
                                            and v is False):
             continue  # an unset flag (a boolean without a default reads as false)

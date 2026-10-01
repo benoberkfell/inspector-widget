@@ -1306,6 +1306,41 @@ def test_a_keyboard_ignored_after_an_a11y_act_start_is_proven_not_switched(probe
     assert probe.system_backs == 0 and fakeagent.key_safety_violations(probe) == []
 
 
+def _deaf_twice_at(probe, target):
+    ignored = []
+
+    def deaf(tb, action):
+        if action == "next" and tb.focus == target and len(ignored) < 2:
+            ignored.append(action)
+            return True
+        return False
+
+    probe.talkback.on_press = deaf
+    return ignored
+
+
+def test_presses_talkback_ignored_mid_list_leave_no_edge_in_the_lap(probe):
+    """Hunt wvlytwx's shape, from a stop in the middle (reached through A11yAct): TalkBack
+    ignored the first two presses, the keyboard was proven from the stop before, and the
+    walk went on, but the two ignored presses stayed in it as "— edge" steps, which split
+    the lap (the model saw only its start) and read as an edge mid-list."""
+    control = walk(probe, start="view:1022", max_steps=16)
+    ignored = _deaf_twice_at(probe, tb_item(2))
+    res = walk(probe, start="view:1022", max_steps=16)
+    rec = saved(res)
+    assert len(ignored) == 2 and rec["proof"] == "next moved focus from view:1021"
+    assert rec["injector_proven"] is True and res["ended"] == "wrap"
+    assert res["lines"][:3] == ['0. view:1022 Button "Item 2. Button"',
+                                '1. view:1023 Button "Item 3. Button"',
+                                '2. view:1024 Button "Item 4. Button"'], res["lines"]
+    edges = [s["i"] for s in rec["steps"] if s.get("edge")]
+    assert edges == [4], rec["steps"]  # the real edge only, after Item 5
+    assert [s["i"] for s in rec["steps"]] == list(range(len(rec["steps"])))
+    assert res["lines"] == control["lines"]
+    assert res["vs_model"] == control["vs_model"]
+    assert not [f for f in res["findings"] if f["code"] == "tb.edge_stuck"]
+
+
 def test_an_edge_talkback_logged_proves_the_keyboard(probe):
     """TalkBack said "Reach edge" for the presses: it took them; no switch, no proof press."""
     def stuck(tb, action):
@@ -1476,6 +1511,43 @@ def test_a_multi_line_utterance_is_one_event():
     assert log.since(0, "hint") == [(6.0, "hint", "Press select to activate")]
 
 
+#: TalkBack 17 feedback lines as emulator-5558 logged them (the TB-1 relaunch walk): the
+#: words end where the fields start (four spaces), queueMode is absent when it is the
+#: default (INTERRUPT: window changes), and a window change often says nothing.
+_T = "         1790851701.130 22875 22875 V talkback: TalkBackFeedbackProvider:  "
+FEEDBACK = [
+    _T + "TYPE_WINDOW_STATE_CHANGED:  ttsOutput=     ttsAddToHistory  "
+         "forceFeedbackEvenIfAudioPlaybackActive  forceFeedbackEvenIfMicrophoneActive  ",
+    _T + "TYPE_WINDOW_CONTENT_CHANGED:  ttsOutput=     forceFeedbackEvenIfPhoneCallActive  ",
+    _T + "TYPE_WINDOW_CONTENT_CHANGED:  ttsOutput=     queueMode=0  ttsAddToHistory  "
+         "ttsSkipDuplicate  ",
+    _T + "EVENT_SPEAK_HINT:  ttsOutput=     queueMode=0  forceFeedbackEvenIfAudioPlaybackActive  "
+         "refreshSourceNode  ",
+    _T + "TYPE_WINDOW_STATE_CHANGED:  ttsOutput= Inbox    ttsAddToHistory  "
+         "forceFeedbackEvenIfAudioPlaybackActive  ",
+    _T + "TYPE_VIEW_ACCESSIBILITY_FOCUSED:  ttsOutput= Allow. Button    queueMode=0  "
+         "ttsAddToHistory  advanceContinuousReading  preventDeviceSleep  haptic=2130903132  "
+         "earcon=2132017181  ",
+    _T + "EVENT_SPEAK_HINT:  ttsOutput= Double-tap to activate    queueMode=0  "
+         "refreshSourceNode  ",
+]
+
+
+def test_feedback_words_end_where_talkbacks_fields_start():
+    """The window feedback (no queueMode) was read whole, flags and all, as an
+    announcement ('TYPE_WINDOW_STATE_CHANGED: ttsAddToHistory  forceFeedback...'), and
+    feedback that says nothing was an announcement too (57 of them in one walk)."""
+    log = tbwalk.TalkBackLog(SERIAL)
+    for i, ln in enumerate(FEEDBACK):
+        log.feed(ln, now=float(i))
+    log._flush()
+    assert log.since(0, "announce") == [(4.0, "announce", "TYPE_WINDOW_STATE_CHANGED: Inbox")]
+    assert log.since(0, "tts") == [(5.0, "tts", "Allow. Button")]
+    assert log.since(0, "hint") == [(6.0, "hint", "Double-tap to activate")]
+    m = tbwalk._RE_TTS.search(FEEDBACK[5])
+    assert m is not None and m.group(1) == "Allow. Button"
+
+
 def test_continuation_lines_without_a_header_are_joined_too():
     log = tbwalk.TalkBackLog(SERIAL)
     for ln in ["I talkback: TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:  "
@@ -1517,7 +1589,23 @@ def test_the_start_reached_by_a_press_has_talkbacks_words(probe):
     res = walk(probe, start="first", until="edge")
     rec = saved(res)
     assert rec["steps"][0]["utt"] == "logcat" and rec["steps"][0]["speak"] == "Title"
-    assert res["utterance"] == "logcat 7/7"
+    assert res["utterance"] == "logcat 6/6"  # the moves: the start is none
+
+
+def test_logcat_counts_only_the_moves(probe):
+    """The header said "logcat 6/6" for a walk of 6 moves with one move in the model's
+    words: the start, heard by the seek, filled the gap (wfr harness; wpq5nbo said
+    "logcat 9/9" for 8 moves)."""
+    probe.talkback.focus = tb_item(3)
+    del probe.talkback.labels[tb_item(2)]  # TalkBack logs no words for one move
+    res = walk(probe, start="first", until="edge")
+    rec = saved(res)
+    moves = [s for s in rec["steps"] if s["i"] > 0 and s.get("moved") and not s.get("edge")]
+    assert len(moves) == 6 and [s["i"] for s in moves if s["utt"] != "logcat"] == [3]
+    assert rec["steps"][0]["utt"] == "logcat"
+    assert res["utterance"] == "logcat 5/6", res["utterance"]
+    note = next(n for n in res["notes"] if "is the model's" in n)
+    assert note.startswith("speech at step(s) 3 is the model's") and len(note.encode()) <= 160
 
 
 def test_utterance_auto_turning_talkback_on_reads_its_log(probe):

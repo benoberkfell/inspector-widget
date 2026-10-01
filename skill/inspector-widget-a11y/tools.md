@@ -149,7 +149,8 @@ implementation either way, so results name capture refs; where the capture
 tools are not listed (the default listing) `keys` maps them to node keys
 (`inspect_node(node_key=...)`), and `next` names only listed tools. Failures are
 error envelopes with a code (`talkback_unavailable`, `busy`, `injector_failed`,
-`start_not_found`, `app_left_foreground`, `talkback_on`, `log_level_failed` ...).
+`start_not_found`, `app_left_foreground`, `launch_failed`, `talkback_on`,
+`log_level_failed` ...).
 Never retried. Being device-wide, they act only on a device and app the caller
 named or its own default session (its last attach or capture), else
 `$ANDROID_SERIAL` or the only device: never on the store's shared default alone
@@ -175,17 +176,25 @@ named or its own default session (its last attach or capture), else
   before TalkBack is touched. Focus on a node no capture holds (scrolled in)
   recaptures, at most once per 3 steps. Stored as `<store>/walks/<id>.json`.
   - `relaunch=true`: TalkBack first, as its users have it: TalkBack on, the app
-    force-stopped and started from its launcher (`cmd package resolve-activity`:
-    alias launchers work), TalkBack's first focus awaited, then the walk.
-    `talkback_started` is `before_app`, `after_app` (TalkBack came on over the
-    running app: RecyclerView rows bound before it have no "N of M", and
-    `tb.trap` / `tb.edge_stuck` / `tb.webview_block` are info, basis
-    `unverified: after_app`) or `before_walk` (already on, nobody recorded when).
+    force-stopped and its launcher component started with the launcher intent
+    (`am start -a MAIN -c LAUNCHER -n`: alias launchers work, a second launcher
+    entry opens no chooser; `launch_failed` when it cannot start), TalkBack's
+    first focus awaited, then the walk. `talkback_started` is `before_app`,
+    `before_screen` (on after the process started but before the screen was
+    built: its activity opened later, or every list row has its "N of M"; the
+    findings stand), `after_app` (TalkBack came on over the running app and
+    screen: RecyclerView rows bound before it have no "N of M", and `tb.trap` /
+    `tb.edge_stuck` / `tb.webview_block` are info, basis `unverified:
+    after_app`; on a screen opened from another activity the hint is
+    `tb_scenario(relaunch=true,...,leave_on=true)`, then `tb_walk`, since a
+    relaunch restarts at the launcher) or `before_walk` (already on, nobody
+    recorded when).
     `injector_proven: false` (the keyboard never moved focus) makes them
     `unverified: injector`.
   - `utterance="auto"` sets VERBOSE while it turns TalkBack on (about 10 s, put
-    back by the restore): `utterance: "logcat 22/22"`; a fallback to the model
-    says why in `notes`. `"model"` skips it (faster, the model's words).
+    back by the restore): `utterance: "logcat 22/22"` (moves read from its
+    log, of all moves); a fallback to the model says why in `notes`, and a
+    partial one names the steps. `"model"` skips it (faster, the model's words).
   - Over its bytes a result merges each code's repeats (`"n": 5, "steps":
     "1-2,4-5"`), shortens messages, drops the diff's ref lists, shortens speech
     (heads first), then cuts plain lines; no finding code is ever dropped.

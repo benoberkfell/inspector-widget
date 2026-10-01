@@ -86,8 +86,9 @@ def test_op_error_codes_and_shape():
         "not_found", "ambiguous", "bad_selector", "bad_args", "facet_unavailable", "unsupported",
         # the TalkBack tools (talkback-navigation.md part 4 B)
         "walk_not_found", "talkback_unavailable", "enable_failed", "restore_failed", "busy",
-        "app_left_foreground", "injector_failed", "keymap_unknown", "focus_unreadable",
-        "start_not_found", "talkback_on", "log_level_failed", "talkback_error"}
+        "app_left_foreground", "launch_failed", "injector_failed", "keymap_unknown",
+        "focus_unreadable", "start_not_found", "talkback_on", "log_level_failed",
+        "talkback_error"}
 
 
 # --------------------------------------------------------------------------- options, meta, raw

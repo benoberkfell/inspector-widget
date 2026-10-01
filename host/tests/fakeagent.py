@@ -262,12 +262,30 @@ class Scene:
         return sw, sh, b"".join(bytes(r) for r in rows)
 
 
+def format_duration(seconds: float) -> str:
+    """``seconds`` as Android's TimeUtils.formatDuration prints a relative time
+    (``-12m29s601ms``, ``-9h50m14s232ms``, ``+1s5ms``, ``0``)."""
+    ms = int(round(seconds * 1000))
+    if ms == 0:
+        return "0"
+    sign, ms = ("-" if ms < 0 else "+"), abs(ms)
+    out = sign
+    for unit, size in (("d", 86400000), ("h", 3600000), ("m", 60000), ("s", 1000)):
+        if ms >= size or (len(out) > 1 and unit != "d"):
+            out += f"{ms // size}{unit}"
+            ms %= size
+    return out + f"{ms}ms"
+
+
 def talkback_scene(n_items: int = 6, visible: Optional[int] = None,
-                   scroll_forward: bool = False) -> "Scene":
+                   scroll_forward: bool = False, recycler: Optional[bool] = None) -> "Scene":
     """A title over a ScrollView of Buttons ("Item 0".."Item N-1"), 80px apart.
 
     Items at index >= ``visible`` are off screen (visible_to_user false);
     ``scroll_forward`` makes the ScrollView advertise ACTION_SCROLL_FORWARD.
+    ``recycler``: the column is a RecyclerView (CollectionInfo, one column) whose rows
+    carry their CollectionItemInfo (True: bound with TalkBack on) or not (False: bound
+    before it started).
     Ids: title 1003, ScrollView 1010, its column 1011, item i 1020+i.
     """
     items = []
@@ -277,10 +295,21 @@ def talkback_scene(n_items: int = 6, visible: Optional[int] = None,
                                 "actions": [(0x10, None), (0x40, None)]}
         if visible is not None and i >= visible:
             a11y["visible_to_user"] = False
+        if recycler:
+            a11y["collection_item_info"] = {"row_index": i, "column_index": 0, "row_span": 1,
+                                            "column_span": 1}
         items.append(ViewSpec(1020 + i, "Button", "android.widget", (16, 120 + i * 80, 328, 64),
                               text=f"Item {i}", a11y=a11y))
-    column = ViewSpec(1011, "LinearLayout", "android.widget", (0, 112, 360, 528),
-                      a11y={"class_name": "android.widget.LinearLayout"}, children=items)
+    if recycler is None:
+        column = ViewSpec(1011, "LinearLayout", "android.widget", (0, 112, 360, 528),
+                          a11y={"class_name": "android.widget.LinearLayout"}, children=items)
+    else:
+        column = ViewSpec(1011, "RecyclerView", "androidx.recyclerview.widget", (0, 112, 360, 528),
+                          a11y={"class_name": "androidx.recyclerview.widget.RecyclerView",
+                                # RecyclerView makes itself important (YES) when AUTO
+                                "important_for_accessibility": 1,
+                                "collection_info": {"row_count": n_items, "column_count": 1}},
+                          children=items)
     scroll = ViewSpec(1010, "ScrollView", "android.widget", (0, 112, 360, 528),
                       a11y={"class_name": "android.widget.ScrollView", "scrollable": True,
                             "actions": [(0x1000, None)] if scroll_forward else []},
@@ -562,6 +591,9 @@ def _fill_a11y(st: StringTable, out: "pb.A11yNode", spec: Dict[str, Any], bounds
         elif key == "actions":
             for aid, label in val:
                 out.actions.add(id=aid, label=st.intern(label))
+        elif isinstance(val, dict):  # a message field: collection_info, collection_item_info
+            for k2, v2 in val.items():
+                setattr(getattr(out, key), k2, v2)
         else:
             setattr(out, key, val)
     if include_extras:
@@ -1290,11 +1322,16 @@ class FakeApp:
     started: Optional[float] = None
     # The launcher activity (cmd package resolve-activity), None: <package>.MainActivity.
     launcher: Optional[str] = None
-    # The launcher entry is an activity-alias: am start -n <package>/.MainActivity fails.
+    # The launcher entry is an activity-alias: am start -n <package>/.MainActivity fails
+    # (unless the start carries the launcher intent's action and category).
     launcher_alias: bool = False
     # What a start launches when the launcher activity is not the app's main screen (a
     # splash activity finishing into it), else the launcher.
     main_activity: Optional[str] = None
+    # More launcher entries listed BEFORE the app's own (LeakCanary's
+    # "leakcanary.internal.activity.LeakLauncherActivity"): an implicit launcher start
+    # (-p) then opens the system's "Open with" chooser (ResolverActivity).
+    extra_launchers: List[str] = field(default_factory=list)
 
     @property
     def data_dir(self) -> str:
@@ -1303,6 +1340,10 @@ class FakeApp:
     @property
     def launcher_component(self) -> str:
         return f"{self.package}/{self.launcher or self.package + '.MainActivity'}"
+
+    @property
+    def launcher_components(self) -> List[str]:
+        return [f"{self.package}/{c}" for c in self.extra_launchers] + [self.launcher_component]
 
 
 @dataclass
@@ -1361,6 +1402,9 @@ class FakeDevice:
         self.secure: Dict[str, str] = {}            # settings secure namespace
         self.talkback: Optional["FakeTalkBack"] = None
         self.activity_stack: List[str] = [f"{DEFAULT_PACKAGE}/.MainActivity"]
+        # When each activity was (re)created, in device uptime s (dumpsys lastLaunchTime);
+        # absent: when its app's process started.
+        self.activity_launched: Dict[str, float] = {}
         # An activity finishing by itself: the next top read still reports it, then it is gone.
         self.leaving: Optional[str] = None
         self.backs_to_app = 0                       # BACKs that reached the app's own activity
@@ -1520,11 +1564,40 @@ class FakeDevice:
         self.activity_stack = [a for a in self.activity_stack
                                if not a.startswith(package + "/")] or ["com.android.launcher3/.Launcher"]
 
-    def launch(self, comp: str) -> Tuple[int, str, str]:
+    def launch(self, comp: str, by_intent: bool = False) -> Tuple[int, str, str]:
         """``am start -W -n comp``: start the process when it is not running (a new pid,
         started now), put the activity on top; TalkBack, when on, focuses the new window
-        (its ``initial_focus``, else nothing)."""
-        return self._launch(comp)
+        (its ``initial_focus``, else nothing). ``by_intent``: the start carries the
+        launcher intent's action and category (an activity-alias starts by name then)."""
+        return self._launch(comp, by_intent=by_intent)
+
+    def push_activity(self, comp: str) -> None:
+        """``comp`` on top of the activity stack, (re)created now (its lastLaunchTime)."""
+        if comp in self.activity_stack:
+            self.activity_stack.remove(comp)
+        self.activity_stack.append(comp)
+        self.activity_launched[comp] = self.uptime()
+
+    def _dumpsys_activities(self) -> str:
+        """``dumpsys activity activities`` for the top activity's task: the Task line (its
+        size), topResumedActivity, and each activity's Hist line and lastLaunchTime
+        (relative to now, as TimeUtils.formatDuration prints it)."""
+        top = self.top
+        pkg = top.split("/", 1)[0]
+        task = [a for a in self.activity_stack if a.split("/", 1)[0] == pkg]
+        now = self.uptime()
+        lines = [f"  * Task{{4f2a1b #42 type=standard A=10123:{pkg} U=0 visible=true "
+                 f"visibleRequested=true mode=fullscreen translucent=false sz={len(task)}}}",
+                 f"    topResumedActivity=ActivityRecord{{1a2b3c u0 {top} t42}}"]
+        for k, a in reversed(list(enumerate(task))):
+            app = self.apps.get(pkg)
+            at = self.activity_launched.get(a)
+            if at is None:
+                at = app.started if app is not None and app.started is not None else 1.0
+            lines += [f"    * Hist  #{k}: ActivityRecord{{{1000 + k:x} u0 {a} t42}}",
+                      f"      launchFailed=false launchCount=0 "
+                      f"lastLaunchTime={format_duration(at - now)}"]
+        return "\n".join(lines) + "\n"
 
     def _launch(self, comp: str, by_intent: bool = False) -> Tuple[int, str, str]:
         pkg, _, cls = comp.partition("/")
@@ -1539,9 +1612,7 @@ class FakeDevice:
             app.started = self.uptime()
             state = "COLD"
         top = f"{pkg}/{app.main_activity}" if app is not None and app.main_activity else comp
-        if top in self.activity_stack:
-            self.activity_stack.remove(top)
-        self.activity_stack.append(top)
+        self.push_activity(top)
         self.starts.append(comp)
         tb = self.talkback
         if tb is not None and tb.running and state == "COLD":
@@ -1747,7 +1818,7 @@ class FakeDevice:
             if self.leaving is not None and top == self.leaving:
                 self.activity_stack.pop()
                 self.leaving = None
-            return 0, f"  topResumedActivity=ActivityRecord{{1a2b3c u0 {top} t42}}\n", ""
+            return 0, self._dumpsys_activities(), ""
         if toks[:2] == ["dumpsys", "input"]:
             name = toks[-1] if len(toks) > 2 else ""
             hit = [n for n in self.input_devices if n == name or not name]
@@ -1791,15 +1862,33 @@ class FakeDevice:
             app = self.apps.get(pkg)
             if app is None or "android.intent.category.LAUNCHER" not in toks:
                 return 0, "No activity found\n", ""
+            comp = app.launcher_component if not app.extra_launchers else \
+                "android/com.android.internal.app.ResolverActivity"
             return 0, ("priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 "
-                       f"isDefault=true\n{app.launcher_component}\n"), ""
+                       f"isDefault=true\n{comp}\n"), ""
+        if toks[:3] == ["cmd", "package", "query-activities"]:
+            app = self.apps.get(toks[-1])
+            if app is None or "android.intent.category.LAUNCHER" not in toks:
+                return 0, "No activities found\n", ""
+            comps = app.launcher_components
+            return 0, f"{len(comps)} activities found:\n" + "".join(
+                f"  Activity #{k}:\n    priority=0 preferredOrder=0 match=0x108000 "
+                f"specificIndex=-1 isDefault=true\n    {c}\n" for k, c in enumerate(comps)), ""
         if toks[:2] == ["am", "start"] and "-W" in toks and "-p" in toks and "-n" not in toks:
             app = self.apps.get(toks[toks.index("-p") + 1])
             if app is None:
                 return 0, "Error: Activity not started, unable to resolve Intent\n", ""
+            if app.extra_launchers:  # two launcher entries: Android asks which one
+                chooser = "android/com.android.internal.app.ResolverActivity"
+                self.push_activity(chooser)
+                return 0, (f"Starting: Intent {{ act=android.intent.action.MAIN "
+                           f"pkg={app.package} }}\nStatus: ok\nLaunchState: COLD\n"
+                           f"Activity: {chooser}\nTotalTime: 173\nWaitTime: 180\n"
+                           f"Complete\n"), ""
             return self._launch(app.launcher_component, by_intent=True)
         if toks[:2] == ["am", "start"] and "-W" in toks and "-n" in toks:
-            return self.launch(toks[toks.index("-n") + 1])
+            return self.launch(toks[toks.index("-n") + 1],
+                               by_intent="android.intent.category.LAUNCHER" in toks)
         if toks[:1] == ["cat"] and len(toks) == 2 and toks[1].startswith("/sdcard/"):
             if toks[1] not in self.files:
                 return 1, "", f"cat: {toks[1]}: No such file or directory"
@@ -1815,9 +1904,7 @@ class FakeDevice:
             return 0, "Broadcast completed: result=0\n", ""
         if toks[:2] == ["am", "start"] and "-n" in toks:
             comp = toks[toks.index("-n") + 1]
-            if comp in self.activity_stack:
-                self.activity_stack.remove(comp)
-            self.activity_stack.append(comp)
+            self.push_activity(comp)
             if tb is not None and comp == tb.PREFS:
                 tb.prefs_screen = "dev"
             return 0, f"Starting: Intent {{ cmp={comp} }}\n", ""

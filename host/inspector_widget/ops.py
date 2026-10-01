@@ -1477,7 +1477,7 @@ TB_CAPTURE = CaptureOptions(props=False)
 
 def _tb_error(exc: BaseException) -> OpError | None:
     """A TalkBack failure as an envelope code: busy, talkback_unavailable,
-    enable_failed, restore_failed, app_left_foreground, injector_failed (the
+    enable_failed, restore_failed, app_left_foreground, launch_failed, injector_failed (the
     injectors tried are the candidates), keymap_unknown, start_not_found ...
     A ValueError from the engine's own argument checks is bad_args."""
     from .talkback import device as tbdevice
@@ -1957,8 +1957,9 @@ def _tb_capture_notes(record: dict[str, Any], hook: _TbCaptures) -> list[str]:
         return notes
     long = {str(d.get("message")) for d in diags}
     notes = [n for n in notes if n not in long]
-    if tbwalk.BOUND_BEFORE_NOTE not in (record.get("notes") or []):
-        notes.append(tbwalk.BOUND_BEFORE_NOTE)
+    note = tbwalk.bound_before_note(tbwalk.deep_screen(record))
+    if note not in (record.get("notes") or []):
+        notes.append(note)
     return notes
 
 

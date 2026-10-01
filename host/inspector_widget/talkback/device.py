@@ -95,7 +95,7 @@ _FLAG_ACTIVITY_REORDER_TO_FRONT = "0x00020000"
 
 class TalkBackError(RuntimeError):
     """A TalkBack control failure. ``code`` is one of: talkback_unavailable,
-    enable_failed, restore_failed, busy, app_left_foreground."""
+    enable_failed, restore_failed, busy, app_left_foreground, launch_failed."""
 
     def __init__(self, code: str, message: str, hint: Optional[str] = None,
                  detail: Optional[Dict[str, Any]] = None) -> None:
@@ -286,9 +286,11 @@ INJECTOR_STATUS: Dict[str, Dict[str, str]] = {}
 CLK_TCK = 100
 #: talkback_started: TalkBack was on before the app's process started (what a TalkBack
 #: user gets: RecyclerView rows carry "N of M", WebViews build their tree), after it
-#: (the walk turned it on: rows bound before it have no item info), or already on with
-#: no record of when.
-STARTED = ("before_app", "after_app", "before_walk")
+#: (the walk turned it on: rows bound before it have no item info), after the process but
+#: before the screen walked was built (its activity was created after TalkBack came on,
+#: or its RecyclerView rows carry their item info: what a TalkBack user gets on that
+#: screen too), or already on with no record of when.
+STARTED = ("before_app", "after_app", "before_screen", "before_walk")
 LAUNCH_WAIT_S = 15.0    # am start -W, then the app in front with a process
 LAUNCH_POLL_S = 0.25
 LAUNCHER = ("-a android.intent.action.MAIN -c android.intent.category.LAUNCHER")
@@ -348,45 +350,146 @@ def talkback_started(serial: str, package: str, on_uptime: Optional[float],
     if now is not None and on_uptime > now + 1:
         return out  # a snapshot from before the device rebooted
     out["talkback_started"] = "before_app" if on_uptime <= app else "after_app"
+    if out["talkback_started"] == "after_app":
+        # Per screen: an activity created after TalkBack came on was built with it on
+        task = top_task(serial)
+        if task.get("activity", "").startswith(package + "/"):
+            out["screen"] = {k: task[k] for k in ("activity", "task_size", "launched_s")
+                             if task.get(k) is not None}
+            if task.get("launched_s") is not None and task["launched_s"] > on_uptime:
+                out["talkback_started"] = "before_screen"
+                out["screen_basis"] = "activity"
     return out
 
 
-def launcher_activity(serial: str, package: str) -> Optional[str]:
-    """``package``'s launcher component as the package manager resolves it
-    (``cmd package resolve-activity --brief``): alias-safe, so an app whose launcher entry
-    is an activity-alias (Thunderbird) starts with ``am start -n`` like any other."""
-    out = adb.shell(serial, f"cmd package resolve-activity --brief {LAUNCHER} "
+_TASK = re.compile(r"\* Task\{\S+ #(\d+) .*?\bsz=(\d+)")
+_HIST = re.compile(r"\* Hist\s+#\d+: ActivityRecord\{\S+ u\d+ ([\w.]+/[\w.$]+) t(\d+)")
+_LAUNCH_TIME = re.compile(r"lastLaunchTime=([+-]?)(\S+)")
+
+
+def parse_duration(text: str) -> Optional[float]:
+    """Seconds from Android's TimeUtils.formatDuration (``-12m29s601ms``, ``+1d2h0m3s4ms``,
+    ``0``), signed; None when it is none of those."""
+    m = re.fullmatch(r"([+-]?)((?:\d+(?:ms|d|h|m|s))+|0)", text.strip())
+    if m is None:
+        return None
+    unit = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+    secs = sum(int(n) * unit[u] for n, u in re.findall(r"(\d+)(ms|d|h|m|s)", m.group(2)))
+    return -secs if m.group(1) == "-" else secs
+
+
+def top_task(serial: str) -> Dict[str, Any]:
+    """The resumed activity on top and its task (``dumpsys activity activities``):
+    ``{"activity", "task_size"`` (activities in its task: more than one when it was opened
+    from another of the app's, so a relaunch, which starts at the launcher, does not walk
+    it), ``"launched_s"`` (when it was created, in device uptime s: its lastLaunchTime, a
+    time relative to now)``}``; empty when the dump says none of it."""
+    out = adb.shell(serial, "dumpsys activity activities | grep -E 'topResumedActivity|"
+                            "mResumedActivity|\\* Task\\{|\\* Hist|lastLaunchTime='",
+                    check=False)
+    m = _RESUMED.search(out)
+    if m is None:
+        return {}
+    activity = f"{m.group(1)}/{m.group(2)}"
+    res: Dict[str, Any] = {"activity": activity}
+    sizes: Dict[str, int] = {}
+    hist: Optional[str] = None  # the task of the top activity's Hist line, once seen
+    for line in out.splitlines():
+        t = _TASK.search(line)
+        if t is not None:
+            sizes.setdefault(t.group(1), int(t.group(2)))
+            continue
+        h = _HIST.search(line)
+        if h is not None:
+            if "launched" in res or hist is not None:
+                break  # past the top activity's own lines
+            if _same_activity(h.group(1), activity):
+                hist = h.group(2)
+            continue
+        lt = _LAUNCH_TIME.search(line)
+        if lt is not None and hist is not None and "launched" not in res:
+            ago = parse_duration(lt.group(1) + lt.group(2))
+            res["launched"] = ago
+            break
+    ago = res.pop("launched", None)
+    if hist is not None and hist in sizes:
+        res["task_size"] = sizes[hist]
+    if ago is not None and ago < 0:  # 0: never launched
+        now = uptime(serial)
+        if now is not None:
+            res["launched_s"] = round(now + ago, 3)
+    return res
+
+
+def _same_activity(a: str, b: str) -> bool:
+    """``pkg/.Cls`` and ``pkg/pkg.Cls`` name the same activity."""
+    def full(c: str) -> str:
+        pkg, _, cls = c.partition("/")
+        return f"{pkg}/{pkg}{cls}" if cls.startswith(".") else c
+    return full(a) == full(b)
+
+
+#: Launcher entries that debug tools add to an app they are built into (LeakCanary's
+#: "Leaks" icon, Chucker's): never the app's own launcher activity.
+TOOL_LAUNCHERS = ("leakcanary.", "com.squareup.leakcanary.", "com.chuckerteam.chucker.",
+                  "com.readystatesoftware.chuck.")
+
+
+def launcher_activities(serial: str, package: str) -> List[str]:
+    """``package``'s launcher components (MAIN/LAUNCHER) as the package manager lists them
+    (``cmd package query-activities``), in its order."""
+    out = adb.shell(serial, f"cmd package query-activities --brief {LAUNCHER} "
                             f"{shlex.quote(package)}", check=False)
-    for line in reversed(out.splitlines()):
+    comps: List[str] = []
+    for line in out.splitlines():
         line = line.strip()
-        if line.startswith(package + "/"):
-            return line
-    return None
+        if line.startswith(package + "/") and line not in comps:
+            comps.append(line)
+    return comps
+
+
+def _tool_launcher(package: str, comp: str) -> bool:
+    cls = comp.split("/", 1)[-1]
+    return (package + cls if cls.startswith(".") else cls).startswith(TOOL_LAUNCHERS)
+
+
+def launcher_activity(serial: str, package: str) -> Optional[str]:
+    """The app's own launcher component: the first of :func:`launcher_activities` that no
+    debug tool added (an app with LeakCanary has two launcher entries, and an implicit
+    launcher start opens the "Open with" chooser between them)."""
+    comps = launcher_activities(serial, package)
+    own = [c for c in comps if not _tool_launcher(package, c)]
+    return (own or comps or [None])[0]
 
 
 def relaunch(serial: str, package: str, wait_s: Optional[float] = None) -> Dict[str, Any]:
     """Restart ``package`` from its launcher, the way a TalkBack user opens it with TalkBack
-    already running: ``am force-stop``, then ``am start -W`` with the launcher intent
-    (``-a MAIN -c LAUNCHER -p <package>``: alias-safe, where ``am start -n`` with an
-    activity-alias's name fails, as Thunderbird's does), else with the component the
-    package manager resolves (:func:`launcher_activity`); then wait until the app is in
-    front with a live process. Returns ``{"activity", "launcher", "pid", "started_at"
-    (device uptime s), "took_ms"}``; raises ``TalkBackError('app_left_foreground')`` when
-    it does not come up. The caller turns TalkBack on first and re-attaches afterwards
-    (the old process and its agent are gone)."""
+    already running: ``am force-stop``, then ``am start -W -a MAIN -c LAUNCHER -n <its
+    launcher component>`` (:func:`launcher_activity`). The launcher intent's action and
+    category make the start alias-safe (``am start -n`` with an activity-alias's name
+    alone fails, as Thunderbird's does), and the explicit component keeps a second
+    launcher entry (LeakCanary's) from opening the "Open with" chooser. Then wait until
+    the app is in front with a live process. Returns ``{"activity", "launcher", "pid",
+    "started_at" (device uptime s), "took_ms"}``; raises ``TalkBackError('launch_failed')``
+    when it cannot be started, ``('app_left_foreground')`` when it does not come to the
+    front. The caller turns TalkBack on first and re-attaches afterwards (the old process
+    and its agent are gone)."""
     wait_s = LAUNCH_WAIT_S if wait_s is None else wait_s
     t0 = time.monotonic()
     adb.shell(serial, f"am force-stop {shlex.quote(package)}", check=False)
     comp = launcher_activity(serial, package)
-    out = adb.shell(serial, f"am start -W {LAUNCHER} -p {shlex.quote(package)}", check=False)
-    if _start_error(out) and comp is not None:
-        out = adb.shell(serial, f"am start -W -n {shlex.quote(comp)}", check=False)
+    if comp is None:
+        raise TalkBackError("launch_failed",
+                            f"{package} has no launcher activity on {serial} (cmd package "
+                            f"query-activities found none)",
+                            hint=f"Check {package} is installed, or open the app by hand and "
+                                 f"walk without relaunch.")
+    out = adb.shell(serial, f"am start -W {LAUNCHER} -n {shlex.quote(comp)}", check=False)
     err = _start_error(out)
     if err:
-        raise TalkBackError("app_left_foreground",
-                            f"{package} could not be started on {serial}: {err}",
-                            hint=f"Check {package} is installed and has a launcher activity "
-                                 f"(cmd package resolve-activity), then retry.")
+        raise TalkBackError("launch_failed",
+                            f"{package} could not be started on {serial} ({comp}): {err}",
+                            hint=f"Open {package} by hand and walk without relaunch.")
     m = re.search(r"^Activity:\s*(\S+)", out, re.M)
     activity = m.group(1) if m else None
     deadline = time.monotonic() + wait_s
@@ -405,7 +508,7 @@ def relaunch(serial: str, package: str, wait_s: Optional[float] = None) -> Dict[
                 f"{package} did not come to the front after a relaunch on {serial} "
                 f"(top: {top_activity(serial) or 'unknown'})",
                 hint=f"Dismiss what covers it (BACK), or start {package} by hand "
-                     f"(am start {LAUNCHER} -p {package}), then walk without relaunch.")
+                     f"(am start {LAUNCHER} -n {comp}), then walk without relaunch.")
         time.sleep(LAUNCH_POLL_S)
     return {"activity": activity or top_activity(serial), "launcher": comp, "pid": pid,
             "started_at": process_start(serial, pid), "took_ms": _ms(t0)}

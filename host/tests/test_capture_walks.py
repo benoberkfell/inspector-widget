@@ -468,7 +468,12 @@ def test_step_lines_keep_the_head_and_the_tail():
     assert len(W.cut_speech(TB1, 48)) == 48
     # the budget shortens the head first, then the tail from its front
     assert W.cut_speech(TB1, 32) == "Localp… 2 of 6. In list. 6 items"
-    assert W.cut_speech(TB1, 24).endswith("… In list. 6 items")
+    # shorter still, the position stays (tb.wrong_announcement is about it), then the count
+    assert W.cut_speech(TB1, 24) == "Localpa… 2 of 6… 6 items"
+    assert W.cut_speech("Localpart of email address, Edit box. Double tap to edit. 2 of 6. "
+                        "In list. 6 items", 24) == "Localpa… 2 of 6… 6 items"
+    assert W.cut_speech("Bullet. 1 of 19. In list. 19 items", 24) == "Bullet… 1 of 19"
+    assert W.cut_speech("Bullet. 1 of 19. In list. 19 items", 32) == "Bullet… 1 of 19… 19 items"
     # no position: the last words still show ([conversation_counter], a state ...)
     cut = W.cut_speech("Re: Thread. 2/10/2023. bob@example.com. [conversation_counter]. "
                        "Thread start message here", 48)

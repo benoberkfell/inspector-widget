@@ -87,11 +87,15 @@ iw tb-walk --show w3f9ak1 --steps 17-42 --speech full
 iw talkback on --serial emulator-5554
 iw tb-walk --serial emulator-5554 --package com.example.app --leave-on
 iw talkback restore --serial emulator-5554
-# start an app by hand as a launcher does (works for activity-alias launchers too)
-adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p com.example.app
+# start an app by hand as a launcher does (works for activity-alias launchers too):
+# its launcher component (cmd package query-activities ... LAUNCHER <pkg>), with the
+# launcher intent's action and category
+adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n <pkg>/<launcher activity>
 ```
-Every walk says `talkback_started`: `before_app` is what a TalkBack user gets; on
-`after_app` (TalkBack turned on over the running app) list positions and page stops can
+Every walk says `talkback_started`: `before_app` is what a TalkBack user gets, and so is
+`before_screen` (TalkBack came on after the app started but before the screen walked was
+built: its activity opened later, or its list rows carry their positions). On `after_app`
+(TalkBack turned on over the running app and screen) list positions and page stops can
 differ, and stuck or trapped findings are marked unverified until a `--relaunch` walk
 confirms them.
 
