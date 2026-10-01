@@ -90,8 +90,10 @@ def active_toolset(env: Mapping[str, str] | None = None) -> str:
 class Param:
     """One tool parameter, on both surfaces.
 
-    ``type`` is a JSON-schema type name, or ``"string|array"`` for a value that
-    is a word or a list (``props``, ``marks``, ``include``). ``items`` is the
+    ``type`` is a JSON-schema type name, ``"string|array"`` for a value that
+    is a word or a list (``props``, ``marks``, ``include``), or
+    ``"string|integer"`` for a selector that may also be a number (find's
+    ``window``: a z index). ``items`` is the
     item type of an array. ``cli`` adds option strings (aliases such as ``-c``)
     beside the canonical ``--kebab-name``; ``positional`` makes the CLI take it
     as a positional (``nargs``). ``surfaces`` says where it exists: a
@@ -228,28 +230,54 @@ INSTRUCTIONS = (
     "@testTag \"label\" flags [x,y wxh] !issue +N (N hidden descendants); coordinates are "
     "screen pixels. After the UI changes, capture again (capture(diff_from=\"prev\") also "
     "reports what changed). serial and package are optional once a session exists.")
-#: Added when the TalkBack tools are listed too.
+#: Added when the TalkBack tools are listed with the capture tools.
 INSTRUCTIONS_TALKBACK = (" TalkBack: outline(view=\"reading\") predicts its order; tb_walk "
                          "drives the real screen reader and diffs the two.")
+#: ... with the legacy tools (no outline): dump_accessibility's focus_order predicts it.
+INSTRUCTIONS_TALKBACK_LEGACY = (" TalkBack: dump_accessibility's focus_order predicts its "
+                                "order; tb_walk drives the real screen reader and compares.")
+#: ... alone: tb_walk is the only TalkBack order there is.
+INSTRUCTIONS_TALKBACK_ONLY = (" TalkBack: tb_walk drives the real screen reader through the "
+                              "app and reports its order and findings; tb_scenario checks "
+                              "focus after an action, back or a list update.")
+_LEGACY_HEAD = ("Inspector Widget reads the live UI of a debuggable Android app: Views, Compose "
+                "and the accessibility tree TalkBack sees.")
+_LEGACY_TOOLS_TEXT = (
+    " Each tool reads the device when called: inspect gives the merged tree, "
+    "dump_accessibility the reading order, a11y_lint the accessibility findings, inspect_node "
+    "one element. Results are compact and brief; detail=\"full\" gives everything and an "
+    "oversize result becomes a spill file.")
+_LEGACY_TAIL = (
+    " serial and package: list_devices and list_processes. The capture-and-walk tools "
+    "(capture once, then query the stored snapshot with small calls) are listed with "
+    "INSPECTOR_WIDGET_TOOLSET=capture (or all).")
 #: The instructions while the capture tools are not listed (the default until S4).
-INSTRUCTIONS_LEGACY = (
-    "Inspector Widget reads the live UI of a debuggable Android app: Views, Compose and the "
-    "accessibility tree TalkBack sees. Each tool reads the device when called: inspect gives "
-    "the merged tree, dump_accessibility the reading order, a11y_lint the accessibility "
-    "findings, inspect_node one element. Results are compact and brief; detail=\"full\" "
-    "gives everything and an oversize result becomes a spill file. serial and package: "
-    "list_devices and list_processes. The capture-and-walk tools (capture once, then query "
-    "the stored snapshot with small calls) are listed with INSPECTOR_WIDGET_TOOLSET=capture "
-    "(or all).")
+INSTRUCTIONS_LEGACY = _LEGACY_HEAD + _LEGACY_TOOLS_TEXT + _LEGACY_TAIL
 INSTRUCTIONS_MAX_BYTES = 900
 
 
 def instructions(listed: Iterable[str]) -> str:
-    """The MCP ``instructions`` for the tools a server lists (at most 900 B)."""
+    """The MCP ``instructions`` for the tools a server lists (at most 900 B).
+
+    The text names only listed tools: the capture workflow when ``capture`` is
+    listed, the legacy inspection tools when they are, and the TalkBack line
+    that matches what predicts the reading order (``outline``, else
+    ``dump_accessibility``, else ``tb_walk`` alone)."""
     names = set(listed)
-    text = INSTRUCTIONS if "capture" in names else INSTRUCTIONS_LEGACY
+    if "capture" in names:
+        text = INSTRUCTIONS
+    else:
+        text = _LEGACY_HEAD
+        if {"inspect", "dump_accessibility", "a11y_lint", "inspect_node"} <= names:
+            text += _LEGACY_TOOLS_TEXT
+        text += _LEGACY_TAIL
     if "tb_walk" in names:
-        text += INSTRUCTIONS_TALKBACK
+        if "outline" in names:
+            text += INSTRUCTIONS_TALKBACK
+        elif "dump_accessibility" in names:
+            text += INSTRUCTIONS_TALKBACK_LEGACY
+        else:
+            text += INSTRUCTIONS_TALKBACK_ONLY
     return text
 
 
@@ -323,7 +351,8 @@ def _specs() -> list[ToolSpec]:
             Param("at", "array", items="number"), Param("overlaps", "array", items="number"),
             Param("min_dp", "number"), Param("max_dp", "number"),
             Param("kind", "string", enum=("view", "compose", "slot", "a11y")),
-            Param("window", "string"),
+            Param("window", "string|integer",
+                  help="A window selector, or its z index (0 = the bottom window)"),
             Param("in", "string", "ui", enum=("ui", "slots", "all")),
             Param("sort", "string", "tree", enum=("tree", "reading", "top", "area")),
             Param("limit", "integer", 20, minimum=1, maximum=200),
@@ -407,6 +436,8 @@ def spec(name: str) -> ToolSpec:
 def _type_schema(p: Param) -> dict[str, Any]:
     if p.type == "string|array":
         s: dict[str, Any] = {"type": ["string", "array"], "items": {"type": p.items or "string"}}
+    elif p.type == "string|integer":
+        s = {"type": ["string", "integer"]}
     elif p.type == "array":
         s = {"type": "array", "items": {"type": p.items or "string"}}
     else:
@@ -445,7 +476,8 @@ def describe(p: Param) -> str:
     if p.enum is not None:
         return f"{p.name}: one of {', '.join(map(str, p.enum))}"
     typ = {"array": f"list of {p.items or 'string'}",
-           "string|array": f"string or list of {p.items or 'string'}"}.get(p.type, p.type)
+           "string|array": f"string or list of {p.items or 'string'}",
+           "string|integer": "string or integer"}.get(p.type, p.type)
     lo = p.minimum if p.minimum is not None else (
         f">{p.exclusive_minimum}" if p.exclusive_minimum is not None else None)
     if lo is not None or p.maximum is not None:
@@ -509,6 +541,11 @@ def validate(ts: ToolSpec, args: Any, surface: str = "mcp") -> dict[str, Any]:
             elif not isinstance(v, str):
                 raise _bad(f"{k} must be a list{' or a string' if '|' in p.type else ''}; "
                            f"got {v!r}", ts, p)
+        elif p.type == "string|integer":
+            if isinstance(v, float) and v.is_integer():
+                v = int(v)
+            if isinstance(v, bool) or not isinstance(v, (str, int)):
+                raise _bad(f"{k} must be a string or an integer; got {v!r}", ts, p)
         else:
             v = _check_scalar(ts, p, v, p.type, k)
         if p.enum is not None and not isinstance(v, list) and v not in p.enum:
@@ -586,10 +623,16 @@ def run(name: str, args: Any, ctx: ops.OpContext, surface: str = "mcp"
 # --------------------------------------------------------------------------- #
 # MCP entries
 # --------------------------------------------------------------------------- #
+#: Tools with a destructive mode: capture(slots="enable") hot-reloads the app
+#: (resetting remember{} state) and captures drop/gc(all=true) delete captures
+#: of every agent sharing the store. MCP clients ask before running them.
+DESTRUCTIVE_TOOLS = frozenset({"capture", "captures"})
+
+
 def annotations(ts: ToolSpec) -> dict[str, Any]:
     if ts.read_only:
         return {"readOnlyHint": True}
-    return {"readOnlyHint": False, "destructiveHint": False}
+    return {"readOnlyHint": False, "destructiveHint": ts.name in DESTRUCTIVE_TOOLS}
 
 
 def mcp_entries(toolset: str = "all", *, context: Callable[[], ops.OpContext] | None = None,
@@ -758,14 +801,96 @@ def cli_main(ts: ToolSpec, ns: argparse.Namespace,
 # --------------------------------------------------------------------------- #
 # Human renderers (the CLI without --json)
 # --------------------------------------------------------------------------- #
+CLI_PROG = "inspector-widget"
+
+
+def _parse_call(text: str) -> tuple[str, list[Any], dict[str, Any]] | None:
+    """``(tool, positional, keywords)`` of a ``next`` hint (``query.call``'s
+    form, JSON values), or None when it is not one."""
+    import ast
+    import re
+
+    src = re.sub(r"([(,])in=", r"\1in_=", text.strip())
+    try:
+        tree = ast.parse(src, mode="eval").body
+    except SyntaxError:
+        return None
+    if not isinstance(tree, ast.Call) or not isinstance(tree.func, ast.Name):
+        return None
+    names = {"true": True, "false": False, "null": None}
+
+    def value(node: ast.AST) -> Any:
+        if isinstance(node, ast.Name) and node.id in names:
+            return names[node.id]
+        if isinstance(node, ast.List):
+            return [value(x) for x in node.elts]
+        return ast.literal_eval(node)
+
+    try:
+        pos = [value(a) for a in tree.args]
+        kw = {("in" if k.arg == "in_" else k.arg): value(k.value) for k in tree.keywords}
+    except (ValueError, KeyError, TypeError):
+        return None
+    return tree.func.id, pos, kw
+
+
+def _cli_word(v: Any) -> str:
+    import shlex
+
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, list):
+        return shlex.quote(",".join(str(x) for x in v))
+    return shlex.quote(str(v))
+
+
+def cli_hint(text: str) -> str:
+    """A ``next`` hint (``outline(root="n10",fields="-bounds")``) as the CLI
+    command that runs it (``inspector-widget outline --root n10
+    --fields=-bounds``). A hint for a tool without a CLI subcommand here, or
+    one that does not parse, is returned unchanged."""
+    _init()
+    parsed = _parse_call(text)
+    if parsed is None or parsed[0] not in BY_NAME:
+        return text
+    tool, pos, kw = parsed
+    ts = BY_NAME[tool]
+    words = [CLI_PROG, ts.cli_name]
+    positionals = [p for p in ts.params_for("cli") if p.positional]
+    given = dict(zip((p.name for p in positionals), pos))
+    for k in list(kw):
+        if any(p.name == k for p in positionals):
+            given[k] = kw.pop(k)
+    if given:
+        last = max(i for i, p in enumerate(positionals) if p.name in given)
+        for p in positionals[:last + 1]:
+            v = given.get(p.name, p.default)
+            if v is None:
+                return text
+            words.append(_cli_word(v))
+    for k, v in kw.items():
+        p = ts.param(k)
+        if p is None or "cli" not in p.surfaces:
+            return text
+        if p.type == "boolean":
+            if bool(v) != bool(p.default):
+                words.append(p.flag if v else "--no-" + p.flag[2:])
+            continue
+        word = _cli_word(v)
+        words.append(f"{p.flag}={word}" if word.startswith("-") else f"{p.flag} {word}")
+    return " ".join(words)
+
+
+def _next_lines(doc: Mapping[str, Any]) -> list[str]:
+    return [f"next: {cli_hint(h)}" for h in doc.get("next") or []]
+
+
 def _footer(doc: Mapping[str, Any]) -> list[str]:
     out: list[str] = []
     for key in ("hidden", "notes", "truncated", "omitted"):
         if doc.get(key):
             out.append(f"{key}: {dumps(doc[key])}")
-    for h in doc.get("next") or []:
-        out.append(f"next: {h}")
-    return out
+    return out + _next_lines(doc)
 
 
 _HEADER_SKIP = frozenset({"lines", "rows", "next", "hidden", "notes", "truncated", "omitted",
@@ -799,7 +924,8 @@ def _render_lines(doc: Mapping[str, Any]) -> list[str]:
 
 
 def _render_json(doc: Mapping[str, Any]) -> list[str]:
-    return [dumps(dict(doc), pretty=True)]
+    body = {k: v for k, v in doc.items() if k != "next"}
+    return [dumps(body, pretty=True), *_next_lines(doc)]
 
 
 def _render_image(doc: Mapping[str, Any]) -> list[str]:
@@ -834,9 +960,7 @@ def _render_capture(doc: Mapping[str, Any]) -> list[str]:
     out.extend(doc.get("outline") or [])
     if doc.get("on_screen"):
         out.append("on screen: " + " | ".join(doc["on_screen"]))
-    for h in doc.get("next") or []:
-        out.append(f"next: {h}")
-    return out
+    return out + _next_lines(doc)
 
 
 # Build the registry now that the renderers exist.
@@ -848,22 +972,57 @@ def cli_names() -> list[str]:
     return [s.cli_name for s in SPECS]
 
 
+def _cli_option_strings(ts: ToolSpec) -> tuple[set[str], set[str]]:
+    """(the flags of ``ts``' subcommand that take a value, every flag it has)."""
+    takes: set[str] = set()
+    every = {"--json", "--pretty", "-h", "--help"}
+    if ts.name == "capture":
+        every |= {"-q", "--quiet"}
+    for p in ts.params_for("cli"):
+        if p.positional:
+            continue
+        opts = {p.flag, *p.cli}
+        if p.type == "boolean":
+            if p.default is True:
+                opts.add("--no-" + p.flag[2:])
+        else:
+            takes |= opts
+        every |= opts
+    return takes, every
+
+
 def cli_argv(argv: Iterable[str]) -> list[str]:
-    """``argv`` with ``--json -`` read as ``--json`` on the capture subcommands:
-    the legacy subcommands take ``--json OUT.json|-``, these always print to
-    stdout, and the habit should not be an argparse error."""
+    """``argv`` as the capture subcommands' parser should read it:
+
+    * ``--json -`` is ``--json``: the legacy subcommands take ``--json
+      OUT.json|-``, these always print to stdout, and the habit should not be
+      an argparse error;
+    * a flag's value that starts with ``-`` but is no flag of the subcommand
+      is joined to it (``--fields -bounds`` -> ``--fields=-bounds``, ``--at
+      -5,10``): spec 6.4's field removal must work as written, and argparse
+      would read ``-bounds`` as an unknown option."""
     argv = list(argv)
     if not argv or argv[0] not in cli_names():
         return argv
+    _init()
+    ts = next(t for t in SPECS if t.cli_name == argv[0])
+    takes, every = _cli_option_strings(ts)
     out: list[str] = []
     skip = False
     for i, a in enumerate(argv):
         if skip:
             skip = False
             continue
-        out.append(a)
-        if a == "--json" and i + 1 < len(argv) and argv[i + 1] == "-":
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--json" and nxt == "-":
+            out.append(a)
             skip = True
+        elif (a in takes and nxt is not None and nxt.startswith("-") and nxt != "-"
+              and nxt.split("=", 1)[0] not in every):
+            out.append(f"{a}={nxt}")
+            skip = True
+        else:
+            out.append(a)
     return out
 
 
@@ -890,6 +1049,7 @@ __all__ = [
     "active_toolset",
     "add_cli",
     "cli_args",
+    "cli_hint",
     "cli_argv",
     "describe",
     "error_result",

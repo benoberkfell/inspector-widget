@@ -25,6 +25,7 @@ import pytest
 import cli
 import mcp_server
 from inspector_widget import surface
+from inspector_widget.capture.model import OpError
 from inspector_widget.output import dumps
 
 #: Parameters one transport has and the other has not, on purpose.
@@ -347,3 +348,104 @@ def test_json_dash_is_json_on_the_capture_subcommands():
     assert surface.cli_argv(["node", "n22", "--json", "-"]) == ["node", "n22", "--json"]
     assert surface.cli_argv(["dump", "--json", "-"]) == ["dump", "--json", "-"]  # legacy
     assert surface.cli_argv([]) == []
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: instructions name listed tools only, destructive hints, find's
+# window z index, dash-leading CLI values, CLI-form next hints
+# --------------------------------------------------------------------------- #
+_NAMED_TOOLS = ("outline", "inspect_node", "dump_accessibility", "a11y_lint", "tb_walk",
+                "tb_scenario", "list_devices", "list_processes", "capture()")
+
+
+@pytest.mark.parametrize("toolset", [None, "legacy", "talkback", "capture", "capture,talkback",
+                                     "legacy,talkback", "all"])
+def test_instructions_name_only_listed_tools(toolset):
+    names = set(surface.toolset_names(toolset) if toolset else surface.toolset_names())
+    text = surface.instructions(names)
+    for tool in _NAMED_TOOLS:
+        if tool in text:
+            assert tool.rstrip("()") in names, f"{tool} named but not listed ({toolset})"
+    assert ("inspect gives" in text) == ("inspect" in names and "capture" not in names)
+
+
+def test_default_instructions_predict_talkback_with_a_listed_tool():
+    text = surface.instructions(surface.toolset_names(surface.DEFAULT_TOOLSET))
+    assert 'outline(view="reading")' not in text
+    assert "focus_order predicts" in text and "tb_walk" in text
+    full = surface.instructions(surface.toolset_names("all"))
+    assert full.endswith(surface.INSTRUCTIONS_TALKBACK)
+
+
+def test_capture_and_captures_are_marked_destructive():
+    assert surface.annotations(surface.spec("capture"))["destructiveHint"] is True
+    assert surface.annotations(surface.spec("captures"))["destructiveHint"] is True
+    assert surface.annotations(surface.spec("outline")) == {"readOnlyHint": True}
+    assert mcp_server.TOOLS["captures"]["annotations"]["destructiveHint"] is True
+
+
+def test_find_window_takes_a_z_index():
+    ts = surface.spec("find")
+    assert surface.validate(ts, {"window": 1}) == {"window": 1}
+    assert surface.validate(ts, {"window": 1.0}) == {"window": 1}
+    assert surface.validate(ts, {"window": "n3"}) == {"window": "n3"}
+    with pytest.raises(OpError) as e:
+        surface.validate(ts, {"window": True})
+    assert e.value.code == "bad_args" and "integer" in (e.value.hint or "")
+    schema = surface.json_schema(ts)["properties"]["window"]
+    assert schema["type"] == ["string", "integer"] and "z index" in schema["description"]
+
+
+def test_cli_takes_dash_leading_values():
+    """Spec 6.4's "-bounds" removes a field; the CLI must accept it as written."""
+    assert surface.cli_argv(["outline", "--fields", "-bounds", "--json"]) == [
+        "outline", "--fields=-bounds", "--json"]
+    assert surface.cli_argv(["find", "--at", "-5,10"]) == ["find", "--at=-5,10"]
+    # a real flag after a value-taking flag is left for argparse to report
+    assert surface.cli_argv(["find", "--serial", "-p", "x"]) == ["find", "--serial", "-p", "x"]
+    import cli
+    ns = cli.build_parser().parse_args(surface.cli_argv(["outline", "--fields", "-bounds"]))
+    assert ns.fields == "-bounds"
+
+
+@pytest.mark.parametrize("hint,want", [
+    ('find(issue="render.")', "inspector-widget find --issue render."),
+    ('outline(fields="-bounds",max_lines=2,cursor="c1:o:ab:20")',
+     "inspector-widget outline --fields=-bounds --max-lines 2 --cursor c1:o:ab:20"),
+    ('lint(rules=["R1"],group="node",within="n38")',
+     "inspector-widget lint --rules R1 --group node --within n38"),
+    ('node("n41")', "inspector-widget node n41"),
+    ('captures(action="show",id="c1")', "inspector-widget captures show c1"),
+    ('find(in="all",text="Delete me")', "inspector-widget find --in all --text 'Delete me'"),
+    ('find(count_only=true)', "inspector-widget find --count-only"),
+    ('tb_walk(start="first")', 'tb_walk(start="first")'),  # no generated subcommand
+])
+def test_cli_hints_are_cli_commands(hint, want):
+    assert surface.cli_hint(hint) == want
+
+
+def test_cli_hints_parse_back_to_the_mcp_arguments():
+    import shlex
+
+    import cli
+    parser = cli.build_parser()
+    for hint in ('outline(fields="-bounds",max_lines=2,cursor="c1:o:ab:20")',
+                 'lint(rules=["R1","R2"],group="node",within="n38",severity="warn")',
+                 'find(in="all",text="Delete me",flags=["click","focus"])',
+                 'node("n41")', 'diff(a="before")'):
+        tool, pos, kw = surface._parse_call(hint)
+        argv = surface.cli_argv(shlex.split(surface.cli_hint(hint))[1:])
+        args = surface.cli_args(surface.spec(tool), parser.parse_args(argv))
+        want = dict(kw)
+        if pos:
+            want[[p.name for p in surface.spec(tool).params if p.positional][0]] = pos[0]
+        assert args == want, hint
+
+
+def test_human_output_prints_cli_hints():
+    doc = {"capture": "c1", "lines": ["n1 View"], "next": ['outline(root="n15")']}
+    assert surface._render_lines(doc)[-1] == "next: inspector-widget outline --root n15"
+    out = surface._render_json({"ref": "n1", "next": ['node("n2")']})
+    assert out[-1] == "next: inspector-widget node n2" and '"next"' not in out[0]
+    cap = surface._render_capture({"capture": "c1", "next": ["lint()"]})
+    assert cap[-1] == "next: inspector-widget lint"
