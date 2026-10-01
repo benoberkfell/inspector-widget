@@ -125,7 +125,7 @@ def test_real_app_lint_counts_now():
     # the same dumps, in the comments. Every change is one of the B8 fixes above.
     names = ("antennapod_home", "antennapod_episodes", "antennapod_filter_sheet",
              "antennapod_player", "thunderbird_drawer", "thunderbird_message", "nia_feed",
-             "nia_settings_dialog")
+             "nia_for_you", "nia_settings_dialog")
     counts = {name: (s["error"], s["warn"], s["info"], (s.get("covered") or {}).get("total", 0))
               for name in names for s in [lint(name).summary]}
     assert counts == {
@@ -136,6 +136,10 @@ def test_real_app_lint_counts_now():
         "thunderbird_drawer": (1, 0, 2, 0),       # was 1, 11, 2: 11 R7 on unselected tabs
         "thunderbird_message": (1, 4, 4, 0),      # was 1, 1, 7: 3 real 40dp buttons excused
         "nia_feed": (0, 0, 14, 0),                # was 5, 0, 9: R1 on chips scrolled half away
+        "nia_for_you": (0, 0, 6, 0),              # was 0, 0, 0: R12 now names rows by their
+                                                  # name, not their state: each topic row and
+                                                  # its own Checkbox are both stops named
+                                                  # "Headlines" (TalkBack 17 stops on both)
         "nia_settings_dialog": (0, 0, 0, 14),     # was 5, 0, 13 with 14 behind the dialog,
                                                   # and 4 R12 on rows saying "Not selected"
     }

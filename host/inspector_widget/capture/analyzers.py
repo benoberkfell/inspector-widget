@@ -73,6 +73,7 @@ GROUPS = ("rule", "node", "none")
 DEFAULT_DENSITY = 420
 CONTRAST_RULE = "a11y.contrast.low"
 TOUCH_RULE = "a11y.touch_target.small"
+DUP_RULE = "a11y.duplicate.label"
 CLIPPED = "render.clipped"
 HIDDEN = "render.hidden"
 OFFSCREEN = "render.offscreen"
@@ -86,7 +87,7 @@ LINT_LIMIT = 30
 PER_RULE = 3
 #: bump when the cached lint shape or its input changes (derived/lint.<hash>.json);
 #: 2: the unified a11y tree replaced Compose semantics as the lint input
-#: 3: evidence ``covered_by`` (a finding under an open dialog)
+#: 3: evidence ``covered_by`` (a finding under an open dialog) and R12's ``name``
 LINT_CACHE_VERSION = 3
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
@@ -663,6 +664,9 @@ def _evidence(f: Any, nid: str, dump: _A11yDump,
             if not v:
                 continue
         ev[k] = v
+    if f.rule == DUP_RULE and (getattr(f, "evidence", None) or {}).get("label"):
+        # the name the nodes share: the node's own label can be its state ("Not selected")
+        ev["name"] = f.evidence["label"]
     return ev
 
 
@@ -1148,6 +1152,10 @@ def _detail(iss: Issue) -> str:
         bits.append(str(ev["why"]))
     elif iss.id == OFFSCREEN and ev.get("outside"):
         bits.append(f"outside {ev['outside']}")
+    elif iss.id == DUP_RULE and ev.get("name"):
+        others = [str(x) for x in ev.get("node_ids") or []]
+        like = " ".join(others[:2]) + (f" +{len(others) - 2}" if len(others) > 2 else "")
+        bits.append(f"named {_quote(ev['name'], 24)}" + (f" like {like}" if like else ""))
     note = ev.get("note")
     out = " ".join(bits)
     if note:
@@ -1398,7 +1406,13 @@ def _rule_items(ix: Index, kept: list[tuple[str, Issue]], per_rule: int,
     for rid, members in by_rule.items():
         rule = R.get(rid, members[0][1].sev)
         sev = R.worst(i.sev for _, i in members) or rule.sev
-        lines = _collapsed(ix, members)
+        if rid == DUP_RULE:  # one collapse per shared name (a row's own label can be its state)
+            by_name: dict[Any, list[tuple[str, Issue]]] = {}
+            for nid, iss in members:
+                by_name.setdefault(iss.evidence.get("name"), []).append((nid, iss))
+            lines = [ln for grp in by_name.values() for ln in _collapsed(ix, grp)]
+        else:
+            lines = _collapsed(ix, members)
         shown = lines[:per_rule]
         rest = sum(n for _, n in lines[per_rule:])
         nodes = [s for s, _ in shown]

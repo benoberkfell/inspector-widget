@@ -374,3 +374,18 @@ def test_a_fling_resolves_no_issue(tmp_path):
                          if ref.startswith("n")]
         assert all(ref in ib.nodes for ref in resolved_refs), issues
         assert issues.get("gone_with_node", 0) >= 3, issues
+
+
+def test_the_lint_names_what_r12_nodes_share(tmp_path):
+    """Now in Android's For you: each topic row (labelled "Not selected", its state) and its
+    own Checkbox are both stops named "Headlines" (or "UI", "Compose"), as TalkBack 17 says.
+    The lint said the shared label was "Not selected" (the row's anchor) and collapsed the
+    three rows into one line."""
+    with Replay("nia_foryou", str(tmp_path)) as r:
+        r.capture()
+        lint = run(r.ctx, "lint", rules=["R12"], per_rule=6)
+        nodes = lint["rules"][0]["nodes"]
+        assert lint["counts"]["info"] == 6 and len(nodes) == 6
+        assert not any('"Not selected"[*]' in x for x in nodes)
+        for name in ("Headlines", "UI", "Compose"):
+            assert sum(f'named "{name}" like n' in x for x in nodes) == 2, nodes
