@@ -435,9 +435,9 @@ same names (`capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`,
   default. Compose text never reports a size, so Compose contrast uses the
   normal-text threshold and a `diagnostics` entry says so.
 - **Off-screen / below-the-fold nodes are skipped** by the lint (not visible to
-  the user → no meaningful touch target or pixels). A row cut off at a scroll edge
-  gets an `info` touch-target finding saying it is probably clipped. Scroll the
-  content into view, then re-lint.
+  the user → no meaningful touch target or pixels). A row cut off at the edge of
+  a list that scrolls further gets `info` touch-target (and missing-label)
+  findings saying it is clipped. Scroll the content into view, then re-lint.
 - **Compose `file:line` comes from the slot table** (`dump_compose` with
   `include_slot_table=true`), never from `inspect_node` or the lint (their
   `source` is null). The slot table is empty until Compose inspection is

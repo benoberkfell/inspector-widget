@@ -483,6 +483,7 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
                         "here is composition order and TalkBack's may differ."),
         })
     _apply_interactive_region(tree)
+    _check_web_content(tree)
     if tree.services == "off":
         holders = [n for n in tree.nodes if n.facet == "interop" and n.visible]
         for n in holders:
@@ -552,6 +553,38 @@ def _exclude_subtree(tree: TbTree, win: TbWindow, top: Dict[str, Any], parent: T
         tree.excluded.append(ex)
         tree.excluded_by_raw[id(raw)] = ex
         stack.extend(raw.get("children") or ())
+
+
+WEBVIEW_CLASS = "android.webkit.WebView"
+_HTML_ACTIONS = (0x00000400, 0x00000800)  # ACTION_NEXT/PREVIOUS_HTML_ELEMENT
+
+
+def _check_web_content(tree: TbTree) -> None:
+    """Flag the WebViews that expose no web content. A WebView builds its accessibility tree
+    only once an accessibility service queries it (Chromium enables accessibility on demand),
+    so in a dump taken with no service on it is an empty box: the model cannot see the page,
+    and must not call the WebView "Unlabelled" for it."""
+    empty: List[TbNode] = []
+    for n in tree.nodes:
+        if n.facet not in ("view", "interop") or n.class_name != WEBVIEW_CLASS:
+            continue
+        content = any(d.supports(*_HTML_ACTIONS) and d.class_name != WEBVIEW_CLASS
+                      for d in list(n.iter())[1:])
+        if not content:
+            n.corrections.append("web_content_not_exposed")
+            empty.append(n)
+    if not empty:
+        return
+    why = ("this dump was taken with no accessibility service on (a11y-services=off), and a "
+           "WebView builds its accessibility tree only once a service queries it: turn TalkBack "
+           "on (talkback on, or tb-walk) and capture again to model the page"
+           if tree.services != "on" else
+           "the page is empty, still loading, or has accessibility turned off")
+    tree.diagnostics.append({
+        "kind": "web_content_not_exposed", "count": len(empty),
+        "keys": [n.key for n in empty][:10],
+        "message": f"{len(empty)} WebView(s) expose no web content: {why}.",
+    })
 
 
 def iter_reported(tree: TbTree) -> Iterator[TbNode]:

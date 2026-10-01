@@ -37,9 +37,19 @@ speaks only through an invisible child reads the entire screen in one utterance.
 :data:`VERSIONS` holds what differs between the 16.2 source and TalkBack 17.0 as observed on
 emulator-5554 (ttsOutput in the verbose log): 17.0 joins the parts with ". " (the
 ``usePeriodAsSeparator`` feature flag, a stub returning false in the open 16.2 source,
-TB/flags/FeatureFlagReader.java:328). Everything else checked so far matches: no "not checked"
-for an unchecked Checkbox in either toolkit, "off. Notify. Switch" for a View Switch,
-"On. Notify. Switch" for Compose, "Button" for an unlabelled Compose button.
+TB/flags/FeatureFlagReader.java:328), and it names a pager by its orientation going in ("In
+horizontal pager", "In vertical pager") and says "Out of grid pager" coming out (Thunderbird's
+message pager, AntennaPod's player, A11yProbe V13/C16). Everything else checked so far matches,
+on the A11yProbe corpus and on Thunderbird, Now in Android and AntennaPod walks: no "not
+checked" for an unchecked Checkbox in either toolkit, "off. Notify. Switch" for a View Switch,
+"On. Notify. Switch" for Compose, "Button" for an unlabelled control ("Search. Button" for a
+clickable ImageView), "not checked. Light. Radio button. 1 of 3. In list. 3 items" for a
+single-choice CheckedTextView, "selected. Inbox. 7. Tab. In list. 9 items".
+
+"Editing" (EditTextDescription.stateDescription: input focus and an active keyboard) depends
+on the walk: with a hardware keyboard TalkBack 17 says it for every edit box it reaches
+(Thunderbird's read-only dropdown fields: "Editing. Every 15 minutes. Edit box. ... read only"),
+so tb-walk's model passes ``keyboard=True``.
 """
 
 from __future__ import annotations
@@ -53,20 +63,26 @@ from .tree import TbNode, populated_text
 SEP = ", "
 
 # What TalkBack speaks differently by version. "16.2": the open source @229212f. "17.0": the
-# Play build observed on emulator-5554 (TALKBACK_DESIGN.md part 9).
+# Play build observed on emulator-5554 (TALKBACK_DESIGN.md part 9; the real-app walks).
 VERSIONS: Dict[str, Dict[str, Any]] = {
-    "16.2": {"separator": ", "},
-    "17.0": {"separator": ". "},
+    "16.2": {"separator": ", ", "pager_in": {}, "pager_out": "Out of pager"},
+    "17.0": {"separator": ". ",
+             "pager_in": {"horizontal": "In horizontal pager", "vertical": "In vertical pager"},
+             "pager_out": "Out of grid pager"},
 }
 DEFAULT_VERSION = "17.0"
 
 
-def separator(version: Optional[str]) -> str:
+def profile(version: Optional[str]) -> Dict[str, Any]:
     try:
-        return VERSIONS[version or DEFAULT_VERSION]["separator"]
+        return VERSIONS[version or DEFAULT_VERSION]
     except KeyError:
         raise ValueError(f"unknown TalkBack version {version!r}; known: {sorted(VERSIONS)}") \
             from None
+
+
+def separator(version: Optional[str]) -> str:
+    return profile(version)["separator"]
 
 # Role.getRole -> the role word (AccessibilityNodeFeedbackUtils.getNodeRoleName :263).
 ROLE_WORDS = {
@@ -104,7 +120,10 @@ class Announcement:
         text = ""
         for s in segs:
             text = s.text if not text else text + (sep if s.glue is None else s.glue) + s.text
-        self.text = text
+        # The utterance is spoken trimmed, non-breaking spaces too, but not inside: "Follow:\xa0"
+        # says "Follow:" (AntennaPod's show notes) while a row's "[attachment_icon] " child keeps
+        # its space before the next part (Thunderbird), on TalkBack 17.0.
+        self.text = text.strip()
         self.parts: List[Dict[str, Any]] = [
             {"text": s.text, "from": s.node.key, "kind": s.kind} for s in segs]
         self.unlabelled = unlabelled
@@ -137,11 +156,13 @@ def node_text(n: TbNode) -> str:
 
 
 class _Composer:
-    def __init__(self, rules: Rules, focused: TbNode, selection_mode: int, sep: str = SEP):
+    def __init__(self, rules: Rules, focused: TbNode, selection_mode: int, sep: str = SEP,
+                 keyboard: bool = False):
         self.r = rules
         self.focused = focused
         self.selection_mode = selection_mode
         self.sep = sep
+        self.keyboard = keyboard
 
     # -- AccessibilityNodeFeedbackUtils --------------------------------------------------------
     def state_description(self, n: TbNode) -> str:
@@ -226,6 +247,8 @@ class _Composer:
                 name = n.text or n.content_description
             role_word = self.role_description(n)
             state = self.state_description(n)
+            if self.editing(n):  # "Editing", isCurrentlyEditing (EditTextDescription:126)
+                state = f"{state}{self.sep}Editing" if state else "Editing"
         elif role in (R.ROLE_IMAGE, R.ROLE_IMAGE_BUTTON):  # NonTextViewsDescription
             name = self.text_or_label(n)
             if n.get("role_description"):
@@ -255,6 +278,14 @@ class _Composer:
                 seen.add(text.lower())
                 segs.append(_Seg(text, n, kind))
         return segs
+
+    def editing(self, n: TbNode) -> bool:
+        """node.isFocused() && isKeyBoardActive(): the edit box has input focus and a keyboard
+        is up. The dump cannot tell whether a keyboard is up, so this needs ``keyboard``; with
+        a hardware keyboard (a key-driven walk) TalkBack 17 says it for every edit box it
+        focuses, input-focused or not."""
+        return n is self.focused and self.keyboard and (
+            n.has("focused") or n.has("focusable") or n.has("editable"))
 
     def _is_pager_page(self, n: TbNode) -> bool:
         p = n.parent
@@ -387,15 +418,20 @@ def collection_root_exclude_self(r: Rules, n: TbNode) -> Optional[TbNode]:
     return None
 
 
-def _should_enter(root: TbNode) -> bool:
-    """CollectionState.shouldEnter (:952): more than one item (or unknown counts)."""
+def _should_enter(r: Rules, root: TbNode) -> bool:
+    """CollectionState.shouldEnter (:952): more than one item (or unknown counts), and not a
+    flat collection that holds another flat one (only the innermost is announced: a feed
+    holding a row of chips says "In list" for the chips, not for the feed)."""
     ci = root.get("collection_info")
     if ci:
         rows, cols = int(ci.get("row_count", -1)), int(ci.get("column_count", -1))
-        if rows == -1 and cols == -1:
-            return True
-        return rows * cols not in (0, 1)
-    return len(root.children) > 1
+        if not (rows == -1 and cols == -1) and rows * cols in (0, 1):
+            return False
+    elif len(root.children) <= 1:
+        return False
+    if r.filter_flat_collection(root) and r.holds_flat_collection(root):
+        return False
+    return True
 
 
 def _counts(root: TbNode):
@@ -434,12 +470,12 @@ def _update_collection(r: Rules, st: SpeechState, n: TbNode) -> None:
     if st.transition in (NAVIGATE_ENTER, NAVIGATE_INTERIOR):
         if new_root is not None and new_root is st.root:
             st.transition = NAVIGATE_INTERIOR
-        elif new_root is not None and _should_enter(new_root):
+        elif new_root is not None and _should_enter(r, new_root):
             st.transition = NAVIGATE_ENTER
         else:
             st.transition = NAVIGATE_EXIT
     else:
-        st.transition = NAVIGATE_ENTER if new_root is not None and _should_enter(new_root) \
+        st.transition = NAVIGATE_ENTER if new_root is not None and _should_enter(r, new_root) \
             else NAVIGATE_NONE
     if st.transition == NAVIGATE_ENTER:
         item = _item_state(r, new_root, n)
@@ -464,9 +500,10 @@ def _collection_name(root: TbNode) -> str:
     return root.get("container_title") or node_text(root)
 
 
-def _collection_transition(r: Rules, st: SpeechState, sep: str = SEP) -> str:
+def _collection_transition(r: Rules, st: SpeechState, sep: str = SEP,
+                           version: Optional[str] = None) -> str:
     """getCollectionTransitionDescription (:54), for lists, grids and pagers without a
-    roleDescription."""
+    roleDescription. TalkBack 17 words a pager by its orientation (:data:`VERSIONS`)."""
     if st.root is None or st.transition not in (NAVIGATE_ENTER, NAVIGATE_EXIT):
         return ""
     role = r.role(st.root)
@@ -475,10 +512,18 @@ def _collection_transition(r: Rules, st: SpeechState, sep: str = SEP) -> str:
     if kind is None:
         return ""
     name = _collection_name(st.root)
+    rows, cols = _counts(st.root)
+    prof = profile(version)
+    if kind == "pager":
+        if st.transition == NAVIGATE_EXIT:
+            word = prof["pager_out"] if rows > -1 and cols > -1 else "Out of pager"
+            return word + (f" {name}" if name else "")
+        axis = ("horizontal" if rows == 1 and cols > 1 else
+                "vertical" if cols == 1 and rows > 1 else None)
+        return prof["pager_in"].get(axis, "In pager") + (f" {name}" if name else "")
     if st.transition == NAVIGATE_EXIT:
         return f"Out of {kind}" + (f" {name}" if name else "")
     head = f"In {kind}" + (f" {name}" if name else "")
-    rows, cols = _counts(st.root)
     if kind == "list":
         vertical = rows >= cols
         count = rows if vertical else cols
@@ -542,14 +587,16 @@ def event_text(node: TbNode) -> str:
 
 
 def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = None, *,
-             transitions: bool = True, version: Optional[str] = None) -> Announcement:
+             transitions: bool = True, version: Optional[str] = None,
+             keyboard: bool = False) -> Announcement:
     """What TalkBack says when ``node`` takes accessibility focus.
 
     ``nav_or_rules``: a :class:`~.order.Navigator` or :class:`~.rules.Rules`. ``state`` carries
     the collection / container / window TalkBack was in (updated in place); without it the
     announcement is the one for a first focus. ``transitions=False`` leaves out the collection,
     container and window transitions (the node's own description only). ``version``: a key of
-    :data:`VERSIONS` (default :data:`DEFAULT_VERSION`).
+    :data:`VERSIONS` (default :data:`DEFAULT_VERSION`). ``keyboard``: TalkBack is driven by a
+    hardware keyboard (an edit box it reaches says "Editing").
     """
     rules: Rules = getattr(nav_or_rules, "rules", nav_or_rules)
     st = state if state is not None else SpeechState()
@@ -559,7 +606,7 @@ def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = Non
     if st.root is not None and st.item is not None:
         sel = int((st.root.get("collection_info") or {}).get("selection_mode", 0) or 0)
     sep = separator(version)
-    comp = _Composer(rules, node, sel, sep)
+    comp = _Composer(rules, node, sel, sep, keyboard)
 
     unl = comp.unlabelled(node)
     segs: List[_Seg] = list(unl) if unl else _mark_descendants(comp.aggregate(node), node)
@@ -567,17 +614,21 @@ def announce(nav_or_rules: Any, node: TbNode, state: Optional[SpeechState] = Non
         ev = event_text(node)
         if ev:
             segs = [_Seg(ev, node, "event")]
-    # Nothing names the node: "Unlabelled", or only role / state words were found.
-    unlabelled = not any(s.kind in _NAMING_KINDS for s in segs)
+    # Nothing names the node: "Unlabelled", or only role / state words were found. A WebView
+    # names itself by its role ("Webview"); its page is not a label it lacks.
+    unlabelled = not any(s.kind in _NAMING_KINDS for s in segs) \
+        and rules.role(node) != R.ROLE_WEB_VIEW
 
     item = _item_transition(rules, st, node) if transitions else []
     if item:
         segs.extend(_Seg(t, node, "collection") for t in item)
     elif rules.is_heading(node):
-        segs.append(_Seg(node.get("role_description") or "Heading", node, "heading"))
+        word = node.get("role_description") or "Heading"
+        if not any(sg.text.lower() == word.lower() for sg in segs):  # "Show notes. heading 2"
+            segs.append(_Seg(word, node, "heading"))
 
     if transitions:
-        coll = _collection_transition(rules, st, sep)
+        coll = _collection_transition(rules, st, sep, version)
         if coll:
             segs.append(_Seg(coll, st.root or node, "collection"))
         else:

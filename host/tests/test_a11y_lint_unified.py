@@ -1272,3 +1272,258 @@ def test_findings_on_a_window_under_a_modal_dialog_say_so():
     by_key = {x.node_key: x for x in f}
     assert by_key["view:3"].window == {"index": 0, "root_view_id": 2, "covered_by": 9}
     assert "covered_by" not in by_key["view:10"].window
+
+
+def test_findings_under_a_modal_dialog_are_counted_apart():
+    activity = decor(2, view(3, "android.widget.ImageButton", flags=CLICK, b=(100, 300, 160, 160)),
+                     view(4, "android.widget.ImageButton", flags=CLICK, b=(400, 300, 160, 160)))
+    dialog = view(9, "android.widget.FrameLayout", b=(100, 800, 880, 600),
+                  kids=[view(10, "android.widget.ImageButton", flags=CLICK, b=(140, 840, 160, 160))])
+    data = screen(activity, dialog)
+    data["windows"][0]["covered_by"] = 9
+    rep = lint(data, enabled=["R1"])
+    assert len(rep.findings) == 3  # every finding is still there for callers that want them all
+    assert keys(rep.reachable) == ["view:10"] and sorted(keys(rep.covered)) == ["view:3", "view:4"]
+    s = rep.summary
+    assert (s["error"], s["total"]) == (1, 1)
+    assert s["covered"] == {"error": 2, "warn": 0, "info": 0, "total": 2, "windows": [9]}
+    out = rep.to_dict()
+    assert [f["node_key"] for f in out["findings"]] == ["view:10"]
+    assert out["covered_by_rule"] == {"a11y.label.missing": {
+        "severity": "error", "message": rep.covered[0].message, "n": 2,
+        "nodes": [f.node_key for f in rep.covered]}}
+    text = L.format_text(rep).splitlines()
+    assert text[0].endswith("1 error, 0 warn, 0 info (+2 under an open dialog)")
+    assert text[2].startswith("-- 2 finding(s) on window(s) under an open dialog")
+    assert "covered_by_rule" not in lint(screen(activity), enabled=["R1"]).to_dict()
+
+
+# --------------------------------------------------------------------------- #
+# Real-app false positives (REALAPP_RESULTS B8), in miniature; test_realapp_accuracy.py runs
+# the real dumps.
+# --------------------------------------------------------------------------- #
+def _rows(n_rows, x=0, y=300, flags=CLICK):
+    return [view(30 + i, "android.widget.FrameLayout", flags=flags, b=(x, y + 200 * i, 1080, 200),
+                 kids=[view(60 + i, "android.widget.TextView", text=f"Episode {i}",
+                            b=(x + 40, y + 200 * i + 40, 900, 60))]) for i in range(n_rows)]
+
+
+def test_r1_skips_a_list_talkback_never_stops_on():
+    # AntennaPod: a long-clickable RecyclerView whose rows are the stops. TalkBack's
+    # shouldFocusNode: focusable, nothing of its own to say -> a silent container, never a stop.
+    rv = view(20, "androidx.recyclerview.widget.RecyclerView", flags=("long_clickable", "scrollable"),
+              b=(0, 300, 1080, 1000), kids=_rows(3), collection_info={"row_count": 3},
+              actions=["LONG_CLICK", "SCROLL_FORWARD"])
+    rep = lint(screen(decor(1, rv)), enabled=["R1"])
+    assert of(rep, "a11y.label.missing") == []
+    assert any(d["code"] == "label.silent_containers" for d in rep.diagnostics)
+
+
+def test_r1_still_flags_a_clickable_card_talkback_cannot_reach():
+    # A clickable card whose only content is its own button: TalkBack never stops on the card,
+    # so its click is unreachable; naming it makes it a stop.
+    inner = view(21, "android.widget.ImageButton", flags=CLICK, cd="Delete", b=(850, 320, 160, 160))
+    card = view(20, "android.widget.FrameLayout", flags=CLICK, b=(0, 300, 1080, 200), kids=[inner])
+    f = of(lint(screen(decor(1, card)), enabled=["R1"]), "a11y.label.missing")
+    assert [(x.node_key, x.severity) for x in f] == [("view:20", "error")]
+    assert "never stops on it" in f[0].message and f[0].evidence["talkback"] == "silent_container"
+
+
+def test_r1_on_a_row_clipped_at_a_scroll_edge_is_info():
+    # Now in Android's feed: a chip at the top edge of a list that scrolls back; Compose dropped
+    # its text with the part scrolled away. TalkBack scrolls it in and reads its label.
+    chip = comp(20, 9, flags=CLICK, b=(120, 276, 288, 120))
+    lazy = comp(20, 5, flags=("scrollable",), b=(0, 300, 1080, 1800), kids=[chip],
+                actions=["SCROLL_FORWARD", "SCROLL_BACKWARD"], collection_info={"row_count": -1})
+    f = of(lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[lazy]))),
+                enabled=["R1"]), "a11y.label.missing")
+    assert [(x.node_key, x.severity) for x in f] == [("compose:20:9", "info")]
+    assert f[0].evidence["clipped_axes"] == ["h"]
+
+
+def test_r7_unselected_tabs_in_their_own_lazy_items_know_their_state():
+    # Thunderbird's drawer: one Tab per LazyColumn item, the selected one in another item, and
+    # a second list of Tab-role actions with no selection of its own.
+    def tab(sem, text, y, selected=False):
+        item = comp(20, sem, b=(0, y, 1080, 168))
+        t = comp(20, sem + 1, flags=CLICK + (("selected",) if selected else ()), b=(36, y, 1008, 168),
+                 kids=[comp(20, sem + 2, "android.widget.TextView", text=text, b=(192, y + 60, 700, 49)),
+                       comp(20, sem + 1 + 1_000_000_000, role_description="Tab", b=(36, y, 1008, 168))])
+        item["children"] = [t]
+        return item
+    folders = comp(20, 100, b=(0, 400, 1080, 600), kids=[tab(10, "Inbox", 400, selected=True),
+                                                         tab(20, "Outbox", 568)],
+                   collection_info={"row_count": 2, "column_count": 1})
+    actions = comp(20, 200, b=(0, 1100, 1080, 200), kids=[tab(30, "Settings", 1100)],
+                   collection_info={"row_count": -1, "column_count": -1})
+    host = view(20, ACV, b=(0, 0, 1080, 2400), kids=[folders, actions])
+    assert of(lint(screen(decor(1, host)), enabled=["R7"]), "a11y.state.not_exposed") == []
+    # With no tab selected anywhere, an unselected tab gives no clue which one is current.
+    folders["children"][0]["children"][0]["flags"].remove("selected")
+    f = of(lint(screen(decor(1, host)), enabled=["R7"]), "a11y.state.not_exposed")
+    assert sorted(keys(f)) == ["compose:20:11", "compose:20:21", "compose:20:31"]
+
+
+def test_r2_a_40dp_button_flush_with_the_screen_edge_is_judged():
+    # The overflow button at x 1160..1280 in Thunderbird, Now in Android and AntennaPod: the
+    # window's edge is no evidence of clipping.
+    more = view(10, "android.widget.ImageView", flags=CLICK, cd="More options", b=(1160, 180, 120, 144))
+    f = of(lint(screen(decor(1, more, b=(0, 0, 1280, 2856))), density=480), "a11y.touch_target.small")
+    assert [x.severity for x in f] == ["warn"] and "clipped_axes" not in f[0].evidence
+
+
+def test_r2_a_scroll_edge_counts_only_where_the_container_scrolls_further():
+    def at_edges(actions):
+        top = view(21, "android.widget.ImageButton", flags=CLICK, cd="Top", b=(900, 260, 44, 30))
+        rv = view(20, "androidx.recyclerview.widget.RecyclerView", flags=("scrollable",),
+                  b=(0, 260, 1080, 1814), kids=[top])
+        rv["actions"] = [a if isinstance(a, dict) else {"id": 0, "name": a} for a in actions]
+        return of(lint(screen(decor(1, rv))), "a11y.touch_target.small")
+    # At the top of a list that can only scroll forward, nothing is cut off at the top.
+    assert [x.severity for x in at_edges(["SCROLL_FORWARD"])] == ["warn"]
+    # A list that can scroll back may hide the rest of the row above its top edge.
+    assert [x.severity for x in at_edges(["SCROLL_FORWARD", "SCROLL_BACKWARD"])] == ["warn"]
+    assert "height is clipped" in at_edges(["SCROLL_BACKWARD"])[0].message
+    # Decoded from the action id, as an older host's CUSTOM_0x... name would not be.
+    assert "height is clipped" in at_edges(
+        [{"id": 0x01020038, "name": "CUSTOM_0x01020038"}])[0].message
+
+
+def test_r2_a_pager_page_at_rest_is_not_clipped_at_its_edges():
+    btn = view(22, "android.widget.ImageView", flags=CLICK, cd="More", b=(1160, 580, 120, 144))
+    page = view(21, "android.widget.FrameLayout", b=(0, 348, 1280, 2436), kids=[btn])
+    pager = view(20, "androidx.viewpager.widget.ViewPager", b=(0, 348, 1280, 2436), kids=[page],
+                 actions=["SCROLL_FORWARD", "SCROLL_BACKWARD"],
+                 collection_info={"row_count": 1, "column_count": 6})
+    f = of(lint(screen(decor(1, pager, b=(0, 0, 1280, 2856))), density=480),
+           "a11y.touch_target.small")
+    assert [x.severity for x in f] == ["warn"]
+
+
+def test_r2_compose_layout_larger_than_its_bounds_is_clipped():
+    node = comp(20, 9, flags=CLICK, cd="Card", b=(0, 0, 400, 30), layout_size={"w": 400, "h": 300})
+    f = of(lint(screen(decor(1, view(20, ACV, b=(0, 0, 1080, 2400), kids=[node])))),
+           "a11y.touch_target.small")
+    assert [x.severity for x in f] == ["info"] and f[0].evidence["clipped_axes"] == ["h"]
+
+
+def _webview(*elements):
+    html = ["NEXT_HTML_ELEMENT", "PREVIOUS_HTML_ELEMENT"]
+    page = _node(50, 4, "android.webkit.WebView", flags=("focusable",), actions=html,
+                 b=(0, 600, 1080, 1200), kids=list(elements), node_key="virtual:50:4")
+    return view(50, "android.webkit.WebView", provider_class="com.example.Notes",
+                b=(0, 600, 1080, 1200), kids=[page])
+
+
+def _web(vid, cls="android.view.View", **kw):
+    kw.setdefault("node_key", f"virtual:50:{vid}")
+    acts = ["NEXT_HTML_ELEMENT", "PREVIOUS_HTML_ELEMENT"] + (["CLICK"] if "clickable" in kw.get("flags", ()) else [])
+    return _node(50, vid, cls, actions=acts, **kw)
+
+
+def test_web_content_gets_web_advice_never_compose_advice():
+    lone = _web(7, flags=CLICK, role_description="link", text="Go", b=(100, 700, 60, 40))
+    f = of(lint(screen(decor(1, _webview(lone)))), "a11y.touch_target.small")
+    assert [x.node_key for x in f] == ["virtual:50:7"]
+    assert "CSS" in f[0].message and "Modifier." not in f[0].message
+    unnamed = _web(8, flags=CLICK, b=(100, 900, 200, 200))
+    f = of(lint(screen(decor(1, _webview(unnamed)))), "a11y.label.missing")
+    assert "aria-label" in f[0].message and "Modifier." not in f[0].message
+
+
+def test_web_links_on_a_line_of_text_are_inline():
+    # AntennaPod's show notes: "- Our weekly longform " then the link, on one line.
+    text = _web(6, "android.widget.TextView", text="- Our weekly longform ", b=(96, 1682, 480, 57))
+    link = _web(7, flags=CLICK, role_description="link", text="Planet Money newsletter",
+                b=(573, 1682, 528, 57))
+    para = _web(5, b=(24, 698, 1233, 1703), kids=[text, link])
+    assert of(lint(screen(decor(1, _webview(para))), density=480), "a11y.touch_target.small") == []
+
+
+def test_a_webview_without_web_content_is_not_unlabelled_and_is_diagnosed():
+    # With no accessibility service on, a WebView exposes no tree: an empty, long-clickable box.
+    bare = view(50, "android.webkit.WebView", flags=CLICK + ("long_clickable",),
+                provider_class="com.example.Notes", b=(0, 600, 1080, 1200))
+    data = screen(decor(1, bare))
+    data["diagnostics"] = "roots=1; a11y-services=off"
+    rep = lint(data)
+    assert of(rep, "a11y.label.missing") == [] and of(rep, "a11y.node.empty_focusable") == []
+    diag = next(d for d in rep.diagnostics if d["code"] == "web.not_exposed")
+    assert diag["keys"] == ["view:50"] and "TalkBack" in diag["message"]
+
+
+def test_r2_a_sliver_at_the_bottom_of_a_scroll_view_is_clipped():
+    # AntennaPod's home (live): a horizontal list of podcast covers shows a 32px sliver at the
+    # bottom of the screen's ScrollView. The ScrollView's one content child fills it (as far as
+    # it shows), which is not a pager page at rest: the covers are clipped.
+    cover = view(404, "android.widget.ImageView", flags=CLICK, cd="Planet Money", b=(48, 2380, 288, 20))
+    covers = view(261, "androidx.recyclerview.widget.RecyclerView", flags=("long_clickable",),
+                  b=(0, 2368, 1280, 32), kids=[cover], collection_info={"row_count": 1, "column_count": 2})
+    content = view(221, "android.widget.LinearLayout", b=(0, 348, 1280, 2052), kids=[covers],
+                   important_for_accessibility="NO")
+    scroll = view(220, "android.widget.ScrollView", flags=("scrollable", "focusable"),
+                  b=(0, 348, 1280, 2052), kids=[content], actions=["SCROLL_FORWARD", "SCROLL_DOWN"])
+    f = of(lint(screen(decor(1, scroll, b=(0, 0, 1280, 2856))), density=480),
+           "a11y.touch_target.small")
+    assert sorted((x.node_key, x.severity) for x in f) == [("view:261", "info"), ("view:404", "info")]
+
+
+
+def test_r2_a_list_that_cannot_scroll_clips_nothing():
+    # Its actions say it cannot scroll (a list that fits): its first and last rows are whole.
+    rows = [view(21 + i, "android.widget.ImageButton", flags=CLICK, cd=f"Row {i}",
+                 b=(0, 260 + 40 * i, 300, 40)) for i in range(2)]
+    lst = view(20, "android.widget.ListView", b=(0, 260, 1080, 80), kids=rows,
+               collection_info={"row_count": 2, "column_count": 1}, actions=["ACCESSIBILITY_FOCUS"])
+    sev = {f.node_key: f.severity for f in of(lint(screen(decor(1, lst))), "a11y.touch_target.small")}
+    assert sev == {"view:21": "warn", "view:22": "warn"}
+
+
+def test_r1_a_childless_view_at_a_scroll_edge_stays_an_error():
+    # A View with no children has no name to lose to the scroll: only its own.
+    ib = view(21, "android.widget.ImageButton", flags=CLICK, b=(900, 2000, 160, 74))
+    rv = view(20, "androidx.recyclerview.widget.RecyclerView", flags=("scrollable",),
+              b=(0, 260, 1080, 1814), kids=[ib], actions=["SCROLL_FORWARD"])
+    f = of(lint(screen(decor(1, rv)), enabled=["R1"]), "a11y.label.missing")
+    assert [x.severity for x in f] == ["error"]
+
+
+def test_r1_a_long_clickable_container_that_is_not_a_list_is_still_flagged():
+    # Its long-press cannot be reached with TalkBack: only lists are exempt.
+    box = view(20, "android.widget.FrameLayout", flags=("long_clickable",), b=(0, 300, 1080, 300),
+               kids=[view(21, "android.widget.Button", text="Play", flags=CLICK, b=(0, 300, 500, 150)),
+                     view(22, "android.widget.ImageButton", cd="More", flags=CLICK, b=(600, 300, 160, 160))])
+    f = of(lint(screen(decor(1, box)), enabled=["R1"]), "a11y.label.missing")
+    assert [x.node_key for x in f] == ["view:20"] and "long-press" in f[0].message
+
+
+def test_r7_a_separate_tab_bar_without_a_selection_is_still_flagged():
+    # A selected tab elsewhere on screen (a TabLayout) says nothing about a bottom bar of tabs.
+    def tab(hv, text, x, y, selected=False):
+        return comp(30, hv, flags=CLICK + (("selected",) if selected else ()), text=text,
+                    b=(x, y, 200, 150), role_description="Tab")
+    tabs = comp(30, 1, b=(0, 200, 1080, 150), kids=[tab(2, "News", 0, 200, True), tab(3, "Sport", 300, 200)],
+                is_traversal_group=True, flags=("is_traversal_group",))
+    bar = comp(30, 10, b=(0, 2200, 1080, 150), kids=[tab(11, "Home", 0, 2200), tab(12, "Saved", 300, 2200)])
+    page = comp(30, 20, b=(0, 0, 1080, 2400), kids=[comp(30, 21, b=(0, 0, 1080, 400), kids=[tabs]), bar])
+    f = of(lint(screen(decor(1, view(30, ACV, b=(0, 0, 1080, 2400), kids=[page]))), enabled=["R7"]),
+           "a11y.state.not_exposed")
+    assert sorted(keys(f)) == ["compose:30:11", "compose:30:12"]
+
+
+def test_web_targets_in_a_row_of_targets_are_not_inline():
+    links = [_web(7 + i, flags=CLICK, role_description="link", text=t, b=(100 + 200 * i, 700, 150, 30))
+             for i, t in enumerate(("Home", "About", "Help"))]
+    row = _web(5, b=(24, 700, 1000, 30), kids=links)
+    f = of(lint(screen(decor(1, _webview(row))), density=160), "a11y.touch_target.small")
+    assert sorted(keys(f)) == ["virtual:50:7", "virtual:50:8", "virtual:50:9"]
+
+
+def test_r12_compares_names_not_states():
+    # Now in Android's settings: merged radio rows whose own label is only their state.
+    def radio(sem, name, y):
+        return comp(40, sem, flags=CLICK + ("checkable",), state="Not selected", b=(0, y, 1080, 120),
+                    kids=[comp(40, sem + 1, "android.widget.TextView", text=name, b=(100, y, 600, 120))])
+    group = comp(40, 1, b=(0, 100, 1080, 400), kids=[radio(10, "Default", 100), radio(20, "Android", 220)])
+    rep = lint(screen(decor(1, view(40, ACV, b=(0, 0, 1080, 2400), kids=[group]))), enabled=["R12"])
+    assert of(rep, "a11y.duplicate.label") == []

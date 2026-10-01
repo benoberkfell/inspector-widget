@@ -654,6 +654,12 @@ def test_restore_after_back_that_goes_to_the_top_fails(probe, monkeypatch):
     res = scenario(probe, "restore", target="Item 3")
     assert res["verdict"] == "top" and res["finding"]["code"] == "tb.restore_failed"
     assert res["opened"]["top"] == f"{PKG}/.DetailActivity"
+    # Measured on TalkBack 17 (A11yProbe C14, Now in Android): neither a paneTitle per
+    # destination nor requestFocus restores focus; an explicit ACTION_ACCESSIBILITY_FOCUS does.
+    fix = res["finding"]["fix"]
+    assert "ACTION_ACCESSIBILITY_FOCUS" in fix and "performAccessibilityAction" in fix
+    assert "paneTitle per destination does not restore" in fix
+    assert not fix.startswith("Give each destination a paneTitle")
 
 
 def test_survive_detects_a_rebound_row_as_drift(probe, monkeypatch):
@@ -1106,3 +1112,27 @@ def test_recycled_views_showing_other_items_are_not_a_loop(probe):
     probe.talkback.on_press = recycle
     res = walk(probe, max_steps=12)
     assert res["ended"] == "max_steps", res["lines"]
+
+
+def test_scroll_action_ids_are_the_platform_ones():
+    # The walk's own table had stale R.id values (0x0102003F for SCROLL_UP...), so a pager's
+    # PAGE_RIGHT read as "page_down" and SCROLL_UP/DOWN were not seen at all.
+    from inspector_widget.a11y import ACTION_NAMES
+    by_name = {name: aid for aid, name in ACTION_NAMES.items()}
+    for aid, word in tbwalk._SCROLL_ACTIONS.items():
+        assert by_name[("SCROLL_" if not word.startswith("page") else "") + word.upper()] == aid
+
+
+def test_a_webview_is_not_a_container_talkback_scrolls():
+    # TalkBack never auto-scrolls web content (the WebView scrolls itself as it moves focus), so
+    # "left the WebView while it can still scroll" is no edge (Thunderbird's message body).
+    def node(cls, parent=None, scrolls=False):
+        x = tbwalk.Node()
+        x.cls, x.parent, x.children = cls, parent, []
+        x.flags = {"scrollable"} if scrolls else set()
+        x.actions = {0x1000} if scrolls else set()
+        return x
+    pager = node("androidx.viewpager.widget.ViewPager", scrolls=True)
+    page_root = node("android.webkit.WebView", node("android.webkit.WebView", pager), scrolls=True)
+    text = node("android.widget.TextView", page_root)
+    assert tbwalk.DumpIndex.scroll_container(None, text) is pager
