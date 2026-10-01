@@ -25,6 +25,12 @@
  * (Server.run's finally: SHUTDOWN, idle stop): each root gets back exactly the delegate it had,
  * null included. A root whose delegate the app replaced since is left alone.
  *
+ * PASSWORDS (Redaction.kt): an event's text is masked when its source is a password field,
+ * and, failing closed, when the source's password status cannot be determined (unresolved, or
+ * a Compose node whose semantics are out of reach) and the source is editable or the event is
+ * a text event. Such a record is [Record.textUnverified], which the response's diagnostics
+ * list (redaction_masked).
+ *
  * THREADING: install / uninstall / record run on the main thread (events are sent there); the
  * buffer is guarded by [lock], which the server thread waits on during a long-poll.
  */
@@ -54,6 +60,12 @@ object A11yEventTap {
     // AccessibilityEvent.CONTENT_CHANGE_TYPE_PANE_TITLE | PANE_APPEARED | PANE_DISAPPEARED.
     private const val PANE_CHANGES = 0x8 or 0x10 or 0x20
 
+    // The events that carry an editable field's content (TEXT_CHANGED and
+    // TEXT_SELECTION_CHANGED carry the whole text).
+    private const val TEXT_EVENTS = AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+        AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED or
+        AccessibilityEvent.TYPE_VIEW_TEXT_TRAVERSED_AT_MOVEMENT_GRANULARITY
+
     /** One recorded event. Strings are interned when a response is built ([toProto]). */
     class Record(
         val seq: Long,
@@ -77,6 +89,8 @@ object A11yEventTap {
         val className: String?,
         val action: Int,
         val hostClass: String?,
+        /** [text] is masked because its source's password status could not be determined. */
+        val textUnverified: Boolean,
     )
 
     /** The fields of an event, read on the main thread before the seq is assigned. */
@@ -85,7 +99,7 @@ object A11yEventTap {
         val contentChangeTypes: Int, val scrollDeltaX: Int, val scrollDeltaY: Int,
         val fromIndex: Int, val toIndex: Int, val itemCount: Int, val scrollX: Int, val scrollY: Int,
         val maxScrollX: Int, val maxScrollY: Int, val text: String?, val paneTitle: String?,
-        val className: String?, val action: Int, val hostClass: String?,
+        val className: String?, val action: Int, val hostClass: String?, val textUnverified: Boolean,
     )
 
     /** Buffered records after some seq, up to [seq] (the newest a read saw). */
@@ -321,7 +335,7 @@ object A11yEventTap {
                 seq, SystemClock.uptimeMillis(), f.type, f.rootViewId, f.hostViewId, f.virtualId,
                 f.contentChangeTypes, f.scrollDeltaX, f.scrollDeltaY, f.fromIndex, f.toIndex,
                 f.itemCount, f.scrollX, f.scrollY, f.maxScrollX, f.maxScrollY, f.text, f.paneTitle,
-                f.className, f.action, f.hostClass,
+                f.className, f.action, f.hostClass, f.textUnverified,
             )
             if (f.type == AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED) lastFocusSeq = seq
             lastEventNanos = System.nanoTime()
@@ -346,8 +360,13 @@ object A11yEventTap {
         }
         // A password field's event text is its content (TYPE_VIEW_TEXT_CHANGED and
         // TYPE_VIEW_TEXT_SELECTION_CHANGED carry the whole text): mask it like every other text
-        // path (Redaction.kt). Resolved only for an event that has text to record.
-        val text = textOf(event) { isPasswordSource(event, hostView, virtualId) }
+        // path (Redaction.kt), and fail closed for an editable source of unknown status.
+        // Resolved only for an event that has text to record.
+        val raw = textOf(event)
+        val state = if (raw == null) Redaction.PasswordState.NOT_PASSWORD else passwordState(event, hostView, virtualId)
+        val masked = state == Redaction.PasswordState.PASSWORD ||
+            (state == Redaction.PasswordState.UNKNOWN && isEditableSource(event, hostView, virtualId))
+        val text = if (masked && raw != null) Redaction.mask(raw) else raw
         val changes = event.contentChangeTypes
         val pane = if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && (changes and PANE_CHANGES) != 0) {
             text
@@ -374,6 +393,7 @@ object A11yEventTap {
             className = event.className?.toString(),
             action = event.action,
             hostClass = hostClass,
+            textUnverified = masked && state == Redaction.PasswordState.UNKNOWN,
         )
     }
 
@@ -382,25 +402,58 @@ object A11yEventTap {
      * password field. Any one signal is enough:
      *  - the event says so (AccessibilityEvent.isPassword): a masked View field, a Compose node
      *    with Password semantics, a provider that copies its node's isPassword (ExploreByTouchHelper);
-     *  - the source View, or a virtual node's host View, is one ([Redaction.isPasswordView]):
+     *  - the source View, or a virtual node's host View, is one ([Redaction.passwordStateOf]):
      *    a visible-password EditText has no isPassword, only its input type;
-     *  - a Compose node's SemanticsNode is one (ComposeInspector.isPasswordNode): a
+     *  - a Compose node's SemanticsNode is one (ComposeInspector.passwordState): a
      *    visible-password Compose field (a password keyboard, no PasswordVisualTransformation)
      *    has no Password semantics, so no isPassword, and Compose sets no input type. Asked of
      *    the semantics tree, not of the provider, whose node would add nothing here and whose
      *    lookup changes the delegate's state (ComposeTraversal);
      *  - any other virtual node: its provider's node is isPassword or of a password input type.
-     * A check that fails counts as "no" for itself only. Main thread.
+     * UNKNOWN (fail closed) when nothing says password and the source is unresolved, a check
+     * threw, a virtual node no longer resolves, or a Compose node's status cannot be determined
+     * (R8 renamed Compose). Main thread.
      */
-    private fun isPasswordSource(event: AccessibilityEvent, host: View?, virtualId: Int): Boolean {
-        if (guarded { event.isPassword }) return true
+    private fun passwordState(event: AccessibilityEvent, host: View?, virtualId: Int): Redaction.PasswordState {
+        if (guarded { event.isPassword }) return Redaction.PasswordState.PASSWORD
+        if (host == null) return Redaction.PasswordState.UNKNOWN
+        val own = Redaction.passwordStateOf(host)
+        if (own == Redaction.PasswordState.PASSWORD || virtualId == A11yIds.HOST_VIEW_ID) return own
+        if (ComposeInspector.isAndroidComposeView(host)) {
+            return own.and(ComposeInspector.passwordState(host, virtualId))
+        }
+        return own.and(
+            try {
+                val node = host.accessibilityNodeProvider?.createAccessibilityNodeInfo(virtualId)
+                when {
+                    node == null -> Redaction.PasswordState.UNKNOWN
+                    node.isPassword || Redaction.isPasswordInputType(node.inputType) -> Redaction.PasswordState.PASSWORD
+                    else -> Redaction.PasswordState.NOT_PASSWORD
+                }
+            } catch (_: Throwable) {
+                Redaction.PasswordState.UNKNOWN
+            },
+        )
+    }
+
+    /**
+     * Whether the source of [event] takes text input, asked for a source of UNKNOWN status: a
+     * text event, an EditText class name (what Compose sets on a text field's text events), an
+     * editable host View, or another provider's editable virtual node (one that no longer
+     * resolves counts as editable). A Compose node is asked no further: its events other than
+     * the text ones name no class but android.view.View and carry no field content.
+     */
+    private fun isEditableSource(event: AccessibilityEvent, host: View?, virtualId: Int): Boolean {
+        if ((event.eventType and TEXT_EVENTS) != 0) return true
+        if (Redaction.isEditableClassName(event.className)) return true
         if (host == null) return false
-        if (Redaction.isPasswordView(host)) return true
-        if (virtualId == A11yIds.HOST_VIEW_ID) return false
-        if (ComposeInspector.isAndroidComposeView(host)) return ComposeInspector.isPasswordNode(host, virtualId)
-        return guarded {
+        if (virtualId == A11yIds.HOST_VIEW_ID) return Redaction.isEditableView(host)
+        if (ComposeInspector.isAndroidComposeView(host)) return false
+        return try {
             val node = host.accessibilityNodeProvider?.createAccessibilityNodeInfo(virtualId)
-            node != null && (node.isPassword || Redaction.isPasswordInputType(node.inputType))
+            node == null || node.isEditable || Redaction.isEditableClassName(node.className)
+        } catch (_: Throwable) {
+            true
         }
     }
 
@@ -411,19 +464,18 @@ object A11yEventTap {
     }
 
     /**
-     * The event's text (else its content description), at most [MAX_TEXT] chars, masked whole
-     * when [secret] says the source is a password field (asked only when there is text). A
-     * masked field's own text is mostly dots already, but not the character just typed
-     * (PasswordTransformationMethod shows it briefly), and a visible-password field's is the
-     * plaintext. Nothing else of the event's text is read: not its beforeText (the text before
-     * a TEXT_CHANGED), and its added / removed counts are not recorded.
+     * The event's text (else its content description), at most [MAX_TEXT] chars; [fields]
+     * masks it whole when the source is a password field. A masked field's own text is mostly
+     * dots already, but not the character just typed (PasswordTransformationMethod shows it
+     * briefly), and a visible-password field's is the plaintext. Nothing else of the event's
+     * text is read: not its beforeText (the text before a TEXT_CHANGED), and its added /
+     * removed counts are not recorded.
      */
-    private fun textOf(event: AccessibilityEvent, secret: () -> Boolean): String? {
+    private fun textOf(event: AccessibilityEvent): String? {
         val joined = event.text?.filter { !it.isNullOrEmpty() }?.joinToString(" ")
         val s = if (!joined.isNullOrEmpty()) joined else event.contentDescription?.toString()
         if (s.isNullOrEmpty()) return null
-        val cut = if (s.length > MAX_TEXT) s.substring(0, MAX_TEXT) else s
-        return if (secret()) Redaction.mask(cut) else cut
+        return if (s.length > MAX_TEXT) s.substring(0, MAX_TEXT) else s
     }
 
     // ------------------------------------------------------------------ reading (any thread)

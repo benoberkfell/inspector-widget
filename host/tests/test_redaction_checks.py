@@ -153,19 +153,48 @@ def _src(name: str) -> str:
 def test_every_text_path_asks_the_one_compose_password_predicate():
     compose = _src("ComposeInspector.kt")
     # The semantics dump masks by it, and the a11y walk's index is filled by it.
-    assert "isPasswordNode(node))" in compose and \
+    assert "passwordState(node)" in compose and \
         "Redaction.redactComposeAttrs(attrs, ctx.secrets, password)" in compose, "semantics dump"
-    assert "passwords.add(id)" in compose, "semantics index"
+    assert "passwords.add(id)" in compose and "unverified.add(id)" in compose, "semantics index"
     a11y_kt = _src("AccessibilityInspector.kt")
-    assert "composePassword(ident, ctx)" in a11y_kt and ".passwords?.contains(" in a11y_kt
-    assert "ComposeInspector.isPasswordNode(view, " in a11y_kt, "lite snapshot"
-    assert "ComposeInspector.isPasswordNode(host, " in _src("A11yEventTap.kt"), "event tap"
+    assert "composePassword(view, ident.virtualId, ctx)" in a11y_kt and \
+        "index.passwordState(virtualId)" in a11y_kt
+    assert "ComposeInspector.passwordState(view, " in a11y_kt, "lite snapshot"
+    assert "ComposeInspector.passwordState(host, " in _src("A11yEventTap.kt"), "event tap"
     # The slot table and the modifier scan go by the same values.
     redaction = _src("Redaction.kt")
     for cls in ("androidx.compose.foundation.text.KeyboardOptions",
                 "androidx.compose.ui.text.input.ImeOptions",
                 "androidx.compose.ui.text.input.PasswordVisualTransformation"):
         assert f'"{cls}"' in redaction, cls
+
+
+def test_every_text_path_fails_closed():
+    """A source whose password status cannot be determined is UNKNOWN, never "not a password",
+    and every text path masks an editable UNKNOWN source (Redaction.mustMask)."""
+    compose = _src("ComposeInspector.kt")
+    a11y_kt = _src("AccessibilityInspector.kt")
+    tap = _src("A11yEventTap.kt")
+    # UNKNOWN: an unresolved source, an unreadable semantics tree, a text field without
+    # keyboard options the check recognises (R8 renamed them).
+    assert "val view = ident.view ?: return Redaction.PasswordState.UNKNOWN" in a11y_kt
+    assert "if (host == null) return Redaction.PasswordState.UNKNOWN" in tap
+    assert "if (node == null) Redaction.PasswordState.UNKNOWN else passwordState(node)" in compose
+    assert "return seen ?: Redaction.PasswordState.UNKNOWN" in compose
+    # ...masked where the source is editable.
+    assert "Redaction.mustMask(state, editable = true)" in compose, "semantics dump"
+    assert "Redaction.mustMask(state, isEditable(node))" in a11y_kt, "a11y tree and focus reader"
+    assert "state == Redaction.PasswordState.UNKNOWN && isEditableSource(" in tap, "event tap"
+    assert "Redaction.mustMaskView(view)" in _src("TreeBuilder.kt"), "View tree"
+    assert "Redaction.mustMaskView(view)" in _src("Properties.kt"), "properties"
+
+
+def test_the_redaction_tokens_the_host_surfaces_are_the_agents():
+    """inspect's summary.redaction picks the agent's tokens by prefix (correlate)."""
+    from inspector_widget import correlate
+    redaction = _src("Redaction.kt")
+    for token in correlate._REDACTION_TOKENS:
+        assert f'"; {token}: ' in redaction, token
 
 
 def test_a11yprobe_has_the_visible_password_secret_the_device_checks_grep_for():

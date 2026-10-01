@@ -411,8 +411,9 @@ class TreeBuilder(val strings: StringTable) {
      * Best-effort text for text-bearing views (framework/ViewExtensions.kt:37-40):
      * TextView.text.toString() paired with false, or null for other views. Guarded
      * because subclasses can throw from getText(). getText() of a password field is
-     * the plaintext (the dots are only a TransformationMethod), so for one
-     * ([Redaction.isPasswordView]) the text is masked and paired with true.
+     * the plaintext (the dots are only a TransformationMethod), so for one, or for an
+     * editable View whose password status cannot be read ([Redaction.mustMaskView]), the
+     * text is masked and paired with true.
      */
     private fun textValueOrNull(view: View): Pair<String, Boolean>? {
         if (view !is TextView) return null
@@ -424,7 +425,7 @@ class TreeBuilder(val strings: StringTable) {
                 null
             } ?: return null
         if (text.isEmpty()) return "" to false
-        return if (Redaction.isPasswordView(view)) {
+        return if (Redaction.mustMaskView(view)) {
             Redaction.mask(text) to true
         } else {
             text.toString() to false

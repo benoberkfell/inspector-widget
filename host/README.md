@@ -356,6 +356,14 @@ agent's diagnostics tokens that say a dump was cut or partly unreadable
 `slot_truncated: ...`, `compose_obfuscated`, `semantics_failed: ...`,
 `properties-changed=N`, ...), keyed by `view` / `compose` / `a11y`; a View
 node's facet carries its `flags` (`CHILDREN_TRUNCATED`, `TEXT_REDACTED`).
+Password redaction fails closed (CONTRACT.md §5): editable text whose password
+status the agent cannot determine (an R8-obfuscated Compose app, an unresolved
+source) goes out masked too, and `summary.redaction` (a dossier's `redaction`)
+carries the agent's `redaction_masked: ...` (which values, by node key) and
+`redaction_unverified: view#...` (the ComposeViews whose password fields cannot
+be identified) tokens, so dots in a field an agent expected to read are
+explained. The same tokens are in the `dump_accessibility` / `dump_compose`
+diagnostics and in those of a focus read (`Session.a11y_focus`, `a11y_act`).
 
 ### Session lifecycle (CLI and Python API)
 

@@ -63,9 +63,13 @@
  * ComposeView; the failures are counted in the diagnostics.
  *
  * PASSWORDS (Redaction.kt): a password field's EditableText / InputText go out masked. A node is
- * one by [isPasswordNode]: Password semantics, a password ContentType, or a text field whose
+ * one by [passwordState]: Password semantics, a password ContentType, or a text field whose
  * modifiers hold a password keyboard (a visible-password field has no Password semantics). The
- * a11y text ([SemanticsIndex.passwords]) and the event tap ask the same predicate.
+ * a11y text ([SemanticsIndex.passwordState]) and the event tap ask the same predicate. It FAILS
+ * CLOSED: a text field whose keyboard options cannot be found or read (R8 renamed them), or a
+ * node that cannot be read, is UNKNOWN, and its text goes out masked too (redaction_masked);
+ * a renamed AndroidComposeView, or one whose semantics are out of reach, is
+ * redaction_unverified.
  * The slot table is read in two passes per ComposeView: the first collects every password
  * field's text (a call with a PasswordVisualTransformation or a password keyboard, a
  * *SecureTextField, a Password semantics node's content, and the secret-named String
@@ -89,6 +93,10 @@
  *   slot_truncated: view#<acvId> depth>80 subtrees=N   (named-composable nesting; or raw>512)
  *   slot table empty (inspection_slot_table_set not populated) for N/M view(s)
  *   view#<acvId>[,view#<acvId>...] produced no compose nodes
+ *   redaction_unverified: view#<acvId>[,view#<acvId>...] (...)   (renamed, or no semantics:
+ *       password fields cannot be identified there; the a11y tree masks its editable text)
+ *   redaction_masked: N editable value(s) masked ...: compose:<acvId>:<id>, ...   (text fields
+ *       whose password status could not be determined, masked)
  */
 package com.oberkfell.viewspector.agent.payload
 
@@ -128,7 +136,7 @@ object ComposeInspector {
     private const val UNMERGED = "unmerged"
 
     /** Per-ComposeView counters and log throttling for one dump. */
-    private class WalkCtx {
+    private class WalkCtx(val acvId: Long, val redaction: Redaction.Unverified) {
         var semNodeFailures = 0
         var semValueFailures = 0
         var semTruncated = 0
@@ -186,11 +194,15 @@ object ComposeInspector {
         var renamedEmpty = 0
 
         val windows = ArrayList<ViewInspection.DumpComposeResponse.Window>()
+        val redaction = Redaction.Unverified()
         for (cv in composeViews) {
             val acvId = cv.uniqueDrawingId
             val renamed = isRenamed(cv)
-            if (renamed) renamedClasses.add(cv.javaClass.name)
-            val ctx = WalkCtx()
+            if (renamed) {
+                renamedClasses.add(cv.javaClass.name)
+                redaction.composeView(acvId)
+            }
+            val ctx = WalkCtx(acvId, redaction)
             // Window px -> screen px shift for everything Compose reports in window coordinates.
             val off = windowOriginOnScreen(cv)
             // Synthetic root: id = the AndroidComposeView's uniqueDrawingId (== Window.view_id).
@@ -218,7 +230,10 @@ object ComposeInspector {
                     ctx.log("semantics walk", t)
                     "error=${SafeString.errorName(t)}"
                 }
-                if (reason != null) tokens.add("semantics_failed: view#$acvId $reason")
+                if (reason != null) {
+                    tokens.add("semantics_failed: view#$acvId $reason")
+                    redaction.composeView(acvId)
+                }
                 if (ctx.semNodeFailures > 0 || ctx.semValueFailures > 0) {
                     tokens.add(
                         "semantics_partial: view#$acvId nodes_failed=${ctx.semNodeFailures} " +
@@ -295,6 +310,7 @@ object ComposeInspector {
         if (noNodes.isNotEmpty()) {
             diag.append("; view#${noNodes.joinToString(",view#")} produced no compose nodes")
         }
+        redaction.appendTo(diag)
         return windows to diag.toString()
     }
 
@@ -498,14 +514,25 @@ object ComposeInspector {
      * the node reserves in layout, including Modifier.minimumInteractiveComponentSize() padding,
      * unlike its a11y boundsInScreen, which Compose widens to the 48dp touch size for any clickable.
      * [passwords] holds the ids of unmerged SemanticsNodes that are password fields
-     * ([isPasswordNode]), whose a11y text is masked.
+     * ([passwordState]), [unverified] those whose status is UNKNOWN, and [indexed] every id
+     * the walk read: an id it did not reach is UNKNOWN too ([passwordState]).
      */
     internal class SemanticsIndex(
         val rootSemanticsId: Int,
         val traversalGroups: Set<Int>,
         val layoutSizes: Map<Int, Long>,
         val passwords: Set<Int>,
-    )
+        val unverified: Set<Int>,
+        val indexed: Set<Int>,
+    ) {
+        /** The password status of unmerged SemanticsNode [id] (an a11y virtual id). */
+        fun passwordState(id: Int): Redaction.PasswordState = when (id) {
+            in passwords -> Redaction.PasswordState.PASSWORD
+            in unverified -> Redaction.PasswordState.UNKNOWN
+            in indexed -> Redaction.PasswordState.NOT_PASSWORD
+            else -> Redaction.PasswordState.UNKNOWN
+        }
+    }
 
     internal fun packSize(w: Int, h: Int): Long = (w.toLong() shl 32) or (h.toLong() and 0xFFFFFFFFL)
 
@@ -522,8 +549,10 @@ object ComposeInspector {
             val groups = HashSet<Int>()
             val sizes = HashMap<Int, Long>()
             val passwords = HashSet<Int>()
-            collectUnmerged(root, groups, sizes, passwords, 0)
-            SemanticsIndex(rootId, groups, sizes, passwords)
+            val unverified = HashSet<Int>()
+            val indexed = HashSet<Int>()
+            collectUnmerged(root, groups, sizes, passwords, unverified, indexed, 0)
+            SemanticsIndex(rootId, groups, sizes, passwords, unverified, indexed)
         } catch (t: Throwable) {
             Log.w(TAG, "semantics index failed", t)
             null
@@ -537,15 +566,26 @@ object ComposeInspector {
         groups: MutableSet<Int>,
         sizes: MutableMap<Int, Long>,
         passwords: MutableSet<Int>,
+        unverified: MutableSet<Int>,
+        indexed: MutableSet<Int>,
         depth: Int,
     ) {
         if (depth > MAX_DEPTH) return
         val id = invoke(node, "getId") as? Int
         if (id != null) {
-            val entries = configEntries(node, INDEX_KEYS)
+            val entries = try {
+                configEntries(node, INDEX_KEYS)
+            } catch (_: Throwable) {
+                null
+            }
             // Compared as a Boolean: never through the app value's equals().
-            if ((entries["IsTraversalGroup"] as? Boolean) == true) groups.add(id)
-            if (passwordOf(node, entries)) passwords.add(id)
+            if ((entries?.get("IsTraversalGroup") as? Boolean) == true) groups.add(id)
+            when (stateOf(node, entries)) {
+                Redaction.PasswordState.PASSWORD -> passwords.add(id)
+                Redaction.PasswordState.UNKNOWN -> unverified.add(id)
+                Redaction.PasswordState.NOT_PASSWORD -> {}
+            }
+            indexed.add(id)
             // SemanticsNode.layoutInfo is the node's LayoutNode (public LayoutInfo width/height).
             val info = invoke(node, "getLayoutInfo")
             val w = intOf(info, "getWidth")
@@ -556,7 +596,7 @@ object ComposeInspector {
             // Per node: one bad subtree must not cost the index of the whole ComposeView.
             if (child != null) {
                 try {
-                    collectUnmerged(child, groups, sizes, passwords, depth + 1)
+                    collectUnmerged(child, groups, sizes, passwords, unverified, indexed, depth + 1)
                 } catch (t: Throwable) {
                     if (!indexFailureLogged) {
                         indexFailureLogged = true
@@ -568,12 +608,13 @@ object ComposeInspector {
     }
 
     /**
-     * The entries of [node]'s SemanticsConfiguration whose key is named in [keys], raw values.
-     * Key names are compared as Strings: never through an app value's equals().
+     * The entries of [node]'s SemanticsConfiguration whose key is named in [keys], raw values;
+     * null when the configuration cannot be read. Key names are compared as Strings: never
+     * through an app value's equals(). Throws when the iteration does.
      */
-    private fun configEntries(node: Any, keys: Set<String>): Map<String, Any?> {
-        val config = invoke(node, "getConfig") ?: return emptyMap()
-        val iter = invoke(config, "iterator") as? Iterator<*> ?: return emptyMap()
+    private fun configEntries(node: Any, keys: Set<String>): Map<String, Any?>? {
+        val config = invoke(node, "getConfig") ?: return null
+        val iter = invoke(config, "iterator") as? Iterator<*> ?: return null
         val out = HashMap<String, Any?>()
         var guard = 0
         while (guard++ < MAX_CONFIG_ENTRIES && iter.hasNext()) {
@@ -585,7 +626,7 @@ object ComposeInspector {
     }
 
     // ---------------------------------------------------------------- passwords
-    // The semantics keys [passwordOf] reads, and the index's (IsTraversalGroup) with them.
+    // The semantics keys [stateOf] reads, and the index's (IsTraversalGroup) with them.
     private val PASSWORD_KEYS = setOf("Password", "ContentType", "EditableText")
     private val INDEX_KEYS = PASSWORD_KEYS + "IsTraversalGroup"
 
@@ -595,50 +636,69 @@ object ComposeInspector {
      *  - Password semantics (a PasswordVisualTransformation, a *SecureTextField);
      *  - a ContentType whose autofill hints name a password (Redaction.isPasswordContentType);
      *  - for a text field (EditableText), a password keyboard or transformation held by a
-     *    modifier on its LayoutNode (Redaction.isComposePasswordModifier). A visible-password
+     *    modifier on its LayoutNode (Redaction.composePasswordModifier). A visible-password
      *    field (KeyboardOptions(keyboardType = Password) without PasswordVisualTransformation)
      *    has no Password semantics, and Compose sets no input type on its node, yet its text is
      *    the plaintext; its ImeOptions are what give it away.
+     * UNKNOWN (fail closed) when the node's configuration cannot be read, or it is a text field
+     * whose modifiers cannot be read or hold no keyboard options the check recognises: every
+     * Compose text field hands its ImeOptions or KeyboardOptions to a modifier, so finding none
+     * means R8 renamed them (or a Compose release moved them), not that there are none.
      * The semantics dump, the a11y tree ([SemanticsIndex.passwords]) and the event tap all ask
      * this, and the slot table goes by the same values (Redaction.isComposePasswordParam), so
      * every path masks the same fields. Never throws.
      */
-    internal fun isPasswordNode(node: Any): Boolean = try {
-        passwordOf(node, configEntries(node, PASSWORD_KEYS))
+    internal fun passwordState(node: Any): Redaction.PasswordState = try {
+        stateOf(node, configEntries(node, PASSWORD_KEYS))
     } catch (_: Throwable) {
-        false
+        Redaction.PasswordState.UNKNOWN
     }
 
     /**
-     * [isPasswordNode] for the unmerged SemanticsNode [semanticsId] of [composeView] (an
-     * accessibility virtual id), found by walking its semantics tree. False when not found.
-     * Main thread.
+     * [passwordState] for the unmerged SemanticsNode [semanticsId] of [composeView] (an
+     * accessibility virtual id), found by walking its semantics tree. UNKNOWN when the tree is
+     * out of reach (R8 renamed Compose) or the node is not in it. Main thread.
      */
-    internal fun isPasswordNode(composeView: View, semanticsId: Int): Boolean = try {
+    internal fun passwordState(composeView: View, semanticsId: Int): Redaction.PasswordState = try {
         val owner = invoke(composeView, "getSemanticsOwner")
         val root = invoke(owner, "getUnmergedRootSemanticsNode")
         val node = root?.let { findSemanticsNode(it, semanticsId, 0) }
-        node != null && isPasswordNode(node)
+        if (node == null) Redaction.PasswordState.UNKNOWN else passwordState(node)
     } catch (_: Throwable) {
-        false
+        Redaction.PasswordState.UNKNOWN
     }
 
-    private fun passwordOf(node: Any, entries: Map<String, Any?>): Boolean {
-        if (entries.containsKey("Password")) return true
-        if (Redaction.isPasswordContentType(entries["ContentType"])) return true
-        return entries.containsKey("EditableText") && hasPasswordModifier(node)
+    /** [passwordState] from [node]'s [entries] (null: its configuration is unreadable). */
+    private fun stateOf(node: Any, entries: Map<String, Any?>?): Redaction.PasswordState {
+        if (entries == null) return Redaction.PasswordState.UNKNOWN
+        if (entries.containsKey("Password")) return Redaction.PasswordState.PASSWORD
+        if (Redaction.isPasswordContentType(entries["ContentType"])) return Redaction.PasswordState.PASSWORD
+        if (!entries.containsKey("EditableText")) return Redaction.PasswordState.NOT_PASSWORD
+        return try {
+            modifierState(node)
+        } catch (_: Throwable) {
+            Redaction.PasswordState.UNKNOWN
+        }
     }
 
-    /** A password keyboard or transformation held by a modifier element of [node]'s LayoutNode. */
-    private fun hasPasswordModifier(node: Any): Boolean {
+    /**
+     * What the modifier elements of a text field [node]'s LayoutNode say
+     * (Redaction.composePasswordModifier); UNKNOWN when they cannot be read or none of them
+     * holds keyboard options.
+     */
+    private fun modifierState(node: Any): Redaction.PasswordState {
         // SemanticsNode.layoutInfo is its LayoutNode; LayoutInfo.getModifierInfo() lists the
         // node's modifier elements (what the slot table's modifier strings are read from).
-        val infos = invoke(invoke(node, "getLayoutInfo"), "getModifierInfo") as? List<*> ?: return false
+        val infos = invoke(invoke(node, "getLayoutInfo"), "getModifierInfo") as? List<*>
+            ?: return Redaction.PasswordState.UNKNOWN
+        var seen: Redaction.PasswordState? = null
         for (mi in infos) {
             val element = invoke(mi, "getModifier") ?: continue
-            if (Redaction.isComposePasswordModifier(element)) return true
+            val st = Redaction.composePasswordModifier(element) ?: continue
+            if (st == Redaction.PasswordState.PASSWORD) return st
+            seen = seen?.and(st) ?: st
         }
-        return false
+        return seen ?: Redaction.PasswordState.UNKNOWN
     }
 
     private fun findSemanticsNode(node: Any, id: Int, depth: Int): Any? {
@@ -711,9 +771,17 @@ object ComposeInspector {
             LinkedHashMap()
         }
         // A password field's content (Redaction.kt); its plaintext also masks the slot table.
-        // Only a node holding field content needs the full check ([isPasswordNode]).
-        val password = attrs.containsKey("Password") ||
-            ((attrs.containsKey("EditableText") || attrs.containsKey("InputText")) && isPasswordNode(node))
+        // Only a node holding field content needs the full check ([passwordState]); one whose
+        // status is UNKNOWN is masked too (fail closed: it is a text field) and listed.
+        val state = when {
+            attrs.containsKey("Password") -> Redaction.PasswordState.PASSWORD
+            attrs.containsKey("EditableText") || attrs.containsKey("InputText") -> passwordState(node)
+            else -> Redaction.PasswordState.NOT_PASSWORD
+        }
+        val password = Redaction.mustMask(state, editable = true)
+        if (state == Redaction.PasswordState.UNKNOWN) {
+            ctx.redaction.masked("compose:${ctx.acvId}:${b.id}")
+        }
         try {
             Redaction.redactComposeAttrs(attrs, ctx.secrets, password)
         } catch (t: Throwable) {

@@ -588,3 +588,31 @@ def test_inspect_carries_truncation_flags_and_diagnostics(monkeypatch):
 def test_a_complete_dump_has_no_incomplete_summary(fake_session):
     merged = correlate.inspect_tree(fake_session)
     assert "incomplete" not in merged["summary"]
+    assert "redaction" not in merged["summary"]
+
+
+def test_inspect_explains_text_masked_for_want_of_a_password_status(monkeypatch):
+    """The agent fails closed: editable text whose password status it could not determine
+    (an R8-obfuscated Compose app) goes out masked, and its diagnostics say so. The integrated
+    view and a node's dossier carry those tokens (summary.redaction), so the dots are explained."""
+    unverified = ("redaction_unverified: view#32 (Compose classes are renamed or unreadable: "
+                  "password fields cannot be identified, so editable text there is masked)")
+    masked = ("redaction_masked: 1 editable value(s) masked because their password status "
+              "could not be determined: compose:32:9")
+
+    def compose(s, diagnostics=None):
+        diagnostics["compose"] = ("found 4 AndroidComposeView(s); bounds=screen; " + unverified)
+        return mf.compose_windows()
+
+    monkeypatch.setattr(correlate, "_shaped_view_tree", lambda s, props, diagnostics=None: (
+        mf.view_roots(), {}))
+    monkeypatch.setattr(correlate, "_shaped_compose", compose)
+    monkeypatch.setattr(correlate, "_shaped_a11y_data", lambda s, rendering=False: dict(
+        a11y.a11y_to_dict(mf.a11y_response()),
+        diagnostics=f"roots=1; api=36; ids=host-key; nodes=12; {unverified}; {masked}"))
+    merged = correlate.inspect_tree(_FakeSession())
+    assert merged["summary"]["redaction"] == {"compose": [unverified], "a11y": [unverified, masked]}
+    assert "incomplete" not in merged["summary"]
+    d = correlate.inspect_node(_FakeSession(), node_key="view:11", include_image=False,
+                               lint_fn=lambda roots, density: [])
+    assert d["redaction"] == merged["summary"]["redaction"]

@@ -32,6 +32,21 @@ android {
             isDebuggable = true
             isMinifyEnabled = false
         }
+        // An R8-shrunk and OBFUSCATED build that stays debuggable, so the agent can attach to
+        // what a release app looks like: Compose's classes renamed (the agent reports
+        // compose_obfuscated and redaction_unverified, and must still never send a password).
+        // Not debuggable to Gradle (a debuggable variant runs R8 in debug mode, which keeps the
+        // names); src/r8/AndroidManifest.xml sets android:debuggable instead. Installs as
+        // com.oberkfell.a11yprobe.r8 next to the debug build:
+        //   scripts/install-a11yprobe.sh <serial> --r8
+        create("r8") {
+            initWith(getByName("release"))
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            applicationIdSuffix = ".r8"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += "release"
+        }
     }
 
     buildFeatures {
