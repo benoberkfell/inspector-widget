@@ -26,7 +26,8 @@ Non-stops (:func:`why_not`)
     ``silent_container`` (focusable, but only its focusable children speak: they are the stops),
     ``merged_into:<key>`` (read as part of that focusable ancestor), ``no_speech``,
     ``web_part`` (web content the WebView reads as part of an element, or a container with
-    nothing to say).
+    nothing to say). ``web_hidden`` content (its WebView is not visible) is no stop for
+    shouldFocusNode, yet a walk that enters the WebView reads it (why_stop: ``web``).
 
 Edges (the ``via`` of a :func:`~.order.simulate` step)
     ``tree``, ``bounds_swap``, ``chain``, ``before:<key>``, ``before_of:<key>``,
@@ -61,6 +62,8 @@ EDGE_CODES = ("tree", "bounds_swap", "chain", "before", "before_of", "after", "w
 def why_stop(rules: Rules, n: TbNode) -> Optional[str]:
     """The reason code of a stop, or None when ``n`` is not one."""
     ok, branch = rules.focus_decision(n)
+    if branch == "web_hidden":
+        return "web"  # the WebView reads it all the same once TalkBack is in (order.Navigator)
     if not ok:
         return None
     if branch in ("web", "pip", "text_orphan"):

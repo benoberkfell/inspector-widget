@@ -401,9 +401,13 @@ def test_an_edit_box_reached_by_keyboard_says_editing():
     assert S.announce(nav, node, transitions=False).text == "Every 15 minutes. Edit box. read only"
     assert S.announce(nav, node, transitions=False, keyboard=True).text == \
         "Editing. Every 15 minutes. Edit box. read only"
+    # Input focus alone is not enough: TalkBack needs a keyboard up too, which a dump cannot
+    # show (EditTextDescription: isFocused() && isKeyBoardActive()).
     box["flags"] = list(box["flags"]) + ["focused", "editable"]
     tree = tb.build([root(box)])
-    assert S.announce(tb.Navigator(tree), tree.node("view:2"), transitions=False).text == \
+    nav, node = tb.Navigator(tree), tree.node("view:2")
+    assert S.announce(nav, node, transitions=False).text == "Every 15 minutes. Edit box"
+    assert S.announce(nav, node, transitions=False, keyboard=True).text == \
         "Editing. Every 15 minutes. Edit box"
 
 

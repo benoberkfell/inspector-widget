@@ -281,10 +281,11 @@ class _Composer:
 
     def editing(self, n: TbNode) -> bool:
         """node.isFocused() && isKeyBoardActive(): the edit box has input focus and a keyboard
-        is up. With a hardware keyboard (a key-driven walk) TalkBack 17 says it for every edit
-        box it focuses, so ``keyboard`` stands for both."""
-        return n is self.focused and (n.has("focused") or (
-            self.keyboard and (n.has("focusable") or n.has("editable"))))
+        is up. The dump cannot tell whether a keyboard is up, so this needs ``keyboard``; with
+        a hardware keyboard (a key-driven walk) TalkBack 17 says it for every edit box it
+        focuses, input-focused or not."""
+        return n is self.focused and self.keyboard and (
+            n.has("focused") or n.has("focusable") or n.has("editable"))
 
     def _is_pager_page(self, n: TbNode) -> bool:
         p = n.parent

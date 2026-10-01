@@ -475,8 +475,9 @@ class Rules:
     def focus_decision(self, n: TbNode, check_children: bool = True) -> Tuple[bool, str]:
         """shouldFocusNode with the branch that decided it:
 
-        ``web`` (a WebView's root or an element its WebView moves focus to), ``web_part`` (web
-        content read as part of an element, or a container with nothing to say),
+        ``web`` (a WebView's root or an element its WebView moves focus to), ``web_hidden``
+        (web content whose WebView is not visible), ``web_part`` (web content read as part of
+        an element, or a container with nothing to say),
         ``not_visible``, ``window_wrapper`` (bounds equal to the window's, has children, neither
         focusable nor clickable), ``leaf`` (accessibility-focusable with no
         children: always focused, the unlabeled-button path), ``speaking`` (focusable with
@@ -496,18 +497,18 @@ class Rules:
 
     def _focus_decision(self, n: TbNode, check_children: bool) -> Tuple[bool, str]:
         if self.supports_web_actions(n):
-            # Inside a WebView, the WebView picks the stops (see web_elements); the root is
-            # reached through nodeFilterOrWebView, with no visibility check.
+            # shouldFocusNode (:848): web content is focused if its WebView container is
+            # visible. (Linear navigation reaches a WebView's root through nodeFilterOrWebView,
+            # with no visibility check, and the WebView then moves through its own elements:
+            # see order.Navigator and web_elements.)
             root = self.web_root_of(n)
-            if root is None:  # HTML actions outside any WebView: 16.2's container check
-                return n.visible, "web"
-            if n is root:
-                return self.is_web_root(n), "web"
-            if not self.is_web_element(n) or any(
+            container = self.web_container_of(n)
+            visible = container.visible if container is not None else n.visible
+            if root is not None and n is not root and (not self.is_web_element(n) or any(
                     self.is_web_element(a) for a in n.ancestors() if a is not root
-                    and root in a.ancestors()):
+                    and root in a.ancestors())):
                 return False, "web_part"
-            return True, "web"
+            return visible, ("web" if visible else "web_hidden")
         if not self.is_visible(n):
             return False, "not_visible"
         if self.are_bounds_identical_to_window(n) and n.children \
@@ -550,6 +551,28 @@ class Rules:
         if not self.supports_web_actions(n):
             return None
         return next((a for a in [n, *n.ancestors()] if self.role(a) == ROLE_WEB_VIEW), None)
+
+    def web_container_of(self, n: Optional[TbNode]) -> Optional[TbNode]:
+        """WebInterfaceUtils.ascendToWebViewContainer (UT/WebInterfaceUtils.java:335): the
+        self-or-ancestor with Role WEB_VIEW whose parent's is not. In the agent's dump that is
+        the WebView View, which holds Chromium's root (also Role WEB_VIEW)."""
+        if not self.supports_web_actions(n):
+            return None
+        for a in [n, *n.ancestors()]:
+            if self.role(a) == ROLE_WEB_VIEW and self.role(a.parent) != ROLE_WEB_VIEW:
+                return a
+        return None
+
+    def outer_web_root(self, n: Optional[TbNode]) -> Optional[TbNode]:
+        """The outermost web root around ``n``: the page an inner WebView-role node (a frame)
+        belongs to, whose elements the WebView walks through in one document order."""
+        root = self.web_root_of(n)
+        if root is None:
+            return None
+        for a in root.ancestors():
+            if self.is_web_root(a):
+                root = a
+        return root
 
     def is_web_element(self, n: TbNode) -> bool:
         """An element ACTION_NEXT_HTML_ELEMENT moves to (Chromium decides; this is the

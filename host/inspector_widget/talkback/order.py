@@ -575,6 +575,11 @@ class Navigator:
             out["autoscroll"] = self.autoscroll_container(pivot, forward, trav)
         self._search(pivot, forward, granularity, out, win, trav)
         t = out["target"]
+        if t is not None and forward and self.rules.is_web_root(t) and self.traps(t):
+            # Whichever path led here (the native search, a fallback out of another WebView,
+            # the wrap, another window), TalkBack cannot focus this root: focus stays put.
+            out.update(stuck=t, target=None, via="stuck", reach_edge=reach_edge)
+            return out
         if t is not None and not self.rules.supports_web_actions(t):
             # "scrollAfterFindTarget returns due to web element" (:1299).
             out["show_on_screen"] = self.show_on_screen_container(
@@ -588,7 +593,7 @@ class Navigator:
     def _html_target(self, pivot: TbNode, forward: bool) -> Optional[TbNode]:
         """navigateToHtmlTarget: the element the WebView moves to from ``pivot``, or None when
         it reports none (the end of the page that way)."""
-        root = self.rules.web_root_of(pivot)
+        root = self.rules.outer_web_root(pivot)
         if root is None:
             return None
         elems = self.rules.web_elements(root)
@@ -629,16 +634,27 @@ class Navigator:
         if target is not None:
             out["via"] = "web"
             return target
-        root = self.rules.web_root_of(pivot) or pivot
+        root = self._anchor(self.rules.outer_web_root(pivot) or pivot, trav)
         target, out["duplicate"] = search_focus(trav, root, forward, accept)
         return target
+
+    @staticmethod
+    def _anchor(n: TbNode, trav: Traversal) -> TbNode:
+        """Where a search from ``n`` starts: ``n`` when the traversal holds it, else its nearest
+        ancestor that it does (web content stays out of the traversal tree; its WebView's root
+        is in it)."""
+        a: Optional[TbNode] = n
+        while a is not None and id(a) not in trav.map:
+            a = a.parent
+        return a if a is not None else n
 
     def _from_web(self, pivot: TbNode, forward: bool, accept: Callable[[TbNode], bool],
                   trav: Traversal, out: Dict[str, Any]) -> Optional[TbNode]:
         """findTargetFromWebElement (:1502): going back from the root, the native node before
         it; otherwise :meth:`_html_or_fallback`."""
         if not forward and self.rules.role(pivot) == ROLE_WEB_VIEW:
-            target, out["duplicate"] = search_focus(trav, pivot, forward, accept)
+            target, out["duplicate"] = search_focus(trav, self._anchor(pivot, trav), forward,
+                                                    accept)
             return target
         return self._html_or_fallback(pivot, forward, accept, trav, out)
 
@@ -646,14 +662,9 @@ class Navigator:
                      accept: Callable[[TbNode], bool], trav: Traversal,
                      out: Dict[str, Any]) -> Optional[TbNode]:
         """findTargetFromMiddlePivot (:1459): a native node is the target; a WebView's root is
-        the target going forward (unless it :meth:`traps`: focus stays put), and going back its
-        last element."""
-        if middle is None or not self.rules.is_web_root(middle):
-            return middle
-        if forward:
-            if self.traps(middle):
-                out["stuck"] = middle
-                return None
+        the target going forward (:meth:`step` checks it :meth:`traps`), and going back its last
+        element."""
+        if middle is None or not self.rules.is_web_root(middle) or forward:
             return middle
         return self._html_or_fallback(middle, forward, accept, trav, out)
 
@@ -668,12 +679,11 @@ class Navigator:
         if web and self.rules.supports_web_actions(pivot):
             target = self._from_web(pivot, forward, accept, trav, out)
         else:
-            # findTargetFromNativeElement (:1351): "returns WebView if find it first".
-            middle, out["duplicate"] = search_focus(trav, pivot, forward, accept_or_web)
+            # findTargetFromNativeElement (:1351): "returns WebView if find it first". (From
+            # web content at another granularity, the search starts at its WebView's root.)
+            middle, out["duplicate"] = search_focus(trav, self._anchor(pivot, trav), forward,
+                                                    accept_or_web)
             target = self._from_middle(middle, forward, accept, trav, out) if web else middle
-        if out["stuck"] is not None:
-            out["via"] = "stuck"
-            return
         if target is not None:
             if out["via"] != "web":
                 out["via"] = trav.via(target)
@@ -697,9 +707,6 @@ class Navigator:
         if out["reach_edge"]:
             middle = find_first_focus_in_tree(trav, win.root, forward, accept_or_web)
             target = self._from_middle(middle, forward, accept, trav, out) if web else middle
-            if out["stuck"] is not None:
-                out["via"] = "stuck"
-                return
             if target is not None:
                 out.update(target=target, via="wrap", reach_edge=False)
                 return
@@ -1174,7 +1181,7 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
             step["hidden_page"] = True
             if id(target) not in hinted:
                 hinted.add(id(target))
-                hints.append(web_hidden_page(nav.rules, target, pivot, False))
+                hints.append(web_hidden_page(nav.rules, target, pivot, nav.traps(target)))
         if res["show_on_screen"] is not None:
             step["show_on_screen"] = res["show_on_screen"].key
             if any(g.startswith("clipped:") for g in ghost_reasons(nav.rules, target)):
@@ -1211,7 +1218,10 @@ def reading_order(roots: Any, include_structural: bool = False,
     several windows)], "diagnostics": [...], "_nodes": [the dump dicts]}``; with
     ``include_structural`` the non-stops TalkBack walks over are listed too (``order`` None,
     ``is_focus_stop`` False). Windows come in TalkBack's geometric order; a WebView's elements
-    follow its root. ``keyboard``: speak as for a key-driven walk (:func:`.speech.announce`).
+    follow its root. A WebView on an off-screen page adds a ``web_hidden_page`` diagnostic; one
+    TalkBack cannot focus marks its root ``"web_trap"`` and the entries after it in its window
+    ``"unreachable": "web_trap"``. ``keyboard``: speak as for a key-driven walk
+    (:func:`.speech.announce`).
     """
     from .speech import SpeechState, announce
 
@@ -1231,6 +1241,7 @@ def reading_order(roots: Any, include_structural: bool = False,
     for w in nav.windows:
         if not nav.accepts_window(w):
             continue
+        trapped = False
         for n, stop in nav.window_order(w):
             if not stop and not include_structural:
                 continue
@@ -1252,11 +1263,17 @@ def reading_order(roots: Any, include_structural: bool = False,
                 entry["is_focus_stop"] = stop
             if multi:
                 entry["window"] = window_pos.get(w.index, 0)
+            if trapped:
+                entry["unreachable"] = "web_trap"  # focus never gets past the trapping WebView
+            elif nav.rules.is_web_root(n) and nav.traps(n):
+                entry["web_trap"] = True
+                trapped = True
             entries.append(entry)
             nodes.append(n.raw)
     diags = list(tb.diagnostics)
     for t in nav._trav.values():
         diags.extend(t.diagnostics)
+    diags.extend(nav.hidden_web_pages())
     covered = [w for w in tb.windows if w.root is not None and not w.reported]
     if covered:
         diags.append({"kind": "unreachable_windows",

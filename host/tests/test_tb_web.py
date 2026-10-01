@@ -279,3 +279,65 @@ def test_v13_static_walk_reports_the_hidden_page():
     good = pb.DumpA11yResponse()
     good.ParseFromString(gzip.decompress((WALKS / "tb_v13-good-walk.a11y.pb.gz").read_bytes()))
     assert "tb.ghost_stop" not in {f["code"] for f in tbwalk.static_walk(good)["findings"]}
+
+
+
+# ------------------------------------------------------------------ review: the edge cases
+def test_shoulds_focus_a_hidden_pages_web_content_only_through_its_webview():
+    # shouldFocusNode (UT/AccessibilityNodeInfoUtils.java:848): web content is focusable if its
+    # WebView container (the WebView View) is visible. So the plain filter, and with it the
+    # initial focus, never picks the root of an off-screen page; only linear navigation's
+    # nodeFilterOrWebView walks in.
+    tree = tb.build(player_with_notes_page(root_on_screen=False))
+    rules = R.Rules(tree)
+    assert rules.focus_decision(tree.node("virtual:40:4")) == (False, "web_hidden")
+    assert tb.Navigator(tree).initial_focus()["key"] != "virtual:40:4"
+    on_screen = tb.build(message_screen())
+    assert R.Rules(on_screen).focus_decision(on_screen.node("virtual:30:4")) == (True, "web")
+
+
+def test_a_trapping_webview_reached_from_another_webview_still_traps():
+    # Leaving WebView A falls back to the native search, which must not walk into a trapping
+    # WebView B either.
+    first = webview(50, web(50, 5, cls="android.widget.TextView", text="Mail body",
+                            b=(0, 400, 1080, 60)), b=(0, 380, 1080, 120))
+    screen = player_with_notes_page()
+    screen[0]["children"].insert(0, first)
+    walk = tb.simulate(tb.build(screen))
+    assert walk.ended == "trap" and walk.steps[-1]["web_root"] == "virtual:40:4"
+
+
+def test_reading_order_marks_a_trapping_webview_and_what_it_cuts_off():
+    ro = tb.reading_order(tb.build(player_with_notes_page()))
+    by_key = {e["key"]: e for e in ro["focus_order"]}
+    assert by_key["virtual:40:4"]["web_trap"] is True
+    assert by_key["view:41"]["unreachable"] == "web_trap"
+    assert "unreachable" not in by_key["view:37"]
+    assert any(d["kind"] == "web_hidden_page" and d["trap"] for d in ro["diagnostics"])
+
+
+def test_heading_navigation_from_web_content_leaves_from_its_webview():
+    # findTargetFromWebElement -> the fallback searches from the WebView's root, not from the
+    # web element (which is not in TalkBack's traversal tree).
+    def heading(host, text, y):
+        return n(host, cls="android.widget.TextView", text=text, flags=VIS + ("heading",),
+                 b=(0, y, 1080, 100))
+    page = webview(30, web(30, 7, cls="android.widget.TextView", text="Paragraph",
+                           b=(0, 620, 1000, 50)))
+    tree = tb.build([root(heading(10, "Native H1", 300), page, heading(11, "Native H2", 1500))])
+    walk = tb.simulate(tree, start="virtual:30:7", granularity="heading", until="steps",
+                       max_steps=1)
+    assert walk.keys() == ["view:11"]
+
+
+def test_a_frame_inside_a_page_does_not_end_the_walk():
+    # An inner WebView-role node (a frame): its elements and the outer page's later ones are
+    # one document, then the walk leaves the outer WebView.
+    inner = web(31, 20, cls=WEBVIEW, b=(0, 700, 1080, 100), children=[
+        web(31, 21, cls="android.widget.TextView", text="In the frame", b=(0, 700, 1080, 50))])
+    page = webview(31, web(31, 10, cls="android.widget.TextView", text="Before", b=(0, 620, 1080, 50)),
+                   inner,
+                   web(31, 30, cls="android.widget.TextView", text="After", b=(0, 820, 1080, 50)))
+    walk = tb.simulate(tb.build([root(page, button(11, "Next", 1500))]))
+    assert walk.keys()[:-1] == ["virtual:31:4", "virtual:31:10", "virtual:31:21", "virtual:31:30",
+                                "view:11"]
