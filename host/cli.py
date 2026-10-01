@@ -496,7 +496,10 @@ def cmd_component_image(args) -> int:
         else:
             print(f"error: {img.get('error', 'component image failed')}", file=sys.stderr)
             return 1
-        return _emit_result(args, "component_image", img, dest="-")
+        # The MCP component_image document: the image under its target and node key.
+        return _emit_result(args, "component_image", img,
+                            results.with_target(img, args.serial, args.package,
+                                                node_key=node.get("node_key")), dest="-")
 
 
 def cmd_screenshot(args) -> int:

@@ -234,3 +234,17 @@ def test_dump_tree_reports_what_the_agent_cut_on_both_surfaces(tmp_path, monkeyp
         assert "CHILDREN_TRUNCATED" in doc["roots"][0]["flags"]
     _same_bytes(mcp[0][0], cli_out[0][0])  # brief: the same bytes
     assert json.loads(cli_out[1][0])["diagnostics"] == diag  # full: the CLI's own document
+
+
+@pytest.mark.skipif(__import__("importlib").util.find_spec("PIL") is None,
+                    reason="Pillow not installed")
+def test_component_image_is_the_same_document(tmp_path):
+    """component-image always prints JSON: the MCP component_image document
+    (with serial, package and node_key), only the PNG's path differs."""
+    cases = [("component_image", {"view_id": 1004}, ["component-image", "--view-id", "1004"])]
+    [(text, is_error)] = _run_mcp("default", str(tmp_path / "m"), cases)
+    [(cli_text, rc)] = _run_cli("default", str(tmp_path / "c"), cases, extra=())
+    assert not is_error and rc == 0
+    mcp_doc, cli_doc = json.loads(text), json.loads(cli_text)
+    assert mcp_doc.pop("path") and cli_doc.pop("path")
+    assert cli_doc == mcp_doc and mcp_doc["node_key"] == "view:1004"

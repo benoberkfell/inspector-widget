@@ -98,6 +98,9 @@ LEGACY_DELTAS: dict[tuple[str, str], str] = {
     ("mcp", "dump_compose"): _NO_COMPOSE,
     ("cli", "compose"): _NO_COMPOSE,
     ("cli", "compose_text"): _NO_COMPOSE,
+    ("cli", "component_image"): "component-image prints the MCP component_image document "
+                                "(serial, package and node_key added), as the other "
+                                "always-JSON subcommands do",
 }
 
 
