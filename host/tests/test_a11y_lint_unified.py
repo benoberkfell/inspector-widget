@@ -791,8 +791,8 @@ def test_rule_aliases_and_atf_names_resolve():
     assert L.resolve_rule_ids("R13,R14") == {"a11y.clickable.duplicate_bounds",
                                              "a11y.editable.content_description"}
     assert L.resolve_rule_ids(None) is None and L.resolve_rule_ids([]) is None
-    assert len(L.ALL_RULE_IDS) == 18
-    assert set(L.RULE_CHOICES) >= set(L.ALL_RULE_IDS) | {f"R{i}" for i in range(1, 19)}
+    assert len(L.ALL_RULE_IDS) == 23  # R19..R23: the real-app hunt's (lint-and-store)
+    assert set(L.RULE_CHOICES) >= set(L.ALL_RULE_IDS) | {f"R{i}" for i in range(1, 24)}
 
 
 def test_unknown_rule_id_raises_a_clear_error():

@@ -1,6 +1,6 @@
 # Inspector Widget — a11y lint rule reference
 
-The `a11y_lint` MCP tool (and the `a11y-lint` CLI subcommand) run rules R1..R18
+The `a11y_lint` MCP tool (and the `a11y-lint` CLI subcommand) run rules R1..R23
 over the app's **unified accessibility tree**: every node TalkBack sees, classic
 Views and Compose alike, in one pass. RecyclerView cells that are ComposeViews,
 AndroidViews inside Compose, Fragments, dialogs and popups (each window is
@@ -281,20 +281,46 @@ description on another; both are folded into the node.
 - **Severity:** `warn`.
 - **Fix:** at least 12sp (14–16sp for body text).
 
+### R22 `a11y.state.label_contradicts` — a toggle's label names the action
+- **Flags:** a checkable control (or a Checkbox/Switch) whose name is an undo action:
+  "Un…" on bookmark, follow, favorite, like, star, pin, mute, subscribe, save and the
+  like, or "Remove (from) bookmarks/favorites/star". Checked, TalkBack says "Checked.
+  Unbookmark", which reads as the opposite of what is on; not checked, the two contradict
+  outright; either way the label flips with the state (Now in Android's bookmark and
+  follow toggles, NIA-10).
+- **Severity:** `warn`.
+- **Fix:** one stable label that names the item ("Bookmark <title>") on the toggleable,
+  so the checked state says on or off; or a plain button (not checkable) whose label
+  names the action.
+- **Evidence:** `said` ("checked" / "not checked"), `undo` (the action word), `role`.
+
 ---
 
 ## Cross-node / structural rules
 
-### R9 `a11y.heading.structure` — headings missing / empty / duplicated
+### R9 `a11y.heading.structure` — section titles, headings missing / empty / duplicated
 - **Flags (per window):**
+  - A section title that is not a heading (`reason: section_title`): a short,
+    text-only stop (1-5 words, no sentence ending, no icon) not marked heading,
+    followed in the reading order by two or more stacked, wide controls (actionable
+    or checkable rows) taller than it, in a window with two or more such titles
+    (sections, not one caption over a list). → `warn` when the title is itself a list
+    item (it is counted in the positions TalkBack reads: Thunderbird's settings,
+    "Accounts. 2 of 11", TB-11), else `info` (Now in Android's Settings dialog:
+    "Theme", "Use Dynamic Color", "Dark mode preference"). Evidence: `rows` (below
+    it), `list_item`, `position`.
   - A long screen with no heading. → `info`. "Long" means more than 12 text
     stops, or at least 8 with a scrollable container that can scroll. Text stops
-    are the reading order's, so the texts inside a (focusable) ScrollView or
-    RecyclerView count.
+    are the reading order's, counted by what they read: a merged Compose row or a
+    View row whose text is in its children counts. A list of three or more items
+    counts once (a long inbox or feed is a long list, not a long page); a small
+    group (a RadioGroup) counts item by item. Not reported when the window has
+    section titles: those findings say where the headings go.
   - A heading with no label. → `warn`.
   - Duplicate adjacent headings. → `info`.
 - **Fix:** Compose `Modifier.semantics { heading() }`; View
-  `android:accessibilityHeading="true"`.
+  `android:accessibilityHeading="true"` (`ViewCompat.setAccessibilityHeading`); a
+  header item in a RecyclerView should not be clickable.
 
 ### R10 `a11y.grouping.missing` — related text read as separate stops
 - **Flags:** a non-focusable container with short, one- or two-line text leaves
@@ -330,6 +356,57 @@ description on another; both are folded into the node.
     reading order becomes undefined.
   - A link to a node that is not in the tree. → `info`.
 - **Fix:** remove one constraint in the cycle; point links at nodes that exist.
+
+### R19 `a11y.label.placeholder_token` — a placeholder read aloud
+- **Flags:** a visible node whose text or contentDescription holds a placeholder:
+  a bracketed identifier (`[attachment_icon]`, `[conversationCounter]`; Compose inline
+  content's `alternateText`, Thunderbird's message rows, TB-7), a resource reference
+  (`@string/x`, `R.string.x`), an unfilled format argument (`%s`, `%1$d`), a template
+  placeholder (`{{name}}`, `${name}`), or a whole contentDescription that is a
+  resource name (`ic_star_border`, `send_button`). A bracketed word (`[Draft]`), an
+  e-mail address or a user name is not one.
+- **Severity:** `warn`, one finding per token per window, on the first stop that reads
+  it, with `rows` (how many rows or stops read it).
+- **Fix:** give inline content a localized `alternateText`
+  (`appendInlineContent(id, alternateText = stringResource(...))`), clear decorative
+  inline content from semantics, or give the row a contentDescription; resolve string
+  resources and format arguments before they are set.
+
+### R20 `a11y.label.shared_prefix` — the same child description first in most rows
+- **Flags:** a list (three or more items) in which 60% or more of the rows start with
+  the same contentDescription of a child that shows no text (an icon): TalkBack reads
+  it first on every swipe, before what tells the rows apart (Thunderbird's settings:
+  every row with the icon starts "Account settings", TB-11). A shared leading *text*
+  is visible content and is not flagged.
+- **Severity:** `warn`, one finding per list, on its first such row.
+- **Fix:** mark the icon decorative: View `android:importantForAccessibility="no"` or
+  `contentDescription="@null"`; Compose `contentDescription = null`.
+- **Evidence:** `prefix`, `child` and `child_class` (the icon), `rows`, `of`.
+
+### R21 `a11y.label.decorative_merged` — a decorative description in every row
+- **Flags:** the same contentDescription of a text-less child merged into 60% or more
+  of a list's rows (three or more), not first (that is R20), and decorative: another
+  control of the row already says it (Thunderbird's View rows end "Star" while each
+  row's own star button says "Add star", TB-12), or it only names a picture (it ends
+  in icon, image, arrow, chevron, ...). A description that changes from row to row is
+  content.
+- **Severity:** `info`.
+- **Fix:** `importantForAccessibility="no"` (Compose `contentDescription = null`) on the
+  decorative child; the state belongs on the control that changes it.
+- **Evidence:** `merged`, `child`, `rows`, `of`, `twin_label` (what the row's own
+  control says).
+
+### R23 `a11y.state.uniform_unselected` — every item says "Not selected"
+- **Flags:** a list of five or more items in which every item exposes a selection
+  state (Compose `selected`, read "Not selected") and none is selected, while each
+  item holds a control of its own named apart from the row, so the row's activation
+  is something else and its state never changes (Now in Android's Interests: every
+  row says "Not selected", NIA-9). An onboarding grid whose rows toggle the same
+  thing as their own checkbox is not flagged.
+- **Severity:** `info`, one finding per list.
+- **Fix:** set `selected` only where a selection is shown (`if (highlight) selected =
+  isSelected`); View: `setSelected(true)` on the current item only.
+- **Evidence:** `state`, `rows` (on screen), `row_count`, `inner_label`.
 
 ---
 

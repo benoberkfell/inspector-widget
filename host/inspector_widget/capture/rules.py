@@ -18,7 +18,7 @@ A rule has:
 * ``sev``: the default (worst) severity. A single issue may be milder; the issue's
   own ``sev`` wins.
 * ``msg`` and ``fix``: one line each.
-* ``alias``: ``R1``..``R18`` for the accessibility rules (the numbering of
+* ``alias``: ``R1``..``R23`` for the accessibility rules (the numbering of
   ``skill/inspector-widget-a11y/rules.md``), and ``atf``: the Accessibility Test
   Framework check name where one exists.
 * ``planned``: the rule id is reserved but nothing produces it yet.
@@ -107,7 +107,8 @@ def _unique_shorts(rules: tuple[Rule, ...]) -> tuple[Rule, ...]:
 
 
 _CATALOG: tuple[Rule, ...] = (
-    # Accessibility lint, R1..R12 (inspector_widget.a11y_lint), R13..R18 (the unified lint).
+    # Accessibility lint, R1..R12 (inspector_widget.a11y_lint), R13..R18 (the unified lint),
+    # R19..R23 (below).
     _r("a11y.label.missing", "error",
        "Actionable node has no accessible name; TalkBack reads only its role.",
        "Add visible text or Modifier.semantics { contentDescription = \"…\" }",
@@ -129,8 +130,10 @@ _CATALOG: tuple[Rule, ...] = (
        "Modifier.toggleable(…) or stateDescription", "R7"),
     _r("a11y.node.empty_focusable", "warn", "Takes focus but announces nothing.",
        "Give it a label, or clearAndSetSemantics {} to remove it", "R8"),
-    _r("a11y.heading.structure", "warn", "Headings missing, empty or duplicated.",
-       "Modifier.semantics { heading() } on section titles", "R9"),
+    _r("a11y.heading.structure", "warn",
+       "Section titles that are not headings, or headings missing, empty or duplicated.",
+       "Modifier.semantics { heading() } (View: accessibilityHeading) on section titles",
+       "R9"),
     _r("a11y.grouping.missing", "info", "Related text reads as separate focus stops.",
        "Modifier.semantics(mergeDescendants = true) {} on the row", "R10"),
     _r("a11y.text.fixed_scaling", "warn", "Text size ignores the user's font scale.",
@@ -149,6 +152,26 @@ _CATALOG: tuple[Rule, ...] = (
        "Fix traversalBefore/After or isTraversalGroup", "R17", "TraversalOrder"),
     _r("a11y.text.too_small", "warn", "Text renders below 12sp.",
        "Use at least 12sp", "R18"),
+    # R19..R23: what the real-app TalkBack hunt heard wrong (docs/realapp-findings.md).
+    _r("a11y.label.placeholder_token", "warn",
+       "TalkBack reads a placeholder or resource name aloud (e.g. \"[attachment_icon]\").",
+       "Localized alternateText for inline content; resolve resources and format args",
+       "R19"),
+    _r("a11y.label.shared_prefix", "warn",
+       "Most items of a list start with the same child description, read on every swipe.",
+       "Mark the child decorative: importantForAccessibility=no / contentDescription = null",
+       "R20"),
+    _r("a11y.label.decorative_merged", "info",
+       "A decorative child's description is merged into every row (e.g. \"..., Star\").",
+       "importantForAccessibility=no / contentDescription = null on the decorative child",
+       "R21"),
+    _r("a11y.state.label_contradicts", "warn",
+       "A toggle's label names the action, so it contradicts its state (e.g. \"checked, "
+       "Unbookmark\").",
+       "One stable label that names the item; let the checked state say on or off", "R22"),
+    _r("a11y.state.uniform_unselected", "info",
+       "Every item of a list says \"Not selected\" and none ever is.",
+       "Set selected only where a selection is shown", "R23"),
     # Render signals (capture/analyzers.py).
     _r("render.clipped", "warn", "Only part of the node is visible.",
        "Scroll it into view, or give the parent room (height, maxLines)"),

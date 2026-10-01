@@ -88,7 +88,8 @@ PER_RULE = 3
 #: bump when the cached lint shape or its input changes (derived/lint.<hash>.json);
 #: 2: the unified a11y tree replaced Compose semantics as the lint input
 #: 3: evidence ``covered_by`` (a finding under an open dialog) and R12's ``name``
-LINT_CACHE_VERSION = 3
+#: 4: R19..R23, R9's section titles, R2 on clear Compose touch areas (lint-and-store)
+LINT_CACHE_VERSION = 4
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
 _EDGE_SLOP = 1
@@ -96,11 +97,14 @@ _LABEL_CUT = 32
 #: evidence the capture does not keep: what the node itself says (label, class),
 #: how the lint worked it out (sampling, label sources searched, the bounds used,
 #: the standard behind min_dp, clipped axes: render.clipped reports clipping), and
-#: the lint's typed keys of other nodes (``node_ids`` names them as refs instead)
+#: the lint's typed keys of other nodes (``node_ids`` names them as refs instead; R19..R23
+#: keep the texts those nodes say: ``twin_label``, ``inner_label``)
 _EVIDENCE_DROP = frozenset({"label", "class_name", "announceable_keys", "structural_keys",
                             "fg_lum", "bg_lum", "px_sampled", "fg_fraction", "sample",
                             "text_size_class", "checked", "bounds_source", "standard",
-                            "floor_dp", "clipped_axes", "duplicates", "duplicate_of"})
+                            "floor_dp", "clipped_axes", "duplicates", "duplicate_of",
+                            "carrier", "child", "container", "twin", "inner",
+                            "touch_rivals"})
 SLIVER_NOTE = "low confidence: only a sliver is visible at the scroll edge"
 
 
@@ -1214,11 +1218,46 @@ def _tb_detail(iss: Issue) -> str:
     return ""
 
 
+def _rows_of(ev: Mapping[str, Any]) -> str:
+    n, of = ev.get("rows"), ev.get("of")
+    return f"{n} of {of} rows" if of else f"{n} row(s)"
+
+
+def _heading_detail(ev: Mapping[str, Any]) -> str:
+    if ev.get("reason") != "section_title":
+        return ""
+    at = f", list item {ev['position']}" if ev.get("position") else (
+        ", a list item" if ev.get("list_item") else "")
+    return f"section title, not a heading ({ev.get('rows')} rows below{at})"
+
+
+#: A few words of evidence on the lint lines of R9's section titles and R19..R23.
+_NEW_DETAIL: dict[str, Callable[[Mapping[str, Any]], str]] = {
+    "a11y.heading.structure": _heading_detail,
+    "a11y.label.placeholder_token": lambda ev: (
+        f"reads {_quote(ev.get('token') or '', 40)} in {ev.get('rows')} row(s)"),
+    "a11y.label.shared_prefix": lambda ev: (
+        f"{_rows_of(ev)} start {_quote(ev.get('prefix') or '', 32)}, the description of "
+        f"{ev.get('child_class') or 'a child'} in each"),
+    "a11y.label.decorative_merged": lambda ev: (
+        f"{_quote(ev.get('merged') or '', 24)} merged into {_rows_of(ev)}, from "
+        f"{ev.get('child_class') or 'a child'}"
+        + (f"; {_quote(ev['twin_label'], 24)} says it" if ev.get("twin_label") else "")),
+    "a11y.state.label_contradicts": lambda ev: (
+        f"{ev.get('said')}, named for the action {_quote(ev.get('undo') or '', 24)}"),
+    "a11y.state.uniform_unselected": lambda ev: (
+        f"{ev.get('rows')} rows say {_quote(ev.get('state') or '', 20)}, none selected"
+        + (f"; each has {_quote(ev['inner_label'], 24)}" if ev.get("inner_label") else "")),
+}
+
+
 def _detail(iss: Issue) -> str:
     ev = iss.evidence or {}
     bits = []
     if iss.id.startswith("tb."):
         bits.append(_tb_detail(iss))
+    elif iss.id in _NEW_DETAIL:
+        bits.append(_NEW_DETAIL[iss.id](ev))
     elif iss.id == TOUCH_RULE and "w_dp" in ev:
         bits.append(f"{_num(ev['w_dp'])}x{_num(ev.get('h_dp'))}dp")
     elif iss.id == CONTRAST_RULE and "ratio" in ev:

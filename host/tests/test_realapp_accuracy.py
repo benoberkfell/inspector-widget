@@ -122,26 +122,44 @@ def test_web_links_get_web_advice_and_the_inline_exception():
 
 def test_real_app_lint_counts_now():
     # (error, warn, info, under a dialog) at 480dpi without contrast; before this round, on
-    # the same dumps, in the comments. Every change is one of the B8 fixes above.
+    # the same dumps, in the comments. Every change is one of the B8 fixes above, or a rule
+    # of the real-app hunt round (lint-and-store; tests/test_realapp_hunt_lint.py pins each).
     names = ("antennapod_home", "antennapod_episodes", "antennapod_filter_sheet",
              "antennapod_player", "thunderbird_drawer", "thunderbird_message", "nia_feed",
-             "nia_for_you", "nia_settings_dialog")
+             "nia_for_you", "nia_settings_dialog", "thunderbird_settings", "nia_interests",
+             "thunderbird_list_views", "thunderbird_list_compose_tb_first")
     counts = {name: (s["error"], s["warn"], s["info"], (s.get("covered") or {}).get("total", 0))
               for name in names for s in [lint(name).summary]}
     assert counts == {
         "antennapod_home": (0, 7, 6, 0),          # was 2, 6, 7: 2 R1 lists, 1 edge R2 excused
         "antennapod_episodes": (0, 9, 0, 0),      # was 1, 8, 1
         "antennapod_filter_sheet": (0, 0, 1, 9),  # was 1, 8, 2 with 10 behind the sheet
-        "antennapod_player": (1, 1, 13, 0),       # was 7, 1, 15: 6 R2 errors on inline web links
+        "antennapod_player": (1, 1, 14, 0),       # was 7, 1, 15: 6 R2 errors on inline web links;
+                                                  # +1 R9 no_headings: 39 text stops of show
+                                                  # notes (web paragraphs count by their text)
         "thunderbird_drawer": (1, 0, 2, 0),       # was 1, 11, 2: 11 R7 on unselected tabs
         "thunderbird_message": (1, 4, 4, 0),      # was 1, 1, 7: 3 real 40dp buttons excused
-        "nia_feed": (0, 0, 14, 0),                # was 5, 0, 9: R1 on chips scrolled half away
+        "nia_feed": (0, 0, 15, 0),                # was 5, 0, 9: R1 on chips scrolled half away;
+                                                  # +1 R9 no_headings (8 text stops, scrolls)
         "nia_for_you": (0, 0, 6, 0),              # was 0, 0, 0: R12 now names rows by their
                                                   # name, not their state: each topic row and
                                                   # its own Checkbox are both stops named
                                                   # "Headlines" (TalkBack 17 stops on both)
-        "nia_settings_dialog": (0, 0, 0, 14),     # was 5, 0, 13 with 14 behind the dialog,
-                                                  # and 4 R12 on rows saying "Not selected"
+        "nia_settings_dialog": (0, 0, 3, 15),     # was 5, 0, 13 with 14 behind the dialog,
+                                                  # and 4 R12 on rows saying "Not selected";
+                                                  # +3 R9 section titles on the dialog (Theme,
+                                                  # Use Dynamic Color, Dark mode preference),
+                                                  # +1 R9 no_headings behind it (For you)
+        "thunderbird_settings": (0, 7, 0, 0),     # was 0, 3, 0 (3 R2 on the section titles):
+                                                  # +3 R9 section titles that are list items,
+                                                  # +1 R20 "Account settings" on 8 rows (TB-11)
+        "nia_interests": (0, 0, 1, 0),            # was 0, 0, 0: +1 R23 "Not selected" on every
+                                                  # row (NIA-9)
+        "thunderbird_list_views": (0, 13, 7, 0),  # was 0, 13, 6: +1 R21 "Star" in every row
+                                                  # while its own button says "Add star" (TB-12)
+        "thunderbird_list_compose_tb_first": (5, 2, 10, 0),  # was 5, 6, 5: 5 Compose stars
+                                                  # with a clear 48dp touch area are R2 info,
+                                                  # +1 R19 "[conversation_counter]" (TB-7)
     }
 
 

@@ -107,8 +107,13 @@ def test_one_short_code_never_names_two_rules():
     assert R.short("a11y.label.redundant") == "label_redundant"
     assert R.short("a11y.text.fixed_scaling") == "text_fixed_scaling"
     assert R.short("a11y.text.too_small") == "text_too_small"
+    assert R.short("a11y.state.not_exposed") == "state_not_exposed"  # R22, R23 joined it
     # the bare group still selects the whole group
-    assert R.resolve("label") == ["a11y.label.missing", "a11y.label.redundant"]
+    assert R.resolve("label") == ["a11y.label.missing", "a11y.label.redundant",
+                                  "a11y.label.placeholder_token", "a11y.label.shared_prefix",
+                                  "a11y.label.decorative_merged"]
+    assert R.resolve("state") == ["a11y.state.not_exposed", "a11y.state.label_contradicts",
+                                  "a11y.state.uniform_unselected"]
     assert R.resolve("label_redundant") == ["a11y.label.redundant"]
 
 
@@ -118,7 +123,9 @@ def test_resolve_accepts_ids_aliases_shorts_families_and_atf_names():
     assert R.resolve([ROLE]) == [ROLE]
     assert R.resolve("TouchTargetSize") == [TOUCH]
     assert R.resolve("clipped") == ["render.clipped"]
-    assert set(R.resolve("label")) == {"a11y.label.missing", "a11y.label.redundant"}
+    assert set(R.resolve("label")) == {"a11y.label.missing", "a11y.label.redundant",
+                                       "a11y.label.placeholder_token", "a11y.label.shared_prefix",
+                                       "a11y.label.decorative_merged"}
     assert set(R.resolve("render.")) == {r for r in R.RULES if r.startswith("render.")}
     assert R.resolve("R5,R7") == [ROLE, STATE]
     assert R.resolve(None) is None and R.resolve([]) is None
@@ -330,17 +337,17 @@ def test_launcher_lint_maps_every_finding_to_its_node():
     """The capture's lint is ``a11y_lint.run_lint`` over the stored unified a11y tree,
     so it finds what the live a11y_lint tool finds on the same dump, and every
     finding lands on its node. The launcher's rows sit in a collection, so the
-    lint no longer asks them for a role (R5); the screen has no heading (R9). The last
-    row is clipped at the list's edge: the live lint measures its 9dp sliver as a small
-    touch target, which the capture does not judge on a render.clipped node (G18)."""
+    lint no longer asks them for a role (R5), and a list counts once toward a long
+    screen, so R9 does not ask the menu for headings. The last row is clipped at the
+    list's edge: the live lint measures its 9dp sliver as a small touch target, which the
+    capture does not judge on a render.clipped node (G18)."""
     from inspector_widget import a11y
 
     ix, loaded = _launcher_loaded()
     _clear(ix)
     an.analyze(ix, loaded, lint="tree", density=480, font_scale=1.0)
     assert not any(d.startswith("lint:") for d in ix.diagnostics), ix.diagnostics
-    assert _issues(ix) == {"n1": [("a11y.heading.structure", "info")],
-                           "n22": [("render.clipped", "info")]}
+    assert _issues(ix) == {"n22": [("render.clipped", "info")]}
     live = a11y_lint.run_lint(
         None, density=480, include_contrast=False,
         a11y_data=a11y.a11y_to_dict(pb.DumpA11yResponse.FromString(loaded.raw("a11y"))),
@@ -405,7 +412,9 @@ def test_analyze_accepts_a_raw_capture_before_publish():
     raw = RawCapture(meta=ix.meta, compose_sem=_real_compose(),
                      a11y=a11y_pb_from_index(cb.launcher_index()).SerializeToString())
     an.analyze(ix, raw, lint="tree")
-    assert sorted(_issues(ix, "a11y.")) == ["n1"]  # n22: clipped, R2 not judged
+    # n22: clipped, R2 not judged; n1: a list counts once toward a long screen (R9)
+    assert sorted(_issues(ix, "a11y.")) == []
+    assert "n22" in _issues(ix)
 
 
 def test_no_a11y_tree_means_no_lint_and_says_so():
@@ -636,7 +645,8 @@ def test_lint_view_groups_by_node_and_flat():
     ix, loaded = _spec_launcher()
     by_node = an.lint_view(ix, loaded, group="node")["lines"]
     assert len(by_node) == 12
-    assert by_node[0] == 'n11 "▶ All scenarios (lint everythin…" !role warn; !state warn'
+    assert by_node[0] == ('n11 "▶ All scenarios (lint everythin…" !role warn; '
+                          '!state_not_exposed warn')
     flat = an.lint_view(ix, loaded, group="none")["lines"]
     assert len(flat) == 14 and flat[0].startswith("n11 ") and " R5 warn" in flat[0]
 
@@ -729,11 +739,11 @@ def test_cursors_page_through_every_finding_once():
 def test_lint_summary_for_capture():
     ix, _ = _analyzed_launcher()
     assert an.lint_summary(ix) == {
-        "lint": "1 info: 1 heading (contrast not run)",
+        "lint": "no findings (contrast not run)",
         "issues": "1 clipped: n22"}
     ix, _ = _spec_launcher()
-    assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state, 1 touch_target "
-                                           "(contrast not run)")
+    assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state_not_exposed, "
+                                           "1 touch_target (contrast not run)")
 
 
 # --------------------------------------------------------------------------- #

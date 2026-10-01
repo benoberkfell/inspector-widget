@@ -329,7 +329,7 @@ def test_outline_root_example(launcher):
     assert out["lines"][0] == "n10 @launcher_list scroll [0,348 1280x2436]"
     assert out["lines"][-1] == ('  n22 @launch_heading "Section heading, MissingHeading" click '
                                 "[0,2757 1280x27] !clipped !role !touch_target")
-    assert out["lines"][1].endswith("!role !state")
+    assert out["lines"][1].endswith("!role !state_not_exposed")  # R22, R23: state_* too
     assert nbytes(out) <= 2000
     assert q.outline(launcher, root="@launcher_list")["lines"] == out["lines"]
 
