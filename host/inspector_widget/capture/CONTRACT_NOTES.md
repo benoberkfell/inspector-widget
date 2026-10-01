@@ -1113,7 +1113,11 @@ with every consumer.
   corpus, and the precision bar (no finding on any GOOD variant), are in
   `tests/test_capture_tb_rules.py`.
 - **Rule catalog (`rules.py`).**
-  - It holds R1..R12 plus R13..R18 (the unified lint's rules). `lint_view` reports
+  - It holds R1..R12 plus R13..R18 (the unified lint's rules) and R19..R23 (the
+    real-app hunt's: placeholder tokens, shared prefixes, merged decorative
+    descriptions, contradicting toggle labels, uniform unselected rows). The
+    `state` group now has three rules, so R7's code is `state_not_exposed`.
+    `lint_view` reports
     a rule the installed lint cannot produce under `unavailable`.
   - It also holds the four render rules, plus the reserved `render.text_overflow`,
     `render.covered` and `render.drawn_mismatch` (`planned`), and the `tb.*` rules
