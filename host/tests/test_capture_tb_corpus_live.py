@@ -1,7 +1,8 @@
 """The static TalkBack rules on LIVE captures of the A11yProbe TalkBack corpus.
 
 tests/fixtures/tb_captures/ holds one real capture per corpus screen (every scenario and
-variant of tb_corpus_expected.json, plus C11 again with ``capture(slots="enable")``), taken
+variant of tb_corpus_expected.json, plus C11 again with ``capture(slots="enable")``, and
+C11 GOOD as it was before its fix, ``tb_c11_good_on_box_slots``), taken
 over MCP on emulator-5556 (API 37, 2076x2152, 390 dpi, TalkBack 17.0 installed and OFF)
 with ``capture(props=false)`` and recorded without screenshots: the agent's View tree,
 Compose semantics, slot table (C11) and accessibility tree, as an agent's capture holds
@@ -23,9 +24,10 @@ C5-C7      -                               -       silent  calibrated / list upd
 C8         edge_stuck                      yes     silent
 C9         wrong_announcement              yes     silent
 C10        -                               -       silent  calibrated
-C11        custom_action_missing (slots)   yes     FIRES   GOOD's customActions sit on the
-                                                           SwipeToDismissBox node, which
-                                                           TalkBack never focuses (see below)
+C11        custom_action_missing (slots)   yes     silent  GOOD's Delete sits on the row
+                                                           stop (its merged Card); before
+                                                           the fix it sat on the
+                                                           SwipeToDismissBox (see below)
 C12-C14    - (trap / dialogs / restore)    -       silent  walk or tb_scenario
 C15        double_stop                     yes     silent  (loop: walk only)
 C16        edge_stuck                      yes     silent
@@ -52,10 +54,13 @@ Precision and recall over (screen, rule) pairs, against the corpus's walk-confir
 (walk-only codes tb.trap and tb.loop left out) plus C11's swipe-only delete and V4's unsaid
 "Wi-Fi" (the recorded walk's own analysis reports it: text on screen no stop read): 27
 true, 3 missed (V3 out_of_order, V13 ghost_stop and out_of_order on web content, which a
-TalkBack-off capture does not hold), 1 on a GOOD screen (C11). Recall 27/30; precision 27/28
-by the corpus's labels, 28/28 if C11 GOOD is judged as TalkBack sees it: the real walk of
-C11 GOOD stops only on each row's Text, which has no action, so its "Delete" is as
-unreachable as BAD's.
+TalkBack-off capture does not hold), none on a GOOD screen. Recall 27/30; precision 27/27.
+
+C11 GOOD used to fire too (precision 27/28): its customActions sat on the
+SwipeToDismissBox node, which TalkBack never focuses (the real walk stopped only on each
+row's Text, which had no action), so its "Delete" was as unreachable as BAD's. The fix puts
+the action on the merged Card, the row's stop; ``tb_c11_good_on_box_slots`` keeps the old
+capture, and the rule still names the node TalkBack never focuses on it.
 """
 
 from __future__ import annotations
@@ -82,6 +87,8 @@ EXTRA_TRUTH = {"tb_c11_bad_slots": {"tb.custom_action_missing"},
 LIVE_TABLE = {f"{k.replace('-', '_')}": v for k, v in TABLE.items()}
 #: live captures of real apps beside the corpus
 REAL_APPS = {"thunderbird_list_tb_off", "nia_foryou_rail"}
+#: corpus screens as they were before a fix (no corpus entry of their own)
+BEFORE_FIX = {"tb_c11_good_on_box_slots"}
 LIVE_TABLE.update({
     "thunderbird_list_tb_off": {"tb.double_stop": 6, "tb.wrong_announcement": 1},
     # a tb_walk's capture (TalkBack on): the topic chips and their checkboxes; no order
@@ -91,8 +98,8 @@ LIVE_TABLE.update({
     # TalkBack off: a WebView builds its accessibility tree only while a service runs, so
     # the off-screen page's web stops (5 ghost stops in the TalkBack-on dump) are not here
     "tb_v13_bad": {"tb.edge_stuck": 1},
-    # GOOD's fix is unreachable for TalkBack (module docstring): the evidence says so
-    "tb_c11_good_slots": {"tb.custom_action_missing": 3},
+    # C11 GOOD before its fix: the action on a node TalkBack never focuses (docstring)
+    "tb_c11_good_on_box_slots": {"tb.custom_action_missing": 3},
 })
 
 
@@ -112,7 +119,7 @@ def test_every_corpus_screen_has_a_live_capture():
     want = {f"{e['scenario']}_{e['variant']}" for e in F.WALK_ENTRIES}
     names = set(F.live_names())
     assert want <= names
-    assert names - want == {"tb_c11_bad_slots", "tb_c11_good_slots"} | REAL_APPS
+    assert names - want == {"tb_c11_bad_slots", "tb_c11_good_slots"} | REAL_APPS | BEFORE_FIX
     for name in names:  # real captures: the View tree and the a11y tree, Compose's too
         _ix, raw = F.live_capture(name)
         assert raw.views and raw.a11y
@@ -140,7 +147,7 @@ def test_live_captures_agree_with_the_captures_derived_from_the_walks():
 
 def test_precision_and_recall_on_the_corpus():
     tp = fn = fp_good = fp_bad = 0
-    for name in sorted(set(F.live_names()) - REAL_APPS):
+    for name in sorted(set(F.live_names()) - REAL_APPS - BEFORE_FIX):
         e = _entry(name)
         got = set(_tb(F.live_capture(name)[0]))
         if e["variant"] != "bad":
@@ -153,12 +160,24 @@ def test_precision_and_recall_on_the_corpus():
         tp += len(truth & got)
         fn += len(truth - got)
         fp_bad += len(got - truth)
-    assert (tp, fn, fp_bad, fp_good) == (27, 3, 0, 1)
-    # recall 27/30; precision 27/28 by the corpus labels (C11 GOOD: see the docstring)
+    assert (tp, fn, fp_bad, fp_good) == (27, 3, 0, 0)
+    # recall 27/30; precision 27/27 (C11 GOOD: fixed, see the docstring)
+
+
+def test_c11_good_offers_delete_on_the_row_talkback_stops_on():
+    """L2: the fixed GOOD puts its Delete on the merged Card, the row's one stop: nothing
+    to report, and the stop carries the action TalkBack's actions menu lists."""
+    ix, raw = F.live_capture("tb_c11_good_slots")
+    assert not [i for n in ix.nodes.values() for i in n.issues if i.id.startswith("tb.")]
+    tbc = T.TbCapture.of(ix, raw)
+    rows = [n for n in ix.nodes.values() if n.label in ("Water plants", "Call Ada", "Pay rent")
+            and tbc.explain(n.id).get("stop")]
+    assert len(rows) == 3
+    assert all("Delete" in str(n.facets.get("a11y")) for n in rows)
 
 
 def test_c11_good_names_the_container_talkback_never_focuses():
-    ix, raw = F.live_capture("tb_c11_good_slots")
+    ix, raw = F.live_capture("tb_c11_good_on_box_slots")
     out = analyzers.lint_view(ix, raw, rules=["tb"], group="none")
     iss = [i for n in ix.nodes.values() for i in n.issues if i.id == "tb.custom_action_missing"]
     assert len(iss) == 3

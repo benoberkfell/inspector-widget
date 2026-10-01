@@ -4,7 +4,7 @@
  "api": 37,
  "compose_generation": 1,
  "consistency": "settled",
- "created_at": 1790826116.883706,
+ "created_at": 1790848138.036526,
  "device": {
   "dpi": 390,
   "font_scale": 1.0,
@@ -14,23 +14,21 @@
    2152
   ]
  },
- "diagnostics": [
-  "the UI changed during capture; settled after 2 attempts"
- ],
+ "diagnostics": [],
  "facets": {
   "a11y": {
-   "bytes": 2253,
-   "ms": 21,
+   "bytes": 1953,
+   "ms": 9,
    "status": "ok"
   },
   "compose": {
-   "bytes": 887,
-   "ms": 17,
+   "bytes": 752,
+   "ms": 3,
    "status": "ok"
   },
   "fingerprint": {
    "bytes": 0,
-   "ms": 12,
+   "ms": 4,
    "status": "ok"
   },
   "props": {
@@ -40,9 +38,10 @@
    "status": "off"
   },
   "shots": {
-   "bytes": 111427,
+   "bytes": 0,
    "ms": 0,
-   "status": "ok"
+   "reason": "screenshot=false",
+   "status": "off"
   },
   "skp": {
    "bytes": 0,
@@ -51,23 +50,23 @@
    "status": "off"
   },
   "slots": {
-   "bytes": 10059,
-   "ms": 87,
+   "bytes": 10039,
+   "ms": 1111,
    "status": "ok"
   },
   "views": {
    "bytes": 487,
-   "ms": 29,
+   "ms": 2,
    "status": "ok"
   },
   "windows": {
    "bytes": 5,
-   "ms": 5,
+   "ms": 1,
    "status": "ok"
   }
  },
- "fingerprint": "f23ffc5d569c2c74efa942f6f5f77016",
- "id": "c4yw3a",
+ "fingerprint": "e6a95d2c20a8d1a1d8e00941d9973235",
+ "id": "cp1vnv",
  "label": "tb_c11_good_slots",
  "lineage": {
   "package": "com.oberkfell.a11yprobe",
@@ -78,13 +77,13 @@
   "lint": "tree",
   "props": false,
   "resolution_stack": false,
-  "screenshot": true,
+  "screenshot": false,
   "screenshot_scale": 1.0,
   "settle_ms": 0,
   "skp": false,
   "slots": "enable"
  },
- "pid": 11553,
+ "pid": 2143,
  "schema": 1,
- "took_ms": 1491
+ "took_ms": 1130
 }
