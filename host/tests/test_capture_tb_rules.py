@@ -339,3 +339,18 @@ def test_an_empty_tb_lint_points_at_a_walk():
     assert out["next"] == ['outline(view="reading",explain=true)', "tb_walk()"]
     # the default lint says nothing of the kind
     assert "note" not in analyzers.lint_view(ix, raw)
+
+
+def test_find_by_severity_counts_what_lint_counts():
+    # The opt-in tb.* codes (an unlabelled control's tb.ghost_stop) are stored on the node
+    # but lint() and find()'s lines leave them out unless asked for: find(issue="warn")
+    # matched three nodes whose lines carried no warn mark (A11yProbe's view screen)
+    from inspector_widget.capture import query as q
+
+    ix, raw = F.fixture_capture("a11yprobe_viewscreen")
+    warn = q.find(ix, issue="warn", loaded=raw)
+    assert warn["total"] == 1 and "!touch_target" in warn["lines"][0]
+    assert analyzers.lint_summary(ix)["lint"].startswith("3 error 1 warn")
+    # asked for by name, they are found (and shown)
+    tb = q.find(ix, issue="tb", loaded=raw)
+    assert tb["total"] == 3 and all("!ghost_stop" in ln for ln in tb["lines"])

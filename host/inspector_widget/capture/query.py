@@ -1540,7 +1540,10 @@ def _has(ix: Index, n: UNode, term: str, props_on: bool) -> bool:
 def _issue_pred(q: str) -> Callable[[UNode], bool]:
     q = q.strip()
     if q in SEVERITY_ORDER:
-        return lambda n: any(i.sev == q for i in n.issues)
+        # what lint() counts at that severity: the opt-in tb.* codes (rules.DEFAULT_TB has
+        # the default ones) come only when asked for by name (issue="tb", "double_stop")
+        return lambda n: any(i.sev == q and (not i.id.startswith("tb.") or i.id in R.DEFAULT_TB)
+                             for i in n.issues)
 
     def pred(n: UNode) -> bool:
         return any(i.id == q or i.id.startswith(q) or L.short_code(i.id) == q
