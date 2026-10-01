@@ -300,6 +300,23 @@ def test_double_stop_from_speech_not_from_the_containers_child_texts():
     res = diff.analyze(record([row, box], ended="max_steps"))
     f = next(f for f in res["findings"] if f["code"] == "tb.double_stop")
     assert "both clickable stops" in f["msg"] and f["refs"] == ["compose:14:3", "compose:14:5"]
+    assert f["sev"] == "warn"  # its own Checkbox: the row should be the one toggleable stop
+
+
+def test_a_double_stop_is_a_warning_on_a_state_control_and_info_on_a_secondary_action():
+    def pair(inner_cls, inner_speak, label):
+        row = step(0, "compose:14:3", (0, 300, 1280, 190), "Wi-Fi", via="start",
+                   flags=["clickable", "focusable"])
+        inner = step(1, "compose:14:5", (900, 330, 120, 120), label, speak=inner_speak,
+                     cls=inner_cls, flags=["clickable", "focusable"])
+        res = diff.analyze(record([row, inner], ended="max_steps"))
+        return [f["sev"] for f in res["findings"] if f["code"] == "tb.double_stop"]
+
+    assert pair("Switch", "ON. Switch", "") == ["warn"]
+    assert pair("View", "ON. Switch", "") == ["warn"]  # the role TalkBack spoke says so
+    assert pair("RadioButton", "Not selected. Radio button", "") == ["warn"]
+    assert pair("Button", "Play. Button", "Play") == ["info"]
+    assert pair("Button", "Switch account. Button", "Switch account") == ["info"]
 
 
 def test_a_walk_from_the_middle_to_the_edge_covers_only_that_part():

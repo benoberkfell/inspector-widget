@@ -563,6 +563,23 @@ def _check_ghosts(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     return _collapse(out, "ghost stops")
 
 
+#: Controls that hold a state of their own (checked, on): inside a clickable row or card,
+#: the row should be the one toggleable stop.
+_STATE_CLASSES = ("CheckBox", "Switch", "RadioButton", "ToggleButton", "CompoundButton",
+                  "SwitchCompat", "SwitchMaterial")
+_STATE_ROLE = re.compile(r"(?:^|\. )(?:check box|switch|radio button|toggle button)(?:\.|$)")
+
+
+def _state_control(s: Dict[str, Any]) -> bool:
+    """Whether walk step ``s`` is a state control: its class (a CheckBox, a Switch, a
+    RadioButton: Compose reports its role as one of them), ``checkable``, or the role
+    TalkBack spoke ("ON. Switch", "checked. Check box")."""
+    cls = str(s.get("cls") or "").rsplit(".", 1)[-1]
+    if any(cls.endswith(c) for c in _STATE_CLASSES) or "checkable" in (s.get("flags") or ()):
+        return True
+    return bool(_STATE_ROLE.search(str(s.get("speak") or "").lower()))
+
+
 def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     out = []
     prev: Optional[Dict[str, Any]] = None
@@ -596,10 +613,12 @@ def _check_double(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                         f"both stops, and {int(overlap * 100)}% of the inner one's words are already "
                         f"spoken at the outer one", [prev, s])
                 elif both:
-                    # the inner control does something else (play, download, follow): a row
-                    # with a secondary action; worth a custom action, not a defect (info)
+                    # an inner Checkbox / Switch is the canonical double stop: the row should
+                    # be the one toggleable stop (warn, as the capture lint says); an inner
+                    # control that does something else (play, download, follow) is a row with
+                    # a secondary action, worth a custom action, not a defect (info)
                     f = _finding(
-                        "tb.double_stop", "info",
+                        "tb.double_stop", "warn" if _state_control(inner) else "info",
                         f"steps {prev['i']}-{s['i']}: {_name(outer)} and {_name(inner)} inside it are "
                         f"both clickable stops: one item takes two swipes, and activating the outer "
                         f"one may not do what the inner control does", [prev, s])
