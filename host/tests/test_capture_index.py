@@ -827,3 +827,31 @@ def test_a11y_children_truncated_is_a_flag(viewscreen_raw):
     flagged = [n for n in ix.nodes.values() if "truncated" in n.flags]
     assert flagged and all("truncated" in (n.facets.get("a11y") or {}).get("flags", [])
                            for n in flagged if "a11y" in n.facets)
+
+
+def test_unlabelled_controls_in_list_cells_get_a_durable_sel():
+    """An unlabelled Button @delete repeated in every cell (its tag is not unique,
+    and a sibling is another Button) is selected through its cell, not its ref,
+    so a stale-ref error can send the agent somewhere (review: anchors)."""
+    from capture_builders import IndexBuilder
+
+    b = IndexBuilder()
+    w = b.window("n1")
+    lst = b.view(w, "n2", "RecyclerView", (0, 0, 400, 800), rid="list")
+    for k in range(3):
+        cell = b.view(lst, f"n{10 + 10 * k}", "ComposeView", (0, 100 * k, 400, 100),
+                      tag=f"cell_{k}")
+        b.view(cell, f"n{11 + 10 * k}", "Button", (300, 100 * k, 50, 50), tag="delete")
+        b.view(cell, f"n{12 + 10 * k}", "Button", (350, 100 * k, 50, 50), tag="archive")
+        row = b.view(cell, f"n{13 + 10 * k}", "Row", (0, 100 * k, 300, 50))
+        b.view(row, f"n{14 + 10 * k}", "Icon", (0, 100 * k, 50, 50), tag="star")
+        b.view(row, f"n{15 + 10 * k}", "Icon", (50, 100 * k, 50, 50), tag="flag")
+    ix = b.build()
+    anchors.assign_sels(ix)
+    assert ix.nodes["n21"].sel == "@cell_1 > @delete"
+    assert ix.nodes["n22"].sel == "@cell_1 > @archive"
+    # through an unlabelled row: the grandparent, the row's unique atom, the tag
+    assert ix.nodes["n24"].sel == "@cell_1 > Row > @star"
+    for n in ix.nodes.values():
+        if n.sel != n.id:
+            assert anchors.match_sel(ix, n.sel) == [n.id], n.sel

@@ -566,3 +566,13 @@ def test_a_capture_says_what_the_agent_could_not_send(tmp_path):
         ref = found["lines"][0].split()[0]
         assert "truncated" in ok(run(ctx, "node", ref=ref))["flags"]
         ctx.sessions.close_all()
+
+
+def test_node_on_a_never_issued_ref_says_so(tmp_path):
+    with ch.harness("launcher", str(tmp_path)):
+        ctx = ch.ops_context()
+        capture(ctx)
+        err = run(ctx, "node", ref="n99999")["error"]
+        assert err["code"] == "ref_not_in_capture" and "never issued" in err["message"]
+        assert 'capture="latest"' not in err["hint"]
+        ctx.sessions.close_all()

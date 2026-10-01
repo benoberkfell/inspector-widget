@@ -801,8 +801,15 @@ with every consumer.
     except `:`.
 - **sel**:
   - Tried in order: `#rid`, `@tag`, `Type"label"`, `"label"`, then `<parent sel> >
-    Type"label"` and `<parent sel> > Type` (unique among the siblings, parent sel
-    not a fallback, at most 3 atoms and 120 chars), else the id.
+    atom` with the first of `Type"label"`, `Type`, `@tag`, `#rid` unique among the
+    siblings (parent sel not a fallback), then `<grandparent sel> > <parent atom>
+    > atom` (each atom unique among its siblings) for a child of an unlabelled
+    row, at most 3 atoms and 120 chars; else the id. An unlabelled `Button @delete`
+    in every list cell is `@cell_1 > @delete`, not its ref.
+  - A tombstone whose sel was the ref itself answers `ref_not_in_capture` with a
+    `find(type=..., text=...)` hint (no candidate that names the gone ref), and a
+    ref at or above the store's counter (`store.peek_next_ref()`, handed to the
+    query through the ops layer's tomb) says it was never issued.
   - Labels are used only when ≤ 40 chars on one line, rids only when they match
     `[A-Za-z_][A-Za-z0-9_.]*`, tags only when they match `[A-Za-z0-9_.:-]+`, and
     types only when they match `[A-Z][A-Za-z0-9_]*`.

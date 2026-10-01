@@ -1064,6 +1064,31 @@ def test_ref_errors_say_why_the_ref_is_missing(launcher):
     assert "capture again" not in e.value.hint
 
 
+def test_a_gone_ref_without_a_durable_sel_does_not_point_at_itself(launcher):
+    """A tombstone whose sel was the ref itself: no 'select it by its sel' circle,
+    a find() to run in a newer capture instead."""
+    tomb = {"n41": ["Button", None, "n41", "c0krga"]}
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, "n41", tomb=tomb)
+    err = e.value
+    assert "(sel n41)" not in err.message and not err.candidates
+    assert "by its sel" not in err.hint and 'find(type="Button")' in err.hint
+    assert "within=" in err.hint
+
+
+def test_a_ref_the_store_never_issued_says_so(launcher):
+    class Tomb(dict):
+        next_ref = 500
+
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, "n9999", tomb=Tomb())
+    assert "never issued" in e.value.message and "n499" in e.value.message
+    assert 'capture="latest"' not in e.value.hint
+    with pytest.raises(OpError) as e:  # issued, but newer than this capture
+        q.resolve_selector(launcher, "n450", tomb=Tomb())
+    assert "newer than every ref" in e.value.message
+
+
 def test_a_direct_child_path_that_should_be_a_descendant_says_so(launcher):
     # @launch_heading is a grandchild of #content's subtree, not a direct child
     with pytest.raises(OpError) as e:

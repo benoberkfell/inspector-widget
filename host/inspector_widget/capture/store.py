@@ -814,6 +814,11 @@ class CaptureStore:
                 self._write_store_json(first + int(n))
             return first
 
+    def peek_next_ref(self) -> int:
+        """The number the next ref will get (nothing reserved): every ref at or
+        above it was never issued by this store."""
+        return self._read_next_ref()
+
     def _read_next_ref(self) -> int:
         data = _read_json(self._p("store.json"))
         if isinstance(data, dict) and isinstance(data.get("next_ref"), int) \

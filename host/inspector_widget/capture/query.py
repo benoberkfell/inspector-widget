@@ -782,7 +782,8 @@ def resolve_selector(ix: Index, sel: Any, *, tomb: Mapping[str, Sequence] | None
 
 
 def _ref_error(ix: Index, ref: str, cid: str, tomb: Mapping[str, Sequence] | None) -> OpError:
-    """``ref_not_in_capture`` that says why: gone (the lineage's tombstone), newer
+    """``ref_not_in_capture`` that says why: gone (the lineage's tombstone), never
+    issued by the store (``tomb.next_ref``, when the caller knows it), newer
     than this capture, or unknown to this app's lineage (another app, a typo)."""
     info = (tomb or {}).get(ref)
     msg = f"{ref} is not in {cid}"
@@ -790,14 +791,29 @@ def _ref_error(ix: Index, ref: str, cid: str, tomb: Mapping[str, Sequence] | Non
         typ, label, last_sel, last_cap = (list(info) + [None] * 4)[:4]
         desc = " ".join(x for x in (typ, L.jstr(label) if label else None) if x)
         msg += f"; last seen in {last_cap} as {desc or 'a node'}"
-        cands = None
-        if last_sel:
+        if last_sel and not is_ref(last_sel) and not is_key(last_sel):
             msg += f" (sel {last_sel})"
-            cands = [last_sel]
+            return OpError("ref_not_in_capture", msg,
+                           hint="It left the screen (refs are never reused): select it by "
+                                "its sel in a newer capture, or bring it back and capture "
+                                "again.", candidates=[last_sel])
+        # No durable selector (its sel was its own ref): name what to search for.
+        filters: dict[str, Any] = {}
+        if typ and typ[:1].isupper():
+            filters["type"] = typ
+        if label:
+            filters["text"] = label
+        how = call("find", **filters) if filters else "find(...)"
         return OpError("ref_not_in_capture", msg,
-                       hint="It left the screen (refs are never reused): select it by its "
-                            "sel in a newer capture, or bring it back and capture again.",
-                       candidates=cands)
+                       hint=f"It left the screen (refs are never reused) and had no stable "
+                            f"selector: in a newer capture, {how}, narrowed with "
+                            f"within=<its list or cell>.")
+    issued = getattr(tomb, "next_ref", None)
+    if isinstance(issued, int) and ref_num(ref) >= issued:
+        return OpError("ref_not_in_capture",
+                       f"{ref} was never issued (this store's refs end at n{issued - 1})",
+                       hint="Take refs from outline() or find() lines of a capture; they are "
+                            "never made up or reused.")
     newest = max((ref_num(r) for r in ix.nodes if is_ref(r)), default=0)
     if ref_num(ref) > newest:
         return OpError("ref_not_in_capture",

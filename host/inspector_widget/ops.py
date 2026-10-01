@@ -422,11 +422,22 @@ def _loaded_for_query(ctx: OpContext, p: dict[str, Any], cursor_key: str = "curs
     return lc, _session_mark(ctx, tuple(lc.meta.lineage), shared)  # type: ignore[arg-type]
 
 
+class _Tomb(dict):
+    """A lineage's tombstones plus ``next_ref``, the store's ref counter: a ref at
+    or above it was never issued (query._ref_error says so)."""
+
+    next_ref: int | None = None
+
+
 def _tomb(ctx: OpContext, lc: LoadedCapture) -> dict:
+    out = _Tomb()
     try:
-        return ctx.store.lineage_state(*lc.meta.lineage).tomb
+        out.update(ctx.store.lineage_state(*lc.meta.lineage).tomb)
     except Exception:  # noqa: BLE001 - last-seen info is a nicety
-        return {}
+        pass
+    with contextlib.suppress(Exception):
+        out.next_ref = int(ctx.store.peek_next_ref())
+    return out
 
 
 # --------------------------------------------------------------------------- #
