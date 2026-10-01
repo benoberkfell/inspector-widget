@@ -907,6 +907,8 @@ def bind_scenario(out: dict[str, Any], binding: Binding, before_at: int,
         f["msg"] = _bind_text(binding, f["msg"], after_at)
     if isinstance(out.get("why"), str):
         out["why"] = _bind_text(binding, out["why"], after_at)
+    if isinstance(out.get("matched"), str):  # the target, found before the action
+        out["matched"] = _bind_text(binding, out["matched"], before_at)
     out["captures"] = binding.ids
     return out
 
@@ -1023,6 +1025,20 @@ def _walk_line(w: Mapping[str, Any], n: int = 28) -> str:
     return f"{w.get('i')} {w.get('ref') or '-'} {_quote(w.get('speak'), n)}"
 
 
+#: ``label (exact) n8 "Item 2. Button" via n9; first of 3``: how, node, quote, the rest.
+_MATCHED = re.compile(r'^(?P<how>.+? \([a-z]+\)) (?P<node>\S+) ".*"(?P<rest>(?: via [^"]+?)?'
+                      r'(?:; first of \d+)?)$')
+
+
+def _matched_text(matched: Any, target: Mapping[str, Any] | None) -> str:
+    """What the selector matched, without the node when it is the target the result
+    already names: ``label (exact)``."""
+    m = _MATCHED.match(str(matched or ""))
+    if m and target and m.group("node") in (target.get("ref"), target.get("key")):
+        return m.group("how") + m.group("rest")
+    return _cut(matched, 90)
+
+
 def _expect_text(e: Mapping[str, Any]) -> str:
     if e.get("reached"):
         return f"{_quote(e.get('label'), 32)} reached ({e.get('at')})"
@@ -1052,7 +1068,7 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
         out["after"] = caps[-1]
     out["target"] = _named(tgt.get("ref"), tgt) if tgt else None
     if rec.get("matched"):
-        out["matched"] = _cut(rec["matched"], 90)
+        out["matched"] = _matched_text(rec["matched"], tgt)
     did = rec.get("action") if rec.get("kind") != "survive" else rec.get("mutate")
     out["did"] = _cut(did, 60) if did else None
     if rec.get("kind") == "focus_after":
@@ -1085,8 +1101,9 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
         out["flags"] = list(rec["flags"])
     if rec.get("speech"):
         out["speech"] = rec["speech"]
-    if rec.get("walk"):
-        out["lines"] = [_walk_line(w) for w in rec["walk"]]
+    walk = [w for w in rec.get("walk") or [] if isinstance(w, Mapping)]
+    if walk:
+        out["lines"] = [_walk_line(w) for w in walk]
     exp = rec.get("expect")
     if isinstance(exp, dict):
         out["expect"] = _expect_text(exp)
@@ -1105,10 +1122,13 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
     if hints:
         out["next"] = hints
     out = {k: v for k, v in out.items() if v not in (None, [], "")}
+    walked = _Lines(out, walk)
 
     def size() -> int:
         return utf8_len(dumps(out))
 
+    # A walk:<n> step's lines are what the call asked for: their quotes shrink first, and
+    # when they must go, the middle goes, never the last presses (where Undo comes, or not).
     shrink: list[Callable[[], bool]] = [
         lambda: _pop_list(out, "notes"),
         lambda: _trim_text(out.get("finding"), "fix", 160),
@@ -1124,14 +1144,17 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
         lambda: _pop_list(out, "panes"),
         lambda: _trim_text(out, "why", 80),
         lambda: _pop_list(out, "next"),
-        lambda: _trim_list(out, "lines", 6),
+        lambda: walked.quote(16),
         lambda: _pop_list(out, "speech"),
-        lambda: _pop_list(out, "speak_before"),
         lambda: _pop_text(out.get("finding"), "fix"),
+        lambda: _pop_list(out, "speak_before"),
+        lambda: walked.elide(2, 4),
+        lambda: walked.quote(12),
         lambda: _trim_list(out, "timeline", 3),
         lambda: _pop_list(out, "matched"),
-        lambda: _trim_list(out, "lines", 4),
+        lambda: walked.elide(1, 3),
         lambda: _pop_list(out, "timeline"),
+        lambda: walked.elide(1, 2),
     ]
     for step in shrink:
         if size() <= max_bytes:
@@ -1142,6 +1165,40 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
 
 def _pop_list(d: dict[str, Any], key: str) -> bool:
     return d.pop(key, None) is not None
+
+
+class _Lines:
+    """A scenario's ``walk:<n>`` lines as the result shrinks them: every press with shorter
+    quotes first (:meth:`quote`), then the first ``head`` and last ``tail`` presses with
+    ``…+N…`` for the middle (:meth:`elide`). The last presses (where Undo comes, or the
+    walk ends) are never dropped."""
+
+    def __init__(self, out: dict[str, Any], walked: Sequence[Mapping[str, Any]]) -> None:
+        self.out, self.walked = out, list(walked)
+        self.n, self.keep = 28, None  # quote length; (head, tail) once elided
+
+    def render(self) -> list[str]:
+        full = [_walk_line(w, self.n) for w in self.walked]
+        if self.keep is None or len(full) <= sum(self.keep) + 1:
+            return full
+        head, tail = self.keep
+        return full[:head] + [f"…+{len(full) - head - tail}…"] + full[len(full) - tail:]
+
+    def _set(self) -> bool:
+        if "lines" not in self.out:
+            return False
+        new = self.render()
+        changed = new != self.out["lines"]
+        self.out["lines"] = new
+        return changed
+
+    def quote(self, n: int) -> bool:
+        self.n = min(self.n, n)
+        return self._set()
+
+    def elide(self, head: int, tail: int) -> bool:
+        self.keep = (head, tail)
+        return self._set()
 
 
 def _trim_list(d: dict[str, Any], key: str, n: int) -> bool:

@@ -2,9 +2,11 @@
 
 talkback/select.py resolves a walk's start or a scenario's target among the model's stops,
 over the real-app hunt dumps (tests/data/realapps: Now in Android's feed, Thunderbird's
-settings) and small synthetic trees: exact beats whole word beats substring ("Bookmark" never
-picks "Unbookmark"), a tie is refused for an activation and listed, keys and Texts inside a
-row climb to the row, and a label no stop speaks says so with the screen's stop count.
+settings) and small synthetic trees: exact beats whole word beats substring ("Bookmark" picks
+"Bookmark" over "Unbookmark", and an activation refuses a match inside a word), a tie is
+refused for an activation and listed, keys and Texts inside a row climb to the row, a label
+no stop speaks says so with the screen's stop count, and a list under an open dialog is
+never scrolled to find one.
 """
 
 from __future__ import annotations
@@ -231,3 +233,104 @@ def test_norm_and_keys():
     assert S.norm("  Theme.  Use, system—default! ") == "theme use system default"
     assert S.is_key("view:12") and S.is_key("compose:8:-3") and S.is_key("virtual:4:5")
     assert not S.is_key("n12") and not S.is_key("Bookmark")
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_an_activation_refuses_a_match_inside_a_word():
+    """With no "Bookmark" on screen, "Bookmark" only matches inside "Unbookmark": the
+    opposite control (NiA's Saved screen, where every card says Unbookmark). An activation
+    refuses it, listing it; a walk may start there, with a note that says so."""
+    for label, sel in (("Unbookmark", "Bookmark"), ("Unfollow", "follow"),
+                       ("Disable notifications", "able")):
+        st = S.stops_from_dump(_screen(_button("view:10", label, 0), _button("view:11", "Settings", 60)))
+        with pytest.raises(S.SelectError) as err:
+            S.require(st, sel, activate=True, where="MainActivity")
+        assert err.value.code == "ambiguous", sel
+        assert "only part of a word" in str(err.value) and "on MainActivity" in str(err.value)
+        assert err.value.tried == [f'view:10 "{label}. Button"']
+        m = S.require(st, sel, activate=False)
+        assert m.key == "view:10" and m.how == "substring"
+        assert m.notes == [f"{sel!r} is only part of a word of view:10 \"{label}. Button\": no "
+                           f"stop says it as a word"]
+    # the whole word still activates, and an exact match still wins over the longer word
+    st = S.stops_from_dump(_screen(_button("view:10", "Unbookmark", 0), _button("view:11", "Bookmark", 60)))
+    assert S.require(st, "Bookmark", activate=True).key == "view:11"
+    st = S.stops_from_dump(_screen(_button("view:10", "Unbookmark", 0)))
+    assert S.require(st, "Unbookmark", activate=True).key == "view:10"
+
+
+def _dialog_over_a_list():
+    """An activity whose RecyclerView scrolls, under a modal dialog whose own ListView
+    scrolls too (the dialog covers the activity: a11y.apply_window_meta's covered_by)."""
+    rows = [_button(f"view:{21 + i}", f"Episode {i}", 100 * i) for i in range(3)]
+    lst = _node("view:20", "androidx.recyclerview.widget.RecyclerView", kids=rows,
+                bounds=(0, 0, 1080, 2000), actions=[{"id": 4096, "name": "SCROLL_FORWARD"}])
+    act = _node("view:1", "android.widget.FrameLayout", kids=[lst], bounds=(0, 0, 1080, 2000))
+    opts = [_button(f"view:{61 + i}", f"Option {i}", 400 + 60 * i) for i in range(2)]
+    dlist = _node("view:60", "android.widget.ListView", kids=opts, bounds=(100, 400, 880, 600),
+                  actions=[{"id": 4096, "name": "SCROLL_FORWARD"}])
+    dlg = _node("view:50", "android.widget.FrameLayout", kids=[dlist], bounds=(100, 400, 880, 600))
+    return {"windows": [{"root_view_id": 1, "window_type": 1, "root": act, "covered_by": 50},
+                        {"root_view_id": 50, "window_type": 2, "modal": True, "root": dlg}]}
+
+
+def test_a_list_under_an_open_dialog_is_never_scrolled_for_a_label():
+    """The seek scrolls to bring a label in: never the list behind a modal dialog (that
+    changes the app's state behind it for nothing), the dialog's own list instead."""
+    d = _dialog_over_a_list()
+    assert [s.key for s in S.stops_from_dump(d)] == ["view:61", "view:62"]
+    assert S.can_bring_more(d) == "view:60 [880x600] scrolls"
+    assert [k for k, _ids in S.scrollables(d)] == ["view:60"]
+    # with only the covered list scrolling, nothing can bring a label in
+    d["windows"][1]["root"]["children"][0]["actions"] = []
+    assert S.can_bring_more(d) is None and S.scrollables(d) == []
+    # a blank window left on top covers nothing: its list is scrolled again
+    d = _dialog_over_a_list()
+    d["windows"][1]["root"] = _node("view:50", "android.widget.FrameLayout", bounds=(0, 0, 1, 1))
+    d["windows"][1]["root"]["flags"] = ["enabled"]
+    assert [k for k, _ids in S.scrollables(d)] == ["view:20"]
+    assert S.covering_window(_dialog_over_a_list(), "view:22") == 50
+    assert S.covering_window(_dialog_over_a_list(), "view:61") is None
+
+
+def test_the_focused_window_s_list_is_scrolled_first():
+    d = _dialog_over_a_list()
+    d["windows"][0].pop("covered_by")  # a non-modal popup over the list
+    d["windows"][1]["modal"] = False
+    assert [k for k, _ids in S.scrollables(d)] == ["view:20", "view:60"]
+    d["windows"][1]["root"]["children"][0]["children"][0]["flags"].append("accessibility_focused")
+    assert [k for k, _ids in S.scrollables(d)] == ["view:60", "view:20"]
+
+
+def test_pre_pane_titles_are_titles_never_a_navigation_bar_s_labels():
+    """pre:pane=Saved on Now in Android's For you screen: the nav bar's "Saved" text is on
+    every destination, so it is no title; the top bar's "Now in Android" is."""
+    assert S.titles(dump("nia_for_you")) == ["Now in Android"]
+    assert "Saved" not in S.titles(dump("nia_feed_two_column"))  # the nav rail's label
+    assert "Interests" in S.titles(dump("nia_interests"))
+    assert S.titles(dump("thunderbird_selection_mode"))[-1] == "1 selected"  # the action mode
+    assert S.titles(dump("thunderbird_settings")) == ["Settings"]  # not the rows' texts
+    assert S.titles(dump("antennapod_episodes")) == ["Episodes"]  # in a long-clickable toolbar
+    assert S.titles(dump("thunderbird_theme_dialog")) == ["Theme"]  # the dialog, not under it
+
+
+def test_the_selectors_number_stops_with_the_talkback_model():
+    """Every hunt dump resolves through talkback.order (the model's stops); a broken call
+    into it (a signature change: TypeError) propagates instead of quietly switching every
+    selector to the a11y model's numbering. Only a dump the model cannot read falls back."""
+    from inspector_widget.talkback import order
+    for p in sorted(DATA.glob("*.a11y.json.gz")):
+        d = json.loads(gzip.decompress(p.read_bytes()))
+        assert len(S.stops_from_dump(d)) == len(order.reading_order(d, keyboard=True)["focus_order"]), p
+    d = _screen(_button("view:10", "Save", 0))
+    S.stops_from_dump(d)
+    real = order.reading_order
+    try:
+        order.reading_order = lambda *a, **k: (_ for _ in ()).throw(TypeError("keyboard"))
+        with pytest.raises(TypeError):
+            S.stops_from_dump(d)
+        order.reading_order = lambda *a, **k: (_ for _ in ()).throw(KeyError("windows"))
+        d["windows"][0]["root"]["children"][0]["order"] = 1
+        assert [s.key for s in S.stops_from_dump(d)] == ["view:10"]
+    finally:
+        order.reading_order = real

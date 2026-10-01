@@ -3,12 +3,14 @@ what did TalkBack say?
 
 * ``focus_after``: act and classify where focus lands (:func:`classify`):
   ``initial_ok`` (a new screen, focus on its first stop) | ``returned_to_opener`` (a window
-  or screen closed, focus back on what opened it) | ``reset_to_top`` (same screen, focus
-  thrown to its first stop: the target was removed) | ``moved_to_nav`` (same screen, focus
-  thrown to a navigation bar or tab) | ``nothing_happened`` (focus stayed and the
-  accessibility tree did not change) | ``stayed_on_opener`` | ``behind_overlay`` |
-  ``on_close_or_unlabeled`` (an unlabelled node, or a close / dismiss / cancel control) |
-  ``left_app`` | ``none`` | ``elsewhere``.
+  or screen closed, focus back on what opened it: TalkBack's log says it restored focus
+  there, or the app put it there) | ``under_closed_window`` (a window closed, focus went to
+  a node under it that nothing shows is its opener) | ``reset_to_top`` (same screen, focus
+  thrown to its first stop) | ``moved_to_nav`` (same screen, focus thrown to a navigation
+  bar or tab) | ``nothing_happened`` (focus stayed and nothing a screen reader reads
+  changed: no text, description, state description, checked or selected state) |
+  ``stayed_on_opener`` | ``behind_overlay`` | ``on_close_or_unlabeled`` (an unlabelled node,
+  or a close / dismiss / cancel control) | ``left_app`` | ``none`` | ``elsewhere``.
 * ``restore``: focus a target, activate it, wait for the opened screen to settle (a window,
   pane or screen change, then focus still for a while; else "opened screen not settled"),
   go back, and classify: ``restored`` | ``near`` | ``top`` | ``none`` | ``elsewhere``.
@@ -28,11 +30,13 @@ pressed. The verdict is about the focus after the last acting step.
 
 Every timeline carries what TalkBack said (its verbose log: ``said``), what it announced
 (window titles, announcements, live regions, click feedback) and why focus went where it did
-(``initial``: TalkBack's own initial focus on a window; ``restore``: put back or kept on
-screen; ``user``: a navigation press; ``app``: an accessibility action). ``speak_before`` /
+(``restore``: TalkBack put back the node it last focused in a window that came back, or
+kept focus on screen; ``initial``: its own initial focus on a window, the first content;
+``user``: a navigation press; ``app``: an accessibility action; ``initial/restore`` and
+``restore/app``: one of the two, on TalkBack 16, which does not log which). ``speak_before`` /
 ``speak_after`` are the target's and the landing node's utterances, and ``flags`` says
 "activated, nothing spoken" or "changed, nothing spoken" when the action changed the screen
-silently. Without TalkBack's verbose log (``talkback(action="on", verbose_log=true)``) the
+silently. Without TalkBack's verbose log (turn TalkBack on with verbose logging first) the
 speech is unknown, and the result says so.
 
 All three share :class:`.walk.Driver` (TalkBack on and restored, the key guard, the
@@ -68,6 +72,9 @@ GRAMMAR = ("activate | long_press[:<sel>] | custom:<label> | back | tap[:<sel>] 
            "'activate; walk:8' or 'pre:pane=Saved; activate; expect:Undo'")
 PROBE_ACTION = "com.oberkfell.a11yprobe.TB_PROBE"
 WINDOW_QUIET_S = 0.7   # TalkBack speaks a new window 550ms after it appears
+#: What a result says without TalkBack's verbose log (the CLI and MCP alike).
+SPEECH_NOT_LOGGED = ("not logged: TalkBack's log level is not VERBOSE (run talkback on with "
+                     "verbose_log first)")
 SAMPLE_S = 0.03
 WALK_MAX = 20          # walk:<n> presses at most
 WAIT_MAX_MS = 10000
@@ -99,6 +106,22 @@ FIXES = {
     "tb.focus_lost": "Same as tb.focus_reset: the focused node was removed or re-created.",
     "tb.focus_drift": "The focused View was rebound to other content (notifyDataSetChanged): use "
                       "DiffUtil / stable ids so the View keeps its item.",
+    # an action that threw focus off a node that is still there (selection mode, a re-keyed
+    # or re-created row: TB-3 / TB-4)
+    "tb.focus_reset:kept": "The acted node is still there: keep accessibility focus on it. Do "
+                           "not re-create or re-key it when the screen changes mode (selection "
+                           "or action mode: stable ids / items(key = ...), no new adapter or "
+                           "composition), and if the app moves focus on purpose, send "
+                           "ACTION_ACCESSIBILITY_FOCUS back to the acted node afterwards "
+                           "(View.performAccessibilityAction / the Compose host's "
+                           "accessibilityNodeProvider.performAction).",
+    # a sheet, dialog or menu closed and focus went to some node under it, not its opener
+    "tb.initial_focus:closed": "Put accessibility focus back on the control that opened the "
+                               "window when it closes: once the window is gone, send that "
+                               "control ACTION_ACCESSIBILITY_FOCUS (View.performAccessibility"
+                               "Action / the Compose host's accessibilityNodeProvider"
+                               ".performAction), and keep its node (no re-created row) so focus "
+                               "has somewhere to return.",
     # an action that removed the focused node on a screen that stays (a list mutation)
     "tb.focus_reset:mutation": "Once the list is laid out again, send "
                                "ACTION_ACCESSIBILITY_FOCUS to the item that took the removed "
@@ -179,8 +202,11 @@ _FLAG_WORDS = (r"(?:queueMode|tts[A-Z]\w*|force\w+|advance\w+|prevent\w+|haptic=
 _FEEDBACK = re.compile(r"TalkBackFeedbackProvider:\s+(\w+):\s+ttsOutput=\s?(.*?)"
                        r"(?=\s{2,}" + _FLAG_WORDS + r"|\s*$)")
 _ENDED = re.compile(r"\s{2,}" + _FLAG_WORDS)
-_REASON = re.compile(r"viewAccessibilityFocused:.*?isInitialFocus=(\w+),\s*"
-                     r"isRestoreFocusOrEnsureOnScreen=(\w+),\s*isEventNavigateByUser=(\w+)")
+#: TalkBack's focus feedback rule logs why focus landed: isInitialFocus and
+#: isEventNavigateByUser (TalkBack 16 and 17), isRestoreFocusOrEnsureOnScreen (17 only).
+_REASON = re.compile(r"viewAccessibilityFocused:.*?\bisInitialFocus=(\w+)")
+_REASON_FLAG = {k: re.compile(r"\b" + k + r"=(\w+)")
+                for k in ("isRestoreFocusOrEnsureOnScreen", "isEventNavigateByUser")}
 _EDGE = re.compile(r"FocusProcessor-LogicalNav: Reach edge")
 #: What the speech controller really spoke, with the event it spoke for: a window title on
 #: a window-state change ("1 selected": its feedback-provider line logs an empty ttsOutput)
@@ -191,8 +217,9 @@ _SPOKEN = re.compile(r'SpeechControllerImpl: Speaking fragment text="(.*)", utte
 def parse_line(line: str) -> Optional[Tuple[str, str]]:
     """One TalkBack log line as (kind, value): ``tts`` (a focus utterance), ``announce``
     (``TYPE`` + tab + text: window titles, announcements, live regions, click feedback),
-    ``hint`` (usage hints), ``reason`` (initial | restore | user | app), ``edge``; None for
-    anything else."""
+    ``hint`` (usage hints), ``reason`` (restore | initial | user | app; on TalkBack 16, which
+    logs no restore flag, initial/restore and restore/app), ``edge``; None for anything
+    else."""
     m = _FEEDBACK.search(line)
     if m:
         etype, text = m.group(1), m.group(2).strip()
@@ -211,9 +238,17 @@ def parse_line(line: str) -> Optional[Tuple[str, str]]:
         return ("announce", f"{etype}\t{text}")
     m = _REASON.search(line)
     if m:
-        initial, restore, user = (g == "true" for g in m.groups())
-        return ("reason", "initial" if initial else "restore" if restore else "user" if user
-                else "app")
+        initial = m.group(1) == "true"
+        flags = {k: (f.group(1) == "true" if f else None)
+                 for k, rx in _REASON_FLAG.items() for f in [rx.search(line, m.start())]}
+        restore, user = flags["isRestoreFocusOrEnsureOnScreen"], flags["isEventNavigateByUser"]
+        if restore:  # with isInitialFocus too: a window came back and TalkBack put back the
+            return ("reason", "restore")  # node it last focused there (restoreLastFocusedNode)
+        if initial:  # TalkBack 16 logs no restore flag: its window-change focus may be either
+            return ("reason", "initial" if restore is False else "initial/restore")
+        if user:
+            return ("reason", "user")
+        return ("reason", "app" if restore is False else "restore/app")
     if _EDGE.search(line):
         return ("edge", "")
     return None
@@ -360,8 +395,7 @@ def _speech(log: Optional[SpeechLog], t0: float, wait_s: float, acted: str,
     """speak_before / speak_after / announced / flags around the action at ``t0``."""
     out: Dict[str, Any] = {}
     if log is None or not log.verbose:
-        out["speech"] = ("not logged: TalkBack's log level is not VERBOSE (talkback(action='on', "
-                         "verbose_log=true) first)")
+        out["speech"] = SPEECH_NOT_LOGGED
         return out
     before = log.before(t0, "tts")
     if before is not None:
@@ -629,7 +663,9 @@ def _do_action(drv: Driver, cur: Snapshot, action: str) -> Tuple[str, Snapshot]:
 
 
 def _check_pre(drv: Driver, cur: Snapshot, pre: List[Step]) -> None:
-    """``pre:activity=<cls>`` / ``pre:pane=<title>``: fail before anything is pressed."""
+    """``pre:activity=<cls>`` / ``pre:pane=<title>``: fail before anything is pressed. A
+    pane is a title the screen shows (:func:`.select.titles`: a pane or window title, a
+    heading, the top bar's title), never a navigation bar's label."""
     for st in pre:
         k, _, v = st.arg.partition("=")
         k, v = k.strip().lower(), v.strip()
@@ -641,12 +677,13 @@ def _check_pre(drv: Driver, cur: Snapshot, pre: List[Step]) -> None:
                                              f"front; nothing was pressed",
                                 hint="Open that screen first, or drop the pre: step.")
         else:
-            panes = _panes(cur)
-            titles = set(panes) | {n.label for n in cur.index.order if n.label and (
-                "heading" in n.flags or n.simple_cls in ("TextView", "Toolbar"))}
+            d, _stops = _dump(cur)
+            titles = tbselect.titles(d) if d else _panes(cur)
             if not any(tbselect.norm(v) == tbselect.norm(p) for p in titles):
-                raise WalkError("not_found", f"precondition pre:pane={v} failed: panes on screen: "
-                                             f"{', '.join(panes) or 'none'}; nothing was pressed",
+                shown = ", ".join(repr(t[:30]) for t in titles[:6]) or "none"
+                raise WalkError("not_found", f"precondition pre:pane={v} failed: titles on screen "
+                                             f"(panes, windows, headings, top bar): {shown}; "
+                                             f"nothing was pressed",
                                 hint="Open that pane first, or drop the pre: step.")
 
 
@@ -685,6 +722,8 @@ def _expect(cur: Snapshot, label: str, walked: List[Dict[str, Any]],
     """Is focus on the stop ``label`` names, or did the walk before reach it?"""
     _d, stops = _dump(cur)
     m = tbselect.resolve(stops, label)
+    if m is not None and m.how == "substring":
+        m = None  # "Bookmark" inside "Unbookmark" is not the stop expected
     keys = {c.key for c in m.candidates} if m is not None else set()
     if tbselect.is_key(label):
         keys.add(label)
@@ -916,6 +955,8 @@ class Facts:
     opened_between: bool = False
     target_clicks: bool = True
     first_new: Optional[str] = None  # the first stop of what the action brought on screen
+    acted: str = "activate"          # the last acting step's kind
+    f1_reason: Optional[str] = None  # why TalkBack's log says focus landed (None: not logged)
 
 
 def classify(f: Facts) -> Tuple[str, str]:
@@ -929,8 +970,9 @@ def classify(f: Facts) -> Tuple[str, str]:
         if f.opened_between:
             return "returned_to_opener", "a screen opened and closed; focus is back on the target"
         if not f.tree_changed and not f.new_screen and not f.closed:
+            clicked = f.acted in ("activate", "tap")
             return "nothing_happened", ("focus stayed and nothing changed in the accessibility "
-                                        "tree" + ("" if f.target_clicks else
+                                        "tree" + ("" if f.target_clicks or not clicked else
                                                   "; the target offers no click action"))
         return "stayed_on_opener", "focus stayed on the target"
     if f.f1_covered:
@@ -939,7 +981,17 @@ def classify(f: Facts) -> Tuple[str, str]:
         return "on_close_or_unlabeled", ("focus is on an unlabelled node" if f.f1_unlabelled
                                          else "focus is on a close / dismiss control")
     if f.closed and f.f1_was_there and f.f1_key != f.first_key:
-        return "returned_to_opener", "a window closed; focus went back to a node under it"
+        if f.f1_reason in ("restore", "app", "restore/app", "initial/restore"):
+            return "returned_to_opener", ("a window closed; focus went back to a node under it ("
+                                          + ("TalkBack restored it" if f.f1_reason == "restore"
+                                             else "the app put it there" if f.f1_reason == "app"
+                                             else "TalkBack 16: " + f.f1_reason) + ")")
+        return "under_closed_window", (
+            "a window closed; focus went to a node under it, "
+            + ("by TalkBack's initial focus (first content), not a restore"
+               if f.f1_reason == "initial"
+               else f"by a {f.f1_reason} move, not a restore" if f.f1_reason
+               else "and TalkBack's log does not say it was restored there (no verbose log)"))
     if f.new_screen:
         if f.f1_key in (f.model_initial, f.first_key, f.first_new):
             return "initial_ok", "a new screen; focus on its first stop"
@@ -986,13 +1038,33 @@ def _screen_pane(s: Snapshot, title: str) -> bool:
     return False
 
 
+#: The flags whose change a screen reader reads (not input or accessibility focus).
+_STATE_FLAGS = frozenset({"checked", "selected", "enabled", "visible_to_user"})
+
+
 def _sig(s: Snapshot) -> set:
-    return {(n.key, n.label, frozenset(n.flags & {"checked", "visible_to_user"}))
-            for n in s.index.order}
+    """What a screen reader can read of a screen, per node: its words (text,
+    contentDescription, stateDescription), its checked / selected / enabled / visible
+    state, its checked, expanded and range values. A toggle that only changes its
+    stateDescription ("Starred") or its selected state is a change."""
+    from .. import a11y
+    if s.resp is None:
+        return {(n.key, n.label, frozenset(n.flags & _STATE_FLAGS)) for n in s.index.order}
+    d = a11y.a11y_to_dict(s.resp)
+    out = set()
+    for n, w in tbselect._iter(d.get("windows") or []):
+        out.add((n.get("node_key") or (w, n.get("host_view_id"), n.get("virtual_id")),
+                 n.get("text") or "", n.get("content_description") or "",
+                 n.get("state_description") or "",
+                 frozenset(set(n.get("flags") or ()) & _STATE_FLAGS),
+                 n.get("checked_state"), n.get("expanded_state"),
+                 (n.get("range_info") or {}).get("current")))
+    return out
 
 
 def facts(drv: Driver, before: Snapshot, after: Snapshot, top0: Optional[str],
-          top1: Optional[str], legacy: bool, opened_between: bool = False) -> Facts:
+          top1: Optional[str], legacy: bool, opened_between: bool = False,
+          acted: str = "activate", reason: Optional[str] = None) -> Facts:
     """The :class:`Facts` of a focus_after from the snapshots before and after the action."""
     f0, f1 = before.focus, after.focus
     _d1, stops1 = _dump(after)
@@ -1042,7 +1114,8 @@ def facts(drv: Driver, before: Snapshot, after: Snapshot, top0: Optional[str],
         first_key=_first_stop(after, legacy, f1.window if f1 is not None else None),
         model_initial=(model or {}).get("key"), opened_between=opened_between,
         first_new=appeared[0].key if appeared else None,
-        target_clicks=f0 is None or bool(f0.actions & {0x10}) or "clickable" in f0.flags)
+        target_clicks=f0 is None or bool(f0.actions & {0x10}) or "clickable" in f0.flags,
+        acted=acted, f1_reason=reason)
 
 
 _WENT = {"reset_to_top": "to the top", "moved_to_nav": "to the navigation bar",
@@ -1064,7 +1137,9 @@ def _focus_after(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, l
     top1 = device.top_activity(drv.serial)
     if log is not None:
         log.settle()
-    fx = facts(drv, start, after, top0, top1, legacy, opened)
+    said = _said(log, t0)
+    reason = next((e.get("why") for e in reversed(said) if e.get("said")), None)
+    fx = facts(drv, start, after, top0, top1, legacy, opened, acted=acting[-1].kind, reason=reason)
     verdict, why = classify(fx)
     new_windows = [w for w in _windows(after) if w not in _windows(start)]
     model = predict_initial(after.resp, new_windows[-1] if new_windows else None)
@@ -1074,7 +1149,7 @@ def _focus_after(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, l
         "action": "; ".join(whats), "new_screen": fx.new_screen,
         "before": {"top": top0, "windows": len(_windows(start)), "panes": _panes(start)},
         "after": {"top": top1, "windows": len(_windows(after)), "panes": _panes(after)},
-        "timeline": _merge(events[:12], _said(log, t0)[:8]), "focus": _desc(after.focus, legacy),
+        "timeline": _merge(events[:12], said[:8]), "focus": _desc(after.focus, legacy),
         "verdict": verdict, "why": why,
     }
     res.update(_speech(log, t0, wait_s, acting[-1].kind, fx.tree_changed))
@@ -1092,8 +1167,14 @@ def _focus_after(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, l
     elif verdict in ("reset_to_top", "moved_to_nav"):
         res["finding"] = {"code": "tb.focus_reset", "sev": "warn", "basis": "walk",
                           "msg": f"after {did}, focus went {went} on the same screen "
-                                 f"({ref} {spoken})",
-                          "fix": FIXES["tb.focus_reset:mutation"]}
+                                 f"({ref} {spoken}); the target is still there",
+                          "fix": FIXES["tb.focus_reset:kept"]}
+    elif verdict == "under_closed_window" and fx.f1_reason is not None:
+        res["finding"] = {"code": "tb.initial_focus", "sev": "warn", "basis": "walk",
+                          "msg": f"after {did}, the window closed and focus went to {ref} "
+                                 f"{spoken} under it ({fx.f1_reason} focus), not back to what "
+                                 f"opened the window",
+                          "fix": FIXES["tb.initial_focus:closed"]}
     elif verdict in ("none", "on_close_or_unlabeled", "behind_overlay") or \
             (fx.new_screen and verdict in ("stayed_on_opener", "elsewhere")):
         res["finding"] = {"code": "tb.initial_focus", "sev": "warn", "basis": "walk",
@@ -1170,8 +1251,7 @@ def _restore(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, legac
         if before is not None:
             res["speak_before"] = before[2]
     else:
-        res["speech"] = ("not logged: TalkBack's log level is not VERBOSE (talkback(action='on', "
-                         "verbose_log=true) first)")
+        res["speech"] = SPEECH_NOT_LOGGED
     if verdict not in ("restored", "near"):
         same_window = _windows(cur) == _windows(back) and top0 == top2
         why = ("single-activity navigation: the window (root, title, pane titles) did not change, so "

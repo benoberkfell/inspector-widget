@@ -12,7 +12,8 @@ announcement (and each ``". "`` part of it), and the texts merged into it from i
 Matches rank exact > whole word > substring ("Bookmark" never matches "Unbookmark" while a
 "Bookmark" exists; "Wear OS" is a whole word of "Wear OS is not followed"). Within the best
 rank several stops are a tie: a walk starts at the first of them in reading order, an
-activation refuses and lists them (:func:`require`).
+activation refuses and lists them (:func:`require`). An activation also refuses a match
+inside a word ("Bookmark" in "Unbookmark", "follow" in "Unfollow": the opposite control).
 
 Everything here is pure: it reads an :func:`inspector_widget.a11y.a11y_to_dict` dump.
 """
@@ -190,14 +191,20 @@ def _key_fn(windows: Sequence[Dict[str, Any]], legacy: bool) -> Callable[[Dict[s
     return key
 
 
+#: What :func:`talkback.order.reading_order` raises on a dump it cannot read (a malformed
+#: or partial one): only then do the selectors fall back to the a11y model's numbering. A
+#: TypeError, AttributeError or ImportError is a bug in the call and propagates.
+_MODEL_ERRORS = (KeyError, ValueError, IndexError, RecursionError)
+
+
 def _ordered(d: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """(stop dicts in reading order, their announcements): talkback.order, else the
-    a11y model's numbering."""
+    """(stop dicts in reading order, their announcements): talkback.order, else (a dump
+    the TalkBack model cannot read) the a11y model's numbering."""
+    from .order import reading_order
     try:
-        from .order import reading_order
         res = reading_order(d, keyboard=True)
         return list(res["_nodes"]), [str(e.get("speak") or "") for e in res["focus_order"]]
-    except Exception:  # noqa: BLE001 - a dump the TalkBack model cannot read
+    except _MODEL_ERRORS:
         pass
     stops: List[Tuple[int, Dict[str, Any]]] = []
     for n, _w in _iter(d.get("windows") or []):
@@ -253,6 +260,36 @@ def _shown(n: Dict[str, Any]) -> bool:
     return False
 
 
+def _blank(windows: Sequence[Dict[str, Any]]) -> Set[int]:
+    """Root ids of the windows that show nothing (their whole tree invisible)."""
+    return {int(w.get("root_view_id") or 0) for w in windows
+            if w.get("root") and not _shown(w["root"])}
+
+
+def live_windows(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The windows of a dump TalkBack can reach: not under a modal window that shows
+    something (a blank one left on top does not cover, see :func:`stops_from_dump`)."""
+    windows = d.get("windows") or []
+    blank = _blank(windows)
+    return [w for w in windows if w.get("covered_by") is None or w.get("covered_by") in blank]
+
+
+def covering_window(d: Dict[str, Any], key: str, *, legacy: bool = False) -> Optional[int]:
+    """The root id of the modal window that covers node ``key``'s window (a dialog over the
+    activity: a TalkBack user cannot reach the node), or None."""
+    windows = d.get("windows") or []
+    key_of = _key_fn(windows, legacy)
+    blank = _blank(windows)
+    for w in windows:
+        by = w.get("covered_by")
+        if by is None or by in blank or not w.get("root"):
+            continue
+        win = int(w.get("root_view_id") or 0)
+        if any(key_of(n, win) == key for n, _w in _iter([w])):
+            return int(by)
+    return None
+
+
 def stops_from_dump(d: Dict[str, Any], *, legacy: bool = False) -> List[Stop]:
     """The model's stops of one :func:`~inspector_widget.a11y.a11y_to_dict` dump.
 
@@ -261,8 +298,7 @@ def stops_from_dump(d: Dict[str, Any], *, legacy: bool = False) -> List[Stop]:
     under it: their stops are what TalkBack reads (the walk reaches them)."""
     windows = d.get("windows") or []
     key_of = _key_fn(windows, legacy)
-    blank = {int(w.get("root_view_id") or 0) for w in windows
-             if w.get("root") and not _shown(w["root"])}
+    blank = _blank(windows)
     if blank and any(w.get("covered_by") in blank for w in windows):
         d = dict(d, windows=[{k: v for k, v in w.items() if k != "covered_by"}
                              if w.get("covered_by") in blank else w for w in windows])
@@ -474,7 +510,17 @@ def vet(m: Match, *, activate: bool, where: str = "",
     (a link). A walk start keeps the first of a tie, with a note."""
     if activate and m.ambiguous:
         raise ambiguity_error(m, f" on {where}" if where else "")
-    if activate and m.how in ("word", "substring") and m.cover < WEAK:
+    if activate and m.how == "substring":
+        # "Bookmark" inside "Unbookmark", "follow" inside "Unfollow": the opposite control
+        raise SelectError(
+            "ambiguous",
+            f"{m.selector!r} is only part of a word in what {len(m.candidates)} stop(s) say "
+            f"(their {m.field}; no stop says it as a word): too loose to activate"
+            + (f" on {where}" if where else ""),
+            hint="Pass the whole word as the stop speaks it, its key or ref, or "
+                 "'<label> within <card label>'.",
+            candidates=candidates(m))
+    if activate and m.how == "word" and m.cover < WEAK:
         raise SelectError(
             "ambiguous",
             f"{m.selector!r} is only part of what {len(m.candidates)} stop(s) say ({m.how} match "
@@ -483,6 +529,9 @@ def vet(m: Match, *, activate: bool, where: str = "",
             hint="Pass the words the stop speaks (more of them), its key or ref, or "
                  "'<label> within <card label>'.",
             candidates=candidates(m))
+    if m.how == "substring":
+        m.notes.append(f"{m.selector!r} is only part of a word of {m.node.line(32)}: no stop "
+                       f"says it as a word")
     if m.ambiguous:
         m.notes.append(f"{m.selector!r}: {len(m.candidates)} stops match ({m.how} {m.field}); "
                        f"took the first, {m.node.key}")
@@ -511,9 +560,10 @@ def require(stops: Sequence[Stop], selector: str, *, activate: bool, where: str 
 def can_bring_more(d: Dict[str, Any]) -> Optional[str]:
     """What could bring a stop that is not in the dump onto the screen: a list or scroll
     view that can still scroll (TalkBack auto-scrolls it), or a WebView whose tree is empty
-    (it builds one only while a screen reader runs). None: nothing can."""
+    (it builds one only while a screen reader runs), in a window TalkBack reaches (not one
+    under an open dialog). None: nothing can."""
     from .walk import _SCROLL_ACTIONS, _WEBVIEW
-    for n, _w in _iter(d.get("windows") or []):
+    for n, _w in _iter(live_windows(d)):
         cls = str(n.get("class_name") or "")
         if cls == _WEBVIEW and not n.get("children"):
             return "an empty WebView"
@@ -527,21 +577,78 @@ def can_bring_more(d: Dict[str, Any]) -> Optional[str]:
 
 
 def scrollables(d: Dict[str, Any]) -> List[Tuple[str, Set[int]]]:
-    """(key, scroll action ids) of each scrolling container, largest first (a list before
-    the chip rows in its cards)."""
+    """(key, scroll action ids) of each scrolling container in a window TalkBack reaches
+    (never a list under an open dialog: scrolling it would change the screen behind the
+    dialog for nothing), those in the window that holds accessibility focus first, then
+    largest first (a list before the chip rows in its cards)."""
     from .walk import _SCROLL_ACTIONS, _WEBVIEW
-    out: List[Tuple[int, str, Set[int]]] = []
-    for n, _w in _iter(d.get("windows") or []):
+    live = live_windows(d)
+    focused = next((w for n, w in _iter(live) if "accessibility_focused" in (n.get("flags") or ())),
+                   None)
+    out: List[Tuple[int, int, str, Set[int]]] = []
+    for n, w in _iter(live):
         if str(n.get("class_name") or "") == _WEBVIEW or not n.get("node_key"):
             continue
         ids = {int(a.get("id") or 0) for a in n.get("actions") or [] if isinstance(a, dict)}
         if ids & set(_SCROLL_ACTIONS):
             b = (n.get("bounds") or {}).get("layout") or {}
-            out.append((int(b.get("w", 0)) * int(b.get("h", 0)), str(n["node_key"]), ids))
-    out.sort(key=lambda t: -t[0])
-    return [(k, ids) for _a, k, ids in out]
+            out.append((0 if focused is None or w == focused else 1,
+                        -int(b.get("w", 0)) * int(b.get("h", 0)), str(n["node_key"]), ids))
+    out.sort(key=lambda t: (t[0], t[1]))
+    return [(k, ids) for _f, _a, k, ids in out]
+
+
+#: The share of a window's height its top bar (a toolbar, an action mode) takes at most.
+TOP_BAND = 0.15
+
+
+#: A node whose texts are a control's or a list's, not a title (a toolbar may be long-clickable).
+_CONTROL = frozenset({"clickable", "focusable", "scrollable"})
+
+
+def titles(d: Dict[str, Any]) -> List[str]:
+    """What names the screen, as ``pre:pane=<title>`` checks it: pane titles, the windows'
+    accessibility titles, headings, and the texts in the top band of each window that sit
+    in no control and no list (a toolbar's or an action mode's title). Never a navigation
+    bar's or rail's labels, which every destination shows, nor a list row's texts."""
+    from .walk import _SCROLL_ACTIONS
+    out: List[str] = []
+
+    def add(t: Any) -> None:
+        t = str(t or "").strip()
+        if t and t not in out:
+            out.append(t)
+
+    def control(n: Dict[str, Any]) -> bool:
+        ids = {a.get("id") for a in n.get("actions") or [] if isinstance(a, dict)}
+        return bool(set(n.get("flags") or ()) & _CONTROL or ids & set(_SCROLL_ACTIONS))
+
+    for w in live_windows(d):
+        root = w.get("root")
+        if not root:
+            continue
+        add(w.get("title"))
+        frame = w.get("frame") or (root.get("bounds") or {}).get("layout") or {}
+        wy, wh = int(frame.get("y", 0)), int(frame.get("h", 0))
+        stack: List[Tuple[Dict[str, Any], bool]] = [(root, False)]
+        while stack:
+            n, inside = stack.pop()
+            fl = set(n.get("flags") or ())
+            add(n.get("pane_title"))
+            if "heading" in fl:
+                add(n.get("content_description") or n.get("text")
+                    or " ".join(_words(c)[0] for c in n.get("children") or [] if _words(c)))
+            b = (n.get("bounds") or {}).get("layout") or {}
+            if (wh > 0 and n.get("text") and not inside and not control(n)
+                    and "visible_to_user" in fl
+                    and int(b.get("y", 0)) < wy + TOP_BAND * wh
+                    and int(b.get("h", 0)) < TOP_BAND * wh):
+                add(n.get("text"))
+            under = inside or control(n)
+            stack.extend((c, under) for c in reversed(n.get("children") or []))
+    return out
 
 
 __all__ = ["FIELDS", "Match", "RANKS", "SelectError", "WEAK", "Stop", "ambiguity_error", "can_bring_more",
-           "candidates", "is_key", "norm", "not_found_error", "require", "resolve", "scrollables",
-           "stops_from_dump", "vet"]
+           "candidates", "covering_window", "is_key", "live_windows", "norm", "not_found_error",
+           "require", "resolve", "scrollables", "stops_from_dump", "titles", "vet"]

@@ -218,6 +218,7 @@ _SIG_SOURCES = (
     "inspector_widget/talkback/walk.py",
     "inspector_widget/talkback/diff.py",
     "inspector_widget/talkback/scenarios.py",
+    "inspector_widget/talkback/select.py",
     # capture and walk (S1/S2): the ops layer, the surface registry and the
     # capture library they drive
     "inspector_widget/ops.py",

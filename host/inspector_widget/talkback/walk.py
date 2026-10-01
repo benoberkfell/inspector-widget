@@ -1480,9 +1480,18 @@ def _seek_resolve(drv: Driver, cur: Snapshot, start: str, *, activate: bool
         return None, cur
     m = select.resolve(stops, start)
     if m is None and select.is_key(start) and start in cur.index.nodes:
-        # a node the model reads as no stop (under a modal window, not important ...):
-        # A11yAct can still put focus on it, as asked
-        drv.notes.append(f"start {start} is no stop the model reads; focused as given")
+        # a node the model reads as no stop (not important, under a modal window ...):
+        # A11yAct can still put focus on it, as asked. Not to activate it under an open
+        # dialog, drawer or sheet: a TalkBack user cannot reach it there (a ref from a
+        # capture taken before the dialog opened lands here too).
+        by = select.covering_window(d, start, legacy=bool(cur.index.legacy))
+        cov = f"the modal window {by}" if by is not None else _cover_text(cur.index, start)
+        if activate and cov:
+            raise select.SelectError(
+                "start_not_found", f"{start} lies under {cov}: a TalkBack user cannot reach it",
+                hint="Close the dialog/drawer/sheet first, or target a stop on it.")
+        drv.notes.append(f"{'target' if activate else 'start'} {start} is no stop the model "
+                         f"reads; focused as given" + (f" (it lies under {cov})" if cov else ""))
         return None, cur
     if m is None and select.is_key(start):
         # a key from an earlier read: the tree changed since (a list update, a scroll)
@@ -1607,7 +1616,12 @@ def _seek_press(drv: Driver, cur: Snapshot, start: str, m: Optional[Any], *,
     """Press "next" until focus is on the stop ``m`` names (any of a tie), or a node ``start``
     names, for at most one lap (:data:`SEEK_MAX_PRESSES`). Without ``m`` (the model could
     not resolve it) the node focus reaches is vetted as a match would be: an activation
-    refuses one that ``start`` names only loosely."""
+    refuses one that ``start`` names only loosely.
+
+    At the last stop TalkBack's first "next" only reaches the edge and the second wraps to
+    the first stop (FocusProcessorForLogicalNavigation), so an edge is pressed through: a
+    target above the focus is reached after the wrap. The lap ends when a press that moved
+    lands on a stop already passed, or when two presses in a row do not move."""
     from . import select
     want = {c.key for c in m.candidates} if m is not None else set()
 
@@ -1634,28 +1648,38 @@ def _seek_press(drv: Driver, cur: Snapshot, start: str, m: Optional[Any], *,
         t, _ = drv.press("prev")
         drv.seek_presses += 1
         return drv.wait(snap.key, t).snap
-    seen: set = set()
-    edged = False
-    presses = 0
+
+    def lap_error(presses: int, why: str) -> select.SelectError:
+        if m is not None:  # the model has the stop: TalkBack's "next" never got there
+            return select.SelectError(
+                "start_not_found",
+                f"TalkBack never focused {m.node.line(32)} in {presses} presses of \"next\" "
+                f"from {before.key} ({why})",
+                hint="It may be outside TalkBack's order or behind a trap: walk the screen "
+                     "(start='first') to see what TalkBack reaches.")
+        return select.not_found_error(start, len(_seek_stops(before)[1]), _screen_name(drv),
+                                      searched=f"{presses} presses, {why}")
+
+    seen: set = {before.key} - {None}
+    presses = still = 0
     while not hit(snap):
-        lapped = edged and snap.key in seen
-        if presses >= SEEK_MAX_PRESSES or lapped:
-            n = len(_seek_stops(before)[1])
-            raise select.not_found_error(start, n, _screen_name(drv),
-                                         searched=f"{presses} presses, one lap")
         if snap.key is not None:
             seen.add(snap.key)
+        if presses >= SEEK_MAX_PRESSES:
+            raise lap_error(presses, "the seek's budget")
+        if still >= 2:
+            raise lap_error(presses, "focus stopped moving")
         t, _ = drv.press("next")
         w = drv.wait(snap.key, t)
         drv.seek_presses += 1
         presses += 1
         if not w.moved:
-            if edged and w.snap.key == snap.key:
-                lapped = True
-            edged = True
-            if lapped:
-                continue
+            still += 1  # the edge: the next press wraps to the first stop
+            continue
+        still = 0
         snap = w.snap
+        if snap.key in seen and not hit(snap):
+            raise lap_error(presses, "one lap")
     return snap
 
 

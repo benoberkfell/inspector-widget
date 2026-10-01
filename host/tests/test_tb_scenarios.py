@@ -122,10 +122,13 @@ def test_verdicts_on_the_hunts_shapes():
     assert v == "reset_to_top"
     assert S.classify(F(f1_key="view:32", f1_label="Navigate up", target_gone=True,
                         f1_covered="ActionBarContextView view:1855"))[0] == "behind_overlay"
-    # AP-9: back closed the filter sheet, focus back on Filter (not the window's first stop)
-    v, _ = S.classify(F(f1_key="view:51", f1_label="Filter", closed=True, f1_was_there=True,
-                        tree_changed=True, first_key="view:12"))
-    assert v == "returned_to_opener"
+    # AP-9: back closed the filter sheet, TalkBack restored focus on Filter (its log says so)
+    v, why = S.classify(F(f1_key="view:51", f1_label="Filter", closed=True, f1_was_there=True,
+                          tree_changed=True, first_key="view:12", f1_reason="restore"))
+    assert v == "returned_to_opener" and "TalkBack restored it" in why
+    for reason in ("app", "restore/app", "initial/restore"):  # the app; TalkBack 16
+        assert S.classify(F(f1_key="view:51", closed=True, f1_was_there=True, tree_changed=True,
+                            first_key="view:12", f1_reason=reason))[0] == "returned_to_opener"
     # t62wh1t: activate on a node that cannot act: nothing changed
     v, why = S.classify(F(f1_key="compose:8:1706", same_node=True, target_clicks=False))
     assert v == "nothing_happened" and "no click action" in why
@@ -258,12 +261,13 @@ def test_back_from_a_sheet_to_its_opener_is_returned_to_opener(probe):
             live = probe.live_scene(PKG)
             live.roots = [r for r in live.roots if r.id != 2001]
             probe.talkback.order = list(ORDER) + TABS
+            probe.talkback.log(_TB17_REASON % ("false", "true"))  # TalkBack's restore
             probe.talkback.set_focus(tb_item(3))  # the opener
 
     probe.on_input = on_input
     res = scenario("focus_after", target="Clear", action="back")
     assert res["verdict"] == "returned_to_opener", res
-    assert "finding" not in res
+    assert "finding" not in res and "TalkBack restored it" in res["why"]
 
 
 # --------------------------------------------------------------------------- what was said (G11)
@@ -289,7 +293,7 @@ def test_timeline_carries_speech_reasons_and_announcements(probe):
 def test_without_the_verbose_log_the_speech_is_not_made_up(probe):
     probe.talkback.log_level = "ERROR"
     res = scenario("focus_after", target="Item 2", action="activate")
-    assert res["speech"].startswith("not logged") and "flags" not in res
+    assert res["speech"] == S.SPEECH_NOT_LOGGED and "flags" not in res
     assert "speak_after" not in res
 
 
@@ -588,3 +592,283 @@ def test_refs_inside_an_action_sequence_resolve_in_the_capture(tb_env, monkeypat
     assert err and doc["error"]["code"] == "ref_not_in_capture"
     assert tb_env.talkback.presses.count("click") == 1  # the second one pressed nothing
     assert fakeagent.settings_changes(tb_env, original) == {}
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_a_window_closing_onto_an_unrelated_node_is_not_returned_to_opener():
+    """A sheet that dropped focus on some row under it: nothing shows that row opened it.
+    TalkBack's initial focus there is a finding; with no focus reason logged it is said."""
+    base = {"f1_key": "view:2011", "f1_label": "Episode 14. 32 minutes", "closed": True,
+            "f1_was_there": True, "tree_changed": True, "first_key": "view:12"}
+    v, why = S.classify(F(**base))
+    assert v == "under_closed_window" and "does not say it was restored" in why
+    v, why = S.classify(F(**base, f1_reason="initial"))
+    assert v == "under_closed_window" and "initial focus (first content), not a restore" in why
+    assert S.classify(F(**base, f1_reason="initial/restore"))[0] == "returned_to_opener"
+
+
+def test_the_no_click_clause_is_only_for_a_click():
+    """probe:noop (a broadcast) did not click the target: no "offers no click action"."""
+    for acted, clause in (("activate", True), ("tap", True), ("probe", False), ("broadcast", False),
+                          ("key", False)):
+        v, why = S.classify(F(f1_key="compose:8:1706", same_node=True, target_clicks=False,
+                              acted=acted))
+        assert v == "nothing_happened" and ("no click action" in why) is clause, acted
+
+
+def test_the_log_parser_reads_talkback_16_focus_reasons():
+    """TalkBack 16.2 logs no isRestoreFocusOrEnsureOnScreen (EventTypeViewAccessibility
+    FocusedFeedbackRule): its reasons are read all the same."""
+    line = ("         1790846354.711 23067 23067 V talkback: EventTypeViewAccessibilityFocusedFeedbackRule:"
+            "  viewAccessibilityFocused: (614316) , ttsOutput={Filter. Button}, isInitialFocus=%s, "
+            "isEventNavigateByUser=%s, isDeviceScreenNoTouch=false,")
+    assert S.parse_line(line % ("true", "false")) == ("reason", "initial/restore")
+    assert S.parse_line(line % ("false", "true")) == ("reason", "user")
+    assert S.parse_line(line % ("false", "false")) == ("reason", "restore/app")
+    tb17 = ("V talkback: EventTypeViewAccessibilityFocusedFeedbackRule:  viewAccessibilityFocused: "
+            "(1) , ttsOutput={X}, isInitialFocus=%s, isRestoreFocusOrEnsureOnScreen=%s, "
+            "isEventNavigateByUser=false, isDeviceScreenNoTouch=false,")
+    assert S.parse_line(tb17 % ("false", "false")) == ("reason", "app")
+    assert S.parse_line(tb17 % ("true", "false")) == ("reason", "initial")
+    # emulator-5556, TalkBack 17: back closed Now in Android's settings dialog and TalkBack
+    # put focus back on the Settings button, logging both flags: a restore
+    assert S.parse_line(tb17 % ("true", "true")) == ("reason", "restore")
+
+
+def test_the_speech_hint_names_no_one_surface():
+    assert "talkback(" not in S.SPEECH_NOT_LOGGED and "--" not in S.SPEECH_NOT_LOGGED
+    assert "verbose_log" in S.SPEECH_NOT_LOGGED
+
+
+def _sheet_scene_and_back(probe, reason_line):
+    clear = ViewSpec(2011, "Button", "android.widget", (40, 400, 120, 48), text="Clear",
+                     a11y={"class_name": "android.widget.Button", "text": "Clear",
+                           "clickable": True, "focusable": True})
+    sheet = ViewSpec(2001, "DecorView", "com.android.internal.policy", (0, 380, 360, 260),
+                     a11y={"class_name": "android.widget.FrameLayout"}, children=[clear])
+
+    def scene():
+        sc = nav_scene()
+        sc.roots.append(sheet)
+        return sc
+
+    probe.scene_factory = scene
+    probe.talkback.order = [(2011, -1)]
+
+    def on_input(args):
+        if args == ["keyevent", "KEYCODE_BACK"] and probe.talkback.focus == (2011, -1):
+            live = probe.live_scene(PKG)
+            live.roots = [r for r in live.roots if r.id != 2001]
+            probe.talkback.order = list(ORDER) + TABS
+            probe.talkback.log(reason_line)
+            probe.talkback.set_focus(tb_item(3))
+
+    probe.on_input = on_input
+
+
+_TB17_REASON = ("EventTypeViewAccessibilityFocusedFeedbackRule:  viewAccessibilityFocused: (7) , "
+                "ttsOutput={Item 3}, isInitialFocus=%s, isRestoreFocusOrEnsureOnScreen=%s, "
+                "isEventNavigateByUser=false, isDeviceScreenNoTouch=false,")
+
+
+def test_back_onto_a_node_talkback_did_not_restore_is_under_closed_window(probe):
+    _sheet_scene_and_back(probe, _TB17_REASON % ("true", "false"))
+    res = scenario("focus_after", target="Clear", action="back")
+    assert res["verdict"] == "under_closed_window", res
+    assert res["finding"]["code"] == "tb.initial_focus"
+    assert res["finding"]["msg"] == ('after back, the window closed and focus went to view:1023 '
+                                     '"Item 3. Button" under it (initial focus), not back to '
+                                     'what opened the window')
+    assert res["finding"]["fix"] == S.FIXES["tb.initial_focus:closed"]
+
+
+def test_a_key_under_a_modal_dialog_is_not_activated(probe):
+    """A key (or a ref from a capture taken before the dialog opened) of a node under an
+    open modal dialog: a TalkBack user cannot reach it, so a scenario refuses to activate
+    it; a walk may still start there, as asked, and says where it lies."""
+    ok = ViewSpec(2011, "Button", "android.widget", (40, 200, 120, 48), text="OK",
+                  a11y={"class_name": "android.widget.Button", "text": "OK",
+                        "clickable": True, "focusable": True, "actions": [(0x10, None), (0x40, None)]})
+
+    def scene():
+        sc = nav_scene()
+        sc.roots.append(ViewSpec(2001, "DecorView", "com.android.internal.policy", (20, 180, 320, 200),
+                                 a11y={"class_name": "android.widget.FrameLayout"}, children=[ok]))
+        sc.windows[2001] = {"title": "Confirm", "window_type": 2, "wm_flags": 0x2,
+                            "layout_title": "com.oberkfell.a11yprobe/Dialog"}
+        return sc
+
+    probe.scene_factory = scene
+    probe.talkback.order = [(2011, -1)]
+    with pytest.raises(tbwalk.WalkError) as err:
+        scenario("focus_after", target="view:1022", action="activate")
+    assert err.value.code == "start_not_found"
+    assert str(err.value) == "view:1022 lies under the modal window 2001: a TalkBack user cannot reach it"
+    assert probe.talkback.clicks == []
+    session = iw.attach(SERIAL, PKG)
+    try:
+        res = tbwalk.run_walk(session, start="view:1022", max_steps=1, until="steps", **FAST)
+    finally:
+        session.disconnect()
+    assert ("start view:1022 is no stop the model reads; focused as given (it lies under the "
+            "modal window 2001)") in res["notes"]
+
+
+def test_the_press_through_seek_wraps_to_a_target_above_the_focus(probe, monkeypatch):
+    """No A11yAct (an older agent): focus on Item 4, start 'Item 1' lies above it. TalkBack's
+    first "next" at the last stop only reaches the edge, the second wraps: the seek goes on
+    through the wrap and reaches Item 1."""
+    monkeypatch.setattr(tbwalk, "make_reader", lambda session: tbwalk.DumpFocusReader(session))
+    probe.talkback.focus = tb_item(4)
+    session = iw.attach(SERIAL, PKG)
+    try:
+        res = tbwalk.run_walk(session, start="Item 1", max_steps=1, until="steps", **FAST)
+    finally:
+        session.disconnect()
+    assert res["lines"][0].startswith("0. view:1021"), res["lines"]
+
+
+def test_a_stop_talkback_never_focuses_is_named_after_one_lap(probe, monkeypatch):
+    monkeypatch.setattr(tbwalk, "make_reader", lambda session: tbwalk.DumpFocusReader(session))
+    probe.talkback.order = [t for t in probe.talkback.order if t != tb_item(3)]
+    probe.talkback.focus = tb_item(1)
+    session = iw.attach(SERIAL, PKG)
+    try:
+        with pytest.raises(tbwalk.WalkError) as err:
+            tbwalk.run_walk(session, start="Item 3", max_steps=1, until="steps", **FAST)
+    finally:
+        session.disconnect()
+    assert err.value.code == "start_not_found"
+    msg = str(err.value)
+    assert msg.startswith('TalkBack never focused view:1023 "Item 3. Button" in ') and msg.endswith(
+        "(one lap)"), msg
+    assert "not found" not in msg
+
+
+def _toggle(field, value):
+    def on_click(tb, target):
+        v = _views(tb.device.live_scene(PKG))[target[0]]
+        v.a11y[field] = value
+        tb.device.agent(PKG).a11y_tap.record(fakeagent.TYPE_WINDOW_CONTENT_CHANGED, 1001, target[0], -1,
+                                             content_change_types=64)
+    return on_click
+
+
+@pytest.mark.parametrize("field,value", [("state_description", "Starred"), ("selected", True)])
+def test_a_toggle_that_only_changes_its_state_is_no_nothing_happened(probe, field, value):
+    """TB-6's kind: the click changed the star's stateDescription (or selected state) and
+    nothing else. That is a change a screen reader reads, not "nothing happened"."""
+    probe.talkback.on_click = _toggle(field, value)
+    res = scenario("focus_after", target="Item 2", action="activate")
+    assert res["verdict"] == "stayed_on_opener", res
+
+
+def test_pre_pane_is_a_title_not_a_navigation_bar_label(probe):
+    """The tab bar's "Saved" (a Text inside the tab, as Compose's NavigationBarItem has it)
+    is on every screen: pre:pane=Saved fails on this one (its title is "Title") and lists
+    the titles it found; pre:pane=Title passes."""
+    def scene():
+        sc = nav_scene()
+        _views(sc)[1062].children = [ViewSpec(1072, "TextView", "android.widget", (200, 600, 140, 30),
+                                              text="Saved", a11y={"class_name": "android.widget.TextView",
+                                                                  "text": "Saved"})]
+        return sc
+
+    probe.scene_factory = scene
+    with pytest.raises(tbwalk.WalkError) as err:
+        scenario("focus_after", target="Item 2", action="pre:pane=Saved; probe:noop")
+    assert err.value.code == "not_found" and "'Title'" in str(err.value)
+    assert "nothing was pressed" in str(err.value) and probe.talkback.presses == []
+    res = scenario("focus_after", target="Item 2", action="pre:pane=Title; activate")
+    assert res["verdict"] == "nothing_happened"
+
+
+def test_a_target_thrown_off_but_still_there_gets_the_kept_fix(probe):
+    """TB-3/TB-4's shape: selection mode threw focus to the top, nothing was removed."""
+    probe.talkback.on_click = lambda tb, target: tb.set_focus(TB_TITLE)
+    res = scenario("focus_after", target="Item 2", action="activate")
+    assert res["verdict"] == "reset_to_top"
+    assert res["finding"]["fix"] == S.FIXES["tb.focus_reset:kept"]
+    assert "removed" not in res["finding"]["fix"] and "still there" in res["finding"]["msg"]
+
+
+def test_expect_does_not_count_a_match_inside_a_word(probe):
+    res = scenario("focus_after", target="Item 2", action="activate; expect:tem 2")
+    assert res["expect"]["reached"] is False and res["expect"]["on_screen"] is False
+
+
+def test_a_walk_s_last_presses_survive_the_result_budget():
+    """NIA-5: 'activate; walk:8' with no expect asks whether Undo comes within 8 presses;
+    UNDO at press 7 must survive the 1 KB result."""
+    rec = {"id": "tabcdef", "kind": "focus_after", "captures": ["c1", "c2"],
+           "target": {"ref": "n12", "speak": "Unbookmark. Check box. checked"},
+           "matched": 'label (exact) n12 "Unbookmark. Check box. checked"',
+           "action": "activate (TalkBack click, Meta+Space)", "new_screen": False,
+           "before": {"windows": 1}, "after": {"windows": 1},
+           "timeline": [{"t": 0, "focus": "n12"}, {"t": 164, "focus": "n19"},
+                        {"t": 170, "said": "Bookmark removed", "why": "restore"}],
+           "focus": {"ref": "n19", "speak": "Bookmark removed"}, "verdict": "reset_to_top",
+           "why": 'same screen; focus thrown to its first stop (the target was removed)',
+           "walk": [{"i": i, "ref": f"n{19 + i}", "speak": s} for i, s in enumerate(
+               ["Bookmark removed", "Search. Button", "Settings. Button", "Headlines. Tab",
+                "Topics followed. In list", "Android Studio Hedgehog news card. In list",
+                "UNDO. Button", "For you. Tab"], 1)],
+           "finding": {"code": "tb.focus_reset", "sev": "warn",
+                       "msg": 'after activate, the focused target was removed and focus went to '
+                              'the top (n19 "Bookmark removed")',
+                       "fix": S.FIXES["tb.focus_reset:mutation"]},
+           "notes": ["a note " * 10], "restore": "restored"}
+    out = walks.scenario_result(rec)
+    assert utf8_len(dumps(out)) <= walks.SCENARIO_MAX_BYTES
+    assert any("UNDO" in x for x in out["lines"]), out["lines"]
+    assert out["lines"][-1].startswith("8 n27"), out["lines"]
+    assert out["finding"]["code"] == "tb.focus_reset"
+    # squeezed hard, the middle goes, never the last presses
+    small = walks.scenario_result(rec, max_bytes=600)
+    assert small["lines"][-1].startswith("8 n27") and any("UNDO" in x for x in small["lines"])
+    assert any(x.startswith("…+") for x in small["lines"]), small["lines"]
+
+
+def test_cli_and_mcp_refuse_a_target_inside_a_word_alike(probe, run_cli, mcp):
+    m = mcp("tb_scenario", kind="focus_after", target="tem 1", action="activate", **FAST)
+    r = run_cli("tb-scenario", "focus-after", "--serial", SERIAL, "--package", PKG,
+                "--target", "tem 1", "--action", "activate", "--json", "-")
+    c = json.loads(r.err)
+    assert r.rc == 1 and m["error"]["code"] == c["error"]["code"] == "ambiguous"
+    assert m["error"]["message"] == c["error"]["message"]
+    assert "only part of a word" in c["error"]["message"]
+    assert probe.talkback.presses == [] and probe.talkback.clicks == []
+
+
+def test_the_capture_surface_names_the_match_once(tb_env, monkeypatch):
+    """matched says how the label matched; the node is the target line's ref, not again as
+    a raw key the capture surface uses nowhere else."""
+    import mcp_server
+    from inspector_widget import surface
+    monkeypatch.setenv(surface.ENV_TOOLSET, "capture,talkback")
+    monkeypatch.setattr(S, "WINDOW_QUIET_S", 0.1)
+    tb_env.scene_factory = fakeagent.talkback_scene
+    tb_env.talkback.order = list(ORDER)
+    tb_env.talkback.labels = {TB_TITLE: "Title", **{tb_item(i): f"Item {i}. Button" for i in range(6)}}
+
+    def call(tool, **args):
+        text, is_error = mcp_server._call_tool_text(tool, args)
+        return json.loads(text), is_error
+
+    doc, err = call("capture", serial=SERIAL, package=PKG)
+    assert not err, doc
+    res, err = call("tb_scenario", kind="focus_after", serial=SERIAL, package=PKG, target="Item 2",
+                    action="activate", wait_ms=400, **FAST)
+    assert not err, res
+    assert res["target"].startswith('n8 "Item 2') and res["matched"] == "label (exact)", res
+    assert "view:" not in json.dumps(res)
+
+
+def test_matched_text_keeps_another_node_and_its_suffixes():
+    tgt = {"ref": "n8", "key": "view:1022"}
+    assert walks._matched_text('label (exact) n8 "Item 2. Button"', tgt) == "label (exact)"
+    assert walks._matched_text('child text (word) n8 "Item 2" via n9; first of 3', tgt) \
+        == "child text (word) via n9; first of 3"
+    assert walks._matched_text('label (exact) n8 "Bookmark. Check box" via within n7', tgt) \
+        == "label (exact) via within n7"  # NiA: 'Bookmark within MAD Skills'
+    assert walks._matched_text('label (exact) n9 "Item 3"', tgt) == 'label (exact) n9 "Item 3"'
