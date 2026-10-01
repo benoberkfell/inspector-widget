@@ -1,0 +1,89 @@
+{
+ "abi": "arm64-v8a",
+ "agent_version": "viewspector-0.1",
+ "api": 37,
+ "compose_generation": 0,
+ "consistency": "settled",
+ "created_at": 1790811286.3856761,
+ "device": {
+  "dpi": 480,
+  "font_scale": 1.0,
+  "orientation": "portrait",
+  "screen": [
+   1280,
+   2856
+  ]
+ },
+ "diagnostics": [],
+ "facets": {
+  "a11y": {
+   "bytes": 8420,
+   "ms": 36,
+   "status": "ok"
+  },
+  "compose": {
+   "bytes": 48,
+   "ms": 2,
+   "reason": "no AndroidComposeView",
+   "status": "ok"
+  },
+  "fingerprint": {
+   "bytes": 0,
+   "ms": 7,
+   "status": "ok"
+  },
+  "props": {
+   "bytes": 50468,
+   "ms": 0,
+   "status": "ok"
+  },
+  "shots": {
+   "bytes": 247597,
+   "ms": 0,
+   "status": "ok"
+  },
+  "skp": {
+   "bytes": 0,
+   "ms": 0,
+   "reason": "skp=false",
+   "status": "off"
+  },
+  "slots": {
+   "bytes": 0,
+   "ms": 1,
+   "reason": "no AndroidComposeView",
+   "status": "unavailable"
+  },
+  "views": {
+   "bytes": 58712,
+   "ms": 143,
+   "status": "ok"
+  },
+  "windows": {
+   "bytes": 5,
+   "ms": 3,
+   "status": "ok"
+  }
+ },
+ "fingerprint": "de87b7145c6b90a8fb8787fcde52f816",
+ "id": "chs5by",
+ "label": "fx_viewscreen",
+ "lineage": {
+  "package": "com.oberkfell.a11yprobe",
+  "serial": "emulator-5558"
+ },
+ "options": {
+  "a11y_rendering": false,
+  "lint": "tree",
+  "props": true,
+  "resolution_stack": false,
+  "screenshot": true,
+  "screenshot_scale": 1.0,
+  "settle_ms": 0,
+  "skp": false,
+  "slots": "if_available"
+ },
+ "pid": 11787,
+ "schema": 1,
+ "took_ms": 193
+}

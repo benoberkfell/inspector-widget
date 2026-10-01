@@ -2147,6 +2147,12 @@ _SEV_RANK = {"error": 0, "warn": 1, "info": 2}
 
 
 def _execute(run: _Run) -> List[Finding]:
+    """Run every enabled rule. A rule that raises becomes a ``rule.error``
+    diagnostic, except for a lost or timed-out session (``TransportError``,
+    e.g. from ``ctx.component_image_fn``): that propagates, so the caller
+    re-attaches or reports it instead of returning a lint that silently
+    skipped rules."""
+    from .client import TransportError
     ctx = run.ctx
     out: List[Finding] = []
     errors: Dict[str, int] = {}
@@ -2160,6 +2166,8 @@ def _execute(run: _Run) -> List[Finding]:
                 continue
             try:
                 out.extend(fn(n, run))
+            except TransportError:
+                raise  # a lost session is not a rule bug
             except Exception as e:  # never abort the lint; always report
                 errors[rid] = errors.get(rid, 0) + 1
                 if errors[rid] <= 3:
@@ -2170,6 +2178,8 @@ def _execute(run: _Run) -> List[Finding]:
             continue
         try:
             out.extend(fn(run))
+        except TransportError:
+            raise
         except Exception as e:
             errors[rid] = errors.get(rid, 0) + 1
             ctx.diag("rule.error", f"{rid} raised {type(e).__name__}: {e}", level="error", rule=rid)

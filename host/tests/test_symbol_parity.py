@@ -4,8 +4,9 @@ host submodule must actually exist on that imported module.
 This is the highest-leverage regression guard for the whole bug class that this
 test pass targets: it statically scans ``cli.py`` and ``mcp_server.py`` for every
 ``<module>.<attr>`` access on the inspector_widget submodules they import
-(adb / a11y / a11y_lint / overlay / png / correlate / strings / inject / client)
-and asserts the referenced attribute is a real member of the imported module.
+(adb / a11y / a11y_lint / overlay / png / correlate / strings / inject / client /
+output / results) and asserts the referenced attribute is a real member of the
+imported module.
 
 It would have caught, in one shot:
   * ``adb.display_density`` / ``adb.font_scale`` missing from adb.py
@@ -42,7 +43,7 @@ _HOST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # signature scan at the bottom of this file covers the rest of the package.
 _POLICED_SUBMODULES = {
     "adb", "a11y", "a11y_lint", "overlay", "png", "correlate", "strings",
-    "inject", "client",
+    "inject", "client", "output", "results", "ops", "surface",
 }
 
 _SCRIPTS = ("cli.py", "mcp_server.py")
@@ -155,7 +156,22 @@ def test_scan_actually_finds_contract_symbols() -> None:
         ("adb", "font_scale"),
         ("a11y_lint", "run_lint"),
         ("overlay", "render_integrated_overlay"),
-        ("png", "_decode_to_rgba"),
+        ("png", "write_png"),
+        # Phase 0: both surfaces leave through the output layer, with the same results
+        ("output", "slim"),
+        ("output", "finalize"),
+        ("output", "augment_schemas"),
+        ("output", "add_cli_flags"),
+        ("output", "tool_args_from_cli"),
+        ("results", "dump_tree"),
+        ("results", "a11y_lint"),
+        # capture and walk: one registry for both surfaces, over the ops layer
+        ("surface", "add_cli"),
+        ("surface", "mcp_entries"),
+        ("surface", "Result"),
+        ("ops", "OpContext"),
+        ("ops", "AttachProvider"),
+        ("ops", "remember_session"),
     }
     not_seen = expected - found
     assert not not_seen, (
@@ -195,11 +211,25 @@ _SIG_SOURCES = (
     "inspector_widget/inject.py",
     "inspector_widget/client.py",
     "inspector_widget/correlate.py",
+    "inspector_widget/output.py",
+    "inspector_widget/results.py",
     "inspector_widget/talkback/device.py",
     "inspector_widget/talkback/inject.py",
     "inspector_widget/talkback/walk.py",
     "inspector_widget/talkback/diff.py",
     "inspector_widget/talkback/scenarios.py",
+    # capture and walk (S1/S2): the ops layer, the surface registry and the
+    # capture library they drive
+    "inspector_widget/ops.py",
+    "inspector_widget/surface.py",
+    "inspector_widget/capture/store.py",
+    "inspector_widget/capture/fetch.py",
+    "inspector_widget/capture/index.py",
+    "inspector_widget/capture/refs.py",
+    "inspector_widget/capture/query.py",
+    "inspector_widget/capture/analyzers.py",
+    "inspector_widget/capture/diff.py",
+    "inspector_widget/capture/images.py",
 )
 
 _NAMED_RECEIVERS = {
@@ -267,8 +297,11 @@ def _instance_attrs(cls) -> Set[str]:
         except (OSError, TypeError, SyntaxError):
             tree = None
         for node in ast.walk(tree) if tree else ():
-            targets = node.targets if isinstance(node, ast.Assign) else (
+            targets = list(node.targets) if isinstance(node, ast.Assign) else (
                 [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+            while any(isinstance(t, (ast.Tuple, ast.List)) for t in targets):
+                targets = [e for t in targets for e in (
+                    t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t])]  # a, self.x = ...
             for t in targets:
                 if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
                         and t.value.id == "self":
@@ -606,10 +639,28 @@ def test_signature_scan_actually_checks_the_contract_calls(signature_scans) -> N
         ("Session", "dump_a11y"),           # the walk's focus reader
         ("adb", "shell"),                   # talkback/device.py
         ("diff", "analyze"),
+        ("output", "slim"),                 # mcp_server / cli -> the output layer
+        ("output", "finalize"),
+        ("output", "add_cli_flags"),
+        ("results", "dump_tree"),           # mcp_server / cli -> the shared result shapes
+        ("results", "get_properties"),
+        ("results", "with_target"),
+        ("strings", "dump_tree_to_dict"),   # mcp_server's dump_tree (E3: no second decoder)
+        ("strings", "get_properties_to_dict"),
+        ("fetch", "fetch"),                 # ops.capture: the pipeline, in contract order
+        ("index", "build_index"),
+        ("analyzers", "analyze"),
+        ("refs", "assign"),
+        ("index", "apply_refs"),
+        ("query", "outline"),               # ops -> the query engine
+        ("images", "crop"),
+        ("surface", "mcp_entries"),         # mcp_server / cli -> the one registry
+        ("surface", "add_cli"),
+        ("ops", "remember_session"),        # attach -> the default session
     }
     assert expected <= seen, f"scan no longer checks: {sorted(expected - seen)}"
     probes = {(o, a) for s in signature_scans.values() for o, a, _ok, _l in s.probes}
-    assert ("Session", "capture_skp") in probes and ("a11y_lint", "lint_a11y") in probes
+    assert ("Session", "capture_skp") in probes
 
 
 def test_signature_scan_catches_seeded_bugs() -> None:

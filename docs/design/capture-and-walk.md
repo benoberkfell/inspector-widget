@@ -303,11 +303,11 @@ Analyzers are the single extension point for roadmap items 1 and 3. They write `
   - `render.clipped`: exact when `declared_b` is known and `visible < 1`. It is inferred when a node's visible rect touches the viewport edge of a scrollable ancestor and is under 50% of the median height of its same-type siblings (the launcher's 27-of-216 px row).
   - Evidence includes `clipped_by`.
 - **Render signals later**: `render.text_overflow` (R1), `render.covered` and `render.drawn_mismatch` (SKP/DumpRender, R3).
-- **Lint adapter**: runs `a11y_lint.lint_tree` on dicts rebuilt from the stored `compose_sem.pb` via `strings.dump_compose_to_dict`. Each finding is mapped to a ref through `sem:<acv>:<id>`.
-  - When improve/a11y-lint-unified (L1) lands, the adapter switches its input to `a11y.a11y_to_dict(a11y.pb)` and maps through `a11y:` keys. That is a one-function change.
+- **Lint adapter**: runs the unified lint, `a11y_lint.run_lint`, over the stored trees exactly as the live `a11y_lint` tool does: the unified a11y tree (`a11y.a11y_to_dict(a11y.pb)`: Views and Compose in one pass, so View screens are linted too) with the Compose semantics (`compose_sem.pb`) joined for detail. Each finding maps to its a11y node by `(host, virtual)` and from there to a ref, as a TalkBack stop does.
   - Touch-target findings on nodes with `render.clipped` at a scroll edge are annotated "likely false positive" (L2).
   - Contrast (~4 s) runs only when `lint="full"` or `lint(contrast=true)`. It reads the stored per-window shot and the result is cached.
-- **Reading order**: `a11y.compute_traversal_order` over the a11y dicts, mapped to refs; sets `stop` and `Index.reading`.
+  - A capture defaults to `a11y_rendering=false`, so the text-size rules that need ExtraRenderingInfo (R11, R18) can report less than the live `a11y_lint` (rendering info on by default); `capture(a11y_rendering=true)` matches it.
+- **Reading order**: `talkback.reading_order` (the TalkBack model; it returns `a11y.reading_order`'s shape) over the whole a11y dump, mapped to refs; sets `stop` and `Index.reading`.
 - **Rule catalog** (`capture/rules.py`): each rule has `id`, `short` (`a11y.<group>.<x>` → `group`, `render.<x>` → `x`), `sev`, `msg` and `fix`, plus aliases `R1..R12`. Unknown ids are rejected (E10).
 - **Template collapse**: findings are grouped by `(rule, src or template anchor)`, e.g. `a11y.label.missing ×8 in #feed cells (FeedRow.kt:42 IconButton), e.g. n118 n125 n132 +5`.
 
@@ -620,7 +620,7 @@ atom     := "#"rid | "@"tag | Type | Type"\"label\"" | "\"label\""   (exact labe
 - `has` / `missing`: from `label role state stop slots props issues a11y compose view`.
 - `issue`: an id prefix or short code (`render.clipped`, `clipped`, `a11y.`, or a severity such as `error`).
 - `at` and `overlaps` replace the old bounds selector.
-- `min_dp` / `max_dp`: on min(w, h) in dp, using the capture's dpi.
+- `min_dp` / `max_dp`: on min(w, h) in dp, using the capture's dpi, of the node's touch (a11y) bounds when it has them, else its bounds: a Compose control's minimumInteractiveComponentSize area counts, as it does for a finger. The touch-target lint (R2) is stricter: it also flags a clickable whose own layout is under 48dp.
 - Domain: `in="ui"` covers view, compose and a11y nodes. `slots` or `all` add slot nodes; using `src` implies `all`.
 - Evaluation is a linear scan over the immutable index, with O(1) maps for rid, tag, type and label. Measured scale is ≤5k nodes, which takes <20 ms.
 - Each hit carries a breadcrumb of its 2 nearest meaningful ancestors (those with a rid, tag, label or collection).
@@ -973,4 +973,4 @@ Library modules read only the public Session surface: `dump_tree`, `get_windows`
 - **improve/a11y-agent-identity** (ID1, ID2, CO4 agent fixes) is not a build gate. The "exact" acceptance in L1 requires fixtures recorded after it merges.
 - **a11y-host-model / a11y-lint-unified** (L1/L2/RO1/OV1/A2-A5): consumed only through the C7 adapter. No capture WP edits `a11y.py`, `a11y_lint.py`, `overlay.py`, `correlate.py` or `strings.py`.
 - **agent-hardening stream** (Dispatcher.kt, TreeBuilder.kt, ComposeInspector.kt): R1 and R3 coordinate with it and start after session-lifecycle.
-- Naming (AGENTS.md §1): every new user-facing name is `inspector-widget`/`INSPECTOR_WIDGET_*`. No codename identifier is renamed. The project is local-only: commit locally, never push.
+- Naming (AGENTS.md §1): every new user-facing name is `inspector-widget`/`INSPECTOR_WIDGET_*`. No codename identifier is renamed. Where work is committed and pushed follows the repository's contributor guide (AGENTS.md, CLAUDE.md), not this design.

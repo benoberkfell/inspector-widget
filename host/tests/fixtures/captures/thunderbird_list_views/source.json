@@ -1,0 +1,5 @@
+{
+ "app": "net.thunderbird.android.debug (thunderbird-fossDebug.apk, Compose 1.12.1)",
+ "how": "onboarding with demo@example.com (DemoAutoDiscovery: offline synthetic mailbox); capture()",
+ "screen": "MessageHomeActivity message list, classic View rows"
+}

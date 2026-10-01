@@ -445,24 +445,45 @@ def forward(serial: str, local_port: int, abstract_name: str) -> int:
     return port
 
 
-def remove_forward(serial: str, local_port: int) -> None:
-    """Remove a single tcp forward (``adb forward --remove tcp:<port>``)."""
+# Removing a forward only talks to the local adb server, so it takes
+# milliseconds; one that takes longer means adb is wedged, and teardown (exit
+# above all) must not wait out the 60s default for each forward.
+FORWARD_REMOVE_TIMEOUT = 5.0
+
+
+def remove_forward(serial: str, local_port: int,
+                   timeout: float = FORWARD_REMOVE_TIMEOUT) -> None:
+    """Remove a single tcp forward (``adb forward --remove tcp:<port>``).
+
+    Raises :class:`AdbError` only if adb doesn't answer within ``timeout``.
+    """
     with _FORWARDS_LOCK:
         _OWN_FORWARDS.pop((serial, local_port), None)
-    _adb(serial, "forward", "--remove", f"tcp:{local_port}", check=False)
+    _adb(serial, "forward", "--remove", f"tcp:{local_port}", check=False, timeout=timeout)
 
 
-def remove_own_forwards() -> int:
+def remove_own_forwards(timeout: float = FORWARD_REMOVE_TIMEOUT) -> int:
     """Remove every forward this process created and still holds. For exit
-    cleanup; returns how many were removed."""
+    cleanup; returns how many were removed.
+
+    Each removal gets ``timeout`` seconds; after the first that runs out, adb
+    is taken to be wedged and the rest are left alone (they end with the adb
+    server anyway), so exit waits at most ``timeout`` here.
+    """
     with _FORWARDS_LOCK:
         leftover = list(_OWN_FORWARDS)
+    removed = 0
     for serial, port in leftover:
         try:
-            remove_forward(serial, port)
+            remove_forward(serial, port, timeout=timeout)
+        except AdbError as exc:
+            if exc.returncode == -1:  # timed out, or no adb binary: stop trying
+                break
+            continue
         except Exception:  # noqa: BLE001 - best-effort at exit
-            pass
-    return len(leftover)
+            continue
+        removed += 1
+    return removed
 
 
 def attach_agent(serial: str, pkg: str, so_path: str, options: str) -> str:

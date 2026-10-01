@@ -130,9 +130,41 @@ def test_sixty_steps_fit_the_budget(tb_env):
     assert len(saved(res)["steps"]) == 61  # the saved walk keeps every step
 
 
+def _legacy_a11y_ids(root):
+    """Rewrite an encoded a11y tree to the ids agents from before the A1 fix send
+    (AccessibilityInspector.kt walk()/virtualIdOf()): every node carries the ROOT's
+    host_view_id, and a child's virtual_id is the low 32 bits of the packed child id
+    (the accessibility view id of the View behind it), so real View children are
+    flagged virtual as well."""
+    root_host = root.host_view_id
+
+    def fix(node):
+        for child in node.children:
+            child.virtual_id = child.host_view_id % 100 + 10  # any small per-View int
+            child.is_virtual = True
+            child.host_view_id = root_host
+            fix(child)
+
+    fix(root)
+
+
 def test_legacy_agent_ids_still_walk(probe):
     def legacy(dev):
-        dev.agent(PKG).legacy_a11y_ids = True
+        agent = dev.agent(PKG)
+        current = agent.behaviour
+
+        def behaviour(req):
+            if req.WhichOneof("command") in ("a11y_focus", "a11y_act"):
+                # An A1-era agent predates A11yFocus/A11yAct: the field is unknown to it.
+                return 0, fakeagent.error_response(req.id, "No command set in request")
+            delay, action = current(req)
+            if req.WhichOneof("command") == "dump_a11y" and action is not None \
+                    and not isinstance(action, (str, bytes)):
+                for w in action.dump_a11y.windows:
+                    _legacy_a11y_ids(w.root)
+            return delay, action
+
+        agent.behaviour = behaviour
 
     res = walk(probe, before=legacy)
     assert res["ended"] == "wrap" and res["findings"] == []

@@ -46,6 +46,7 @@ FOOTER_RESERVE = 200
 SPILL_TTL_S = 3600
 PREVIEW_MAX_LINES = 25
 PREVIEW_DEPTH = 2
+PREVIEW_CHAIN = 8  # members of a single-child chain shown on one preview line
 ENV_MAX_BYTES = "INSPECTOR_WIDGET_MAX_BYTES"
 
 #: Tools whose result is a tree (they accept max_depth and root).
@@ -359,6 +360,8 @@ def _node_line_parts(n: Mapping) -> tuple[str, str, str, str, list[int] | None]:
     rid = ""
     res = src.get("resource")
     name = src.get("view_id_name") or (res.get("name") if isinstance(res, Mapping) else None)
+    if not name and isinstance(res, str) and "/" in res:  # brief inspect: "@pkg:id/name"
+        name = res.rsplit("/", 1)[-1]
     if not name and src.get("view_id_resource_name"):
         name = str(src["view_id_resource_name"]).split("/")[-1]
     if name:
@@ -370,51 +373,108 @@ def _node_line_parts(n: Mapping) -> tuple[str, str, str, str, list[int] | None]:
     return key, typ, rid, str(label), nz.rect_list(n.get("bounds"))
 
 
+def _preview_seg(n: Mapping) -> tuple[str, list[int] | None]:
+    key, typ, rid, label, b = _node_line_parts(n)
+    parts = [key]
+    if typ:
+        parts.append(typ)
+    if rid:
+        parts.append(rid)
+    if label:
+        parts.append(json.dumps(label if len(label) <= 30 else label[:29] + "…",
+                                ensure_ascii=False))
+    return " ".join(parts), b
+
+
+def _preview_kids(n: Mapping) -> list[Mapping]:
+    """The children a preview shows: not a zero-size leaf (a ViewStub, an empty
+    status-bar scrim), which outline hides too."""
+    out = []
+    for c in n.get("children") or []:
+        if not isinstance(c, Mapping):
+            continue
+        b = nz.rect_list(c.get("bounds"))
+        if b is not None and (b[2] <= 0 or b[3] <= 0) and not c.get("children"):
+            continue
+        out.append(c)
+    return out
+
+
+def _only_child(n: Mapping) -> Mapping | None:
+    kids = _preview_kids(n)
+    return kids[0] if len(kids) == 1 else None
+
+
 def preview_lines(result: Any, max_lines: int = PREVIEW_MAX_LINES,
                   depth: int = PREVIEW_DEPTH) -> list[str]:
     """A generic ``depth``-level outline (at most ``max_lines`` lines) of a tree result.
 
     ``key Type #rid "label" [x,y wxh] +N``, where N counts the hidden descendants.
+    A single-child chain is one line (``view:2 DecorView > view:3 LinearLayout >
+    ...``, at most ``PREVIEW_CHAIN`` members) and costs one level, as in outline,
+    so the levels shown are the ones that branch; zero-size leaves (ViewStubs) are
+    left out.
     """
     lines: list[str] = []
     total = 0
-    for _, root in _tree_roots(result):
-        for n, d in _walk(root):
-            if d >= depth:
-                continue
-            total += 1
-            if len(lines) >= max_lines:
-                continue
-            key, typ, rid, label, b = _node_line_parts(n)
-            parts = ["  " * d + key]
-            if typ:
-                parts.append(typ)
-            if rid:
-                parts.append(rid)
-            if label:
-                parts.append(json.dumps(label if len(label) <= 30 else label[:29] + "…",
-                                        ensure_ascii=False))
+
+    def walk(n: Mapping, d: int) -> None:
+        nonlocal total
+        if d >= depth:
+            return
+        chain = [n]
+        while len(chain) < PREVIEW_CHAIN:
+            only = _only_child(chain[-1])
+            if only is None:
+                break
+            chain.append(only)
+        last = chain[-1]
+        total += 1
+        if len(lines) < max_lines:
+            segs = [_preview_seg(x) for x in chain]
+            line = "  " * d + " > ".join(seg for seg, _b in segs)
+            b = segs[-1][1]
             if b:
-                parts.append(f"[{b[0]},{b[1]} {b[2]}x{b[3]}]")
-            hidden = 0
-            if d == depth - 1:
-                hidden = _count(n) - 1
+                line += f" [{b[0]},{b[1]} {b[2]}x{b[3]}]"
+            hidden = _count(last) - 1 if d == depth - 1 else 0
             if hidden:
-                parts.append(f"+{hidden}")
-            lines.append(" ".join(parts))
+                line += f" +{hidden}"
+            lines.append(line)
+        for c in _preview_kids(last):
+            walk(c, d + 1)
+
+    for _, root in _tree_roots(result):
+        walk(root, 0)
     if total > len(lines):
         lines[-1:] = [f"  …{total - len(lines) + 1} more lines"] if lines else []
     return lines
 
 
-def _hint(tool: str) -> str:
+#: Tools with a max_bytes argument of their own beside OUTPUT_PARAMS' (tb_walk's
+#: walk budget, which finalize also applies).
+OWN_MAX_BYTES_TOOLS = frozenset({"tb_walk"})
+
+
+def takes_max_bytes(tool: str) -> bool:
+    """Whether ``tool`` takes a ``max_bytes`` argument (and ``--max-bytes``)."""
+    return tool in OWN_MAX_BYTES_TOOLS or any(
+        p.name == "max_bytes" for p in OUTPUT_PARAMS.get(tool, []))
+
+
+def _hint(tool: str, detail: str | None = None) -> str:
     narrow = "Narrow with max_depth=2 or root=<id>, " if tool in TREE_TOOLS else ""
-    return (f"{narrow}raise max_bytes (<={HARD_MAX_BYTES}), use detail=\"brief\", or read "
-            "spill_path with jq.")
+    brief = 'use detail="brief", ' if detail == "full" else ""
+    if takes_max_bytes(tool):
+        return (f"{narrow}raise max_bytes (<={HARD_MAX_BYTES}), {brief}or read "
+                "spill_path with jq.")
+    # No max_bytes argument here: only the environment raises this tool's budget.
+    return (f"{narrow}{brief}read spill_path with jq, or raise the budget with "
+            f"{ENV_MAX_BYTES} (0 = unlimited) in the server's environment.")
 
 
 def envelope(tool: str, result: Any, text: str, max_bytes: int, spill_path: str | None,
-             preview: list[str] | None = None, error: str | None = None) -> dict[str, Any]:
+             preview: list[str] | None = None, error: str | None = None,
+             detail: str | None = None) -> dict[str, Any]:
     """The spill envelope (spec 2.5), shrunk until it is at most
     ``min(3000, max_bytes)`` bytes."""
     limit = min(ENVELOPE_MAX_BYTES, max_bytes) if max_bytes > 0 else ENVELOPE_MAX_BYTES
@@ -428,7 +488,7 @@ def envelope(tool: str, result: Any, text: str, max_bytes: int, spill_path: str 
         env["spill_path"] = spill_path
     if error:
         env["spill_error"] = error
-    env["hint"] = _hint(tool)
+    env["hint"] = _hint(tool, detail)
     if isinstance(result, Mapping) and isinstance(result.get("error"), str):
         env["error"] = result["error"]
 
@@ -448,14 +508,16 @@ def envelope(tool: str, result: Any, text: str, max_bytes: int, spill_path: str 
 
 def finalize(tool: str, result: Any, *, max_bytes: int | None,
              spill_dir: str | None = None, preview: list[str] | None = None,
-             pretty: bool = False, now: float | None = None) -> str:
+             pretty: bool = False, now: float | None = None,
+             detail: str | None = None) -> str:
     """Encode a (slimmed) result for the wire.
 
     Returns the compact (or ``pretty``) JSON text when it fits ``max_bytes``
     (``None`` -> env default; ``0`` -> unlimited). Otherwise the result is written
     to a spill file in ``spill_dir`` (default ``<store>/spill``; files older than
     1 h are purged) and the returned text is the spill envelope. The budget is
-    always measured on the compact encoding.
+    always measured on the compact encoding. ``detail`` is the call's (the
+    envelope suggests brief only to a call that asked for full).
     """
     limit = resolve_max_bytes(max_bytes)
     text = dumps(result)
@@ -468,7 +530,8 @@ def finalize(tool: str, result: Any, *, max_bytes: int | None,
         path = write_spill(tool, text, spill_dir, now=now)
     except OSError as exc:
         error = f"{type(exc).__name__}: {exc}"
-    env = envelope(tool, result, text, limit, path, preview=preview, error=error)
+    env = envelope(tool, result, text, limit, path, preview=preview, error=error,
+                   detail=detail)
     return dumps(env, pretty=pretty)
 
 
@@ -550,6 +613,13 @@ def _finish(out: dict, ctx: _Ctx, extra: Mapping[str, int] | None = None) -> dic
     return out
 
 
+def _mark_clipped(out: dict, bounds: Any) -> None:
+    """strings._bounds_to_dict clamps a negative size to 0 and says ``clipped``;
+    the brief ``[x,y,w,h]`` keeps that as ``clipped: true``."""
+    if isinstance(bounds, Mapping) and bounds.get("clipped"):
+        out["clipped"] = True
+
+
 # ---- dump_tree ------------------------------------------------------------- #
 def _view_pred(spec: str) -> Callable[[Mapping], bool]:
     target = _strip_prefix(spec, "view:", "w:")
@@ -573,6 +643,7 @@ def _brief_view_node(n: Mapping, depth: int, ctx: _Ctx, seen: dict[int, Mapping]
     b = nz.rect_list(n.get("bounds"))
     if b is not None:
         out["bounds"] = b
+        _mark_clipped(out, n.get("bounds"))
     quad = nz.render_quad(n.get("bounds"))
     if quad:
         out["render"] = quad
@@ -707,6 +778,7 @@ def _brief_compose_node(n: Mapping, depth: int, ctx: _Ctx, user_only: bool,
     b = nz.rect_list(n.get("bounds"))
     if b is not None:
         out["bounds"] = b
+        _mark_clipped(out, n.get("bounds"))
     quad = nz.render_quad(n.get("bounds"))
     if quad:
         out["render"] = quad
@@ -807,10 +879,13 @@ def _slim_compose_overlay(tool: str, result: Mapping, args: Mapping) -> dict:
 
 # ---- dump_accessibility ---------------------------------------------------- #
 def _a11y_pred(spec: str) -> Callable[[Mapping], bool]:
+    """A node's ``node_key`` (``view:<id>``, ``compose:<acv>:<sem>``), else
+    ``host:virt`` / ``a11y:host:virt``, else its packed ``id``."""
     target = _strip_prefix(spec, "a11y:")
     if ":" in target:
         host, _, virt = target.partition(":")
-        return lambda n: str(n.get("host_view_id")) == host and str(n.get("virtual_id")) == virt
+        return lambda n: n.get("node_key") == spec or (
+            str(n.get("host_view_id")) == host and str(n.get("virtual_id")) == virt)
     return lambda n: str(n.get("id")) == target
 
 
@@ -859,15 +934,38 @@ def _slim_dump_accessibility(tool: str, result: Mapping, args: Mapping) -> dict:
         elif mode == "none":
             extra["focus_order"] = len(order)
         else:
-            stops = [e for e in order if isinstance(e, Mapping) and e.get("is_focus_stop")]
-            out["focus_order"] = [{"order": e.get("order"), "id": e.get("id"),
-                                   "speakable": e.get("speakable")} for e in stops]
+            stops = [e for e in order if isinstance(e, Mapping) and _is_stop(e)]
+            out["focus_order"] = [_brief_stop(e) for e in stops]
             extra["focus_order_non_stops"] = len(order) - len(stops)
     return _finish(out, ctx, extra)
 
 
+def _is_stop(entry: Mapping) -> bool:
+    """a11y.py lists stops only (``is_focus_stop`` appears only with structural
+    entries); recordings from before it marked every entry."""
+    return bool(entry.get("is_focus_stop", entry.get("order") is not None))
+
+
+def _brief_stop(entry: Mapping) -> dict:
+    """A focus stop as ``{order, key, speak}`` (plus ``unlabeled`` / ``window`` when
+    set); the packed ``id`` only when there is no ``key`` (older recordings, which
+    call ``speak`` ``speakable``)."""
+    out: dict[str, Any] = {"order": entry.get("order")}
+    if entry.get("key") is not None:
+        out["key"] = entry["key"]
+    else:
+        out["id"] = entry.get("id")
+    for k in ("speak", "speakable", "unlabeled", "window", "covered_by"):
+        if k in entry:
+            out[k] = entry[k]
+    return out
+
+
 # ---- a11y_lint --------------------------------------------------------------- #
 def _finding_node_id(f: Mapping) -> Any:
+    """The finding's node_key (what inspect_node takes), else its node id."""
+    if f.get("node_key"):
+        return f["node_key"]
     node = f.get("node")
     if isinstance(node, Mapping):
         return node.get("id")
@@ -875,9 +973,15 @@ def _finding_node_id(f: Mapping) -> Any:
 
 
 def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
+    """Findings grouped by rule (count, message once, 3 node keys); the run's
+    ``stats`` and its info-level diagnostics are left out and counted."""
     if (args.get("group_by") or "rule") == "none":
         return dict(result)
-    out: dict[str, Any] = {k: v for k, v in result.items() if k not in ("findings", "summary")}
+    out: dict[str, Any] = {k: v for k, v in result.items()
+                           if k not in ("findings", "summary", "stats", "diagnostics")}
+    extra: dict[str, int] = {}
+    if isinstance(result.get("stats"), Mapping):
+        extra["stats"] = len(result["stats"])
     summary = result.get("summary")
     if isinstance(summary, Mapping):
         out["summary"] = {k: v for k, v in summary.items() if k != "by_rule"}
@@ -894,7 +998,15 @@ def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
         if r["n"] > len(r["nodes"]):
             r["more"] = r["n"] - len(r["nodes"])
     out["by_rule"] = by_rule
-    return out
+    diags = result.get("diagnostics")
+    if isinstance(diags, list):
+        kept = [d for d in diags if not (isinstance(d, Mapping) and d.get("level") == "info")]
+        extra["info_diagnostics"] = len(diags) - len(kept)
+        if kept:
+            out["diagnostics"] = kept
+    elif diags is not None:
+        out["diagnostics"] = diags
+    return _finish(out, _Ctx({}), extra)
 
 
 # ---- inspect / inspect_node -------------------------------------------------- #

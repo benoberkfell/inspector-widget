@@ -567,6 +567,31 @@ def test_find_role():
     assert fids(q.find(ix, role="Sw*")) == ["n3"]
 
 
+def test_find_type_ands_with_rid_tag_src_role():
+    """Every glob filter keeps its own pattern when ANDed with another (the
+    predicates once shared one late-bound glob: type="Button" + tag="delete"
+    found nothing, type="Checkbox" + role="Button" matched every Button)."""
+    b = IndexBuilder()
+    w = b.window("n1")
+    b.view(w, "n2", "Button", (0, 0, 10, 10), tag="delete", role="Button",
+           src="Cells.kt:40")
+    b.view(w, "n3", "Button", (0, 10, 10, 10), tag="archive", role="Button",
+           src="Cells.kt:52")
+    b.view(w, "n4", "MaterialTextView", (0, 20, 10, 10), rid="preview", src="Row.kt:7")
+    b.view(w, "n5", "Checkbox", (0, 30, 10, 10), tag="delete", role="Checkbox",
+           src="Row.kt:9")
+    ix = b.build()
+    assert fids(q.find(ix, type="Button", tag="delete")) == ["n2"]
+    assert fids(q.find(ix, type="*TextView", rid="preview")) == ["n4"]
+    assert fids(q.find(ix, type="Button", src="Cells.kt")) == ["n2", "n3"]
+    assert fids(q.find(ix, type="Button", src="Cells.kt:5?")) == ["n3"]
+    assert fids(q.find(ix, type="Checkbox", role="Button")) == []
+    assert fids(q.find(ix, type="Button", role="Button", tag="arch*")) == ["n3"]
+    assert fids(q.find(ix, src="Row.kt", role="Checkbox")) == ["n5"]
+    assert fids(q.find(ix, src="Row.kt:7", role="Checkbox")) == []
+    assert fids(q.find(ix, tag="delete", rid="preview")) == []
+
+
 def test_find_flags_all_and_any(launcher):
     assert q.find(launcher, flags=["click"])["total"] == 12
     assert q.find(launcher, flags="click,scroll")["total"] == 0
@@ -762,9 +787,11 @@ def test_node_n22_dossier(launcher):
 
 
 def test_node_facet_priority_and_omitted(launcher):
+    # 683: the node's core is 17 B smaller since node() stopped repeating the key
+    # its ids already spell ("key":"sem:82:448"); the packing below is unchanged
     d = q.node(launcher, None, ["n22"], facets="all", ancestors=True, children=True,
-               max_bytes=700)
-    assert nbytes(d) <= 700
+               max_bytes=683)
+    assert nbytes(d) <= 683
     # issues come first (cut to fit, with a "+N more" marker), then a11y; the rest
     # is listed in omitted (short form here, since the long one does not fit)
     assert d["issues"][-1].endswith("more") and "a11y" in d
@@ -1035,6 +1062,31 @@ def test_ref_errors_say_why_the_ref_is_missing(launcher):
         q.resolve_selector(launcher, "n100", tomb={})
     assert "no record" in e.value.message and "another app" in e.value.hint
     assert "capture again" not in e.value.hint
+
+
+def test_a_gone_ref_without_a_durable_sel_does_not_point_at_itself(launcher):
+    """A tombstone whose sel was the ref itself: no 'select it by its sel' circle,
+    a find() to run in a newer capture instead."""
+    tomb = {"n41": ["Button", None, "n41", "c0krga"]}
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, "n41", tomb=tomb)
+    err = e.value
+    assert "(sel n41)" not in err.message and not err.candidates
+    assert "by its sel" not in err.hint and 'find(type="Button")' in err.hint
+    assert "within=" in err.hint
+
+
+def test_a_ref_the_store_never_issued_says_so(launcher):
+    class Tomb(dict):
+        next_ref = 500
+
+    with pytest.raises(OpError) as e:
+        q.resolve_selector(launcher, "n9999", tomb=Tomb())
+    assert "never issued" in e.value.message and "n499" in e.value.message
+    assert 'capture="latest"' not in e.value.hint
+    with pytest.raises(OpError) as e:  # issued, but newer than this capture
+        q.resolve_selector(launcher, "n450", tomb=Tomb())
+    assert "newer than every ref" in e.value.message
 
 
 def test_a_direct_child_path_that_should_be_a_descendant_says_so(launcher):

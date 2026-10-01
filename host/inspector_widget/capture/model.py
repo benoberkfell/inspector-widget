@@ -43,6 +43,8 @@ FLAGS = (
     "click", "longclick", "focus", "focused", "scroll", "checkable", "checked",
     "partial", "selected", "disabled", "heading", "edit", "password", "hidden",
     "live", "tgroup", "webview", "interop",
+    # What the agent could not send: children cut at its depth cap, masked text.
+    "truncated", "redacted",
 )
 FLAG_SET = frozenset(FLAGS)
 

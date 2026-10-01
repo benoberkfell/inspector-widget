@@ -988,7 +988,7 @@ def test_an_undecodable_reply_poisons_the_client(agent):
 def test_minimal_validator_checks_numeric_bounds_and_array_items(fake_device, monkeypatch):
     monkeypatch.setitem(sys.modules, "jsonschema", None)  # the SDK-less fallback's only check
     res = mcp_server._run_tool("screenshot", {"serial": SERIAL, "package": PKG, "scale": -1})
-    assert res["error"].startswith("invalid argument scale: -1 is less than the minimum")
+    assert res["error"] == "invalid argument scale: -1 is less than or equal to the minimum of 0"
     res = mcp_server._run_tool("a11y_lint", {"serial": SERIAL, "package": PKG, "rules": [1]})
     assert res["error"] == "invalid argument rules: every item must be a string"
     assert fake_device.adb_log == []

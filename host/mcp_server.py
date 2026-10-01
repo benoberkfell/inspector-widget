@@ -18,9 +18,19 @@
 #      `notifications/initialized`) to drive the same tool surface.
 #
 # The host driver is the single source of truth for adb/injection/transport.
-# This module owns only: tool schemas, argument validation, per-(serial,package)
-# session caching, screenshot temp-file materialisation, and JSON shaping of the
-# protobuf responses (string-table ids resolved to text) for the agent.
+# This module owns only: the 18 legacy tool schemas (15 inspection tools + 3
+# TalkBack tools), argument validation, per-(serial,package) session caching, and
+# screenshot temp-file materialisation. Protobuf responses are shaped by the
+# package (strings, a11y, correlate, results); every legacy tool result then
+# leaves through inspector_widget.output: compact JSON, brief by default
+# (detail="full" for the legacy content), and over max_bytes a spill envelope
+# plus a spill file (Phase 0 of docs/design/capture-and-walk.md).
+#
+# The 8 capture-and-walk tools (capture, captures, outline, find, node, image,
+# lint, diff) come from one registry, inspector_widget.surface, which also
+# generates the CLI subcommands; inspector_widget.ops implements them.
+# INSPECTOR_WIDGET_TOOLSET chooses what tools/list shows (default: the legacy
+# and TalkBack tools); every tool stays callable by name.
 #
 # See host/README.md for build + run + `claude mcp add` instructions.
 
@@ -36,6 +46,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import threading
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -55,9 +66,8 @@ log = logging.getLogger("inspector-widget.mcp")
 # Host-driver facade.
 #
 # We depend on the public surface of `inspector_widget` (built as a sibling
-# module).  The facade below isolates the exact import shape in ONE place and
-# adapts a couple of reasonable naming variants so the MCP layer stays stable
-# even if the host module exposes its entry points slightly differently.
+# module). The facade below isolates the import in ONE place, so a broken host
+# package is one clear error (and --self-check can probe it).
 #
 # Required `inspector_widget` public API (documented in host/README.md):
 #
@@ -96,8 +106,8 @@ log = logging.getLogger("inspector-widget.mcp")
 #           -> ViewInspection.ScreenshotResponse  (raw proto message)
 #
 # The proto module is `inspector_widget.proto.view_inspection_pb2` (generated;
-# protobuf package `viewspector.proto`); we import it for enum names + screenshot
-# decoding helpers. The self-check probes it; the tools reach it via the package.
+# protobuf package `viewspector.proto`). The self-check probes it; the tools reach
+# it through the package.
 # --------------------------------------------------------------------------- #
 
 
@@ -119,28 +129,18 @@ def _import_host() -> Any:
 
 
 def _import_proto() -> Any:
-    """Import the generated protobuf module used to read response fields.
-
-    The bindings live in the host package's ``proto`` subpackage
-    (``inspector_widget/proto/view_inspection_pb2.py``) — the same module the
-    rest of the package imports via ``from .proto import view_inspection_pb2``.
-    The bare names are kept only as fallbacks for a flat protoc layout.
-    """
-    for name in (
-        "inspector_widget.proto.view_inspection_pb2",
-        "view_inspection_pb2",
-        "inspector_widget.view_inspection_pb2",
-    ):
-        try:
-            # fromlist non-empty -> __import__ returns the leaf submodule itself.
-            return __import__(name, fromlist=["Request"])
-        except Exception:
-            continue
-    raise HostUnavailableError(
-        "Could not import the generated protobuf module "
-        "'inspector_widget.proto.view_inspection_pb2'. "
-        "Run scripts/build.sh to generate it."
-    )
+    """Import the generated protobuf bindings (``inspector_widget/proto/
+    view_inspection_pb2.py``, the module the package itself uses); for
+    ``--self-check`` and the startup health line."""
+    try:
+        from inspector_widget.proto import view_inspection_pb2
+    except Exception as exc:
+        raise HostUnavailableError(
+            "Could not import the generated protobuf module "
+            "'inspector_widget.proto.view_inspection_pb2'. "
+            f"Run scripts/build.sh to generate it. Underlying error: {exc!r}"
+        ) from exc
+    return view_inspection_pb2
 
 
 class HostFacade:
@@ -169,12 +169,10 @@ class HostFacade:
 
     # -- adb-level queries -------------------------------------------------- #
     def list_devices(self) -> List[Dict[str, Any]]:
-        fn = _first_attr(self.host, "list_devices", "devices")
-        return list(fn())
+        return list(self.host.list_devices())
 
     def list_processes(self, serial: str) -> List[Dict[str, Any]]:
-        fn = _first_attr(self.host, "list_processes", "processes", "list_packages")
-        return list(fn(serial))
+        return list(self.host.list_processes(serial))
 
     def attach(self, serial: str, package: str, force_reinject: bool = False) -> Any:
         return self.host.attach(serial, package, force_reinject=force_reinject)
@@ -183,18 +181,36 @@ class HostFacade:
         return self.host.connect_existing(serial, package)
 
 
-def _first_attr(obj: Any, *names: str) -> Callable[..., Any]:
-    for name in names:
-        fn = getattr(obj, name, None)
-        if callable(fn):
-            return fn
-    raise HostUnavailableError(
-        f"inspector_widget is missing any of {names!r}; the host driver API does "
-        "not match the version this MCP server expects."
-    )
-
-
 HOST = HostFacade()
+
+
+# --------------------------------------------------------------------------- #
+# Shutdown and per-call state.
+#
+# _closing is set first thing in exit cleanup: from then on no tool retries
+# and no session is attached (or cached), so a call the cleanup cut off can't
+# re-attach behind it and leave a session or an adb forward nobody removes.
+#
+# _CALL holds the state of the tool call running on this thread (_run_tool
+# sets it): the sessions it used, for the stale-build note, and the detach
+# count it first saw per app, so its retry never re-injects an agent that a
+# concurrent detach just stopped.
+# --------------------------------------------------------------------------- #
+_closing = threading.Event()
+_CALL = threading.local()
+
+
+class _CallState:
+    """What one tool call touched: the sessions it got, and for each (serial,
+    package) the stop count it saw first (see SessionCache.detaching)."""
+
+    def __init__(self) -> None:
+        self.sessions: List[Any] = []
+        self.stops_seen: Dict[Tuple[str, str], int] = {}
+
+
+def _current_call() -> Optional[_CallState]:
+    return getattr(_CALL, "state", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -203,13 +219,15 @@ HOST = HostFacade()
 # A cached session is reused only while Session.is_alive() holds (the socket
 # is open and the app still runs under the same pid); otherwise it is dropped
 # and re-attached. Each key has its own lock, so a slow cold inject into one
-# app never blocks tools on another.
+# app never blocks tools on another; detach holds it too.
 # --------------------------------------------------------------------------- #
 class SessionCache:
     def __init__(self) -> None:
         self._sessions: Dict[Tuple[str, str], Any] = {}
         self._key_locks: Dict[Tuple[str, str], threading.Lock] = {}
-        self._lock = threading.Lock()  # guards the two dicts only
+        # How many times detach stopped (or set out to stop) each key's agent.
+        self._stops: Dict[Tuple[str, str], int] = {}
+        self._lock = threading.Lock()  # guards the dicts only
 
     def _key(self, serial: str, package: str) -> Tuple[str, str]:
         return (serial, package)
@@ -221,10 +239,11 @@ class SessionCache:
     def get_or_attach(self, serial: str, package: str, force: bool = False) -> Any:
         key = self._key(serial, package)
         with self._key_lock(key):
+            self._check_may_attach(key, serial, package)
             with self._lock:
                 session = self._sessions.get(key)
             if session is not None and not force and _session_alive(session):
-                return session
+                return _note_used(session)
             if session is not None:
                 # Dead (agent idled out, app restarted, stream broke) or forced:
                 # release it before attaching afresh.
@@ -232,8 +251,46 @@ class SessionCache:
                 _disconnect(session)
             session = HOST.attach(serial, package, force_reinject=force)
             with self._lock:
-                self._sessions[key] = session
-            return session
+                if not _closing.is_set():
+                    self._sessions[key] = session
+                    return _note_used(session)
+            # Exit cleanup began while this attach ran and has emptied the
+            # cache already: release the new session (and its forward) here.
+            _disconnect(session)
+            raise ServerClosingError(_CLOSING_MESSAGE)
+
+    def _check_may_attach(self, key: Tuple[str, str], serial: str, package: str) -> None:
+        """Refuse while the server shuts down, and, within one tool call, once
+        a detach stopped this app's agent (the call's retry must not re-inject
+        it). The next call attaches as usual."""
+        if _closing.is_set():
+            raise ServerClosingError(_CLOSING_MESSAGE)
+        call = _current_call()
+        if call is None:
+            return
+        with self._lock:
+            stops = self._stops.get(key, 0)
+        if call.stops_seen.setdefault(key, stops) != stops:
+            raise ToolError(f"{package} on {serial} was detached while this call ran; "
+                            f"call the tool again to attach afresh")
+
+    @contextlib.contextmanager
+    def detaching(self, serial: str, package: str, stop: bool) -> Iterator[Optional[Any]]:
+        """Hold the key's lock for a detach; yield the cached session (dropped
+        from the cache), or None. ``stop``: the agent is about to be stopped,
+        so no call that was using it may re-attach (retry) afterwards."""
+        key = self._key(serial, package)
+        with self._key_lock(key):
+            with self._lock:
+                if stop:
+                    self._stops[key] = self._stops.get(key, 0) + 1
+                session = self._sessions.pop(key, None)
+            yield session
+
+    def stopped_during(self, call: _CallState) -> bool:
+        """Whether a detach stopped an agent ``call`` used, after it first used it."""
+        with self._lock:
+            return any(self._stops.get(key, 0) != seen for key, seen in call.stops_seen.items())
 
     def _forget(self, key: Tuple[str, str], session: Any) -> None:
         with self._lock:
@@ -253,7 +310,8 @@ class SessionCache:
             return list(self._sessions.values())
 
     def close_all(self) -> None:
-        """Disconnect every cached session (agents keep running). For exit."""
+        """Disconnect every cached session (agents keep running). For exit,
+        once ``_closing`` is set, so that no attach caches a session after it."""
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
@@ -262,6 +320,16 @@ class SessionCache:
 
 
 SESSIONS = SessionCache()
+
+_CLOSING_MESSAGE = "the MCP server is shutting down; not attaching"
+
+
+def _note_used(session: Any) -> Any:
+    """Record ``session`` as used by the current tool call; returns it."""
+    call = _current_call()
+    if call is not None:
+        call.sessions.append(session)
+    return session
 
 
 def _session_alive(session: Any) -> bool:
@@ -301,259 +369,22 @@ def _serial(serial: Optional[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Proto -> JSON shaping.  String-table ids are resolved to text here so the
-# agent sees readable trees/properties rather than raw integer indices.
+# Screenshots: written as PNG by inspector_widget.png (the one decoder of record,
+# AGENTS.md section 6) into this server's temp directory.
 # --------------------------------------------------------------------------- #
-def _strings_to_map(strings_msg: Any) -> Dict[int, str]:
-    """ViewInspection.Strings -> {id: str}.  id 0 is implicitly "" (absent)."""
-    table: Dict[int, str] = {0: ""}
-    if strings_msg is None:
-        return table
-    for entry in getattr(strings_msg, "entries", []):
-        table[entry.id] = entry.str
-    return table
+def _save_screenshot_png(screenshot_msg: Any, dest_path: str) -> Dict[str, Any]:
+    """Write a Screenshot proto to ``dest_path`` as PNG; returns
+    ``{path, width, height, bytes, scale}``."""
+    from inspector_widget import png as pngmod
 
-
-def _s(table: Dict[int, str], sid: int) -> Optional[str]:
-    """Resolve a string-table id to text; id 0 -> None (absent)."""
-    if not sid:
-        return None
-    return table.get(sid)
-
-
-_PROPERTY_TYPE_NAMES = {
-    0: "STRING", 1: "BOOLEAN", 2: "BYTE", 3: "CHAR", 4: "DOUBLE", 5: "FLOAT",
-    6: "INT16", 7: "INT32", 8: "INT64", 9: "OBJECT", 10: "COLOR", 11: "GRAVITY",
-    12: "INT_ENUM", 13: "INT_FLAG", 14: "RESOURCE", 15: "DRAWABLE", 16: "ANIM",
-    17: "ANIMATOR", 18: "INTERPOLATOR", 19: "DIMENSION",
-}
-
-# Types whose payload travels in str_value (a string-table id).
-_STR_VALUE_TYPES = {0, 9, 12, 15, 16, 17, 18}  # STRING, OBJECT, INT_ENUM, DRAWABLE, ANIM, ANIMATOR, INTERPOLATOR
-# Types whose payload travels in int32_value.
-_INT32_VALUE_TYPES = {2, 3, 6, 7, 10, 11, 13}  # BYTE, CHAR, INT16, INT32, COLOR, GRAVITY, INT_FLAG
-
-
-def _resource_to_json(table: Dict[int, str], res: Any) -> Optional[Dict[str, Any]]:
-    if res is None:
-        return None
-    type_name = _s(table, res.type)
-    name = _s(table, res.name)
-    namespace = _s(table, res.namespace)
-    if type_name is None and name is None and namespace is None:
-        return None
-    out: Dict[str, Any] = {}
-    if namespace is not None:
-        out["namespace"] = namespace
-    if type_name is not None:
-        out["type"] = type_name
-    if name is not None:
-        out["name"] = name
-    # Convenience @type/name string, e.g. "@id/my_button".
-    if type_name is not None and name is not None:
-        out["ref"] = f"@{type_name}/{name}"
-    return out
-
-
-def _bounds_to_json(bounds: Any) -> Optional[Dict[str, Any]]:
-    if bounds is None:
-        return None
-    # Bounds.layout is a sub-message; in proto3 reading it always yields a value
-    # (a default all-zero Rect if unset), which we surface as-is.
-    layout = bounds.layout
-    out: Dict[str, Any] = {
-        "x": layout.x, "y": layout.y, "w": layout.w, "h": layout.h,
-    }
-    if bounds.HasField("render"):
-        q = bounds.render
-        out["render_quad"] = [
-            [q.x0, q.y0], [q.x1, q.y1], [q.x2, q.y2], [q.x3, q.y3],
-        ]
-    return out
-
-
-def _node_to_json(table: Dict[int, str], node: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "id": node.id,
-        "class_name": _s(table, node.class_name),
-        "package_name": _s(table, node.package_name),
-    }
-    bounds = _bounds_to_json(node.bounds if node.HasField("bounds") else None)
-    if bounds is not None:
-        out["bounds"] = bounds
-    resource = _resource_to_json(table, node.resource if node.HasField("resource") else None)
-    if resource is not None:
-        out["resource"] = resource
-    layout_resource = _resource_to_json(
-        table, node.layout_resource if node.HasField("layout_resource") else None
-    )
-    if layout_resource is not None:
-        out["layout_resource"] = layout_resource
-    view_id_name = _s(table, node.view_id_name)
-    if view_id_name:
-        out["view_id_name"] = view_id_name
-    text = _s(table, node.text_value)
-    if text:
-        out["text"] = text
-    if node.flags:
-        flag_names = []
-        # Flag.IS_WEBVIEW == 1 (bitmask) per proto.
-        if node.flags & 1:
-            flag_names.append("IS_WEBVIEW")
-        out["flags"] = flag_names
-    children = [_node_to_json(table, c) for c in node.children]
-    if children:
-        out["children"] = children
-    return out
-
-
-def _property_to_json(table: Dict[int, str], prop: Any, include_stack: bool) -> Dict[str, Any]:
-    ptype = int(prop.type)
-    out: Dict[str, Any] = {
-        "name": _s(table, prop.name),
-        "type": _PROPERTY_TYPE_NAMES.get(ptype, str(ptype)),
-    }
-    if prop.is_layout:
-        out["is_layout"] = True
-
-    # Pull the single populated value slot per type.
-    if ptype == 1:  # BOOLEAN
-        out["value"] = bool(prop.int32_value)
-    elif ptype in (10,):  # COLOR -> #AARRGGBB
-        out["value"] = _color_hex(prop.int32_value)
-    elif ptype in _INT32_VALUE_TYPES:
-        out["value"] = prop.int32_value
-    elif ptype == 8:  # INT64
-        out["value"] = prop.int64_value
-    elif ptype == 4:  # DOUBLE
-        out["value"] = prop.double_value
-    elif ptype in (5, 19):  # FLOAT, DIMENSION
-        out["value"] = prop.float_value
-    elif ptype in _STR_VALUE_TYPES:
-        out["value"] = _s(table, prop.str_value)
-    elif ptype == 14:  # RESOURCE
-        out["value"] = _resource_to_json(
-            table, prop.resource_value if prop.HasField("resource_value") else None
-        )
-    else:
-        # Unknown / future type: surface whatever non-empty slot we can.
-        if prop.str_value:
-            out["value"] = _s(table, prop.str_value)
-        elif prop.int64_value:
-            out["value"] = prop.int64_value
-        elif prop.int32_value:
-            out["value"] = prop.int32_value
-
-    source = _s(table, prop.source)
-    if source:
-        out["source"] = source
-    if include_stack and prop.resolution_stack:
-        stack = [_s(table, sid) for sid in prop.resolution_stack]
-        out["resolution_stack"] = [s for s in stack if s]
-    return out
-
-
-def _color_hex(argb: int) -> str:
-    # int32 may be negative (sign bit set); mask to 32 bits.
-    v = argb & 0xFFFFFFFF
-    return "#{:08X}".format(v)
-
-
-def _property_group_to_json(
-    table: Dict[int, str], group: Any, include_stack: bool
-) -> Dict[str, Any]:
-    return {
-        "view_id": group.view_id,
-        "properties": [
-            _property_to_json(table, p, include_stack) for p in group.properties
-        ],
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Screenshot decoding: the wire `Screenshot.data` is a Deflate(BEST_SPEED)
-# buffer of [9-byte header | raw pixels].  The host driver is expected to expose
-# a decoder that yields a PNG; if it does not, we decode here using stdlib
-# (zlib) + a tiny BMP/PNG writer fallback.  We prefer the driver's decoder.
-# --------------------------------------------------------------------------- #
-def _save_screenshot_png(session: Any, screenshot_msg: Any, dest_path: str) -> Dict[str, Any]:
-    """Materialise a Screenshot proto to a PNG file at dest_path.
-
-    Returns metadata {path, width, height, bytes}.
-    """
-    # 1. Prefer a host-driver decoder that returns PNG bytes (it already owns the
-    #    Deflate + header + pixel-config decoding to stay byte-exact with the agent).
-    png_bytes: Optional[bytes] = None
-    decoder = None
-    for name in ("screenshot_to_png", "decode_screenshot_png", "to_png"):
-        fn = getattr(session, name, None) or getattr(HOST.host, name, None)
-        if callable(fn):
-            decoder = fn
-            break
-    if decoder is not None:
-        try:
-            png_bytes = decoder(screenshot_msg)
-        except Exception:  # pragma: no cover - fall back to our own decoder
-            log.debug("host screenshot decoder failed; using stdlib decoder", exc_info=True)
-            png_bytes = None
-    if png_bytes is None:
-        # 2. Self-contained stdlib decode (zlib + minimal PNG writer).
-        png_bytes = _decode_screenshot_to_png(screenshot_msg)
-
-    with open(dest_path, "wb") as fh:
-        fh.write(png_bytes)
+    pngmod.write_png(screenshot_msg, dest_path)
     return {
         "path": dest_path,
         "width": int(screenshot_msg.width),
         "height": int(screenshot_msg.height),
-        "bytes": len(png_bytes),
+        "bytes": os.path.getsize(dest_path),
         "scale": float(screenshot_msg.scale) if screenshot_msg.scale else 1.0,
     }
-
-
-def _decode_screenshot_to_png(screenshot_msg: Any) -> bytes:
-    """Decode the Inspector Widget BITMAP wire format -> PNG bytes.
-
-    Decoding is delegated to ``inspector_widget.png._decode_to_rgba`` (the single
-    source of truth for the Deflate + 9-byte header + pixel-config handling, incl.
-    the ARGB_8888/type-3 R/B swap), then encoded to PNG with our stdlib encoder.
-    """
-    from inspector_widget import png as pngmod  # type: ignore
-
-    width, height, rgba = pngmod._decode_to_rgba(screenshot_msg)
-    return _rgba_to_png(rgba, width, height)
-
-
-def _rgba_to_png(rgba: bytearray, width: int, height: int) -> bytes:
-    """Minimal RGBA8888 -> PNG encoder (stdlib zlib, no Pillow)."""
-    import struct
-    import zlib
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    # IHDR: width, height, bit depth 8, colour type 6 (RGBA), no interlace.
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-
-    stride = width * 4
-    raw = bytearray()
-    for y in range(height):
-        raw.append(0)  # filter type 0 (None) per scanline
-        start = y * stride
-        raw += rgba[start : start + stride]
-    idat = zlib.compress(bytes(raw), 9)
-
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", idat)
-        + chunk(b"IEND", b"")
-    )
 
 
 _TMP_PREFIX = "viewspector_"
@@ -617,7 +448,12 @@ def _cleanup_at_exit() -> None:
     """Restore the TalkBack settings this server changed, disconnect cached
     sessions (removing their adb forwards; agents keep running for the next
     start), remove any other forward this process still holds (an attach cut
-    short), and delete this process's PNG directory."""
+    short), and delete this process's PNG directory.
+
+    ``_closing`` goes up first: a tool call this cuts off must not retry, and
+    no attach may cache a session behind the cleanup.
+    """
+    _closing.set()
     try:
         from inspector_widget.talkback import device as tbdevice
         tbdevice.restore_owned()
@@ -644,36 +480,23 @@ def _cleanup_at_exit() -> None:
 # the MCP layer (real or fallback) runs them in a worker thread because the host
 # driver does blocking adb + socket I/O.
 # --------------------------------------------------------------------------- #
-def _device_to_json(d: Any) -> Dict[str, Any]:
-    if isinstance(d, dict):
-        return {
-            "serial": d.get("serial"),
-            "api": d.get("api"),
-            "abi": d.get("abi"),
-            "model": d.get("model"),
-            "state": d.get("state", "device"),
-        }
+def _device_to_json(d: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``inspector_widget.list_devices()`` entry, as list_devices reports it."""
     return {
-        "serial": getattr(d, "serial", None),
-        "api": getattr(d, "api", None),
-        "abi": getattr(d, "abi", None),
-        "model": getattr(d, "model", None),
-        "state": getattr(d, "state", "device"),
+        "serial": d.get("serial"),
+        "api": d.get("api"),
+        "abi": d.get("abi"),
+        "model": d.get("model"),
+        "state": d.get("state", "device"),
     }
 
 
-def _process_to_json(p: Any) -> Dict[str, Any]:
-    if isinstance(p, dict):
-        return {
-            "package": p.get("package"),
-            "pid": p.get("pid"),
-            "running": bool(p.get("pid")) if p.get("running") is None else bool(p.get("running")),
-        }
-    pid = getattr(p, "pid", None)
+def _process_to_json(p: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``inspector_widget.list_processes()`` entry."""
     return {
-        "package": getattr(p, "package", None),
-        "pid": pid,
-        "running": bool(getattr(p, "running", pid is not None)),
+        "package": p.get("package"),
+        "pid": p.get("pid"),
+        "running": bool(p.get("pid")) if p.get("running") is None else bool(p.get("running")),
     }
 
 
@@ -722,10 +545,40 @@ def tool_attach(serial: Optional[str], package: str, force: bool = False) -> Dic
         "root_ids": root_ids,
         "session": f"{serial}/{package}",
     }
-    note = getattr(session, "note", None) or _stale_build_note(info.get("build_id"))
+    note = _session_note(session)
     if note:
         result["note"] = note
+    _remember_session(serial, package)
+    if "capture" in _listed_tools():
+        result["next"] = ["capture()"]
     return result
+
+
+def _session_note(session: Any) -> Optional[str]:
+    """The warning a session carries, as the CLI prints it for every subcommand:
+    the attach's own note (e.g. a stale-build agent kept for other clients), else
+    whether a cached session's agent runs another build than the local payload.jar."""
+    note = getattr(session, "note", None)
+    if note:
+        return str(note)
+    if not hasattr(session, "build_id"):
+        return None  # not a host Session (a test double): nothing to compare
+    return _stale_build_note(session.build_id)
+
+
+def _add_session_note(result: Any, call: _CallState) -> None:
+    """Add the note of the session ``call`` used last to ``result`` (a tool's
+    dict, an error included), after any note the tool gave itself."""
+    if not isinstance(result, dict) or not call.sessions:
+        return
+    note = _session_note(call.sessions[-1])
+    if not note:
+        return
+    own = result.get("note")
+    if not own:
+        result["note"] = note
+    elif note not in str(own):
+        result["note"] = f"{str(own).rstrip()} Also: {note}"
 
 
 def _stale_build_note(agent_build: Optional[str]) -> Optional[str]:
@@ -753,6 +606,7 @@ def tool_dump_tree(
     serial = _serial(serial)
     scale = _clamp_scale(scale)
     root_id = _as_int(root_id, "root_id")
+    from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_tree(
         root_id=root_id,
@@ -761,21 +615,11 @@ def tool_dump_tree(
         include_screenshot=bool(include_screenshot),
         screenshot_scale=scale,
     )
-    table = _strings_to_map(resp.strings if resp.HasField("strings") else None)
-    result: Dict[str, Any] = {
-        "serial": serial,
-        "package": package,
-        "roots": [_node_to_json(table, r) for r in resp.roots],
-        "root_count": len(resp.roots),
-    }
-    if include_properties:
-        result["properties"] = [
-            _property_group_to_json(table, g, include_resolution_stack)
-            for g in resp.properties
-        ]
+    result = results.dump_tree(st.dump_tree_to_dict(resp), serial, package,
+                               include_properties=bool(include_properties))
     if include_screenshot and resp.HasField("screenshot"):
         with _png_output(serial, package, "tree") as dest:
-            result["screenshot"] = _save_screenshot_png(session, resp.screenshot, dest)
+            result["screenshot"] = _save_screenshot_png(resp.screenshot, dest)
     return result
 
 
@@ -788,22 +632,14 @@ def tool_get_properties(
     _require(package, "package")
     view_id = _as_int(view_id, "view_id")
     serial = _serial(serial)
+    from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.get_properties(
         view_id=view_id, include_resolution_stack=bool(include_resolution_stack)
     )
-    table = _strings_to_map(resp.strings if resp.HasField("strings") else None)
-    group = resp.group if resp.HasField("group") else None
-    return {
-        "serial": serial,
-        "package": package,
-        "view_id": view_id,
-        "group": (
-            _property_group_to_json(table, group, include_resolution_stack)
-            if group is not None
-            else None
-        ),
-    }
+    if not resp.HasField("group"):
+        return {"serial": serial, "package": package, "view_id": view_id, "group": None}
+    return results.get_properties(st.get_properties_to_dict(resp), serial, package)
 
 
 def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> Dict[str, Any]:
@@ -815,7 +651,7 @@ def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> 
     if not resp.HasField("screenshot"):
         raise ToolError("agent returned no screenshot")
     with _png_output(serial, package, "shot") as dest:
-        meta = _save_screenshot_png(session, resp.screenshot, dest)
+        meta = _save_screenshot_png(resp.screenshot, dest)
     meta.update({"serial": serial, "package": package})
     return meta
 
@@ -823,10 +659,19 @@ def tool_screenshot(serial: Optional[str], package: str, scale: float = 1.0) -> 
 def tool_detach(serial: Optional[str], package: str, shutdown: bool = True) -> Dict[str, Any]:
     """shutdown=True (default): stop the agent for every client, whether or not
     this server attached it (never injects one). shutdown=False: only drop this
-    server's cached connection and leave the agent running."""
+    server's cached connection and leave the agent running.
+
+    Holds the app's session lock throughout, so no tool attaches to the app
+    in between; a call that loses its session to this shutdown won't retry."""
     _require(package, "package")
     serial = _serial(serial)
-    cached = SESSIONS.drop(serial, package)
+    with SESSIONS.detaching(serial, package, stop=bool(shutdown)) as cached:
+        return _detach_locked(serial, package, bool(shutdown), cached)
+
+
+def _detach_locked(serial: str, package: str, shutdown: bool,
+                   cached: Optional[Any]) -> Dict[str, Any]:
+    """tool_detach's body; the caller holds the key lock and dropped ``cached``."""
     if not shutdown:
         if cached is None:
             return {"serial": serial, "package": package, "detached": False,
@@ -862,17 +707,20 @@ def tool_dump_compose(
     """Dump the Compose layer (semantics tree + slot table) of the app's UI."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import strings as st
+    from inspector_widget import results, strings as st
     session = SESSIONS.get_or_attach(serial, package)
+    if enable_inspection:
+        # The hot reload re-mints semantics ids: the next capture must not carry
+        # refs by device id (even if this request fails after reaching the agent).
+        _note_hot_reload(serial, package, getattr(session, "pid", None))
     resp = session.dump_compose(include_semantics=include_semantics,
                                 include_slot_table=include_slot_table,
                                 enable_inspection=enable_inspection)
-    data = st.dump_compose_to_dict(resp)
-    data.update({"serial": serial, "package": package})
-    if include_slot_table and not enable_inspection and not st.compose_slot_table_populated(data):
-        data["note"] = ("slot table not populated (semantics only). Pass enable_inspection=true for "
-                        "composable names/params/file:line. WARNING: "
-                        + st.ENABLE_INSPECTION_WARNING % "enable_inspection=true")
+    data = results.with_target(st.dump_compose_to_dict(resp), serial, package)
+    if include_slot_table and not enable_inspection:
+        note = results.compose_note(data, "enable_inspection=true", st.ENABLE_INSPECTION_WARNING)
+        if note:
+            data["note"] = note
     return data
 
 
@@ -936,14 +784,9 @@ def _h_compose_overlay(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _session_get_windows(session: Any) -> Dict[str, Any]:
-    """Normalise session.get_windows() to {root_ids, strings} regardless of
-    whether the host returns a proto message or a plain dict."""
-    raw = session.get_windows()
-    if isinstance(raw, dict):
-        return {"root_ids": list(raw.get("root_ids", [])), "strings": raw.get("strings", {})}
-    # Proto GetWindowsResponse
-    table = _strings_to_map(raw.strings if raw.HasField("strings") else None)
-    return {"root_ids": list(raw.root_ids), "strings": table}
+    """``{root_ids}`` of the app's windows (a GetWindowsResponse)."""
+    from inspector_widget import strings as st
+    return st.get_windows_to_dict(session.get_windows())
 
 
 # --------------------------------------------------------------------------- #
@@ -951,6 +794,10 @@ def _session_get_windows(session: Any) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 class ToolError(Exception):
     """Raised for invalid arguments / tool-level failures; surfaced to the agent."""
+
+
+class ServerClosingError(ToolError):
+    """The server is shutting down (exit cleanup began): nothing attaches any more."""
 
 
 def _require(value: Any, name: str) -> None:
@@ -1028,33 +875,41 @@ def _h_detach(args: Dict[str, Any]) -> Dict[str, Any]:
                        shutdown=args.get("shutdown", True))
 
 
-_SERIAL = {
-    "type": "string",
-    "description": "ADB serial from list_devices; default $ANDROID_SERIAL, else the only device.",
-}
-_PACKAGE = {
-    "type": "string",
-    "description": "Debuggable app package, e.g. 'com.example.app'.",
-}
+_SERIAL = {"type": "string", "description": "Default: $ANDROID_SERIAL or the only device"}
+_PACKAGE = {"type": "string"}  # the tools say "debuggable app"; list_processes lists them
+# Screenshot scale; 0 < scale <= 1 says it all (tools/list stays small, spec 2.4).
+_SCALE = {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.0}
 
 # --------------------------------------------------------------------------- #
 # Accessibility tools (dump / lint / overlay).
 # --------------------------------------------------------------------------- #
+#: How long a density / font-scale probe stays fresh. Short: an agent testing at
+#: a large font or display size changes them between calls (settings put
+#: system font_scale, wm density), and every lint and capture must use the
+#: values the device has now, as the CLI (which probes on every run) does.
+_METRICS_TTL_S = 2.0
+
+
 def _a11y_device_metrics(serial: str):
-    """(density_dpi, font_scale) for the lint, probed once per serial and cached."""
+    """(density_dpi, font_scale) of the device now, for the lint and captures:
+    probed at most once per _METRICS_TTL_S per serial (one tool call's
+    probes share one read; the next call re-reads)."""
     from inspector_widget import adb
     cache = _a11y_device_metrics.__dict__.setdefault("_cache", {})
-    if serial not in cache:
-        try:
-            density = adb.display_density(serial)
-        except Exception:
-            density = None  # the lint assumes 420dpi and says so in its diagnostics
-        try:
-            fscale = adb.font_scale(serial)
-        except Exception:
-            fscale = 1.0
-        cache[serial] = (density, fscale)
-    return cache[serial]
+    now = time.monotonic()
+    hit = cache.get(serial)
+    if hit is not None and len(hit) == 3 and now - hit[2] < _METRICS_TTL_S:
+        return hit[0], hit[1]
+    try:
+        density = adb.display_density(serial)
+    except Exception:
+        density = None  # the lint assumes 420dpi and says so in its diagnostics
+    try:
+        fscale = adb.font_scale(serial)
+    except Exception:
+        fscale = 1.0
+    cache[serial] = (density, fscale, now)
+    return density, fscale
 
 
 def _a11y_lint_rules(rules: Any):
@@ -1076,14 +931,13 @@ def tool_dump_accessibility(
     exactly as TalkBack/UiAutomator see it, plus the host-computed reading order."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import a11y as a11ymod, correlate
+    from inspector_widget import a11y as a11ymod, correlate, results
     session = SESSIONS.get_or_attach(serial, package)
     resp = session.dump_a11y(root_id=0, include_extras=bool(include_extras),
                              include_rendering_info=bool(include_rendering_info))
     data = a11ymod.a11y_to_dict(resp)
     correlate.record_a11y(session, data)  # its Compose keys re-resolve in inspect_node
-    data.update({"serial": serial, "package": package})
-    return data
+    return results.with_target(data, serial, package)
 
 
 def tool_a11y_lint(
@@ -1097,7 +951,7 @@ def tool_a11y_lint(
     typed node keys plus a summary and diagnostics. Contrast samples each window."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import a11y_lint, correlate
+    from inspector_widget import a11y_lint, correlate, results
     enabled = _a11y_lint_rules(rules)
     scale = _clamp_scale(scale)
     session = SESSIONS.get_or_attach(serial, package)
@@ -1107,10 +961,7 @@ def tool_a11y_lint(
         include_contrast=bool(include_contrast), scale=scale, wcag_mode=bool(wcag_mode),
         rules=enabled, include_rendering_info=bool(include_rendering_info))
     correlate.record_a11y(session, report.a11y_data, (report.compose_data or {}).get("windows"))
-    out = report.to_dict()
-    out.update({"serial": serial, "package": package,
-                "contrast_sampled": bool(out["stats"].get("contrast_windows"))})
-    return out
+    return results.a11y_lint(report.to_dict(), serial, package)
 
 
 def tool_a11y_overlay(
@@ -1184,31 +1035,24 @@ def _h_a11y_overlay(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def _load_a11y_rule_choices() -> List[str]:
-    try:
-        from inspector_widget import a11y_lint
-        return list(a11y_lint.RULE_CHOICES)
-    except Exception:  # keep the server importable even if the lint cannot load
-        return []
-
-
-_A11Y_RULE_CHOICES = _load_a11y_rule_choices()
-_A11Y_RULE_ITEMS: Dict[str, Any] = (
-    {"type": "string", "enum": _A11Y_RULE_CHOICES} if _A11Y_RULE_CHOICES else {"type": "string"})
+# Rule ids are checked by _a11y_lint_rules (a clear error naming the valid ids), not
+# by an enum in the schema: listing all 47 ids and aliases would cost ~900 B of
+# tools/list on every session (spec 2.4).
+_A11Y_RULE_ITEMS: Dict[str, Any] = {"type": "string"}
 
 
 TOOLS: Dict[str, Dict[str, Any]] = {
     "list_devices": {
         "handler": _h_list_devices,
         "description": (
-            "List adb-visible devices and emulators with serial, API level and ABI. Call first."
+            "List adb devices and emulators (serial, API level, ABI). Call first."
         ),
         "schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     "list_processes": {
         "handler": _h_list_processes,
         "description": (
-            "List a device's debuggable packages (only those can be inspected), with the pid of "
+            "List a device's debuggable packages (only those can be inspected) and the pid of "
             "each running one."
         ),
         "schema": {
@@ -1220,11 +1064,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "attach": {
         "handler": _h_attach,
         "description": (
-            "Inject the agent into a RUNNING debuggable app and open a session (idempotent per "
-            "serial+package; other tools auto-attach). Returns pid, warm (agent already running), "
-            "reused (cached session), API level, ABI, agent version and windows (window_count, "
-            "root_ids for dump_tree). A dropped session (idle timeout, app restart) re-attaches "
-            "automatically; an agent from another build is replaced."
+            "Inject the agent into a RUNNING debuggable app and open a session (idempotent; "
+            "other tools auto-attach): pid, warm, reused, API level, ABI, agent version, "
+            "window_count, root_ids. A dropped session re-attaches by itself."
         ),
         "schema": {
             "type": "object",
@@ -1232,8 +1074,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "force": {"type": "boolean", "default": False,
-                          "description": "Stop any running agent (for every client) and inject a "
-                                         "fresh one."},
+                          "description": "Stop any running agent and inject a fresh one."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1242,9 +1083,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_tree": {
         "handler": _h_dump_tree,
         "description": (
-            "The live View hierarchy as a JSON tree (auto-attaches). Nodes carry id "
-            "(uniqueDrawingId, for get_properties), class_name, package_name, screen bounds "
-            "{x,y,w,h} (render_quad when transformed), @id resource, TextView text and IS_WEBVIEW."
+            "The View hierarchy (auto-attaches). Nodes carry id (uniqueDrawingId, for "
+            "get_properties), class_name, bounds [x,y,w,h] in screen px (render when "
+            "transformed), resource, text and flags. max_depth=1 lists the window roots."
         ),
         "schema": {
             "type": "object",
@@ -1254,7 +1095,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_properties": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Inline every view's attributes (large; see get_properties).",
+                    "description": "Add each view's non-default attributes.",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
@@ -1266,13 +1107,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                     "default": False,
                     "description": "Also save a screenshot PNG (screenshot.path).",
                 },
-                "scale": {
-                    "type": "number",
-                    "default": 1.0,
-                    "minimum": 0.0,
-                    "maximum": 1.0,
-                    "description": "Screenshot scale in (0, 1].",
-                },
+                "scale": _SCALE,
                 "root_id": {
                     "type": "integer",
                     "default": 0,
@@ -1286,8 +1121,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "get_properties": {
         "handler": _h_get_properties,
         "description": (
-            "Every attribute of one view: typed name/type/value, is_layout for layout params, "
-            "colors as #AARRGGBB, gravity/flags decoded, resource references resolved."
+            "Every attribute of one view as {name: value}: colors #AARRGGBB, dimensions px, "
+            "gravity/flags by name, resources @type/name."
         ),
         "schema": {
             "type": "object",
@@ -1296,7 +1131,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "view_id": {
                     "type": "integer",
-                    "description": "The view's uniqueDrawingId (its 'id' in dump_tree).",
+                    "description": "Its 'id' in dump_tree (uniqueDrawingId).",
                 },
                 "include_resolution_stack": {
                     "type": "boolean",
@@ -1311,21 +1146,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "screenshot": {
         "handler": _h_screenshot,
         "description": (
-            "Save a PNG of the app's current UI; returns path, width, height (auto-attaches). "
-            "Every tool's PNGs live in a per-server temp dir deleted on exit: copy one to keep it."
+            "Save a PNG of the app's UI; returns path, width, height. PNGs live in a "
+            "per-server temp dir deleted on exit: copy one to keep it."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {
-                    "type": "number",
-                    "default": 1.0,
-                    "minimum": 0.0,
-                    "maximum": 1.0,
-                    "description": "Scale in (0, 1]; 1 = full resolution.",
-                },
+                "scale": _SCALE,
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1334,9 +1163,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_compose": {
         "handler": _h_dump_compose,
         "description": (
-            "The Jetpack Compose layer dump_tree cannot see (it stops at AndroidComposeView): the "
-            "semantics tree (text, contentDescription, role, state, bounds of every on-screen "
-            "element) and, when populated, slot-table composables with file:line. Auto-attaches."
+            "The Jetpack Compose layer dump_tree stops at: the semantics tree (text, "
+            "contentDescription, role, state, bounds of each on-screen element) and, when "
+            "populated, the slot table's app composables with file:line. Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1346,12 +1175,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "include_semantics": {"type": "boolean", "default": True,
                     "description": "Include the semantics tree."},
                 "include_slot_table": {"type": "boolean", "default": True,
-                    "description": "Include the slot table (composables, parameters, file:line)."},
+                    "description": "Include the slot table (composables, file:line)."},
                 "enable_inspection": {"type": "boolean", "default": False,
                     "description": "Populate the slot table by hot-reloading. DESTRUCTIVE: "
-                                   "resets remember{} state in every composition (open dialogs, "
-                                   "text input, scroll, toggles) and re-mints Compose ids once. "
-                                   "The semantics tree does not need it."},
+                                   "resets remember{} state in every composition (dialogs, text "
+                                   "input, scroll, toggles) and re-mints Compose ids."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1360,16 +1188,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "compose_overlay": {
         "handler": _h_compose_overlay,
         "description": (
-            "Screenshot with every on-screen Compose element boxed and labelled (text/role). "
-            "Returns the PNG path and the on-screen text: the quickest look at a Compose screen."
+            "Screenshot with each on-screen Compose element boxed and labelled (text/role); "
+            "returns the PNG path and the on-screen text."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
-                          "description": "Screenshot scale in (0, 1]."},
+                "scale": _SCALE,
                 "all_boxes": {"type": "boolean", "default": False,
                               "description": "Box every node, not only those with text or a role."},
             },
@@ -1380,15 +1207,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "dump_accessibility": {
         "handler": _h_dump_accessibility,
         "description": (
-            "The unified accessibility tree TalkBack sees: Views and Compose virtual nodes in one "
-            "tree. Nodes carry host_view_id+virtual_id, a node_key (view:<id> | "
-            "compose:<acvId>:<semId>) for inspect_node (valid for this dump's generation), "
-            "text/contentDescription/state/role, flags, bounds, decoded actions, collection/range "
-            "info and extras. focus_order is TalkBack's reading order ([{order, key, speak}], "
-            "e.g. 'Delete, button'): Views not important for accessibility are skipped (ignored; "
-            "their children read in their place) and windows under an open modal dialog are "
-            "unreachable (covered_by). reading_order_diagnostics lists cycles, dangling targets "
-            "and covered windows. Auto-attaches."
+            "The accessibility tree TalkBack sees: Views and Compose virtual nodes in one tree. "
+            "Nodes carry node_key (view:<id> | compose:<acvId>:<semId>, for inspect_node), "
+            "text/contentDescription/state/role, flags, bounds, actions, collection/range info. "
+            "focus_order is TalkBack's reading order ({order, key, speak}); nodes under an "
+            "open dialog are unreachable (covered_by). Auto-attaches."
         ),
         "schema": {
             "type": "object",
@@ -1396,7 +1219,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "include_extras": {"type": "boolean", "default": True,
-                    "description": "Read each node's extras (roleDescription, Compose testTag)."},
+                    "description": "Read extras (roleDescription, Compose testTag)."},
                 "include_rendering_info": {"type": "boolean", "default": False,
                     "description": "Add layout and text sizes (slow)."},
             },
@@ -1407,15 +1230,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_lint": {
         "handler": _h_a11y_lint,
         "description": (
-            "Lint the unified a11y tree (Views, Compose, RecyclerView cells, "
-            "AndroidView-in-Compose) with rules R1..R18: missing labels, small touch targets, "
-            "low contrast (sampled per window), redundant/duplicate labels, clickables without a "
-            "role, images without descriptions, toggles without state, empty stops, "
-            "headings/grouping, fixed or tiny text, duplicate clickable bounds, text fields with "
-            "a contentDescription, form labels, unclear links, traversal cycles. A finding has "
-            "rule, alias (R#), severity, node_key (for inspect_node), node, bounds (px, dp), "
-            "window (covered_by: under an open dialog), collection position, message and "
-            "evidence; plus summary, diagnostics, generation. Auto-attaches."
+            "Lint the a11y tree (Views, Compose, RecyclerView cells, AndroidView-in-Compose), "
+            "rules R1..R18: labels, touch targets, contrast (per window), roles, state, empty "
+            "stops, headings, grouping, text size, duplicates, forms, links, traversal. by_rule: "
+            "each rule's count, message and first node_keys (for inspect_node); group_by=none "
+            "lists every finding (node_key, bounds px/dp, window, message, evidence)."
         ),
         "schema": {
             "type": "object",
@@ -1424,12 +1243,12 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "package": _PACKAGE,
                 "include_contrast": {"type": "boolean", "default": True,
                     "description": "Sample screenshots for the contrast rule (R3)."},
-                "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
-                    "description": "Screenshot scale in (0, 1]."},
+                "scale": _SCALE,
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "WCAG 44dp targets instead of Material 48dp."},
                 "rules": {"type": "array", "items": _A11Y_RULE_ITEMS,
-                    "description": "Rules to run; omit for all."},
+                    "description": "Rule ids (a11y.label.missing, ...), R1..R18 or ATF check "
+                                   "names; omit for all."},
                 "include_rendering_info": {"type": "boolean", "default": True,
                     "description": "Read View text sizes (R11, R18, size-aware contrast)."},
             },
@@ -1440,17 +1259,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "a11y_overlay": {
         "handler": _h_a11y_overlay,
         "description": (
-            "Screenshot with every a11y node boxed: its spoken label and TalkBack order number, "
-            "colored by lint severity (red error, amber warn, blue info, green clean). Returns the "
-            "PNG path and the lint summary."
+            "Screenshot with each a11y node boxed with its spoken label and TalkBack order, "
+            "colored by lint severity. Returns the PNG path and the lint summary."
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
-                "scale": {"type": "number", "default": 1.0, "minimum": 0.0, "maximum": 1.0,
-                    "description": "Screenshot scale in (0, 1]."},
+                "scale": _SCALE,
                 "include_contrast": {"type": "boolean", "default": True,
                     "description": "Run the contrast rule too."},
                 "wcag_mode": {"type": "boolean", "default": False,
@@ -1463,9 +1280,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     "detach": {
         "handler": _h_detach,
         "description": (
-            "End a session. shutdown=true (default) stops the agent for every client, even one "
-            "this server did not attach (it never injects one just to stop it); shutdown=false "
-            "only drops this server's connection. Safe when not attached."
+            "End a session. shutdown=true (default) stops the agent for every client (it never "
+            "injects one to stop it); shutdown=false only drops this server's connection."
         ),
         "schema": {
             "type": "object",
@@ -1473,8 +1289,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "serial": _SERIAL,
                 "package": _PACKAGE,
                 "shutdown": {"type": "boolean", "default": True,
-                             "description": "Stop the agent (true) or only drop this server's "
-                                            "connection (false)."},
+                             "description": "false: only drop this server's connection."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1490,60 +1305,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 #   component_image  — cut a per-component image (SKP by layerId else BITMAP crop)
 # Defined here (before _run_tool) and registered via TOOLS.update(...).
 # --------------------------------------------------------------------------- #
-def _device_density(serial: str) -> int:
-    """Best-effort device density as raw DPI (e.g. 420) for dp-based a11y lint.
-
-    Returned as DPI (NOT a px/dp ratio): it is forwarded to inspect_node's
-    density=, which feeds the lint as a DPI int (matching LintContext.density).
-    Default 420 on any failure.
-    """
-    try:
-        from inspector_widget import adb  # type: ignore
-        out = adb.shell(serial, "wm density").strip()
-        # "Physical density: 420" (and maybe an Override line); prefer override.
-        dpi = None
-        for line in out.splitlines():
-            if ":" in line:
-                try:
-                    dpi = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-        if dpi:
-            return dpi
-    except Exception:
-        pass
-    return 420
-
-
-def _lint_fn():
-    """Return inspector_widget.a11y_lint.lint_a11y if importable, else None.
-
-    correlate.inspect_node calls this as lint_fn(roots, density_dpi) — the unified
-    a11y tree, or Compose-semantics roots for a lint that only takes those — and
-    expects a list[dict] of findings.
-    """
-    try:
-        from inspector_widget import a11y_lint  # type: ignore
-        fn = getattr(a11y_lint, "lint_a11y", None)
-        return fn if callable(fn) else None
-    except Exception:
-        return None
-
-
 def tool_inspect(serial: str, package: str, include_properties: bool = False,
                  include_overlay: bool = False) -> Dict[str, Any]:
     """Whole-screen integrated tree: each node carries view/compose/a11y/image-ref + correlation."""
     _require(package, "package")
     serial = _serial(serial)
-    from inspector_widget import correlate
+    from inspector_widget import correlate, results
     session = SESSIONS.get_or_attach(serial, package)
     merged = correlate.inspect_tree(session, include_properties=bool(include_properties))
-    result: Dict[str, Any] = {
-        "serial": serial, "package": package,
-        "roots": merged.get("roots", []),
-        "summary": merged.get("summary", {}),
-        "sources": merged.get("sources", {}),
-    }
+    result = results.inspect(merged, serial, package)
     if include_overlay:
         from inspector_widget import overlay as ov
         with _png_scratch(serial, package, "integrated_base") as base:
@@ -1583,7 +1353,7 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
             dossier = correlate.inspect_node(
                 session, node_key=node_key, view_id=vid, semantics_id=sid, bounds=bounds,
                 include_image=bool(include_image), image_path=image_path,
-                lint=True, density=density or _device_density(serial), font_scale=fscale,
+                lint=True, density=density, font_scale=fscale,
             )
         except correlate.NodeKeyError as exc:
             raise ToolError(str(exc)) from None
@@ -1591,8 +1361,8 @@ def tool_inspect_node(serial: str, package: str, node_key: Optional[str] = None,
             raise ToolError("no matching element found for the given selector")
         if image_path and not (dossier.get("component_image") or {}).get("path"):
             _remove_quietly(image_path)
-    dossier.update({"serial": serial, "package": package})
-    return dossier
+    from inspector_widget import results
+    return results.with_target(dossier, serial, package)
 
 
 def tool_component_image(serial: str, package: str, node_key: Optional[str] = None,
@@ -1619,8 +1389,8 @@ def tool_component_image(serial: str, package: str, node_key: Optional[str] = No
         img = correlate.component_image(session, node, out_path=out, merged=merged)
         if not img.get("path"):
             _remove_quietly(out)
-    img.update({"serial": serial, "package": package, "node_key": node.get("node_key")})
-    return img
+    from inspector_widget import results
+    return results.with_target(img, serial, package, node_key=node.get("node_key"))
 
 
 def _h_inspect(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1650,7 +1420,7 @@ def _h_component_image(args: Dict[str, Any]) -> Dict[str, Any]:
 
 _BOUNDS_SCHEMA = {
     "type": "object",
-    "description": "Screen px {x,y,w,h}: the deepest covering element.",
+    "description": "Screen px; the deepest covering element.",
     "properties": {
         "x": {"type": "integer"}, "y": {"type": "integer"},
         "w": {"type": "integer"}, "h": {"type": "integer"},
@@ -1663,12 +1433,11 @@ TOOLS.update({
     "inspect": {
         "handler": _h_inspect,
         "description": (
-            "The whole screen as one merged tree: the View hierarchy with every ComposeView's "
-            "semantics grafted in (RecyclerView cells, AndroidView nesting included) and a11y "
-            "facets joined by id (a one-to-one bounds fallback within a window). Keys view:<id>, "
-            "compose:<acvId>:<semId>, composeview:<acvId>. Nodes carry view{}, compose{}, a11y{} "
-            "(with TalkBack order), list_item{}, image_ref{} and correlation_confidence "
-            "(exact|overlap|none); summary has counts and the Compose id generation."
+            "The whole screen as one merged tree: Views with every ComposeView's semantics "
+            "grafted in (RecyclerView cells, AndroidView nesting) and a11y joined by id. Keys "
+            "view:<id>, compose:<acvId>:<semId>, composeview:<acvId>. Nodes carry bounds, view{}, "
+            "compose{}, a11y{} (TalkBack order) and conf when the join is not exact; summary "
+            "has counts."
         ),
         "schema": {
             "type": "object",
@@ -1678,7 +1447,7 @@ TOOLS.update({
                 "include_properties": {"type": "boolean", "default": False,
                     "description": "Inline view properties (view.properties)."},
                 "include_overlay": {"type": "boolean", "default": False,
-                    "description": "Also render a labelled, colored overlay PNG (overlay.path)."},
+                    "description": "Also render an overlay PNG (overlay.path)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1687,14 +1456,11 @@ TOOLS.update({
     "inspect_node": {
         "handler": _h_inspect_node,
         "description": (
-            "Everything about ONE element, chosen by node_key (any key inspect, "
-            "dump_accessibility or a11y_lint gives), view_id, semantics_id or bounds. An older "
-            "Compose key is re-resolved (resolved_from); a rebound RecyclerView cell gets "
-            "key_note; Compose children merged into a parent are a11y_only (a11y_parent). Returns "
-            "every facet (view properties, full a11y, compose attrs; source file:line when the "
-            "slot table is populated), context (window > list row > ComposeView), a component "
-            "image PNG cut from its own window (SKP by layerId, else a crop), and its a11y_lint "
-            "findings (with those merged into it), lint_summary and lint_diagnostics."
+            "Everything about ONE element, by node_key (from inspect, dump_accessibility or "
+            "a11y_lint), view_id, semantics_id or bounds: view properties, a11y, compose attrs "
+            "(file:line when the slot table is populated), context (window > list row > "
+            "ComposeView), a component image PNG and its lint findings. Old Compose keys are "
+            "re-resolved (resolved_from)."
         ),
         "schema": {
             "type": "object",
@@ -1705,11 +1471,10 @@ TOOLS.update({
                     "description": "view:<id> | compose:<acvId>:<semId> | composeview:<acvId>."},
                 "view_id": {"type": "integer", "description": "A view's uniqueDrawingId."},
                 "semantics_id": {"type": "integer",
-                    "description": "A Compose semantics id; ambiguous across ComposeViews, so "
-                                   "prefer node_key."},
+                    "description": "Ambiguous across ComposeViews: prefer node_key."},
                 "bounds": _BOUNDS_SCHEMA,
                 "include_image": {"type": "boolean", "default": True,
-                    "description": "Cut and save the component image (component_image.path)."},
+                    "description": "Cut the component image (component_image.path)."},
             },
             "required": ["package"],
             "additionalProperties": False,
@@ -1719,8 +1484,8 @@ TOOLS.update({
         "handler": _h_component_image,
         "description": (
             "Save one element's image as a PNG: from the SKP by its Compose graphicsLayer id when "
-            "available, else cropped from its own window's screenshot (a dialog node from the "
-            "dialog). Returns path, source (skp | bitmap_crop) and window (root view id)."
+            "available, else cropped from its own window's screenshot. Returns path, source "
+            "(skp | bitmap_crop) and window."
         ),
         "schema": {
             "type": "object",
@@ -1745,9 +1510,8 @@ TOOLS.update({
 # system screen reader on (snapshotting the settings first) and restore it.
 # --------------------------------------------------------------------------- #
 _DEVICE_WIDE = (
-    "DEVICE-WIDE: TalkBack runs for every app on the device (and anyone using it), and a11y "
-    "dumps change. Settings are snapshotted first and restored afterwards, at server exit, or "
-    "with talkback(action='restore'). ")
+    "DEVICE-WIDE: TalkBack runs for every app; settings are snapshotted and restored "
+    "afterwards, at exit, or by talkback(action='restore'). ")
 _TB_ANNOTATIONS = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
                    "openWorldHint": False}
 _TB_WALK_ARGS = ("start", "direction", "max_steps", "until", "expect", "step_timeout_ms",
@@ -1803,11 +1567,10 @@ TOOLS.update({
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack status / on / off / restore",
                             idempotentHint=True),
         "description": (
-            _DEVICE_WIDE + "status (read-only): installed/enabled, touch exploration, enabled "
-            "services, a pending restore, injectors. on: snapshot, add TalkBack to the enabled "
-            "services (others stay) and wait for touch exploration; stays on until off/restore/exit. "
-            "off: TalkBack off (exact restore if it was off). restore: write the snapshot back and "
-            "verify."
+            _DEVICE_WIDE + "status (read-only): installed/enabled, touch exploration, services, "
+            "a pending restore, injectors. on: add TalkBack to the enabled services and wait for "
+            "touch exploration (stays on until off/restore/exit). off: TalkBack off. restore: "
+            "write the snapshot back and verify."
         ),
         "schema": {
             "type": "object",
@@ -1816,9 +1579,8 @@ TOOLS.update({
                 "action": {"type": "string", "enum": ["status", "on", "off", "restore"]},
                 "package": dict(_PACKAGE, description="on: the app to keep in the foreground."),
                 "verbose_log": {"type": "boolean", "default": False,
-                                "description": "on: set TalkBack's log level to VERBOSE first, so "
-                                               "walks read exact announcements from logcat; "
-                                               "restore resets it."},
+                                "description": "on: TalkBack log level VERBOSE first (walks read "
+                                               "exact announcements); restore resets it."},
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -1826,13 +1588,13 @@ TOOLS.update({
     },
     "tb_walk": {
         "handler": _h_tb_walk,
-        "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus through the app"),
+        "annotations": dict(_TB_ANNOTATIONS, title="Walk real TalkBack focus"),
         "description": (
             _DEVICE_WIDE + "Presses REAL TalkBack's next/previous (uinput keyboard, touch "
-            "fallback), records where focus lands, and diffs that order against the model's "
-            "prediction and a visual order. Returns one line per step, how it ended (wrap, edge, "
-            "loop, stuck, left_app, max_steps), vs_model and tb.* findings with fixes; the full "
-            "walk is saved. TalkBack is restored afterwards unless leave_on. ~0.1-0.4s per step."
+            "fallback), records where focus lands and diffs that order with the model's and a "
+            "visual order. Returns one line per step, how it ended (wrap, edge, loop, stuck, "
+            "left_app, max_steps), vs_model and tb.* findings with fixes; the full walk is saved. "
+            "~0.1-0.4s per step."
         ),
         "schema": {
             "type": "object",
@@ -1861,13 +1623,12 @@ TOOLS.update({
                                              "node."},
                 "utterance": {"type": "string", "enum": ["auto", "model", "logcat"],
                               "default": "auto",
-                              "description": "auto: TalkBack's logcat if its log is VERBOSE, else "
-                                             "the model's announcement; logcat: set VERBOSE first "
-                                             "(~5s) and back after."},
+                              "description": "auto: TalkBack's logcat when VERBOSE, else the "
+                                             "model; logcat: set VERBOSE (~5s) first."},
                 "injector": {"type": "string", "enum": ["auto", "uinput", "touch"],
                              "default": "auto"},
                 "leave_on": {"type": "boolean", "default": False,
-                             "description": "Leave TalkBack on (talkback action=restore later)."},
+                             "description": "Leave TalkBack on (restore it later)."},
                 "max_lines": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
                 "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 100000,
                               "default": 5000},
@@ -1880,10 +1641,10 @@ TOOLS.update({
         "handler": _h_tb_scenario,
         "annotations": dict(_TB_ANNOTATIONS, title="TalkBack focus scenarios"),
         "description": (
-            _DEVICE_WIDE + "Checks where REAL TalkBack focus goes. focus_after: do action, "
-            "classify the landing (tb.initial_focus). restore: activate the target, go back, "
-            "classify (tb.restore_failed). survive: focus the target, apply mutate, classify over "
-            "wait_ms (tb.focus_reset/lost/drift). The target is reached by pressing next."
+            _DEVICE_WIDE + "Where REAL TalkBack focus goes. focus_after: do action, classify "
+            "the landing (tb.initial_focus). restore: activate the target, go back, classify "
+            "(tb.restore_failed). survive: focus the target, apply mutate, classify over wait_ms "
+            "(tb.focus_reset/lost/drift). The target is reached by pressing next."
         ),
         "schema": {
             "type": "object",
@@ -1894,8 +1655,8 @@ TOOLS.update({
                 "target": {"type": "string",
                            "description": "Node key or part of a label; default: current focus."},
                 "action": {"type": "string", "default": "activate",
-                           "description": "focus_after: activate (TalkBack's click) | back | tap "
-                                          "(bypasses TalkBack) | key:<combo>, e.g. key:META+SPACE."},
+                           "description": "activate (TalkBack's click) | back | tap (bypasses "
+                                          "TalkBack) | key:<combo>, e.g. key:META+SPACE"},
                 "mutate": {"type": "string",
                            "description": "survive: tap:<selector> | activate | key:<combo> | "
                                           "broadcast:<args> | probe:<action>."},
@@ -1914,10 +1675,73 @@ TOOLS.update({
 })
 
 
+# Phase-0 output parameters (detail, max_bytes, max_depth, root, user_code_only,
+# focus_order, group_by, filter), generated from inspector_widget.output's one
+# OUTPUT_PARAMS table; the CLI gets the same flags from it (add_cli_flags).
+# If the host package won't import, the server still starts (compact JSON, no
+# output parameters) and --self-check says why.
+try:
+    from inspector_widget import output
+except Exception:  # pragma: no cover - depends on the host package
+    output = None  # type: ignore[assignment]
+if output is not None:
+    output.augment_schemas(TOOLS)
+
+
 # Tools that manage the session themselves (attach re-attaches once on its own;
-# detach must never re-attach), so _run_tool doesn't retry them. The TalkBack
+# detach must never re-attach), so _run_tool never retries them. The TalkBack
 # tools press keys device-wide: a retry would repeat half a walk.
 _NO_RETRY = frozenset({"attach", "detach", "talkback", "tb_walk", "tb_scenario"})
+
+# Tools that only read the app's state, so running one twice is harmless even if
+# the agent acted on the first request before the connection went. dump_compose
+# joins them unless enable_inspection hot-reloads the app, and capture unless
+# slots="enable" does (see _read_only). The other capture-and-walk tools read
+# the store only.
+_READ_ONLY_TOOLS = frozenset({
+    "list_devices", "list_processes", "dump_tree", "get_properties", "screenshot",
+    "compose_overlay", "dump_accessibility", "a11y_lint", "a11y_overlay", "inspect",
+    "inspect_node", "component_image",
+    "captures", "outline", "find", "node", "image", "lint", "diff",
+})
+
+
+def _read_only(name: str, args: Dict[str, Any]) -> bool:
+    if name == "dump_compose":
+        return not args.get("enable_inspection")
+    if name == "capture":
+        return args.get("slots") != "enable"
+    return name in _READ_ONLY_TOOLS
+
+
+def _retry_refusal(name: str, args: Dict[str, Any], exc: BaseException,
+                   call: _CallState) -> Optional[str]:
+    """Why a call that lost its session must not be retried, or None to retry.
+
+    Never while the server shuts down, never for the _NO_RETRY tools, never once a
+    detach stopped the agent the call used (the retry would re-inject it); and
+    a call that changes the app (dump_compose with enable_inspection) only when
+    the request provably never reached the agent (NotSentError). Never
+    capture(slots="enable"): its hot reload is one of several requests, so a
+    later request's NotSentError says nothing about the reload already sent.
+    """
+    if _closing.is_set():
+        return "the server is shutting down"
+    if name in _NO_RETRY:
+        return "this tool is never retried"
+    if SESSIONS.stopped_during(call):
+        return "the app was detached while this call ran"
+    if _read_only(name, args):
+        return None
+    if name == "capture":
+        # capture sends several requests, the hot reload first: a NotSentError
+        # proves only that the failing (later) request never left, not that
+        # the delivered DumpCompose(enable_inspection) did not run.
+        return ("capture(slots=\"enable\") hot-reloads the app before it reads it; "
+                "never run twice")
+    if isinstance(exc, _not_sent_error()):
+        return None
+    return "the request may have reached the agent, and running it twice is not harmless"
 
 
 def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1930,7 +1754,9 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     Arguments are validated against the tool's inputSchema first, the same way
     for every transport. If the agent drops the session mid-call (idle timeout,
-    app restart), the call is retried once on a fresh attach.
+    app restart), a read-only call is retried once on a fresh attach (see
+    _retry_refusal for when it isn't). A result from a tool that used a session
+    carries that session's warning as "note", as the CLI prints it.
     """
     entry = TOOLS.get(name)
     if entry is None:
@@ -1938,20 +1764,47 @@ def _run_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 "available_tools": sorted(TOOLS.keys())}
     if args is None:
         args = {}
+    call = _CallState()
+    outer = _current_call()
+    _CALL.state = call
     try:
-        _validate_arguments(name, entry["schema"], args)
+        result = _run_tool_call(name, entry, args, call)
+    finally:
+        _CALL.state = outer
+    _add_session_note(result, call)
+    return result
+
+
+def _run_tool_call(name: str, entry: Dict[str, Any], args: Any,
+                   call: _CallState) -> Dict[str, Any]:
+    """_run_tool's body, with ``call`` as this thread's call state.
+
+    A capture-and-walk tool (an entry with ``on_error``) validates its own
+    arguments (bad_args) and reports every failure in its error envelope."""
+    on_error = entry.get("on_error")
+    try:
+        args = _normalize_arguments(entry["schema"], args)
+        if on_error is None:
+            _validate_arguments(name, entry["schema"], args)
         try:
             return entry["handler"](args)
         except _session_lost_error() as exc:
-            if name in _NO_RETRY:
+            refusal = _retry_refusal(name, args, exc, call)
+            if refusal is not None:
+                log.info("tool %s: %s; not retrying: %s", name, exc, refusal)
                 raise
             # The client closed itself, so the retry's get_or_attach sees a dead
             # session and re-attaches.
             log.info("tool %s: %s; re-attaching and retrying once", name, exc)
             return entry["handler"](args)
     except ToolError as exc:
+        if on_error is not None:
+            return on_error(_session_lost_error()(str(exc)))  # closing / detached meanwhile
         return {"error": str(exc), "tool": name}
     except Exception as exc:  # never leak a stack trace through the transport
+        if on_error is not None:
+            log.warning("tool %s failed: %s", name, exc)
+            return on_error(exc)
         if _is_expected_error(exc):
             log.warning("tool %s failed: %s", name, exc)
         else:
@@ -1995,6 +1848,14 @@ def _session_lost_error() -> type:
     return SessionLostError
 
 
+def _not_sent_error() -> type:
+    try:
+        from inspector_widget.client import NotSentError
+    except Exception:  # pragma: no cover - host package missing
+        return _NeverRaised
+    return NotSentError
+
+
 def _is_expected_error(exc: BaseException) -> bool:
     """Errors with a clear message of their own (no traceback needed in the log)."""
     try:
@@ -2007,9 +1868,134 @@ def _is_expected_error(exc: BaseException) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Capture and walk (inspector_widget.surface / ops): capture once, then query the
+# stored capture. One registry generates these tools and the CLI subcommands.
+# They are always registered (callable by name); INSPECTOR_WIDGET_TOOLSET picks
+# what tools/list shows (_listed_tools).
+# --------------------------------------------------------------------------- #
+try:
+    from inspector_widget import surface
+except Exception:  # pragma: no cover - depends on the host package
+    surface = None  # type: ignore[assignment]
+
+_TOOLSET_ENV = "INSPECTOR_WIDGET_TOOLSET"  # surface.ENV_TOOLSET
+_OPS: Optional[Any] = None
+_OPS_LOCK = threading.Lock()
+
+
+class _McpSessions:
+    """The ops layer's SessionProvider over this server's session cache."""
+
+    def get(self, serial: str, package: str) -> Any:
+        return SESSIONS.get_or_attach(serial, package)
+
+    def live_pid(self, serial: str, package: str) -> Optional[int]:
+        session = SESSIONS.peek(serial, package)
+        return getattr(session, "pid", None) if session is not None else None
+
+    def device(self, serial: str) -> Dict[str, Any]:
+        density, fscale = _a11y_device_metrics(serial)
+        return {"dpi": density, "font_scale": fscale}
+
+    def close_all(self) -> None:  # the server's exit cleanup owns the sessions
+        pass
+
+
+def _ops_context() -> Any:
+    """The capture store and session provider of this server, created on first use
+    (again when $INSPECTOR_WIDGET_CAPTURE_DIR or _PERSIST names another store)."""
+    global _OPS
+    from inspector_widget import ops
+    from inspector_widget.capture.model import default_store_root
+    from inspector_widget.capture.store import CaptureStore, env_persist
+    root, persist = default_store_root(), env_persist()
+    with _OPS_LOCK:
+        if _OPS is None or _OPS.store.configured_root != root or _OPS.store.persist != persist:
+            _OPS = ops.OpContext(CaptureStore(), _McpSessions(), "mcp")
+        return _OPS
+
+
+def _remember_session(serial: str, package: str) -> None:
+    """attach makes (serial, package) the default session of the capture tools."""
+    if surface is None:
+        return
+    try:
+        from inspector_widget import ops
+        ops.remember_session(_ops_context(), serial, package)
+    except Exception:  # noqa: BLE001 - a convenience, never a failure
+        log.debug("could not record the default session", exc_info=True)
+
+
+def _note_hot_reload(serial: str, package: str, pid: Optional[int]) -> None:
+    if surface is None:
+        return
+    with contextlib.suppress(Exception):
+        _ops_context().bump_generation(serial, package, pid)
+
+
+if surface is not None:
+    TOOLS.update({
+        name: dict(entry, on_error=surface.error_result)
+        for name, entry in surface.mcp_entries(
+            "all", context=_ops_context, passthrough=(_session_lost_error(),)).items()
+    })
+
+
+def _listed_tools() -> Dict[str, Dict[str, Any]]:
+    """The TOOLS entries tools/list shows: the INSPECTOR_WIDGET_TOOLSET toolset
+    (default: the 15 legacy tools and the TalkBack tools), in TOOLS order."""
+    if surface is None:
+        return dict(TOOLS)
+    try:
+        names = set(surface.toolset_names())
+    except ValueError as exc:
+        log.warning("%s; listing the default toolset", exc)
+        names = set(surface.toolset_names(surface.DEFAULT_TOOLSET))
+    return {name: entry for name, entry in TOOLS.items() if name in names}
+
+
+def _instructions() -> Optional[str]:
+    """The MCP ``instructions`` for the listed toolset (at most 900 B)."""
+    if surface is None:
+        return None
+    return surface.instructions(_listed_tools())
+
+
+# --------------------------------------------------------------------------- #
 # Argument validation against each tool's inputSchema (all transports).
 # --------------------------------------------------------------------------- #
 _VALIDATORS: Dict[str, Any] = {}
+
+
+def _normalize_arguments(schema: Dict[str, Any], args: Any) -> Any:
+    """``args`` with an explicit null for an optional argument dropped (null
+    means "use the default", as omitting it does) and a whole-number float for
+    an integer one made an int (12.0 -> 12; JSON has a single number type and
+    some clients send every number as a float). Nested objects too. Anything
+    else is left for validation to report."""
+    if not isinstance(args, dict):
+        return args
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or ())
+    out: Dict[str, Any] = {}
+    for key, value in args.items():
+        spec = props.get(key)
+        if spec is None:
+            out[key] = value  # unknown: validation names it
+            continue
+        if value is None and key not in required:
+            continue
+        typ = spec.get("type")
+        if typ == "integer" and _whole_float(value):
+            value = int(value)
+        elif typ == "object" and isinstance(value, dict) and spec.get("properties"):
+            value = _normalize_arguments(spec, value)
+        out[key] = value
+    return out
+
+
+def _whole_float(value: Any) -> bool:
+    return isinstance(value, float) and value.is_integer()
 
 
 def _validate_arguments(name: str, schema: Dict[str, Any], args: Any) -> None:
@@ -2055,6 +2041,19 @@ _JSON_TYPES: Dict[str, Tuple[type, ...]] = {
 }
 
 
+def _check_bounds(spec: Dict[str, Any], value: Any, name: str) -> None:
+    """The numeric bounds of ``spec``, with jsonschema's wording."""
+    checks = (
+        ("minimum", lambda v, b: v < b, "less than the minimum"),
+        ("exclusiveMinimum", lambda v, b: v <= b, "less than or equal to the minimum"),
+        ("maximum", lambda v, b: v > b, "greater than the maximum"),
+        ("exclusiveMaximum", lambda v, b: v >= b, "greater than or equal to the maximum"),
+    )
+    for keyword, fails, words in checks:
+        if keyword in spec and fails(value, spec[keyword]):
+            raise ToolError(f"invalid argument {name}: {value!r} is {words} of {spec[keyword]!r}")
+
+
 def _minimal_validate(schema: Dict[str, Any], args: Dict[str, Any], where: str = "") -> None:
     """The jsonschema-free fallback: required, unknown, type and numeric bounds."""
     props = schema.get("properties", {})
@@ -2071,17 +2070,13 @@ def _minimal_validate(schema: Dict[str, Any], args: Dict[str, Any], where: str =
         typ = spec.get("type")
         ok = True
         if typ in _JSON_TYPES:
-            ok = isinstance(value, _JSON_TYPES[typ]) and not (
-                typ in ("integer", "number") and isinstance(value, bool))
+            # As jsonschema: a bool is no number, and 12.0 is an integer.
+            ok = (isinstance(value, _JSON_TYPES[typ]) or (typ == "integer" and _whole_float(value))
+                  ) and not (typ in ("integer", "number") and isinstance(value, bool))
         if not ok:
             raise ToolError(f"invalid argument {where}{key}: {value!r} is not of type '{typ}'")
         if typ in ("integer", "number"):
-            if "minimum" in spec and value < spec["minimum"]:
-                raise ToolError(f"invalid argument {where}{key}: {value!r} is less than the "
-                                f"minimum of {spec['minimum']}")
-            if "maximum" in spec and value > spec["maximum"]:
-                raise ToolError(f"invalid argument {where}{key}: {value!r} is greater than the "
-                                f"maximum of {spec['maximum']}")
+            _check_bounds(spec, value, f"{where}{key}")
         if typ == "object" and isinstance(value, dict) and spec.get("properties"):
             _minimal_validate(spec, value, f"{where}{key}.")
         if typ == "array" and isinstance(value, list):
@@ -2101,16 +2096,57 @@ def _call_tool_text(name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
     failures identically (``isError: true`` + a JSON ``{"error": ...}`` body).
     ``_run_tool`` converts handler failures into a top-level ``{"error": ...}``
     dict rather than raising, so that key is what marks a failed call.
+
+    Every legacy result leaves through the output layer (Phase 0): the brief
+    rules of ``output.slim`` unless ``detail="full"``, then ``output.finalize``,
+    which encodes compact JSON and, over ``max_bytes``, writes the result to a
+    spill file and returns the spill envelope instead. An unknown or ambiguous
+    ``root`` comes back from ``slim`` as an error. The capture-and-walk tools
+    budget their own responses and are only encoded (compact JSON).
     """
+    text, _images, is_error = _call_tool(name, arguments)
+    return text, is_error
+
+
+def _call_tool(name: str, arguments: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]], bool]:
+    """``(text, images, is_error)``: :func:`_call_tool_text` plus the images a
+    capture-and-walk tool returns beside its text (``image(inline=true)``), as
+    ``(mime, base64)`` pairs for MCP ImageContent."""
     try:
-        result = _run_tool(name, {} if arguments is None else arguments)
-        is_error = isinstance(result, dict) and "error" in result
-        return json.dumps(result, indent=2, default=str), is_error
+        args = {} if arguments is None else arguments
+        result = _run_tool(name, args)
+        if surface is not None and isinstance(result, surface.Result):
+            return result.text(), result.images, result.is_error
+        text, is_error = _render_result(name, result, args)
+        return text, [], is_error
     except (ToolError, HostUnavailableError) as exc:
-        return json.dumps({"error": str(exc)}), True
+        return _compact({"error": str(exc)}), [], True
     except Exception as exc:  # surfaced to the agent, not raised
         log.exception("tool %s failed", name)
-        return json.dumps({"error": f"{type(exc).__name__}: {exc}", "tool": name}), True
+        return _compact({"error": f"{type(exc).__name__}: {exc}", "tool": name}), [], True
+
+
+def _compact(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _render_result(name: str, result: Any, args: Any) -> Tuple[str, bool]:
+    """``(text, is_error)`` for a tool's result dict and the arguments it was called
+    with: errors as they are (compact), everything else slimmed and budgeted."""
+    if surface is not None and isinstance(result, surface.Result):
+        return result.text(), result.is_error
+    failed = isinstance(result, dict) and "error" in result
+    if failed or output is None:
+        return _compact(result), failed
+    entry = TOOLS.get(name)
+    if entry is not None and isinstance(args, dict):
+        args = _normalize_arguments(entry["schema"], args)  # as the tool saw them
+    if not isinstance(args, dict):
+        args = {}
+    brief = output.slim(name, result, args)
+    text = output.finalize(name, brief, max_bytes=args.get("max_bytes"),
+                           detail=args.get("detail"))
+    return text, isinstance(brief, dict) and "error" in brief
 
 
 def _build_mcp_server() -> Any:
@@ -2141,16 +2177,30 @@ def _build_mcp_server() -> Any:
         return types.Tool(**kw)
 
     def tool_list() -> List[Any]:
-        return [tool(name, entry) for name, entry in TOOLS.items()]
+        return [tool(name, entry) for name, entry in _listed_tools().items()]
 
     async def run_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Any:
-        text, is_error = await asyncio.to_thread(_call_tool_text, name, arguments or {})
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=text)], isError=is_error
-        )
+        text, images, is_error = await asyncio.to_thread(_call_tool, name, arguments or {})
+        content = [types.TextContent(type="text", text=text)]
+        content += [types.ImageContent(type="image", data=data, mimeType=mime)
+                    for mime, data in images]
+        return types.CallToolResult(content=content, isError=is_error)
+
+    instructions = _instructions()
+
+    def new_server(**kw: Any) -> Any:
+        """Server(...) with the instructions, or without them on an SDK that has
+        no such parameter (they are also in each tool's description)."""
+        if instructions:
+            try:
+                return Server("inspector-widget", version=_SERVER_INFO["version"],
+                              instructions=instructions, **kw)
+            except TypeError:
+                pass
+        return Server("inspector-widget", version=_SERVER_INFO["version"], **kw)
 
     if hasattr(Server, "list_tools"):  # mcp 1.x decorator API
-        server = Server("inspector-widget", version=_SERVER_INFO["version"])
+        server = new_server()
 
         @server.list_tools()
         async def list_tools() -> List[Any]:  # type: ignore[misc]
@@ -2175,12 +2225,7 @@ def _build_mcp_server() -> Any:
     async def on_call_tool(ctx: Any, params: Any) -> Any:
         return await run_tool(params.name, params.arguments)
 
-    return Server(
-        "inspector-widget",
-        version=_SERVER_INFO["version"],
-        on_list_tools=on_list_tools,
-        on_call_tool=on_call_tool,
-    )
+    return new_server(on_list_tools=on_list_tools, on_call_tool=on_call_tool)
 
 
 def _serve_with_mcp() -> bool:
@@ -2235,25 +2280,35 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
     req_id = message.get("id")
     if not isinstance(method, str):
         return _jsonrpc_error(req_id, -32600, "invalid request: 'method' must be a string")
+    if "id" not in message:
+        # A notification: never answered, not even with an error (JSON-RPC 2.0
+        # section 4.1). MCP's are notifications/* (initialized, cancelled, ...),
+        # which need nothing from this server; any other is ignored rather than
+        # run, since its result could never be reported.
+        if not method.startswith("notifications/"):
+            log.debug("ignoring JSON-RPC notification %r", method)
+        return None
     params = message.get("params")
     if params is None:
         params = {}
     if not isinstance(params, dict):
         return _jsonrpc_error(req_id, -32602, "invalid params: 'params' must be an object")
 
-    # Notifications (no id) get no response.
-    if method == "notifications/initialized" or (method and method.startswith("notifications/")):
-        return None
+    if method.startswith("notifications/"):
+        # Sent as a request (with an id) by mistake: a request is always
+        # answered, and there is nothing to report but that it arrived.
+        return _jsonrpc_result(req_id, {})
 
     if method == "initialize":
-        return _jsonrpc_result(
-            req_id,
-            {
-                "protocolVersion": _PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": _SERVER_INFO,
-            },
-        )
+        result = {
+            "protocolVersion": _PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": _SERVER_INFO,
+        }
+        instructions = _instructions()
+        if instructions:
+            result["instructions"] = instructions
+        return _jsonrpc_result(req_id, result)
 
     if method == "ping":
         return _jsonrpc_result(req_id, {})
@@ -2266,7 +2321,7 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
                 "inputSchema": entry["schema"],
                 **({"annotations": entry["annotations"]} if entry.get("annotations") else {}),
             }
-            for name, entry in TOOLS.items()
+            for name, entry in _listed_tools().items()
         ]
         return _jsonrpc_result(req_id, {"tools": tools})
 
@@ -2275,14 +2330,12 @@ def _fallback_handle(message: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(name, str):
             return _jsonrpc_error(req_id, -32602, "invalid params: 'name' must be a string")
         arguments = params.get("arguments")
-        text, is_error = _call_tool_text(name, {} if arguments is None else arguments)
-        return _jsonrpc_result(
-            req_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
-        )
+        text, images, is_error = _call_tool(name, {} if arguments is None else arguments)
+        content = [{"type": "text", "text": text}]
+        content += [{"type": "image", "data": data, "mimeType": mime} for mime, data in images]
+        return _jsonrpc_result(req_id, {"content": content, "isError": is_error})
 
-    if req_id is not None:
-        return _jsonrpc_error(req_id, -32601, f"method not found: {method}")
-    return None
+    return _jsonrpc_error(req_id, -32601, f"method not found: {method}")
 
 
 def _serve_fallback() -> None:
@@ -2305,6 +2358,8 @@ def _serve_fallback() -> None:
             response = _fallback_handle(message)
         except Exception as exc:  # pragma: no cover - the traceback goes to stderr only
             log.exception("internal error handling a JSON-RPC message")
+            if isinstance(message, dict) and "id" not in message:
+                continue  # a notification: no reply, not even an error
             req_id = message.get("id") if isinstance(message, dict) else None
             response = _jsonrpc_error(req_id, -32603, f"internal error: {type(exc).__name__}: {exc}")
         if response is not None:
@@ -2324,7 +2379,14 @@ def _self_check() -> int:
     """
     failed = False
     print("Inspector Widget MCP server — self check")
-    print(f"  tools ({len(TOOLS)}): {', '.join(TOOLS)}")
+    listed = _listed_tools()
+    toolset = surface.active_toolset() if surface is not None else "all"
+    print(f"  toolset: {toolset} ({len(listed)} listed; set {_TOOLSET_ENV} = legacy, "
+          f"capture, talkback, all or a comma list)")
+    print(f"  tools ({len(listed)}): {', '.join(listed)}")
+    hidden = [name for name in TOOLS if name not in listed]
+    if hidden:
+        print(f"  not listed, callable by name ({len(hidden)}): {', '.join(hidden)}")
     try:
         HOST.host  # noqa: B018 - trigger import
         print("  inspector_widget: OK")
@@ -2494,8 +2556,9 @@ def _log_startup_health() -> None:
     mcp_sdk = _present("mcp")
     transport = "mcp-sdk" if mcp_sdk == "present" else "jsonrpc-fallback"
     log.info(
-        "Inspector Widget MCP starting: %d tools | host=%s proto=%s | "
-        "Pillow(overlays)=%s grpcio(SKP images)=%s mcp-sdk=%s | transport=%s",
+        "Inspector Widget MCP starting: %d tools listed (toolset %s), %d callable | host=%s "
+        "proto=%s | Pillow(overlays)=%s grpcio(SKP images)=%s mcp-sdk=%s | transport=%s",
+        len(_listed_tools()), surface.active_toolset() if surface is not None else "all",
         len(TOOLS), host_status, proto_status, pillow, grpcio, mcp_sdk, transport,
     )
     try:

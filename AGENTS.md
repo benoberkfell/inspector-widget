@@ -38,7 +38,8 @@ host (python) ──adb push/run-as/attach-agent/forward──► libviewspector
                                                              └► DexClassLoader(payload, parent=appCL)
                                                                 └► payload (Kotlin): LocalServerSocket
 host socket client ◄── VWSPCT01-framed protobuf (proto/view_inspection.proto) ──► Dispatcher
-cli.py / mcp_server.py ── drive the host; mcp_server exposes 18 tools to an LLM agent
+cli.py / mcp_server.py ── drive the host; mcp_server lists 18 tools by default (26 with
+                           INSPECTOR_WIDGET_TOOLSET=all: + the 8 capture-and-walk tools)
 ```
 
 - **Wire**: 8-byte magic `VWSPCT01` + 4-byte big-endian length + protobuf. Abstract socket
@@ -72,8 +73,8 @@ host/                         Python host driver + entry points
   inspector_widget/           the package (adb, inject, framing, client, png, strings,
                               a11y, a11y_lint, overlay, correlate, skiaparser, skia_client,
                               proto/, skia_grpc/, _cli.py/_mcp.py console-script wrappers)
-  cli.py                      CLI entry point (16 subcommands)
-  mcp_server.py               MCP server (18 tools) + `--self-check`
+  cli.py                      CLI entry point (24 subcommands)
+  mcp_server.py               MCP server (26 tools, 18 listed by default) + `--self-check`
   tests/                      device-free pytest suite (+ @device smoke and a11y golden tests)
   pyproject.toml              packaging (wheel ships cli.py + mcp_server.py as py-modules)
   README.md  PACKAGING.md     host driver + packaging docs
@@ -130,8 +131,11 @@ sends SHUTDOWN, which stops the agent for every client (each one sees EOF at onc
 injects one first; it reports the agent stopped only once nothing listens on its socket (exit 1,
 MCP `agent_stopped: false`, otherwise). `--force` (MCP `attach(force=true)`) stops a running agent
 and injects afresh. The MCP server re-attaches a cached session that died (idle timeout, app
-restart, another client's SHUTDOWN) and retries a call once if the connection drops mid-way; a
-timeout is reported, not retried. Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`,
+restart, another client's SHUTDOWN) and retries a read-only call once if the connection drops
+mid-way; a timeout is reported, not retried, and so is a destructive call (`dump_compose` with
+`enable_inspection=true`) unless its request never left the host. Nothing re-attaches once exit
+cleanup starts, or after a `detach` stopped that app's agent.
+Each agent request has a deadline (`INSPECTOR_WIDGET_TIMEOUT`,
 default 30s, 4x for screenshots/Compose/a11y dumps; `0` disables it), so a frozen app returns an
 error, not a hang. An app in the background can be frozen by Android (the cached-apps freezer);
 attach then says so rather than queuing an injection, and asks for the app in the foreground.
@@ -145,7 +149,7 @@ listed under the same `@viewspector_<pid>` for as long as it is open (`adb.socke
 # or manually, from the repo root so $PWD expands to your checkout:
 claude mcp add inspector-widget -- \
   env PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
-host/mcp_server.py --self-check                  # prints proto status + the 18 tools
+host/mcp_server.py --self-check                  # prints proto status, the toolset + its tools
 ```
 
 **Test**:
@@ -194,7 +198,7 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 
 ## 5. Capabilities (CLI ↔ MCP parity)
 
-16 CLI subcommands / 18 MCP tools. Keep them at parity (see §6).
+24 CLI subcommands / 26 MCP tools (18 listed by default). Keep them at parity (see §6).
 
 | Group | MCP tools | CLI subcommands |
 |---|---|---|
@@ -204,6 +208,23 @@ a few seconds, so it also needs `INSPECTOR_WIDGET_TALKBACK_TESTS=1`.
 | Accessibility | `dump_accessibility`, `a11y_lint`, `a11y_overlay` | `a11y` (+`--lint`/`--overlay`), `a11y-lint` |
 | Integrated | `inspect`, `inspect_node`, `component_image` | `inspect`, `inspect-node`, `component-image` |
 | TalkBack (device-wide; needs TalkBack installed) | `talkback`, `tb_walk`, `tb_scenario` | `talkback status\|on\|off\|restore`, `tb-walk`, `tb-scenario` |
+| Capture and walk (MCP: opt-in, `INSPECTOR_WIDGET_TOOLSET=capture` or `all`) | `capture`, `captures`, `outline`, `find`, `node`, `image`, `lint`, `diff` | the same names |
+
+The capture-and-walk tools come from one registry, `inspector_widget/surface.py` (the MCP
+schemas and the CLI flags, same names and defaults), over `inspector_widget/ops.py`: `capture`
+snapshots the app once into the on-disk store both surfaces share; the others query a stored
+capture without device I/O. `INSPECTOR_WIDGET_TOOLSET` (`legacy`, `capture`, `talkback`, `all`,
+or a comma list) picks what the MCP server lists; the default is `legacy,talkback` until the
+deliberate flip (WP S4), and every tool stays callable by name. The MCP `instructions` name only
+listed tools (with the default listing, `dump_accessibility`'s `focus_order` is the predicted
+TalkBack order, not `outline(view="reading")`). `capture` and `captures` carry `destructiveHint`.
+
+Session defaulting for the capture tools: explicit `serial`/`package`, then a named capture's
+lineage, then the **caller's own** default session (the MCP server's last attach or capture, in
+memory; `INSPECTOR_WIDGET_SESSION=serial/package` for a CLI), then the store's shared default
+(`session.json`, rewritten by every caller), then the single running debuggable app. Concurrent
+agents on one store therefore stay on their own apps; a query resolved by the shared default
+while the store holds other apps carries `session`. Captures read dpi and font scale each time.
 
 Every subcommand routes through `inspector_widget.attach() -> Session` (the same facade the MCP
 uses); the older ones then drive `session.client` directly (works; their bodies are not yet shared
@@ -221,7 +242,8 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
 
 1. **Symbol-parity test** — `host/tests/test_symbol_parity.py` AST-scans `cli.py`,
    `mcp_server.py` and the device-path package modules. It asserts every `adb.*` / `a11y.*` /
-   `a11y_lint.*` / `overlay.*` / `png.*` / `correlate.*` / `inject.*` / `client.*` access resolves,
+   `a11y_lint.*` / `overlay.*` / `png.*` / `correlate.*` / `inject.*` / `client.*` / `output.*` /
+   `results.*` access resolves,
    and it binds every resolvable call into `inspector_widget` against the real signature
    (kwargs, arity, Session/Client/Injection methods, proto fields, `getattr` probes). Run it;
    if you add a cross-module call, it must pass.
@@ -236,7 +258,8 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
    If you change the agent's wire behaviour, update the fake to match (it also models older
    agents: `build_id=None`, `reply_to_shutdown=False`, `linger_after_stop=True`,
    `close_clients_on_stop=False`, `hello_waits_for_other_clients=True`). Its a11y ids are the
-   A1-fixed agent's; `legacy_a11y_ids=True` reproduces what the agent on this branch sends.
+   A1-fixed agent's; a test that needs an A1-era agent rewrites the dump in a behaviour hook
+   (see `test_legacy_agent_ids_still_walk`).
    Session-lifecycle behaviour (deadlines, poisoning, re-attach, detach, serials, the build
    handshake) is covered in `host/tests/test_session_lifecycle.py`.
 3. **Live-verify on the emulator**, not just pytest. Launch the test app
@@ -245,6 +268,10 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
    the agent sends.
 4. **Keep CLI ↔ MCP ↔ Session at parity.** A capability reachable one way but not the other is
    a bug. If you add an MCP tool, add the CLI subcommand (and vice versa).
+5. **Goldens.** `host/tests/test_legacy_golden.py` pins every legacy tool's and subcommand's
+   output on four offline scenes, brief (the default) and legacy (`detail="full"`,
+   `max_bytes=0`). A deliberate change re-records with `host/tests/record_goldens.py` and says
+   why in the commit; a legacy entry also needs its reason in `LEGACY_DELTAS`.
 
 **Conventions:**
 - `.java` files live under `agent/src/main/java/...`, **not** `src/main/kotlin` — Kotlin
@@ -264,11 +291,18 @@ density, an ARGB red/blue swap). Defend against it on **every** change:
   `compose:<acvId>:<semanticsId>`; a dump's `generation` changes when Compose re-mints ids, and
   `correlate.record_a11y` / the per-app-process key registry let `inspect_node` re-resolve keys.
 - Units: a11y lint density is **device DPI (e.g. 420)**, not a px/dp ratio. `LintContext.density`
-  is DPI; `adb.display_density()` returns DPI; `mcp_server._device_density()` returns DPI.
+  is DPI; `adb.display_density()` returns DPI; `mcp_server._a11y_device_metrics()` returns DPI.
 - Overlays: node bounds are full-resolution; a screenshot captured at `scale < 1` is smaller.
   Overlay renderers take a `scale` and multiply coordinates by it — always pass the capture scale.
 - One screenshot decoder of record: `inspector_widget.png._decode_to_rgba` (handles RGB_565 /
-  ABGR_8888 / ARGB_8888, the last needs an R/B swap). Don't fork it; `mcp_server` delegates to it.
+  ABGR_8888 / ARGB_8888, the last needs an R/B swap), and one PNG writer, `png.write_png`, which
+  both surfaces use. Don't fork them. Likewise one wire decoder: `inspector_widget.strings`.
+- Output: every tool result leaves through `inspector_widget.output` (compact JSON, brief by
+  default with counted omissions, `max_bytes` with a spill envelope; `detail="full"` for the
+  whole result). The MCP and the CLI build the same documents with `inspector_widget.results`,
+  so `--json -` prints the MCP text byte for byte (`test_phase0_parity.py`). New output
+  parameters go in `output.OUTPUT_PARAMS`, which generates the MCP schemas and the CLI flags;
+  `tools/list` stays at or under 18,500 B compact (`test_phase0_budget.py`).
 - protobuf runtime must be **>= 6.33.5, < 7** (the checked-in gencode's floor). Pinning lower
   makes the proto module unimportable on install. Regenerate the bindings only with
   `host/generate_proto.sh` (or `make -C host proto`): it requires protoc 33.x and refuses others.

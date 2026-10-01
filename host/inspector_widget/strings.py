@@ -100,7 +100,14 @@ def property_to_dict(resolver: StringResolver, prop: "pb.Property") -> Dict[str,
         out["value"] = resolver.opt(prop.str_value)
     elif t == P.BOOLEAN:
         out["value"] = bool(prop.int32_value)
-    elif t in (P.BYTE, P.CHAR, P.INT16, P.INT32, P.COLOR, P.GRAVITY, P.INT_FLAG, P.DIMENSION):
+    elif t in (P.GRAVITY, P.INT_FLAG):
+        # The agent sends the decoded flag set as one "|"-joined string in
+        # str_value (Properties.kt; id 0 = the empty set) and leaves int32_value 0.
+        # A raw int32 is only kept when there is no string at all (never sent by
+        # the payload in this repo, but not worth losing).
+        flags = resolver.opt(prop.str_value)
+        out["value"] = prop.int32_value if flags is None and prop.int32_value else flags or ""
+    elif t in (P.BYTE, P.CHAR, P.INT16, P.INT32, P.COLOR, P.DIMENSION):
         out["value"] = prop.int32_value
         # For flag/enum-like ints a decoded label may also be interned.
         label = resolver.opt(prop.str_value)

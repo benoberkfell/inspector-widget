@@ -8,8 +8,11 @@ accessibility tree, one screenshot per window), keeps it on disk under an id suc
 
 Spec: "Capture and Walk" (sections 3-7 and the section 10 contracts).
 Implementation decisions beyond the spec, module by module, are in
-[`CONTRACT_NOTES.md`](CONTRACT_NOTES.md). This package is pure library code. It is not
-wired to the CLI or the MCP server yet (P0-2, S1 and S2 do that).
+[`CONTRACT_NOTES.md`](CONTRACT_NOTES.md). This package is pure library code. The
+surfaces reach it through `../ops.py` (S1: the capture pipeline and the tool
+functions) and `../surface.py` (S2: one registry that generates the MCP tools and the
+CLI subcommands); the output layer (`output.py`, `normalize*.py`) serves the legacy
+tools since P0-2.
 
 ## Module map
 
@@ -86,7 +89,8 @@ another process published meanwhile. `tests/test_capture_pipeline_offline.py`
 
 ## How the wiring packages call in
 
-**P0-2 (legacy tools, both surfaces)** needs only the output layer:
+**P0-2 (legacy tools, both surfaces; done)** uses only the output layer, as
+`mcp_server._render_result` and `cli._emit_result` do:
 
 ```python
 brief = output.slim(tool, result, args)                      # detail="full" is identity
@@ -100,7 +104,7 @@ output.add_cli_flags(subparser, tool)                         # CLI flags, same 
 `INSPECTOR_WIDGET_CAPTURE_PERSIST=0`, so memory-only mode never spills into the
 persistent cache.
 
-**S1 (`ops.py`)** owns sessions, the capture pipeline and the tool functions:
+**S1 (`ops.py`, done)** owns sessions, the capture pipeline and the tool functions:
 
 - One `CaptureStore()` per process (`persist` honours the environment). Resolve the
   `capture` argument with `store.resolve(spec, lineage)` and read with
@@ -121,7 +125,7 @@ persistent cache.
 - `analyzers.lint_summary(ix)` gives the capture summary's `lint`/`issues` lines;
   `Pipeline.summary` in the pipeline test is a stand-in for the capture response.
 
-**S2 (`surface.py`)** generates both surfaces from one registry of `ToolSpec`s whose
+**S2 (`surface.py`, done)** generates both surfaces from one registry of `ToolSpec`s whose
 functions are S1's. Validation happens once there (`bad_args`); the library
 functions also validate and raise `OpError("bad_args")`, so either layer is safe.
 Per-tool defaults to copy into the specs: `query.DEFAULT_MAX_BYTES`,
@@ -135,4 +139,11 @@ for find's domain); the CLI renders the same calls as hints, not flags.
 The `tests/test_capture_*.py` files cover each module; `test_capture_pipeline_offline.py`
 runs the whole pipeline over the recorded launcher and View-screen replays, the
 259-view wide scene and a mixed View/Compose/dialog scene, checks every default
-response against its budget, and runs every emitted hint.
+response against its budget, and runs every emitted hint. Through the wiring, over
+the harness fake adb and agent (`tests/capture_harness.py`): `test_ops.py` (the
+pipeline, resolution, staleness, errors), `test_capture_budgets.py` (the real
+renderers' sizes and the workflow totals), `test_surface.py` (parity, validation,
+toolsets, instructions) and `test_e2e_capture.py` (MCP and CLI on one store).
+`test_capture_replay.py` replays real captures recorded live (A11yProbe,
+Thunderbird, Now in Android; `tests/fixtures/captures`, `tests/capture_replay.py`)
+through the same pipeline and budgets.

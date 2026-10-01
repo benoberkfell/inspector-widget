@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 import fakeagent
+import test_e2e_capture as cap_tests  # capture and walk, both surfaces (not re-collected)
 import test_tb_walk as tb_tests  # the TalkBack tools' e2e tests (a module: not re-collected)
 from fakeagent import DEFAULT_PACKAGE as PKG
 from fakeagent import DEFAULT_PID as PID
@@ -405,7 +406,7 @@ def test_cli_dump_text(fake_device, run_cli):
 def test_cli_dump_json_with_properties_resolution_and_screenshot(fake_device, run_cli, tmp_path):
     shot = tmp_path / "tree.png"
     res = run_cli("dump", "--json", "-", "--resolution-stack", "--screenshot", shot,
-                  "--scale", "0.5", "--root-id", "1001")
+                  "--scale", "0.5", "--root-id", "1001", "--detail", "full")
     assert res.rc == 0, res
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_resolution_stack,
@@ -419,6 +420,15 @@ def test_cli_dump_json_with_properties_resolution_and_screenshot(fake_device, ru
     assert title["text"]["resolution_stack"][-1] == "@android:style/Widget.Material.TextView"
     assert data["screenshot"]["bitmap_type"] == 2
     assert png_size(shot) == (180, 320)
+    # brief (the default): the MCP dump_tree document, the screenshot as the PNG written
+    brief = run_cli("dump", "--json", "-", "--resolution-stack", "--screenshot", shot,
+                    "--scale", "0.5", "--root-id", "1001").json()
+    assert brief["root_count"] == 1 and brief["roots"][0]["bounds"] == [0, 0, 360, 640]
+    assert brief["properties"]["1003"]["text"] == {
+        "value": "Hello world", "source": "@style/Widget.App.Title",
+        "stack": ["@layout/activity_main", "@style/Widget.App.Title",
+                  "@android:style/Widget.Material.TextView"]}
+    assert brief["screenshot"]["path"] == str(shot) and brief["screenshot"]["width"] == 180
 
 
 def test_cli_compose_json(fake_device, run_cli):
@@ -455,7 +465,7 @@ def test_cli_compose_overlay(fake_device, run_cli, tmp_path):
 
 
 def test_cli_a11y_json(fake_device, run_cli):
-    res = run_cli("a11y", "--json", "-")
+    res = run_cli("a11y", "--json", "-", "--detail", "full")
     assert res.rc == 0, res
     req = fake_device.requests("dump_a11y")[-1]
     assert (req.root_id, req.include_extras, req.include_rendering_info) == (0, True, False)
@@ -467,6 +477,11 @@ def test_cli_a11y_json(fake_device, run_cli):
     stops = [(e["speak"], e["key"]) for e in data["focus_order"]]
     assert stops[:3] == [("Hello world", "view:1003"), ("OK, button", "view:1004"),
                          ("Submit, button", "compose:1006:2")]
+    brief = run_cli("a11y", "--json", "-").json()
+    assert brief["focus_order"][:3] == [
+        {"order": 1, "key": "view:1003", "speak": "Hello world", "window": 0},
+        {"order": 2, "key": "view:1004", "speak": "OK, button", "window": 0},
+        {"order": 3, "key": "compose:1006:2", "speak": "Submit, button", "window": 0}]
 
 
 def test_cli_a11y_reading_order_text_and_flags(fake_device, run_cli):
@@ -491,7 +506,7 @@ def test_cli_a11y_overlay_with_lint(fake_device, run_cli, tmp_path):
 
 
 def test_cli_a11y_lint_json(fake_device, run_cli):
-    res = run_cli("a11y-lint", "--json", "-")
+    res = run_cli("a11y-lint", "--json", "-", "--detail", "full")
     assert res.rc == 0, res
     req = fake_device.requests("dump_compose")[-1]
     assert (req.include_semantics, req.include_slot_table) == (True, False)
@@ -502,10 +517,14 @@ def test_cli_a11y_lint_json(fake_device, run_cli):
     assert by_rule["a11y.touch_target.small"] >= 1 and by_rule["a11y.label.missing"] == 1
     missing = [f for f in data["findings"] if f["rule"] == "a11y.label.missing"]
     assert [f["node_key"] for f in missing] == ["compose:1006:6"]
+    brief = run_cli("a11y-lint", "--json", "-").json()  # grouped by rule, node keys
+    assert brief["by_rule"]["a11y.label.missing"]["nodes"] == ["compose:1006:6"]
+    assert "findings" not in brief and brief["omitted"]["stats"] > 0
 
 
 def test_cli_a11y_lint_rule_filter_without_contrast(fake_device, run_cli):
-    res = run_cli("a11y-lint", "--json", "-", "--rule", "a11y.label.missing", "--no-contrast")
+    res = run_cli("a11y-lint", "--json", "-", "--rule", "a11y.label.missing", "--no-contrast",
+                  "--group-by", "none")
     assert res.rc == 0, res
     assert "screenshot" not in fake_device.commands()
     assert {f["rule"] for f in res.json()["findings"]} == {"a11y.label.missing"}
@@ -521,7 +540,7 @@ def test_cli_a11y_lint_overlay(fake_device, run_cli, tmp_path):
 
 
 def test_cli_inspect_json(fake_device, run_cli):
-    res = run_cli("inspect", "--json", "-")
+    res = run_cli("inspect", "--json", "-", "--detail", "full")
     assert res.rc == 0, res
     assert fake_device.commands()[:4] == ["hello", "dump_tree", "dump_compose", "dump_a11y"]
     compose_req = fake_device.requests("dump_compose")[-1]
@@ -537,11 +556,14 @@ def test_cli_inspect_json(fake_device, run_cli):
 
 
 def test_cli_inspect_with_properties(fake_device, run_cli):
-    res = run_cli("inspect", "--properties", "--json", "-")
+    res = run_cli("inspect", "--properties", "--json", "-", "--detail", "full")
     assert res.rc == 0, res
     assert fake_device.requests("dump_tree")[-1].include_properties
     title = find(res.json()["roots"], node_key="view:1003")
     assert props_by_name(title["view"]["properties"])["text"]["value"] == "Hello world"
+    brief = run_cli("inspect", "--properties", "--json", "-").json()
+    title = find(brief["roots"], node_key="view:1003")["view"]
+    assert title["properties"]["text"] == "Hello world" and title["omitted_defaults"] > 0
 
 
 @needs_pil
@@ -603,7 +625,7 @@ def test_cli_screenshot(fake_device, run_cli, tmp_path):
 
 
 def test_cli_get_properties(fake_device, run_cli):
-    res = run_cli("get-properties", "--view-id", "1003", "--json", "-")
+    res = run_cli("get-properties", "--view-id", "1003", "--json", "-", "--detail", "full")
     assert res.rc == 0, res
     req = fake_device.requests("get_properties")[-1]
     assert (req.view_id, req.include_resolution_stack) == (1003, False)
@@ -616,12 +638,16 @@ def test_cli_get_properties(fake_device, run_cli):
 
 
 def test_cli_get_properties_decodes_gravity_flags_and_dimensions(fake_device, run_cli):
-    props = props_by_name(run_cli("get-properties", "--view-id", "1003", "--json", "-")
-                          .json()["properties"])
-    assert props["gravity"]["label"] == "center_vertical|start"
-    assert props["inputType"]["label"] == "text|textCapSentences"
+    props = props_by_name(run_cli("get-properties", "--view-id", "1003", "--json", "-",
+                                  "--detail", "full").json()["properties"])
+    assert props["gravity"]["value"] == "center_vertical|start" and "label" not in props["gravity"]
+    assert props["inputType"]["value"] == "text|textCapSentences"
+    assert props["scrollIndicators"]["value"] == ""  # the empty flag set
     assert props["paddingStart"]["value"] == 42
     assert props["layout_marginTop"]["value"] == 16
+    brief = run_cli("get-properties", "--view-id", "1003", "--json", "-").json()["properties"]
+    assert (brief["gravity"], brief["inputType"], brief["paddingStart"]) == (
+        "center_vertical|start", "text|textCapSentences", 42)
 
 
 def test_cli_get_properties_unknown_view_surfaces_the_agent_error(fake_device, run_cli):
@@ -660,6 +686,9 @@ CLI_SUBCOMMAND_TESTS = {
     "talkback": tb_tests.test_cli_talkback_round_trip,
     "tb-walk": tb_tests.test_cli_tb_walk_and_scenario,
     "tb-scenario": tb_tests.test_cli_tb_walk_and_scenario,
+    # capture and walk (tests/test_e2e_capture.py runs them with the MCP server)
+    **{name: cap_tests.test_capture_and_walk_through_the_mcp_server_and_the_cli
+       for name in ("capture", "captures", "outline", "find", "node", "image", "lint", "diff")},
 }
 
 
@@ -717,9 +746,10 @@ def test_mcp_session_is_cached_and_reused(mcp, fake_device):
 def test_mcp_dump_tree(mcp, fake_device):
     res = mcp("dump_tree")
     assert res["root_count"] == 2 and "properties" not in res and "screenshot" not in res
-    title = find(res["roots"], id=1003)
-    assert title["resource"]["ref"] == "@id/title" and title["text"] == "Hello world"
-    assert title["bounds"] == {"x": 16, "y": 24, "w": 328, "h": 40}
+    title = find(res["roots"], id=1003)  # the strings.py node shape (E3)
+    assert title["resource"] == {"namespace": PKG, "type": "id", "name": "title"}
+    assert title["text"] == "Hello world"
+    assert title["bounds"] == {"layout": {"x": 16, "y": 24, "w": 328, "h": 40}}
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_screenshot) == (0, False, False)
 
@@ -731,7 +761,7 @@ def test_mcp_dump_tree_with_properties_and_screenshot(mcp, fake_device):
     req = fake_device.requests("dump_tree")[-1]
     assert (req.root_id, req.include_properties, req.include_screenshot) == (1001, True, True)
     assert req.screenshot_scale == 0.5
-    assert [g["view_id"] for g in res["properties"]] == list(range(1001, 1007))
+    assert sorted(res["properties"]) == list(range(1001, 1007))
     shot = res["screenshot"]
     assert (shot["width"], shot["height"], shot["scale"]) == (180, 320, 0.5)
     assert fake_device.tmpdir in Path(shot["path"]).parents and png_size(shot["path"]) == (180, 320)
@@ -741,25 +771,28 @@ def test_mcp_get_properties(mcp, fake_device):
     res = mcp("get_properties", view_id=1003)
     req = fake_device.requests("get_properties")[-1]
     assert (req.view_id, req.include_resolution_stack) == (1003, False)
-    props = props_by_name(res["group"]["properties"])
+    props = props_by_name(res["group"]["properties"])  # strings.py shape: COLOR is the int
     assert props["text"]["value"] == "Hello world"
-    assert props["textColor"]["value"] == "#FF202124"
+    assert props["textColor"]["value"] == -14671580  # 0xFF202124
     assert props["textSize"]["value"] == 42.0
     assert props["enabled"]["value"] is True
     assert props["visibility"]["value"] == "visible"
-    assert props["id"]["value"]["ref"] == "@id/title"
+    assert props["id"]["value"] == {"namespace": PKG, "type": "id", "name": "title"}
     assert props["layout_gravity"]["is_layout"] is True
 
 
-@pytest.mark.xfail(strict=True, reason="E3: the MCP property decoder reads GRAVITY/INT_FLAG as "
-                   "int32 and DIMENSION as float (the agent sends str_value / int32_value)")
 def test_mcp_get_properties_decodes_gravity_flags_and_dimensions(mcp, fake_device):
+    """E3: the MCP decodes properties with inspector_widget.strings, as the CLI does."""
     props = props_by_name(mcp("get_properties", view_id=1003)["group"]["properties"])
-    assert "center_vertical|start" in (props["gravity"].get("value"), props["gravity"].get("label"))
-    assert "text|textCapSentences" in (props["inputType"].get("value"),
-                                       props["inputType"].get("label"))
+    assert props["gravity"]["value"] == "center_vertical|start"
+    assert props["inputType"]["value"] == "text|textCapSentences"
     assert props["paddingStart"]["value"] == 42
     assert props["layout_marginTop"]["value"] == 16
+    text, is_error = mcp_server._call_tool_text(
+        "get_properties", {"serial": SERIAL, "package": PKG, "view_id": 1003})
+    brief = json.loads(text)["properties"]  # the default: {name: value}, colors as #AARRGGBB
+    assert not is_error and brief["textColor"] == "#FF202124"
+    assert (brief["gravity"], brief["paddingStart"]) == ("center_vertical|start", 42)
 
 
 def test_mcp_get_properties_unknown_view(mcp, fake_device):
@@ -783,16 +816,20 @@ def test_mcp_screenshot(mcp, fake_device):
         assert png_pixel(res["path"], 20, 50) == OK_BUTTON_RGB
 
 
-@pytest.mark.parametrize("scale,wire", [(0, 1.0), (0.25, 0.25), (1, 1.0)])
-def test_mcp_screenshot_scale_is_clamped(mcp, fake_device, scale, wire):
-    assert "error" not in mcp("screenshot", scale=scale)
+@pytest.mark.parametrize("scale,wire", [(0.25, 0.25), (1, 1.0), (None, 1.0)])
+def test_mcp_screenshot_scale_reaches_the_wire(mcp, fake_device, scale, wire):
+    assert "error" not in mcp("screenshot", scale=scale)  # null: the default
     assert fake_device.requests("screenshot")[-1].scale == wire
 
 
-def test_mcp_scale_out_of_schema_range_is_rejected_before_touching_the_device(mcp, fake_device):
-    res = mcp("screenshot", scale=5)
-    assert res == {"error": "invalid argument scale: 5 is greater than the maximum of 1.0",
-                   "tool": "screenshot"}
+@pytest.mark.parametrize("scale,error", [
+    (5, "invalid argument scale: 5 is greater than the maximum of 1.0"),
+    (0, "invalid argument scale: 0 is less than or equal to the minimum of 0"),
+])
+def test_mcp_scale_out_of_schema_range_is_rejected_before_touching_the_device(mcp, fake_device,
+                                                                              scale, error):
+    res = mcp("screenshot", scale=scale)
+    assert res == {"error": error, "tool": "screenshot"}
     assert fake_device.adb_log == [] and fake_device.wire == []
 
 
@@ -869,21 +906,11 @@ def test_mcp_inspect(mcp, fake_device):
     res = mcp("inspect")
     assert fake_device.commands()[1:] == ["dump_tree", "dump_compose", "dump_a11y"]
     assert res["summary"]["nodes"] == 15 and res["sources"]["a11y"] is True
-    host = find(res["roots"], node_key="view:1006")
-    assert find(host["children"], node_key="compose:1006:6")["a11y"]["virtual_id"] == 6
-
-
-@pytest.mark.xfail(strict=True, reason="A1: the agent on this branch gives every a11y node the "
-                   "root View's host_view_id and the low 32 bits of the packed child id as its "
-                   "virtual_id, so the host's a11y joins only work with the ids of the A1-fixed "
-                   "agent (improve/a11y-agent-identity), which is what the fake sends by default. "
-                   "When that agent lands, delete FakeAgent.legacy_a11y_ids and this test.")
-def test_mcp_inspect_with_the_a11y_ids_this_branchs_agent_sends(mcp, fake_device):
-    fake_device.start_agent(PKG).legacy_a11y_ids = True
-    res = mcp("inspect")
+    # The agent's a11y ids: each node carries its own View's host_view_id, and a
+    # Compose node its semantics id as virtual_id (ledger A1, fixed on device).
     assert find(res["roots"], node_key="view:1004")["a11y"]["host_view_id"] == 1004
     host = find(res["roots"], node_key="view:1006")
-    assert find(host["children"], node_key="compose:6")["a11y"]["virtual_id"] == 6
+    assert find(host["children"], node_key="compose:1006:6")["a11y"]["virtual_id"] == 6
 
 
 @needs_pil
@@ -978,6 +1005,8 @@ MCP_TOOL_TESTS = {
     "tb_walk": tb_tests.test_mcp_tb_walk_and_scenario,
     "tb_scenario": tb_tests.test_mcp_tb_walk_and_scenario,
     "detach": test_mcp_detach,
+    **{name: cap_tests.test_capture_and_walk_through_the_mcp_server_and_the_cli
+       for name in ("capture", "captures", "outline", "find", "node", "image", "lint", "diff")},
 }
 
 
@@ -1087,24 +1116,19 @@ def test_scenario_integrated_cli_command_leaves_a_live_mcp_session_alone(mcp, fa
     assert "error" not in res, res
 
 
-@pytest.mark.xfail(strict=True, reason="E3: CLI and MCP decode the same properties differently "
-                   "(GRAVITY/INT_FLAG/DIMENSION)")
 def test_scenario_property_decoding_parity_cli_vs_mcp(mcp, fake_device, run_cli):
-    cli_props = props_by_name(run_cli("get-properties", "--view-id", "1003", "--json", "-")
-                              .json()["properties"])
+    cli_props = props_by_name(run_cli("get-properties", "--view-id", "1003", "--json", "-",
+                                      "--detail", "full").json()["properties"])
     mcp_props = props_by_name(mcp("get_properties", view_id=1003)["group"]["properties"])
     for name in ("gravity", "inputType", "layout_gravity", "paddingStart", "layout_marginTop",
                  "textSize", "text", "visibility", "enabled"):
         assert decoded(cli_props[name]) == decoded(mcp_props[name]), name
 
 
-@pytest.mark.xfail(strict=True, reason="E3: dump --properties (CLI) and dump_tree "
-                   "include_properties (MCP) disagree on GRAVITY/DIMENSION values")
 def test_scenario_dump_tree_property_parity_cli_vs_mcp(mcp, fake_device, run_cli):
-    cli_props = props_by_name(run_cli("dump", "--properties", "--json", "-")
+    cli_props = props_by_name(run_cli("dump", "--properties", "--json", "-", "--detail", "full")
                               .json()["properties"]["1003"])
-    groups = mcp("dump_tree", include_properties=True)["properties"]
-    mcp_props = props_by_name(next(g for g in groups if g["view_id"] == 1003)["properties"])
+    mcp_props = props_by_name(mcp("dump_tree", include_properties=True)["properties"][1003])
     for name in ("gravity", "paddingStart", "layout_marginTop"):
         assert decoded(cli_props[name]) == decoded(mcp_props[name]), name
 
@@ -1254,7 +1278,8 @@ def test_stdio_transport_end_to_end(tmp_path, transport):
     attach, tree, props, missing, detach = (results[i] for i in range(2, 7))
     assert _payload(attach)["window_count"] == 2 and attach["isError"] is False
     assert _payload(tree)["root_count"] == 2 and len(_payload(tree)["properties"]) == 8
-    assert _payload(props)["group"]["view_id"] == 1003
+    assert _payload(props)["view_id"] == 1003  # brief: properties as {name: value}
+    assert _payload(props)["properties"]["gravity"] == "center_vertical|start"
     assert missing["isError"] is True
     assert "No view found with id 999" in _payload(missing)["error"]
     assert _payload(detach)["detached"] is True

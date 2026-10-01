@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "am start -S -n com.oberkfell.a11yprobe/.InteropActivity --es scenario D1; capture()",
+ "screen": "InteropActivity D1 (DialogFragment window)"
+}

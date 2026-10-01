@@ -268,6 +268,12 @@ with every consumer.
     `a11y:<host>:<virt>`, by shape.
   - `+N` counts the descendants hidden below the preview depth. It is shown on the
     last previewed level only, so root lines have no `+N`.
+  - A single-child chain is one line (`a > b > c`, at most 8 members) and costs
+    one level, and zero-size leaves (ViewStubs) are left out, so the two levels
+    shown are ones that branch (L1: live on S1 the preview stopped at
+    DecorView/LinearLayout). A brief inspect node's `@pkg:id/name` is `#name`.
+  - The hint suggests `detail="brief"` only when the call asked for full
+    (`finalize(..., detail=)`).
 - **Counted omissions**: `omitted` is a dict of counters, with keys
   - `defaults`, `duplicates`, `depth`, `properties_views`, `attr_values`,
     `boilerplate_actions`, `empty_extras`, `focus_order`,
@@ -300,8 +306,10 @@ with every consumer.
     `group_by` (a11y_lint) and `filter` (get_properties).
 
   The compact-only tools get no extra params, since `tools/list` must stay at or
-  under 18,500 B. It is 18,379 B with main's TOOLS, which leaves about 120 B for
-  P0-2's doc edits.
+  under 18,500 B. With the three TalkBack tools that took trimming (P0-2): shorter
+  tool and parameter descriptions, `package` without one, a shared `scale`, and
+  `a11y_lint.rules` without its 47-id enum (the handler checks the ids first and
+  names the valid ones). It is 18,337 B with all 18 tools.
   - `max_bytes` defaults to the environment value both in the schema and on the
     CLI, so the two stay equal.
   - The CLI adds `--pretty` everywhere. `add_cli_flags` skips flags a subparser
@@ -310,8 +318,9 @@ with every consumer.
   - `CLI_SUBCOMMANDS` maps each MCP tool to its subcommand, and
     `tool_args_from_cli(ns, tool)` turns parsed flags back into MCP args.
 - **Brief property values** (`normalize.prop_value`):
-  - COLOR becomes `#AARRGGBB`, and GRAVITY/INT_FLAG become their label. The legacy
-    MCP shape has lost the label and stays `0`.
+  - COLOR becomes `#AARRGGBB`. GRAVITY/INT_FLAG are the agent's flag string: the
+    value since E3 (`strings.property_to_dict`), the `label` beside a `0` in older
+    recordings. The legacy MCP recordings lost it and stay `0`.
   - Resources become `@ns:type/name`, and drawable, animator and object class
     names become simple names.
   - FLOAT is rounded to 7 significant digits, which is float32-exact.
@@ -349,6 +358,15 @@ with every consumer.
   `host/tests/gen_library_files.py`. A missing source counts as library. The
   origin is `app` when the file is not a library file and the composable name
   starts upper-case. dump_compose always keeps the window root and semantics nodes.
+- **P0-2 changes to the brief rules**, found wiring them to the live shapes:
+  - a11y_lint lists a finding's `node_key` (what inspect_node takes; the packed
+    id only when there is none) and leaves out `stats` and the info-level
+    diagnostics, counted as `omitted.stats` (fields) and `omitted.info_diagnostics`.
+  - focus_order: a11y.py lists stops only (`is_focus_stop` appears only with
+    structural entries), as `{order, key, id, speak, unlabeled?, window?}`; a
+    brief stop is `{order, key, speak}` plus `unlabeled`/`window`/`covered_by`,
+    and `id` only when there is no `key` (the recordings).
+  - dump_accessibility `root` also takes a node's `node_key`.
 - **Measured brief sizes on the checked-in real outputs**, in compact bytes (spec
   2.6 target in parentheses):
   - launcher `dump_compose`: 17,399 (24,000); with `include_slot_table=false`,
@@ -360,6 +378,66 @@ with every consumer.
   - launcher `get_properties`: 2,154 (3,500)
   - View screen `inspect`: 14,477 (18,000)
   - View screen `dump_tree(include_properties)`: 16,584 (20,000)
+
+## Phase-0 wiring (P0-2, `mcp_server.py`, `cli.py`, `results.py`)
+
+- **MCP.** `_call_tool_text` -> `_render_result(name, result, args)`: an error
+  result goes out as it is (compact, `isError`); anything else is
+  `slim(name, result, args)` with the arguments normalized as the tool saw them
+  (a `null` optional dropped, `12.0` an int), then `finalize(name, brief,
+  max_bytes=args.get("max_bytes"))`. A `slim` error (an unknown `root`) is
+  `isError` too. `output.augment_schemas(TOOLS)` runs once, after the TalkBack
+  tools are in. If the host package cannot import, the server still starts and
+  answers compact JSON.
+- **CLI.** `_emit_result(args, tool, legacy, result)`: `--detail full` prints
+  `legacy`, the subcommand's own pre-Phase-0 document; otherwise `slim(tool,
+  result)`, where `result` is the MCP tool's document built by the same
+  `results.*` function. So `--json -` is byte-equal to the MCP text for the same
+  arguments, except the flag a dump_compose note names (`--enable-inspection` on
+  the CLI). `--json -` is budgeted like the MCP (an envelope and a spill file);
+  `--json FILE` gets the whole document and never spills; exit code 1 when `slim`
+  rejects an argument. The subcommands that always print JSON (inspect-node,
+  get-properties and component-image without `--json`, talkback) go through it
+  too. `add_cli_flags` runs for every subcommand that prints JSON, so `--pretty`
+  is on all of them. A brief `a11y --lint` groups its embedded lint by rule.
+- **`results.py`** (new): the documents both surfaces build, with the target
+  (`serial`, `package`) and the fields each tool always reports
+  (`root_count`, `contrast_sampled`, the dump_compose note).
+- **E3.** mcp_server's own proto decoder is gone: `dump_tree` and
+  `get_properties` use `strings.dump_tree_to_dict` / `get_properties_to_dict`,
+  so the full shapes are the CLI's (bounds `{layout, render?}`, resources
+  `{namespace, type, name}`, properties keyed by view id, COLOR as its int).
+  `strings.property_to_dict` now gives GRAVITY/INT_FLAG the agent's flag string as
+  the value (`""` for an empty set), not `0` beside a `label`. Also deleted: the
+  screenshot helpers and the second PNG encoder (`png.write_png` for both
+  surfaces), `_first_attr` and the `_import_proto` fallback names, the dict branch
+  of `_session_get_windows`, the object branches of `_device_to_json` /
+  `_process_to_json`, `_device_density` and `_lint_fn`.
+- **Goldens** (`tests/golden/legacy/`, `test_legacy_golden.py`): the rollback
+  (`detail="full"`, `max_bytes=0`) reproduces the pre-Phase-0 outputs recorded at
+  G1 except the documented deltas (`record_goldens.LEGACY_DELTAS`): the E3 shapes
+  (MCP `dump_tree`, `get_properties`; GRAVITY/INT_FLAG values in both surfaces'
+  property lists) and the MCP screenshot's file size (another PNG encoder, the
+  same pixels).
+- **Measured** through `_call_tool_text` and the CLI's `--json -` over the harness
+  fake adb and agent (compact bytes; "legacy" is the full result with indent=2,
+  as the MCP sent it before Phase 0):
+
+  | Scene | Call | Legacy | MCP = CLI | Target |
+  |---|---|---|---|---|
+  | launcher | `dump_compose()` | 567,142 | 17,399 | 24,000 |
+  | launcher | `dump_compose(include_slot_table=false)` | 23,941 | 4,470 | 6,000 |
+  | launcher | `inspect()` | 115,286 | 12,781 | 13,000 |
+  | launcher | `dump_accessibility()` | 85,974 | 10,250 | 12,500 |
+  | launcher | `a11y_lint()` | 3,624 | 1,053 | 1,200 |
+  | launcher | `dump_tree(include_properties)` | 106,813 | 3,691 | 8,000 |
+  | launcher | `get_properties(82)` | 11,178 | 2,157 | 3,500 |
+  | View screen | `inspect()` | 117,913 | 14,081 | 18,000 |
+  | View screen | `dump_tree(include_properties)` | 644,021 | 16,767 | 20,000 |
+  | 259-view | `dump_tree(max_depth=1)` | 169,658 | 297 | 2,000 |
+  | 259-view | `dump_tree` / `dump_accessibility` / `inspect` / `+props` | 170 KB-3.85 MB | envelopes of 766-866 | 3,000 |
+
+  `tools/list` is 18,337 B compact (18 tools).
 
 ## Query engine and line grammar (C6, `capture/query.py`, `capture/lines.py`)
 
@@ -419,7 +497,9 @@ with every consumer.
   - In semantic detail a node is shown when it is a window, has a
     label/rid/tag, is actionable (click, longclick, edit, checkable, scroll),
     is a stop, has issues, is a leaf, or has 2 or more shown direct children.
-  - Zero-size nodes and ViewStubs are hidden with their subtree.
+  - Zero-size nodes and ViewStubs are hidden with their subtree. An empty
+    `AndroidViewsHandler` (Compose interop plumbing) is not a content leaf: it
+    collapses into its parent's `+N` (L1: one line per Thunderbird ComposeView row).
   - Each tree node is exactly one of: on a line, collapsed (hoisted through),
     hidden, or counted in one line's `+N`. The response's
     `hidden:{zero_size, collapsed, library}` counts the middle two, and a
@@ -694,7 +774,23 @@ with every consumer.
     `label`, `text`, `desc`, `state` and `hint` are capped at 1,000 chars.
   - `flags`: the union of a11y, Compose attr and View property flags, in `FLAGS`
     order. `focus` is dropped when `click` or `longclick` is set (clickable implies
-    focusable), matching the spec's outline examples.
+    focusable), matching the spec's outline examples. Two flags say what the
+    agent could not send: `truncated` (ViewNode `CHILDREN_TRUNCATED`, A11yNode
+    `children_truncated`: children cut at the wire depth cap; the view facet also
+    has `children_truncated: true`) and `redacted` (`TEXT_REDACTED`: a password
+    field's text is masked; view facet `text_redacted: true`). Neither is a
+    behaviour change in `diff`.
+  - `diagnostics` starts with the agent's own incomplete-data tokens, one
+    `facet: token` line each (`views: depth-truncated=3 (...)`, `compose:
+    semantics_failed: view#9 ...`, `a11y: node-cap=...`; the prefixes are
+    `index.INCOMPLETE_TOKENS`, the list correlate's `summary["incomplete"]` uses,
+    plus `index.REDACTION_TOKENS`: `redaction_unverified` / `redaction_masked`,
+    which say editable text went out masked because redaction failed closed),
+    then a count of the `truncated` Views with the `find` call that lists them.
+    `fetch` marks the compose facet `unavailable` ("obfuscated: ...") when the
+    agent reports `compose_obfuscated`, or the first `semantics_failed` token
+    when no ComposeView produced semantics, and the slots facet the same way
+    (never the destructive "not populated" hint there).
 - **Anchors** (`anchors.py`).
   - Views: `Class#rid`, or `Class:k`. Semantics and a11y-only nodes: `@tag`, else
     `Type"label≤24"`, else `Type:k` / `:k`. A duplicate among siblings gets `:k`.
@@ -707,8 +803,15 @@ with every consumer.
     except `:`.
 - **sel**:
   - Tried in order: `#rid`, `@tag`, `Type"label"`, `"label"`, then `<parent sel> >
-    Type"label"` and `<parent sel> > Type` (unique among the siblings, parent sel
-    not a fallback, at most 3 atoms and 120 chars), else the id.
+    atom` with the first of `Type"label"`, `Type`, `@tag`, `#rid` unique among the
+    siblings (parent sel not a fallback), then `<grandparent sel> > <parent atom>
+    > atom` (each atom unique among its siblings) for a child of an unlabelled
+    row, at most 3 atoms and 120 chars; else the id. An unlabelled `Button @delete`
+    in every list cell is `@cell_1 > @delete`, not its ref.
+  - A tombstone whose sel was the ref itself answers `ref_not_in_capture` with a
+    `find(type=..., text=...)` hint (no candidate that names the gone ref), and a
+    ref at or above the store's counter (`store.peek_next_ref()`, handed to the
+    query through the ops layer's tomb) says it was never issued.
   - Labels are used only when ≤ 40 chars on one line, rids only when they match
     `[A-Za-z_][A-Za-z0-9_.]*`, tags only when they match `[A-Za-z0-9_.:-]+`, and
     types only when they match `[A-Z][A-Za-z0-9_]*`.
@@ -785,6 +888,11 @@ with every consumer.
     skips nodes inside collection cells, and never breaks an IoU tie.
   - The a11y uniqueId locator is read from `facets.a11y.unique_id` (or
     `uniqueId`); C4 should store it under `unique_id`.
+- **Views without device identity (L1).** A #rid is unique per screen, not per
+  app: without an identity match, the locator, structure and geometry passes
+  pair a View only with a View of the same class inflated from the same layout
+  (`layout_res`), so another activity's #coordinator_layout never takes the ref
+  (live: Thunderbird's message list and composer).
 - **Test helpers**: `tests/capture_keyscenes.py` (renamed from `capture_scenes.py`
   when C4's scene module of that name merged) builds key-space scenes (`V`, `C`,
   `S`, `A`, `scene()`), re-keys them (`rekey`, `shift_udids`, `key_space`), and
@@ -832,7 +940,12 @@ with every consumer.
   - Order: b's pre-order for changed, moved, added and rebound nodes, then the
     removals in a's pre-order.
   - `issues`: `{resolved, new}`, each `"<rule> ×N: n1 n2 n3 +k"` (at most 6
-    rules). An issue change alone does not make a node "changed". When only one
+    rules), compared on the refs both captures hold: `resolved` means the node
+    is still there and the finding is gone. The issues of removed nodes are
+    counted as `gone_with_node`, those of added nodes as `on_new_nodes` (when
+    non-zero); a rebound pair (a recycled cell showing another item) counts as a
+    removal plus an addition. A scroll or a closed dialog resolves nothing. An issue change alone does
+    not make a node "changed". When only one
     capture ran `lint=full`, `a11y.contrast*` rules are not compared (noted);
     when one ran `lint=none`, issues are not compared at all (noted).
   - Slot nodes are compared only when both captures have a slot table.
@@ -923,6 +1036,11 @@ with every consumer.
   - Only nodes with content (a label, text or actions), or containers of such
     nodes, are reported, at most one render issue per subtree. Content scrolled
     fully out of a scroll container is not an issue.
+- **Inferred clips compare look-alikes (L1).** `render.clipped` (inferred)
+  measures a node at a scroll edge against the median of siblings of the same
+  type *and* #rid (a row's #star_click_area is not a #divider), and a scroll
+  container whose actions do not name an axis gets it from its CollectionInfo
+  (rows x 1: vertical; 1 x cols: horizontal).
 - **False positives at a scroll edge.** A touch-target finding on a node clipped
   at a scroll edge gets `note: "likely false positive: clipped at scroll edge"`.
   A contrast finding there gets a low-confidence note and conf inferred.
@@ -953,6 +1071,15 @@ with every consumer.
     in its smallest form (one example node, then no msg/fix), and the optional
     fields are shed to stay within `max_bytes` (500 at least).
   - `lint_summary(ix)` returns the `lint` and `issues` one-liners for `capture()`.
+  - Template collapse groups one rule's findings by `src`, else by the anchor
+    with every collection index `[i]` and every label from the item segment down
+    to (not including) the node's own segment wildcarded: a Compose row's merged
+    label (an email subject) differs per row, the unlabelled button in it does
+    not. A rule's `+N more: lint(rules=[...],group="node",...)` repeats the
+    caller's `within`, `severity`, `contrast` and `wcag`.
+- **Outline expand hint.** `outline(root=<ref>)` (or `max_children`) follows the
+  cut that hides the most descendants on the page (ties in tree order), not the
+  first cut.
 
 ## Images (C9, `capture/images.py`)
 
@@ -1083,3 +1210,160 @@ what now holds:
   findings while the adapter read Compose semantics (the unified lint closed it),
   and action `0x01020036` showed as `CUSTOM_0x01020036` (action-ids decodes it as
   `SHOW_ON_SCREEN`).
+
+## Ops (S1, `inspector_widget/ops.py`)
+
+- **Entry points.** One function per tool, `capture`, `captures`, `outline`, `find`,
+  `node`, `image`, `lint`, `diff`, each `fn(ctx, **args) -> dict`, raising `OpError`.
+  `ops.run(ctx, tool, args)` maps every exception to the error envelope
+  (`error_envelope`): `OpError` as it is; `adb.DeviceError` -> `no_session`;
+  `TransportError` (a lost session), `AdbError` and other `OSError` -> `device_lost`;
+  `InjectionError` saying the app is not running or not debuggable -> `no_session`;
+  `AgentTimeoutError`, `ClientError` and any other `InjectionError` -> `agent_error`; anything
+  else is a bug and gets the code `internal` (outside the spec's vocabulary on
+  purpose: it is not the agent's fault).
+- **`OpContext(store, sessions, caller)`.** `sessions` is a `SessionProvider`:
+  `get(serial, package)`, `close_all()`, and optionally `live_pid(serial,
+  package)` (a cached session's pid, no device I/O) and `device(serial)` (`{dpi,
+  font_scale}`; else adb's, cached per context). `ops.AttachProvider` attaches with
+  `inspector_widget.attach` and disconnects at `close_all()` (never SHUTDOWN): the
+  CLI's provider and the tests'. The MCP server's wraps its session cache.
+  `caller` changes nothing in the responses: the CLI and the MCP get the same bytes.
+- **Session defaulting.** `device_lineage` (capture): explicit serial and package;
+  else the lineage of `diff_from`/`if_changed_since` when it names one capture;
+  else the store's default session (a lone serial or package must match it);
+  else `adb.resolve_serial` (honours `$ANDROID_SERIAL`) and the single running
+  debuggable app, `no_session` with candidates otherwise. `query_lineage` (every
+  other tool) stops before adb: explicit, the capture argument's lineage, the
+  default session; a lone serial or package picks the one lineage of the store
+  that matches (`ambiguous`, or `capture_not_found` when none); None resolves
+  across the whole store. `attach` (MCP and CLI) records the default session.
+- **Capture order** as above ("Capture order"), with the generation: the lineage
+  latest's `compose_generation` when the pid is the same, raised by
+  `OpContext.bump_generation` (the MCP's legacy `dump_compose(enable_inspection)`
+  calls it). The CLI cannot see a hot reload made by another process's legacy
+  tool; the carry-over's collection guard and locators are the fallback there.
+- **`diff_from`** is resolved before any device I/O, in terms of the new capture:
+  `prev` is today's `latest`, `latest~N` today's `latest~(N-1)`, `latest` itself is
+  `bad_args`. A diff that fails after the publish is reported inside `diff`
+  (`{a, error}`), never as a failed capture. **`if_changed_since`** that names no
+  capture (the first poll) captures.
+- **The capture summary** (spec 5.3), within `max_bytes` (3,000): `capture`,
+  `label`/`moved_from`, `pinned`, `session`, `pid`, `device`, `took_ms`,
+  `consistency`, `facets` (counts, or the status reason: `off`, `not populated
+  (...)`), `windows`, `lint`, `issues`, `warning` (slots=enable), `diagnostics` (at
+  most 3, 120 chars), `store` (memory-only), `note` (the session's), `diff`
+  (`{a, summary, lines<=10, issues?}`; empty issue deltas left out), then the
+  preview `outline` (depth 2, at most `outline_lines` lines and 800 B, 400 B next to
+  a diff), `on_screen` (the labelled TalkBack stops the preview does not show, in
+  reading order, at most 3), and `next`. Every cut list ends with `…N more: <call>`;
+  a budget below the header's size never drops the header.
+- **Staleness** on every query response, right after `capture` (after `b` in
+  diff): `age_s` over 120 s; `stale: "<latest> is newer (<dt>s)"` where dt is how
+  much later the lineage's latest was taken; `pid_changed: true` when the
+  provider's live pid, else the latest capture's pid, differs.
+- **Resolution details.** A `cursor` names its capture, which wins over the
+  default `capture="latest"`. `diff(a="prev")` is b's predecessor (`meta.prev`),
+  not the lineage's second newest. `node(refs=[x])` with one entry is `node(ref=x)`.
+  `node(image=true)` embeds `{path, px}` of the crop (or `{error}`).
+- **`captures export`**: `format="raw"` copies the protobuf replies (the whole
+  capture for what nodes/all/raw, else the facet's pb) and `format="legacy"`
+  regenerates the old dump JSON (views, compose, slots, a11y); a `what` without
+  that form is `bad_args` (L1: both were ignored).
+- **`captures`.** `list` shows the resolved session's lineage (all of the store
+  when none, or with `all=true`), newest first, and says how many captures of
+  other apps it hides; `show` is the meta (non-default options, facet statuses,
+  diagnostics, path); `label` with an empty label removes it; `export` writes
+  `out/{nodes.jsonl|nodes.json, views.json, compose.json, slots.json, a11y.json,
+  props.json, issues.jsonl}`, or for `raw` the stored files as they are
+  (`out/raw/*.pb`, `out/shot/w_<root>.pb`, `out/meta.json`), and returns the path (the `out/` directory
+  for several files), rows and bytes, never contents; `gc` summarizes the
+  store's gc (`all=true` wipes everything, the ref counter included).
+- **node() trim (C6).** node() leaves out `key` when its `ids` spell it
+  (`view:16` = `ids.view` 16, `sem:82:448` = `ids.sem`, `a11y:34:21` for an a11y-only
+  node); slot and `a11y:path:` keys stay.
+- **Measured** through `ops.run` over the harness fake adb and agent
+  (`tests/test_capture_budgets.py`, compact bytes; target in parentheses):
+  - launcher: capture 1,153 (2,500); capture with a diff 1,229; `outline()` 2,012
+    (2,500); `outline(root=@launcher_list)` 1,639 (2,000); `outline(view="slots")`
+    491 (6,000); `outline(view="reading")` 1,553 (2,000); `find(text="state",
+    flags=click)` 388 (600); `node(@launch_heading)` 1,276 (1,500); `lint()` 453
+    (1,200); `captures()` 259 (400); `image(ref)` 296 (400).
+  - View screen: capture 1,482; `outline()` 2,688 (3,000, all 40 Views);
+    `node(#badSwitch, props="nondefault")` 1,197 on a recapture (1,200); `lint()`
+    1,330 (14 findings).
+  - wide: capture 1,517 (3,000); outline pages <= 5,926 (6,000), exactly the 259
+    Views; `find(text="Label 4", limit=20)` 1,505 (3,000); `node(#view_47,
+    props="nondefault")` 782 (1,500).
+  - mixed: capture 1,271; `outline()` 992; `lint()` 500.
+  - Workflows (tokens, spec section 8): W1 907 (1,100), W2 563 (1,100), W3 1,004
+    (1,200; 1,462 with the stand-in renderer), W4 1,976 (2,800), W6 1,261 (2,400),
+    W7 870 (1,600).
+
+## Surface (S2, `inspector_widget/surface.py`)
+
+- **One registry.** `SPECS` holds a `ToolSpec` per tool (`name`, `cli_name`,
+  `summary`, `params`, `fn` = the ops function, `read_only`, `toolsets`,
+  `description`, a human renderer). `json_schema(spec)` gives the MCP
+  inputSchema, `mcp_entries(toolset, context=, passthrough=)` the entries
+  `mcp_server.TOOLS` holds (with `surface` and, added by the server, `on_error`),
+  `add_cli(subparsers, context=)` the subcommands.
+- **Parameters.** A `Param` is on both surfaces unless allow-listed: `image.inline`
+  is MCP-only (the pixels ride as ImageContent), `image.out` and
+  `capture.build_out` are CLI-only. The CLI flag is `--kebab-name` with the MCP
+  default (booleans that default to true get `--x/--no-x`), plus aliases
+  (`-s -p -c`, `--scale`, `--count`, a repeatable `--rule`); `captures`'s action,
+  id and label, `node`'s refs, `image`'s ref and `diff`'s a/b are positionals. A
+  list parameter takes `a,b` on the CLI. `cli_args` passes only values that differ
+  from the default, so `inspector-widget outline` is exactly MCP `outline()`.
+- **Validation** (`validate`, stdlib, one place for every transport): unknown
+  names, types (a whole-number float is an int), enums, ranges and rule ids
+  (`rules.resolve`) raise `bad_args` with a hint describing the parameter; an
+  explicit null means the default; a comma string is accepted for a list. The MCP
+  server skips its own jsonschema check for these tools.
+- **Toolsets.** `INSPECTOR_WIDGET_TOOLSET` is a name or a comma list: `legacy`
+  (the 15), `capture` (the 4 session tools + the 8 = 12), `talkback` (4 + 3),
+  `all` (26). The default is `legacy,talkback`: exactly the 18 tools (and the
+  18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
+  logs a warning and lists the default. Every tool stays callable by name.
+  Measured tools/list (compact): default 18,337 B, capture 11,634 (12,000),
+  legacy 13,247, capture,talkback 16,724, all 28,385 (the capture tools spend each
+  parameter description once; the instructions carry the rest). Instructions:
+  764 B (capture), 875 B (capture,talkback), 714 B (the default).
+- **Instructions** (`instructions(listed)`, at most 900 B): the spec 5.13 text when
+  `capture` is listed, else a legacy text naming the toolset variable; plus a
+  TalkBack sentence when `tb_walk` is listed. Sent in initialize by the SDK 1.x
+  and 2.x servers (a Server without the parameter gets none) and the fallback.
+- **Running.** `execute(name, args, ctx, surface=, passthrough=)` returns a
+  `Result` (a dict, plus `images` and `is_error`); `run()` gives `(text, images,
+  is_error)`. `image(inline=true)` adds `inline_tokens` to the text and the PNG
+  (downscaled to `max_side`) as `(mime, base64)`. The MCP server passes
+  `SessionLostError` through so its retry applies: `capture` is repeated once on a
+  fresh attach unless `slots="enable"` (a hot reload is never repeated).
+- **CLI.** `--json` prints the MCP text byte for byte (`--pretty` indents it);
+  without it a human rendering (a header line, then the lines; `capture` prints
+  its id first, `-q` only the id; `image` prints the path). Errors print the same
+  JSON envelope to stderr, exit 1. The generated subcommands never resolve a
+  serial through adb themselves (queries do no device I/O) and close their
+  sessions without SHUTDOWN.
+
+## Live verification and real replays (L1)
+
+- **Fixtures.** `tests/fixtures/captures/<name>/`: `meta.json`, `raw/<facet>.pb.gz`,
+  `shot/w_<root>.pb` and `source.json`, recorded on emulator-5558 (API 37,
+  480 dpi) with the post-hardening agent: A11yProbe (launcher, launcher after
+  slots=enable, View screen, all scenarios, D1 dialog, S1 before/after a scroll,
+  the bare-widget defaults screen), Thunderbird's message list with View and
+  with ComposeView rows (demo mailbox), Now in Android's For you and Settings
+  dialog. `tests/capture_replay.py` records them (`record STORE ID NAME`) and
+  serves one as a `fakescenes.SceneData` (`FakeAgent.from_capture(name)`);
+  `replay_device` gives the harness device the recorded package, pid, density
+  and font scale. `tests/test_capture_replay.py` runs every budget, the >= 95%
+  `conf:exact` and no-ID1 checks, per-window crops, the scroll rebinding and the
+  live regressions over them.
+- **Hardened agent values.** SafeString sends an unlabelled AccessibilityAction as
+  `<action>`, a labelled one as its label and a lambda as `<lambda>`;
+  `normalize.is_action_attr(raw, key)` takes the marker and the SemanticsActions
+  keys, so they stay actions, not attr values.
+- **Composited screens** alpha-composite each window over the ones below (a
+  dialog window is transparent outside its card).

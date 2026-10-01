@@ -59,6 +59,8 @@ SLOTS_NOT_POPULATED = 'not populated (slots="enable" is destructive: resets reme
 SLOTS_ENABLE_WARNING = ("slots=enable hot-reloaded every composition (resets remember{} state); "
                         "semantics ids re-minted; refs carried by locator/structure")
 NO_COMPOSE = "no AndroidComposeView"
+COMPOSE_OBFUSCATED = ("obfuscated: Compose classes are renamed in this build (no semantics or "
+                      "slot table; the a11y tree still works)")
 UNSETTLED_DIAGNOSTIC = ("consistency unsettled: the UI kept changing across {n} attempts, "
                         "so facets may disagree slightly")
 
@@ -344,12 +346,30 @@ def _run_shots(att: _Attempt) -> None:
                 nbytes=nbytes)
 
 
+def _tokens(diagnostics: str, prefix: str) -> list[str]:
+    return [t.strip() for t in (diagnostics or "").split(";") if t.strip().startswith(prefix)]
+
+
+def _has_semantics(resp: Any) -> bool:
+    return any(c.kind == _SEMANTICS for w in resp.windows if w.HasField("root")
+               for c in w.root.children)
+
+
 def _run_compose(att: _Attempt) -> None:
     resp = _dump_sem(att.session)
     att.compose_msg = resp
     att.raw.compose_sem = resp.SerializeToString()
-    reason = None if len(resp.windows) else NO_COMPOSE
-    att.set("compose", "ok", reason=reason, nbytes=len(att.raw.compose_sem))
+    nbytes = len(att.raw.compose_sem)
+    failed = _tokens(resp.diagnostics, "semantics_failed")
+    if not len(resp.windows):
+        att.set("compose", "ok", reason=NO_COMPOSE, nbytes=nbytes)
+    elif _tokens(resp.diagnostics, "compose_obfuscated"):
+        # The agent still sends a window per ComposeView: not "ok, 0 nodes".
+        att.set("compose", "unavailable", reason=COMPOSE_OBFUSCATED, nbytes=nbytes)
+    elif failed and not _has_semantics(resp):
+        att.set("compose", "unavailable", reason=failed[0], nbytes=nbytes)
+    else:
+        att.set("compose", "ok", nbytes=nbytes)
 
 
 def _slots_populated(resp: Any) -> bool:
@@ -372,6 +392,10 @@ def _run_slots(att: _Attempt) -> None:
         att.set("slots", "ok", nbytes=len(att.raw.slots))
     elif not len(resp.windows):
         att.set("slots", "unavailable", reason=NO_COMPOSE)
+    elif _tokens(resp.diagnostics, "compose_obfuscated"):
+        att.set("slots", "unavailable", reason=COMPOSE_OBFUSCATED)  # enabling cannot help
+    elif _tokens(resp.diagnostics, "slot_failed"):
+        att.set("slots", "error", reason=_tokens(resp.diagnostics, "slot_failed")[0])
     elif enable:
         att.set("slots", "unavailable", reason="slot table still empty after enable_inspection")
     else:
@@ -595,6 +619,7 @@ def fetch(session: CaptureSession, opts: CaptureOptions | None = None, *,
 
 __all__ = [
     "FACETS",
+    "COMPOSE_OBFUSCATED",
     "FINGERPRINT_SEM_ATTRS",
     "NO_COMPOSE",
     "RETRIES",

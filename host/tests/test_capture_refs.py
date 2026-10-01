@@ -921,3 +921,30 @@ def test_random_mutations_never_reuse_or_duplicate_a_ref(seed):
                                        ("id", "locator", "structure", "geometry", "new",
                                         "rebound"))
     assert json.dumps(sorted(ever, key=m.ref_num)[:3]) == '["n1", "n2", "n3"]'
+
+
+def test_a_rid_reused_by_another_screen_never_carries_to_another_view_class():
+    """Live on Thunderbird: MessageHome's #coordinator_layout (a RelativeLayout from
+    layout/message_list) and MessageCompose's (a CoordinatorLayout from
+    layout/message_compose) are unique on each screen, and are different Views."""
+    def screen(cls, layout, udid, *, cid):
+        return scene(V("DecorView", 1,
+                       V(cls, udid, V("AppBarLayout", udid + 1, rid="app_bar_layout",
+                                      b=(0, 0, 400, 100),
+                                      facets={"view": {"class": "AppBarLayout",
+                                                       "layout_res": layout}}),
+                         rid="coordinator_layout", b=(0, 0, 400, 800),
+                         facets={"view": {"class": cls, "layout_res": layout}}),
+                       b=(0, 0, 400, 800)), cid=cid)
+
+    chain = Chain()
+    a = chain.publish(screen("RelativeLayout", "@app:layout/message_list", 200, cid="c00001"))
+    b = chain.publish(screen("CoordinatorLayout", "@app:layout/message_compose", 450,
+                             cid="c00002"))
+    assert b.by_key["view:450"] != a.by_key["view:200"]
+    assert b.by_key["view:451"] != a.by_key["view:201"]  # another layout's app bar
+    # the same View class re-inflated from the same layout (a recreated fragment) carries
+    c = chain.publish(screen("CoordinatorLayout", "@app:layout/message_compose", 700,
+                             cid="c00003"))
+    assert c.by_key["view:700"] == b.by_key["view:450"]
+    assert c.by_key["view:701"] == b.by_key["view:451"]

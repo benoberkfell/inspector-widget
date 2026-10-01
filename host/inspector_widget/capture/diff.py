@@ -24,8 +24,13 @@ that shift together (a scroll) collapse: a descendant that shifts with its paren
 is counted as ``(+k inside)``, and three or more siblings that shift by the same
 amount share one line.
 
-Issue deltas compare ``(ref, rule)`` pairs: ``resolved`` were in ``a`` only, ``new``
-in ``b`` only, grouped per rule with three example refs.
+Issue deltas compare ``(ref, rule)`` pairs on the refs both captures hold:
+``resolved`` were in ``a`` only (the node is still there and the finding is
+gone), ``new`` in ``b`` only, grouped per rule with three example refs. The
+issues of removed nodes are not "resolved", nor are those of added nodes "new":
+they are counted apart, as ``gone_with_node`` and ``on_new_nodes`` (a scroll
+or a closed dialog fixes nothing). A rebound pair (a recycled cell showing
+another item) counts as a removal plus an addition here.
 
 When fewer than 40% of the refs are shared (rebound pairs count as shared), the
 result is ``"verdict":"new screen"`` plus b's outline preview instead of hundreds
@@ -83,7 +88,8 @@ STATE_WORDS = {
 }
 #: Flags compared under "a11y" (what a node does, rather than its state).
 BEHAVIOUR_FLAGS = tuple(f for f in FLAGS
-                        if f not in STATE_FLAGS and f not in ("hidden", "webview", "interop"))
+                        if f not in STATE_FLAGS
+                        and f not in ("hidden", "webview", "interop", "truncated", "redacted"))
 #: Properties that flicker with touch and never mean the UI changed.
 VOLATILE_PROPS = frozenset({"pressed", "hovered"})
 VISIBLE_EPS = 0.05
@@ -753,11 +759,22 @@ def diff(a: Index, b: Index, *, within: str | None = None, include: Any = None,
             def skip(rule: str) -> bool:
                 return contrast_one_sided and rule.startswith("a11y.contrast")
 
-            ia = _issue_pairs(a, ids_a, skip)
-            ib = _issue_pairs(b, ids_b, skip)
+            # Compare on the refs both captures hold. A rebound pair is a
+            # recycled cell now showing ANOTHER item: its old item left (with
+            # its issues) and a new one arrived, so it counts as removed + added.
+            both = set(shared)
+            ia = _issue_pairs(a, [i for i in ids_a if i in both], skip)
+            ib = _issue_pairs(b, [i for i in ids_b if i in both], skip)
             res_lines, _ = _issue_groups(k for k in ia if k not in ib)
             new_lines, issues_new_n = _issue_groups(k for k in ib if k not in ia)
             issues = {"resolved": res_lines, "new": new_lines}
+            gone = len(_issue_pairs(a, [*removed, *rebound_old], skip))
+            fresh = len(_issue_pairs(b, [*added, *rebound], skip))
+            if gone:
+                issues["gone_with_node"] = gone
+            if fresh:
+                issues["on_new_nodes"] = fresh
+                issues_new_n += fresh
 
     image_result = None
     if want_pixels:

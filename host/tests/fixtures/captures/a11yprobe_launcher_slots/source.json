@@ -1,0 +1,5 @@
+{
+ "app": "com.oberkfell.a11yprobe",
+ "how": "capture(slots=\"enable\") after capture() of the same process: compose_generation 1, slot table populated",
+ "screen": "MainActivity launcher"
+}

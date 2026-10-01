@@ -130,6 +130,25 @@ def test_property_to_dict_boolean_and_color(strings_builder):
     assert dc["value"] == 0xFF0000
 
 
+def test_property_to_dict_gravity_and_flags_are_their_flag_string(strings_builder):
+    """E3: the agent sends GRAVITY/INT_FLAG as one "|"-joined str_value (Properties.kt)
+    and leaves int32_value 0; the value is that string, never a made-up 0."""
+    sb = strings_builder
+    P = pb.Property
+    gravity = P(name=sb.intern("gravity"), type=P.GRAVITY,
+                str_value=sb.intern("center_vertical|start"))
+    flags = P(name=sb.intern("inputType"), type=P.INT_FLAG,
+              str_value=sb.intern("text|textCapSentences"))
+    empty = P(name=sb.intern("scrollIndicators"), type=P.INT_FLAG)  # the empty set: id 0
+    raw = P(name=sb.intern("layout_gravity"), type=P.GRAVITY, int32_value=17)  # no string
+    dim = P(name=sb.intern("paddingStart"), type=P.DIMENSION, int32_value=42)
+    resolver = st.StringResolver(sb.build())
+    got = [st.property_to_dict(resolver, p) for p in (gravity, flags, empty, raw, dim)]
+    assert [d["value"] for d in got] == [
+        "center_vertical|start", "text|textCapSentences", "", 17, 42]
+    assert not any("label" in d for d in got)
+
+
 # --------------------------------------------------------------------------- #
 # compose_node_to_dict / dump_compose_to_dict
 # --------------------------------------------------------------------------- #

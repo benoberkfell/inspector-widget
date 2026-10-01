@@ -83,11 +83,21 @@ def _roundtrip(block_mcp: bool) -> dict:
 
 def _assert_protocol(by_id: dict) -> None:
     assert by_id[1]["result"]["serverInfo"]["name"] == "inspector-widget"
-    names = {t["name"] for t in by_id[2]["result"]["tools"]}
-    assert names == set(mcp_server.TOOLS)
+    # the instructions (spec 5.13) go out in initialize, at most 900 B
+    instructions = by_id[1]["result"].get("instructions")
+    assert instructions == mcp_server._instructions()
+    assert 0 < len(instructions.encode("utf-8")) <= 900
+    tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
+    # the default toolset: every tool but the capture-and-walk ones (opt-in until S4)
+    assert set(tools) == set(mcp_server._listed_tools())
+    assert set(tools) == set(mcp_server.TOOLS) - set(mcp_server.surface.CAPTURE_TOOLS)
+    # the Phase-0 output parameters are in the schemas the server really lists
+    props = tools["dump_tree"]["inputSchema"]["properties"]
+    assert {"detail", "max_bytes", "max_depth", "root"} <= set(props)
     call = by_id[3]["result"]
     assert call["isError"] is True
-    assert "error" in json.loads(call["content"][0]["text"])
+    text = call["content"][0]["text"]
+    assert "error" in json.loads(text) and "\n" not in text  # compact JSON
 
 
 def test_sdk_transport_roundtrip():
@@ -111,8 +121,9 @@ def test_build_server_with_mcp2_handler_api(monkeypatch):
     )
 
     class Server2:  # 2.x: no list_tools/call_tool decorators
-        def __init__(self, name, *, version="", on_list_tools=None, on_call_tool=None):
-            self.name, self.version = name, version
+        def __init__(self, name, *, version="", instructions=None, on_list_tools=None,
+                     on_call_tool=None):
+            self.name, self.version, self.instructions = name, version, instructions
             self.on_list_tools, self.on_call_tool = on_list_tools, on_call_tool
 
     mcp_pkg = types.ModuleType("mcp")
@@ -125,9 +136,10 @@ def test_build_server_with_mcp2_handler_api(monkeypatch):
 
     server = mcp_server._build_mcp_server()
     assert isinstance(server, Server2)
+    assert server.instructions == mcp_server._instructions()
 
     listed = asyncio.run(server.on_list_tools(None, None))
-    assert {t.name for t in listed.tools} == set(mcp_server.TOOLS)
+    assert {t.name for t in listed.tools} == set(mcp_server._listed_tools())
 
     params = types.SimpleNamespace(name="no_such_tool", arguments=None)
     result = asyncio.run(server.on_call_tool(None, params))
@@ -158,3 +170,20 @@ def test_self_check_flags_grpcio_that_cannot_load_the_stubs(monkeypatch, capsys)
     out = capsys.readouterr().out
     grpc_line = next(line for line in out.splitlines() if "grpcio" in line)
     assert "UNUSABLE" in grpc_line and "1.81.0" in grpc_line
+
+
+@pytest.mark.parametrize("block_mcp", [False, True], ids=["sdk", "fallback"])
+def test_capture_toolset_over_stdio(monkeypatch, block_mcp):
+    """With INSPECTOR_WIDGET_TOOLSET=capture the real server (SDK or fallback, over
+    stdio) lists the 12 capture-and-walk tools and sends their instructions; a
+    capture tool's error is its envelope, with isError."""
+    if not block_mcp:
+        pytest.importorskip("mcp")
+    from inspector_widget import surface
+
+    monkeypatch.setenv("INSPECTOR_WIDGET_TOOLSET", "capture")
+    by_id = _roundtrip(block_mcp=block_mcp)
+    assert by_id[1]["result"]["instructions"] == surface.INSTRUCTIONS
+    names = [t["name"] for t in by_id[2]["result"]["tools"]]
+    assert set(names) == set(surface.toolset_names("capture")) and len(names) == 12
+    assert by_id[3]["result"]["isError"] is True  # no_such_tool, as ever

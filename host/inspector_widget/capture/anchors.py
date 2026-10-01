@@ -286,9 +286,18 @@ def _is_atom_path(sel: str | None) -> bool:
     return bool(sel) and not is_ref(sel) and not is_key(sel)
 
 
+#: Atoms tried below a parent (or grandparent) sel, each unique among siblings:
+#: the label, the type, then the tag and the resource id (an unlabelled
+#: ``Button @delete`` in a list cell whose siblings hold another Button).
+_CHILD_KINDS = ("typelabel", "type", "tag", "rid")
+
+
 def assign_sels(ix: Index) -> None:
-    """Set ``sel`` on every node: the first unique locator in the spec order, else
-    the node's id. Slot nodes always get their id (selectors resolve ui nodes)."""
+    """Set ``sel`` on every node: the first unique locator in the spec order
+    (``#rid``, ``@tag``, ``Type"label"``, ``"label"``), else ``<parent sel> >
+    atom`` with an atom unique among the siblings (:data:`_CHILD_KINDS`), else
+    ``<grandparent sel> > parent atom > atom``, else the node's id. Slot nodes
+    always get their id (selectors resolve ui nodes)."""
     ui_nodes = [n for _, n in _ui_preorder(ix)]
     atoms = {n.id: _atoms(n) for n in ui_nodes}
     counts: dict[str, Counter] = {k: Counter() for k in ("rid", "tag", "typelabel", "label")}
@@ -306,7 +315,7 @@ def assign_sels(ix: Index) -> None:
     parents = {c: p for p, kids in ui.children.items() for c in kids}
     sib_counts: dict[str, dict[str, Counter]] = {}
     for pid, kids in ui.children.items():
-        per: dict[str, Counter] = {"typelabel": Counter(), "type": Counter()}
+        per: dict[str, Counter] = {k: Counter() for k in _CHILD_KINDS}
         for c in kids:
             a = atoms.get(c)
             if a is None:
@@ -323,21 +332,40 @@ def assign_sels(ix: Index) -> None:
             if v and counts[kind][v] == 1:
                 n.sel = v
                 break
-        if n.sel is None:
-            p = ix.nodes.get(parents[n.id]) if n.id in parents else None
-            if p is not None and _is_atom_path(p.sel) and p.sel.count(" > ") < SEL_MAX_ATOMS - 1:
-                for kind in ("typelabel", "type"):
-                    v = a[kind]
-                    if v and sib_counts[p.id][kind][v] == 1:
-                        cand = f"{p.sel} > {v}"
-                        if len(cand) <= SEL_MAX_LEN:
-                            n.sel = cand
-                        break
+        p = ix.nodes.get(parents[n.id]) if n.id in parents else None
+        if n.sel is None and p is not None:
+            mine = _sibling_atom(a, sib_counts.get(p.id))
+            if mine and _is_atom_path(p.sel) and p.sel.count(" > ") < SEL_MAX_ATOMS - 1:
+                cand = f"{p.sel} > {mine}"
+                if len(cand) <= SEL_MAX_LEN:
+                    n.sel = cand
+            gp = ix.nodes.get(parents[p.id]) if p.id in parents else None
+            if n.sel is None and mine and gp is not None and _is_atom_path(gp.sel) \
+                    and gp.sel.count(" > ") < SEL_MAX_ATOMS - 2:
+                # the parent has no selector of its own (an unlabelled row): step
+                # through it with an atom unique among the grandparent's children
+                theirs = _sibling_atom(atoms.get(p.id) or {}, sib_counts.get(gp.id))
+                cand = f"{gp.sel} > {theirs} > {mine}" if theirs else ""
+                if theirs and len(cand) <= SEL_MAX_LEN:
+                    n.sel = cand
         if n.sel is None:
             n.sel = n.id
     for n in ix.nodes.values():
         if n.kind == "slot":
             n.sel = n.id
+
+
+def _sibling_atom(a: Mapping[str, str | None], sibs: Mapping[str, Counter] | None
+                  ) -> str | None:
+    """The first atom of ``a`` (in :data:`_CHILD_KINDS` order) unique among its
+    siblings (``sibs``: their atom counts), or None."""
+    if not sibs:
+        return None
+    for kind in _CHILD_KINDS:
+        v = a.get(kind)
+        if v and sibs[kind][v] == 1:
+            return v
+    return None
 
 
 def _ui_preorder(ix: Index) -> Iterable[tuple[str, UNode]]:

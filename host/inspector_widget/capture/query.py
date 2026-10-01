@@ -782,7 +782,8 @@ def resolve_selector(ix: Index, sel: Any, *, tomb: Mapping[str, Sequence] | None
 
 
 def _ref_error(ix: Index, ref: str, cid: str, tomb: Mapping[str, Sequence] | None) -> OpError:
-    """``ref_not_in_capture`` that says why: gone (the lineage's tombstone), newer
+    """``ref_not_in_capture`` that says why: gone (the lineage's tombstone), never
+    issued by the store (``tomb.next_ref``, when the caller knows it), newer
     than this capture, or unknown to this app's lineage (another app, a typo)."""
     info = (tomb or {}).get(ref)
     msg = f"{ref} is not in {cid}"
@@ -790,14 +791,29 @@ def _ref_error(ix: Index, ref: str, cid: str, tomb: Mapping[str, Sequence] | Non
         typ, label, last_sel, last_cap = (list(info) + [None] * 4)[:4]
         desc = " ".join(x for x in (typ, L.jstr(label) if label else None) if x)
         msg += f"; last seen in {last_cap} as {desc or 'a node'}"
-        cands = None
-        if last_sel:
+        if last_sel and not is_ref(last_sel) and not is_key(last_sel):
             msg += f" (sel {last_sel})"
-            cands = [last_sel]
+            return OpError("ref_not_in_capture", msg,
+                           hint="It left the screen (refs are never reused): select it by "
+                                "its sel in a newer capture, or bring it back and capture "
+                                "again.", candidates=[last_sel])
+        # No durable selector (its sel was its own ref): name what to search for.
+        filters: dict[str, Any] = {}
+        if typ and typ[:1].isupper():
+            filters["type"] = typ
+        if label:
+            filters["text"] = label
+        how = call("find", **filters) if filters else "find(...)"
         return OpError("ref_not_in_capture", msg,
-                       hint="It left the screen (refs are never reused): select it by its "
-                            "sel in a newer capture, or bring it back and capture again.",
-                       candidates=cands)
+                       hint=f"It left the screen (refs are never reused) and had no stable "
+                            f"selector: in a newer capture, {how}, narrowed with "
+                            f"within=<its list or cell>.")
+    issued = getattr(tomb, "next_ref", None)
+    if isinstance(issued, int) and ref_num(ref) >= issued:
+        return OpError("ref_not_in_capture",
+                       f"{ref} was never issued (this store's refs end at n{issued - 1})",
+                       hint="Take refs from outline() or find() lines of a capture; they are "
+                            "never made up or reused.")
     newest = max((ref_num(r) for r in ix.nodes if is_ref(r)), default=0)
     if ref_num(ref) > newest:
         return OpError("ref_not_in_capture",
@@ -931,6 +947,14 @@ def _truncated(tool: str, ix: Index, h: str, offset: int, shown: int, total: int
 # --------------------------------------------------------------------------- #
 # outline (spec 5.5, 6.3)
 # --------------------------------------------------------------------------- #
+def _plumbing(n: UNode) -> bool:
+    """Compose interop plumbing with nothing in it: every ComposeView has an
+    AndroidViewsHandler whose AndroidView children the index re-parents, so an
+    empty one is not content. Live on Thunderbird's ComposeView rows it took one
+    outline line per row; it collapses into the parent's +N like a wrapper."""
+    return n.kind == "view" and n.type == "AndroidViewsHandler"
+
+
 def _stub(n: UNode) -> bool:
     """A ViewStub placeholder (hidden like zero-size nodes)."""
     if n.kind != "view":
@@ -1031,7 +1055,7 @@ class _Outline:
                 s = False
             else:
                 s = bool(n.z is not None or n.label or n.rid or n.tag or n.issues
-                         or n.stop is not None or not kids
+                         or n.stop is not None or (not kids and not _plumbing(n))
                          or not ACTIONABLE.isdisjoint(n.flags))
                 if not s:  # a node with 2 or more shown children is shown too
                     s = sum(1 for c in kids if shown[c]) >= 2
@@ -1290,10 +1314,13 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
 
     # prefix facts over the page range, so each footer() is O(1)
     span = items[offset:min(total, offset + max_lines)]
-    first_cut_at: list[_Item | None] = [None]
+    # the expand hint follows the cut that hides the most (+N), ties in tree
+    # order: the message list's +67, not the toolbar's +5 above it
+    biggest_cut_at: list[_Item | None] = [None]
     render_upto, a11y_upto = [False], [False]
     for it in span:
-        first_cut_at.append(first_cut_at[-1] or (it if it.cut else None))
+        best = biggest_cut_at[-1]
+        biggest_cut_at.append(it if it.cut and (best is None or it.plus > best.plus) else best)
         ids = [i.id for i in ix.nodes[it.anchor].issues]
         render_upto.append(render_upto[-1] or any(x.startswith("render.") for x in ids))
         a11y_upto.append(a11y_upto[-1] or any(x.startswith("a11y.") for x in ids))
@@ -1306,7 +1333,7 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
             f["truncated"] = _truncated("outline", ix, h, offset, shown, total, why)
             hints.append(cursor_call("outline", user_args, page_args,
                                      f["truncated"]["cursor"]))
-        first_cut = first_cut_at[shown]
+        first_cut = biggest_cut_at[shown]
         if first_cut is not None:
             ref = ix.nodes[first_cut.anchor].id
             if first_cut.cut == "children":
@@ -1419,9 +1446,14 @@ def _text_fields(n: UNode) -> list[str]:
 
 
 def _min_dp(n: UNode, dpi: float | None) -> float | None:
-    if not n.b or not dpi:
+    """min(w, h) in dp of what a finger hits: the a11y (touch) bounds when the
+    node has them (a Compose control's minimumInteractiveComponentSize area is
+    48dp around a 40dp visual), else its bounds; the lint's touch-target rule
+    measures the same, so find(max_dp=47) and lint agree."""
+    b = (n.facets.get("a11y") or {}).get("b") or n.b
+    if not b or not dpi:
         return None
-    return min(n.b[2], n.b[3]) / (dpi / 160.0)
+    return min(b[2], b[3]) / (dpi / 160.0)
 
 
 def _intersects(b: Sequence[float], r: Sequence[float]) -> bool:
@@ -1447,30 +1479,33 @@ def _find_predicates(ix: Index, params: Mapping[str, Any], props_on: bool
             raise _bad(f"text_re is not a valid regex: {e}") from None
         preds.append(lambda n: any(rx.search(s) for s in _text_fields(n)))
         norm["text_re"] = text_re
+    # Every glob is bound by a default argument: the filters are ANDed, so a
+    # later filter must not rebind an earlier predicate's glob.
     typ = _str("type", params.get("type"))
     if typ:
-        g = _glob(typ)
-        preds.append(lambda n: any(g(s) for s in type_names(n)))
+        g_type = _glob(typ)
+        preds.append(lambda n, g=g_type: any(g(s) for s in type_names(n)))
         norm["type"] = typ
     for name, getter in (("rid", lambda n: n.rid), ("tag", lambda n: n.tag)):
         pat = _str(name, params.get(name))
         if pat:
-            g = _glob(pat, case=True)
-            preds.append(lambda n, g=g, getter=getter: g(getter(n)))
+            g_id = _glob(pat, case=True)
+            preds.append(lambda n, g=g_id, getter=getter: g(getter(n)))
             norm[name] = pat
     src = _str("src", params.get("src"))
     if src:
+        g_src = _glob(src, case=True)
         if ":" in src:
-            g = _glob(src, case=True)
-            preds.append(lambda n: g(n.src))
+            preds.append(lambda n, g=g_src: g(n.src))
         else:
-            g = _glob(src, case=True)
-            preds.append(lambda n: bool(n.src) and g(n.src.split(":", 1)[0].rsplit("/", 1)[-1]))
+            preds.append(lambda n, g=g_src: bool(n.src)
+                         and g(n.src.split(":", 1)[0].rsplit("/", 1)[-1]))
         norm["src"] = src
     role = _str("role", params.get("role"))
     if role:
-        g = _glob(role)
-        preds.append(lambda n: g(n.role) or g((n.facets.get("a11y") or {}).get("role")))
+        g_role = _glob(role)
+        preds.append(lambda n, g=g_role: g(n.role)
+                     or g((n.facets.get("a11y") or {}).get("role")))
         norm["role"] = role
     for name, want_all in (("flags", True), ("any_flags", False)):
         fl = _str_list(name, params.get(name))
@@ -2038,6 +2073,16 @@ class _Part:
     detail: str = ""
 
 
+def _key_in_ids(n: UNode) -> bool:
+    """Whether ``n.key`` is spelled by its ``ids`` (``view:16`` = ``ids.view`` 16,
+    ``sem:82:448`` = ``ids.sem`` "82:448", ``a11y:34:21`` = ``ids.a11y`` for an
+    a11y-only node), so node() need not repeat it."""
+    ids = n.ids or {}
+    prefix = {"view": "view", "compose": "sem", "a11y": "a11y"}.get(n.kind)
+    return prefix is not None and ids.get(prefix) is not None \
+        and n.key == f"{prefix}:{ids[prefix]}"
+
+
 def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, raw: bool,
                 ancestors: bool, children: bool, props_fn: PropsFn | None, idx: int,
                 image: Any, issue_fmt: Callable[[Issue], str] | None,
@@ -2054,7 +2099,9 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
         core.append(("label", nz.cap(n.label, VALUE_MAX)))
     if n.b:
         core.append(("b", list(n.b)))
-    extra: list[tuple[str, Any]] = [("key", n.key)]
+    extra: list[tuple[str, Any]] = []
+    if not _key_in_ids(n):  # else ids says it (view:16 is ids.view 16)
+        extra.append(("key", n.key))
     if n.rid and n.sel != "#" + L.ident(n.rid):
         extra.append(("rid", n.rid))
     if n.tag and n.sel != "@" + L.ident(n.tag):

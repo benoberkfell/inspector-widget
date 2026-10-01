@@ -150,6 +150,11 @@ def test_finalize_spills_oversize_results_to_an_envelope(tmp_path):
     assert env["preview"][0] == "view:1001 LinearLayout #view_1 [1,3 300x60]"
     assert env["preview"][1] == "  view:1002 LinearLayout #view_2 [2,6 300x60] +42"
     assert "max_depth=2" in env["hint"] and "root=" in env["hint"]
+    # the call was brief already: the hint does not suggest it (live, it did)
+    assert "brief" not in env["hint"]
+    full = json.loads(out.finalize("dump_tree", brief, max_bytes=None, detail="full",
+                                   spill_dir=str(tmp_path / "spill")))
+    assert 'use detail="brief"' in full["hint"]
     # the spill file holds the complete brief result, private to the user
     with open(env["spill_path"], encoding="utf-8") as f:
         assert json.load(f) == json.loads(full_text)
@@ -245,13 +250,23 @@ def test_the_store_tightens_a_root_that_something_else_created(tmp_path):
 def test_preview_lines_cover_every_tree_shape():
     a11y = lf.load("launcher", "a11y")
     lines = out.preview_lines(a11y)
-    assert lines[0].startswith("a11y:1:-1 FrameLayout [0,0 1280x2856]")
+    assert lines[0].startswith("a11y:1:-1 FrameLayout > ")
+    assert lines[0].endswith(" [0,0 1280x2856]")
     comp = lf.load("launcher", "compose_sem")
-    assert out.preview_lines(comp)[:2] == ["compose:82 AndroidComposeView [0,0 1280x2856]",
-                                           "  compose:150 Node [0,0 1280x2856] +16"]
+    assert out.preview_lines(comp)[:2] == [
+        "compose:82 AndroidComposeView > compose:150 Node > compose:310 Node [0,0 1280x2856]",
+        "  compose:325 launcher_list @launcher_list [0,348 1280x2436] +12"]
     ins = lf.load("launcher", "inspect")
-    assert out.preview_lines(ins)[:2] == ["view:1 DecorView [0,0 1280x2856]",
-                                          "  view:78 LinearLayout [0,0 1280x2856] +23"]
+    # a single-child chain is one line (the ViewStub beside #content is a zero-size
+    # leaf, left out), so the two levels shown reach the ComposeView
+    assert out.preview_lines(ins)[:2] == [
+        "view:1 DecorView [0,0 1280x2856]",
+        "  view:78 LinearLayout > view:80 FrameLayout #content > view:81 ComposeView > "
+        "view:82 AndroidComposeView [0,0 1280x2856] +19"]
+    screen = out.preview_lines(lf.load("viewscreen", "inspect"))
+    assert screen[0].startswith("view:34 DecorView > view:35 LinearLayout > ")
+    assert screen[0].endswith("> view:1 ScrollView > view:2 LinearLayout [0,0 1280x2856]")
+    assert screen[1] == '  view:3 MaterialTextView "1. ImageButton contentDescrip…" [48,48 757x101]'
     many = out.preview_lines(out.slim("dump_tree", wide_tree_result(props=False), {}),
                              max_lines=5, depth=3)
     assert len(many) == 5 and many[-1].strip().startswith("…") and "more lines" in many[-1]
@@ -625,7 +640,9 @@ def test_cli_subcommand_map_matches_the_real_cli_and_mcp():
     import cli
     import mcp_server
 
-    assert set(out.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS)
+    from inspector_widget import surface
+
+    assert set(out.CLI_SUBCOMMANDS) == set(mcp_server.TOOLS) - set(surface.CAPTURE_TOOLS)
     parser = cli.build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     assert set(out.CLI_SUBCOMMANDS.values()) <= set(sub.choices)
@@ -636,18 +653,24 @@ def test_cli_subcommand_map_matches_the_real_cli_and_mcp():
         out.add_cli_flags(sp, tool)
 
 
-def test_tools_list_stays_within_budget():
+@pytest.mark.parametrize("toolset,limit", [
+    (None, 20000),               # the default listing: the legacy and TalkBack tools
+    ("legacy", 20000),
+    ("capture", 12000),          # spec section 7: the capture toolset's tools/list
+    ("capture,talkback", 20000),
+    ("all", 32000),
+])
+def test_tools_list_stays_within_budget(monkeypatch, toolset, limit):
     import mcp_server
 
-    tools = copy.deepcopy(mcp_server.TOOLS)
-    out.augment_schemas(tools)
-    listing = {"tools": [{"name": n, "description": e["description"], "inputSchema": e["schema"]}
+    if toolset is not None:
+        monkeypatch.setenv("INSPECTOR_WIDGET_TOOLSET", toolset)
+    tools = mcp_server._listed_tools()
+    listing = {"tools": [{"name": n, "description": e["description"], "inputSchema": e["schema"],
+                          **({"annotations": e["annotations"]} if e.get("annotations") else {})}
                          for n, e in tools.items()]}
-    # ~22,550 B for 18 tools today. The per-tool average is what keeps new tools honest.
-    # Once INSPECTOR_WIDGET_TOOLSET exists (capture-wiring S2), budget each toolset's listing
-    # separately (the default legacy listing stays <= 20,000 B); the average applies to every
-    # listing.
-    assert size(listing) <= 23000
+    # The per-tool average is what keeps new tools honest.
+    assert size(listing) <= limit, size(listing)
     assert size(listing) / len(listing["tools"]) <= 1300
 
 
@@ -672,3 +695,101 @@ def test_layout_resource_null_marks_a_view_not_inflated_from_its_parents_layout(
     assert root["layout_resource"] == {"type": "layout", "name": "main"}
     assert root["children"][0]["layout_resource"] is None
     assert "layout_resource" not in root["children"][1]
+
+
+# --------------------------------------------------------------------------- P0-2 shapes
+def test_a11y_lint_brief_on_the_unified_report_shape():
+    """The unified lint's report: node_keys (what inspect_node takes) instead of
+    packed ids; ``stats`` and info-level diagnostics are left out and counted."""
+    report = {
+        "density": 420, "summary": {"error": 1, "warn": 1, "info": 0, "total": 2},
+        "findings": [
+            {"rule": "a11y.label.missing", "severity": "error", "node_key": "compose:5:6",
+             "node": {"id": 99}, "message": "no name"},
+            {"rule": "a11y.touch_target.small", "severity": "warn", "node_key": "view:7",
+             "node": {"id": 7}, "message": "small"}],
+        "diagnostics": [{"level": "info", "code": "a11y.dump", "message": "roots=1"},
+                        {"level": "warn", "code": "identity.degenerate", "message": "keys"}],
+        "stats": {"nodes": 40, "rules": ["a11y.label.missing"], "elapsed_ms": 3},
+        "generation": "g1", "contrast_sampled": True}
+    brief = out.slim("a11y_lint", report, {})
+    assert brief["by_rule"]["a11y.label.missing"] == {"sev": "error", "n": 1, "msg": "no name",
+                                                      "nodes": ["compose:5:6"]}
+    assert brief["diagnostics"] == [report["diagnostics"][1]]
+    assert brief["omitted"] == {"info_diagnostics": 1, "stats": 3}
+    assert "stats" not in brief and "findings" not in brief
+    assert brief["contrast_sampled"] is True and brief["generation"] == "g1"
+    assert out.slim("a11y_lint", report, {"group_by": "none"}) == report
+
+
+def test_focus_order_brief_on_the_current_a11y_shape():
+    """a11y.py lists stops only, as {order, key, id, speak, unlabeled?, window?}."""
+    order = [{"order": 1, "key": "view:3", "id": 12884901887, "speak": "Title", "window": 0},
+             {"order": 2, "key": "compose:6:2", "id": 25769803778, "speak": "Unlabeled",
+              "unlabeled": True, "window": 1}]
+    data = {"windows": [], "focus_order": order}
+    brief = out.slim("dump_accessibility", data, {})
+    assert brief["focus_order"] == [
+        {"order": 1, "key": "view:3", "speak": "Title", "window": 0},
+        {"order": 2, "key": "compose:6:2", "speak": "Unlabeled", "unlabeled": True, "window": 1}]
+    assert "omitted" not in brief  # every entry is a stop: nothing left out
+
+
+def test_dump_accessibility_root_takes_a_node_key():
+    leaf = {"host_view_id": 6, "virtual_id": 2, "id": 2, "node_key": "compose:6:2"}
+    host = {"host_view_id": 6, "virtual_id": -1, "id": 5, "node_key": "view:6",
+            "children": [leaf]}
+    data = {"windows": [{"root_view_id": 1, "root": {"host_view_id": 1, "virtual_id": -1,
+                                                     "id": 1, "node_key": "view:1",
+                                                     "children": [host]}}]}
+    for spec in ("view:6", "6:-1", "a11y:6:-1"):
+        assert out.slim("dump_accessibility", data, {"root": spec})["windows"][0]["root"][
+            "node_key"] == "view:6", spec
+    assert out.slim("dump_accessibility", data, {"root": "compose:6:2"})["windows"][0][
+        "root"]["node_key"] == "compose:6:2"
+
+
+def test_brief_keeps_the_clipped_mark_of_clamped_bounds():
+    """strings._bounds_to_dict clamps a negative size and says clipped; the brief
+    [x,y,w,h] must not lose that (host/README "brief keeps it")."""
+    view = {"roots": [{"id": 1, "class_name": "FrameLayout",
+                       "bounds": {"layout": {"x": 0, "y": 0, "w": 100, "h": 100}},
+                       "children": [{"id": 2, "class_name": "View",
+                                     "bounds": {"layout": {"x": 10, "y": 90, "w": 0, "h": 0},
+                                                "clipped": True}}]}]}
+    brief = out.slim("dump_tree", view, {})
+    kid = brief["roots"][0]["children"][0]
+    assert kid["bounds"] == [10, 90, 0, 0] and kid["clipped"] is True
+    assert "clipped" not in brief["roots"][0]
+
+
+def test_the_preview_names_the_rid_of_a_brief_inspect_node():
+    """The brief inspect view facet carries its resource as "@pkg:id/name"; the
+    envelope preview must still say #name (live on S1 it said nothing)."""
+    ins = {"roots": [{"node_key": "view:11", "bounds": [0, 309, 1280, 2475],
+                      "view": {"id": 11, "class_name": "RecyclerView",
+                               "resource": "@com.oberkfell.a11yprobe:id/interop_list"}}]}
+    assert out.preview_lines(ins) == ["view:11 RecyclerView #interop_list [0,309 1280x2475]"]
+
+
+def test_the_spill_hint_names_max_bytes_only_where_the_tool_takes_it():
+    """A spill envelope must not tell the agent to pass max_bytes to a tool that
+    rejects it (inspect_node, compose_overlay, ...): the call would fail with
+    "unknown argument(s): max_bytes"."""
+    import mcp_server
+
+    big = {"roots": [{"text": "x" * 400, "children": []} for _ in range(200)]}
+    for tool, entry in mcp_server.TOOLS.items():
+        if tool in surface_tools():
+            continue  # the capture tools budget themselves (no spill envelope)
+        env = json.loads(out.finalize(tool, big, max_bytes=1000))
+        takes = "max_bytes" in entry["schema"].get("properties", {})
+        assert takes == out.takes_max_bytes(tool), tool
+        assert ("raise max_bytes" in env["hint"]) is takes, (tool, env["hint"])
+        if not takes:
+            assert out.ENV_MAX_BYTES in env["hint"]
+
+
+def surface_tools():
+    from inspector_widget import surface
+    return set(surface.CAPTURE_TOOLS)
