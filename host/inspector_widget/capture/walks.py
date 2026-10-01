@@ -404,6 +404,16 @@ class Binding:
                 return str(sp) if sp else None
         return None
 
+    def has_window(self, cid: str | None, root_view_id: Any) -> bool | None:
+        """Whether capture ``cid`` holds the window rooted at ``root_view_id`` (None: no
+        such capture)."""
+        for _a, c in self._caps:
+            if c.id == cid:
+                with contextlib.suppress(TypeError, ValueError):
+                    return int(root_view_id) in c.windows
+                return None
+        return None
+
     def window_ref(self, root_view_id: Any) -> str | None:
         with contextlib.suppress(TypeError, ValueError):
             for _a, c in reversed(self._caps):
@@ -429,6 +439,27 @@ def _bind_key(binding: Binding, key: Any, at: int | None) -> str | None:
         return key
     ref, _cid = binding.ref(key, at=at)
     return ref or key
+
+
+def _mark_screen_changes(record: dict[str, Any], binding: Binding) -> None:
+    """``via="screen"`` on a step that reached a new window while the window of the step
+    before is gone from the step's capture: the screen was replaced under the walk (an
+    activity started, a dialog's host closed), not walked by TalkBack. The walk's checks
+    then compare the model with the first screen only (talkback/diff.py)."""
+    prev: dict[str, Any] | None = None
+    for s in record.get("steps") or []:
+        if not s.get("moved") or not s.get("key") or s.get("edge"):
+            continue
+        if prev is not None and s.get("via") == "window" and s.get("window") != prev.get("window") \
+                and s.get("cap") and prev.get("cap") and s["cap"] != prev["cap"] \
+                and binding.has_window(prev["cap"], prev.get("window")) \
+                and binding.has_window(s["cap"], prev.get("window")) is False:
+            s["via"] = "screen"
+            note = (f"step {s['i']}: the screen changed under the walk (window "
+                    f"{binding.window_ref(prev.get('window')) or prev.get('window')} is gone): "
+                    "the model's prediction covers the steps before it")
+            record["notes"] = list(record.get("notes") or []) + [note]
+        prev = s
 
 
 def bind_walk(record: dict[str, Any], binding: Binding,
@@ -485,6 +516,7 @@ def bind_walk(record: dict[str, Any], binding: Binding,
     for o in record.get("orphans") or []:
         if o.get("key"):
             o["ref"] = _bind_key(binding, o["key"], None)
+    _mark_screen_changes(record, binding)
     if record.get("notes"):  # the engine's notes name nodes by key: by ref here
         record["notes"] = [_KEY_IN_TEXT.sub(lambda m: _bind_key(binding, m.group(0), None)
                                             or m.group(0), str(n))

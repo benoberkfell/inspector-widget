@@ -296,3 +296,46 @@ def test_a_walks_notes_name_nodes_by_ref():
     W.bind_walk(rec, W.Binding([(0, _Loaded(rx, raw))]))
     assert rec["notes"][0].startswith("A11yAct could not focus n") and "view:" not in rec["notes"][0]
     assert rec["notes"][1] == "compose:99:4 is not in any capture"  # unknown: kept as is
+
+
+def test_a_screen_replaced_mid_walk_is_not_read_as_talkback_navigation():
+    """Live, emulator-5556: another activity of the app started 14 s into a walk of the V12
+    list. The walk went on in the new window; the checks read the switch as TalkBack's
+    doing (window_order, edge_stuck on the list, its unread rows "skipped"). The step's
+    capture no longer holds the list's window: it is a screen change, and the model's
+    prediction is compared with the first screen only."""
+    import tb_capture_fixtures as F
+
+    def loaded(name):
+        ix, raw = F.live_capture(name)
+        return _Loaded(ix, raw)
+
+    def step(i, key, label, b, window, via="next", **kw):
+        return {"i": i, "key": key, "label": label, "speak": label, "cls": "TextView",
+                "bounds": b, "window": window, "via": via, "moved": True,
+                "window_rect": [0, 0, 2076, 2152], **kw}
+
+    v12 = [("view:2", "V12 BAD: A list with an empty header item", [0, 136, 2076, 120])] + [
+        (f"view:{13 + i}", f"Message {i + 1}", [0, 257 + 137 * i, 2076, 137]) for i in range(4)]
+    c2 = [("sem:7:4", "C2 BAD: products", [39, 175, 416, 69]),
+          ("sem:7:7", "Product A1", [39, 264, 989, 293]),
+          ("sem:7:17", "Product B1", [1048, 264, 989, 244])]
+    steps = [step(0, *v12[0], 4, via="start")]
+    steps += [step(i, *v12[i], 4, container="view:3", container_can=["forward"],
+                   container_cls="RecyclerView", container_rect=[0, 256, 2076, 1818])
+              for i in range(1, 5)]
+    steps += [step(5, *c2[0], 1, via="window"), step(6, *c2[1], 1), step(7, *c2[2], 1),
+              dict(step(8, *c2[2], 1), edge=True), step(9, *c2[0], 1, via="wrap")]
+    predicted = [{"key": f"view:{k}", "label": f"Message {k - 12}", "window": 4,
+                  "bounds": [0, 257 + 137 * (k - 13), 2076, 137]} for k in range(13, 22)]
+    predicted.insert(0, {"key": "view:2", "label": v12[0][1], "window": 4,
+                         "bounds": v12[0][2]})
+    rec = _record()
+    rec.update(steps=steps, predicted=predicted, ended="wrap", findings=[])
+    W.bind_walk(rec, W.Binding([(0, loaded("tb_v12_bad")), (5, loaded("tb_c2_bad"))]))
+    assert rec["steps"][5]["via"] == "screen"
+    codes = {f["code"] for f in rec["findings"]}
+    assert not codes & {"tb.window_order", "tb.edge_stuck", "tb.skipped"}, rec["findings"]
+    assert rec["vs_model"]["differ"] == 0
+    assert any("the screen changed under the walk" in n for n in rec["notes"])
+    assert W.step_line(rec["steps"][5]).endswith('"C2 BAD: products" via=screen')

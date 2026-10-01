@@ -171,16 +171,31 @@ def first_lap(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Moves up to the first edge or wrap (the lap the order checks look at)."""
     out: List[Dict[str, Any]] = []
     for s in steps:
-        if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost"):
+        if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost", "screen"):
             break
         if s.get("moved") and s.get("key") and (not out or out[-1]["key"] != s["key"]):
             out.append(s)
     return out
 
 
+def _first_screen(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The steps before the screen was replaced under the walk (``via="screen"``: another
+    activity or window took the place of the one it was in; capture/walks.py marks it).
+    What the model predicted is about that first screen only."""
+    out: List[Dict[str, Any]] = []
+    for s in steps:
+        if s.get("via") == "screen":
+            break
+        out.append(s)
+    return out
+
+
 def _lap_complete(walk: Dict[str, Any]) -> bool:
     """A full lap: the walk wrapped (past an edge and back onto a stop it had read)."""
-    return walk.get("ended") == "wrap" or any(s.get("via") == "wrap" for s in walk["steps"])
+    steps = _first_screen(walk["steps"])
+    if len(steps) < len(walk["steps"]):
+        return any(s.get("via") == "wrap" for s in steps)
+    return walk.get("ended") == "wrap" or any(s.get("via") == "wrap" for s in steps)
 
 
 def _dp(px: float, density: int) -> float:
@@ -205,6 +220,8 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
     pos: Optional[int] = P.index(_pk(lap[0])) if lap and _pk(lap[0]) in P else None
     for s in lap[1:]:
         k = _pk(s)
+        if s.get("via") == "screen":  # another screen: the prediction was for the first one
+            break
         if s.get("via") == "stolen":  # the app moved focus, not TalkBack: nothing to predict
             pos = P.index(k) if k in P else None
             continue
@@ -257,7 +274,7 @@ def _coverage(walk: Dict[str, Any], P: List[str], visited: set) -> Tuple[int, in
         return 0, len(P) - 1, "in a full lap"
     first = next((_pk(s) for s in _moves(walk["steps"]) if _pk(s) in P), None)
     start = P.index(first) if first is not None else min(idx)
-    if any(s.get("edge") for s in walk["steps"]):
+    if any(s.get("edge") for s in _first_screen(walk["steps"])):
         if walk.get("direction", "next") == "next":
             return start, len(P) - 1, "from the start to the edge"
         return 0, start, "from the start back to the edge"
@@ -421,7 +438,8 @@ def _check_order(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[List[
     segments: List[List[Dict[str, Any]]] = [[]]
     for s in lap:
         escaped = bool(s.get("_escape")) != bool(segments[-1] and segments[-1][-1].get("_escape"))
-        if (s.get("via") in ("autoscroll", "window", "stolen") or escaped) and segments[-1]:
+        if (s.get("via") in ("autoscroll", "window", "stolen", "screen") or escaped) \
+                and segments[-1]:
             segments.append([])
         segments[-1].append(s)
     out = []
