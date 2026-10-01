@@ -307,3 +307,27 @@ def test_elevation_decides_what_is_drawn_above_before_child_order():
     # equal Z: child order (the RelativeLayout content under the drawer's ComposeView)
     drawer, content = dump_node("view:218"), dump_node("view:207")
     assert exact(drawer, content) is True and guess(drawer, content) is True
+
+
+def test_the_hints_lead_where_opt_in_tb_codes_are_listed():
+    # C2 BAD (live): the reading view shows !out_of_order, which lint() does not list
+    from inspector_widget.capture import query as q
+
+    ix, raw = F.live_capture("tb_c2_bad")
+    out = q.outline(ix, view="reading", loaded=raw)
+    assert any("!out_of_order" in x for x in out["lines"])
+    assert out["next"][0] == 'lint(rules=["tb"])'
+    # a node found for a TalkBack rule shows that rule's code
+    found = q.find(ix, issue="tb.out_of_order")["lines"]
+    assert found and all("!out_of_order" in x for x in found)
+    assert not any("!out_of_order" in x for x in q.find(ix, flags="click")["lines"])
+
+
+def test_an_empty_tb_lint_points_at_a_walk():
+    # C12 BAD (live): a focus trap, which only a walk shows
+    ix, raw = F.live_capture("tb_c12_bad")
+    out = analyzers.lint_view(ix, raw, rules=["tb"])
+    assert out["rules"] == [] and "walk" in out["note"]
+    assert out["next"] == ['outline(view="reading",explain=true)', "tb_walk()"]
+    # the default lint says nothing of the kind
+    assert "note" not in analyzers.lint_view(ix, raw)

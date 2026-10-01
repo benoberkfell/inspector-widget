@@ -1318,6 +1318,12 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if not explicit and any(i.id.startswith("render.") for n in ix.nodes.values()
                             for i in n.issues):
         nxt.append('find(issue="render.")')
+    if explicit and not kept and any(r.startswith("tb.") for r in selected_set):
+        # nothing static: traps, loops and focus after an action or a list update show
+        # only on the device
+        out["note"] = ("no static TalkBack finding; a trap, a loop, or focus lost after an "
+                       "action or a list update shows only in a walk (tb_walk, tb_scenario)")
+        nxt += ['outline(view="reading",explain=true)', "tb_walk()"]
     nxt = next_hints(nxt)
     if nxt:
         out["next"] = nxt

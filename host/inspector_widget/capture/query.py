@@ -1424,13 +1424,16 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
     # the expand hint follows the cut that hides the most (+N), ties in tree
     # order: the message list's +67, not the toolbar's +5 above it
     biggest_cut_at: list[_Item | None] = [None]
-    render_upto, a11y_upto = [False], [False]
+    render_upto, a11y_upto, tb_upto = [False], [False], [False]
     for it in span:
         best = biggest_cut_at[-1]
         biggest_cut_at.append(it if it.cut and (best is None or it.plus > best.plus) else best)
         ids = [i.id for i in ix.nodes[it.anchor].issues]
         render_upto.append(render_upto[-1] or any(x.startswith("render.") for x in ids))
         a11y_upto.append(a11y_upto[-1] or any(x.startswith("a11y.") for x in ids))
+        # the reading view shows every tb.* code; lint() lists only the default ones
+        tb_upto.append(tb_upto[-1] or (view == "reading" and any(
+            x.startswith("tb.") and x not in R.DEFAULT_TB for x in ids)))
 
     def footer(shown: int, more: bool) -> dict[str, Any]:
         f: dict[str, Any] = {"shown": shown}
@@ -1451,6 +1454,8 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
                                                 if k not in ("root", "depth")}, root=ref))
         if render_upto[shown]:
             hints.append(call("find", issue="render."))
+        if tb_upto[shown]:
+            hints.append(call("lint", rules=["tb"]))
         if a11y_upto[shown]:
             hints.append(call("lint"))
         if reveal is not None:
@@ -1797,13 +1802,17 @@ def find(ix: Index, **params: Any) -> dict[str, Any]:
     cid = _cid(ix)
     if count_only:
         return {"capture": cid, "total": total}
+    # a node found for a TalkBack rule shows that rule's code, opt-in or not
+    issue_arg = params.get("issue")
+    tb_issue = any(str(x).strip().lower().startswith("tb") for x in (
+        issue_arg if isinstance(issue_arg, (list, tuple)) else [issue_arg]) if x)
     if offset > total:
         raise _bad(f"cursor offset {offset} is past the end ({total} hits)")
 
     def render(i: int, minimal: bool) -> Any:
         n = hits[i]
         row = {"ref": n.id} if minimal else node_row(
-            ix, n, fields, crumbs=L.breadcrumbs(ix, n), props_fn=props_fn)
+            ix, n, fields, crumbs=L.breadcrumbs(ix, n), props_fn=props_fn, all_tb=tb_issue)
         return row if fmt == "json" else L.format_line(row)
 
     base: dict[str, Any] = {"capture": cid, "total": total}
