@@ -690,7 +690,10 @@ def execute(name: str, args: Any, ctx: ops.OpContext, *, surface: str = "mcp",
     except passthrough:
         raise
     except Exception as exc:  # noqa: BLE001 - the agent-facing envelope
-        return Result(listed_hint(ops.error_envelope(exc), ctx.listed))
+        # a caller of a tool it does not list (called by name) knows the hidden ones
+        listed = ctx.listed if ts is not None and ctx.listed is not None \
+            and ts.name in ctx.listed else None
+        return Result(listed_hint(ops.error_envelope(exc), listed))
     images: list[tuple[str, str]] = []
     if inline and isinstance(doc.get("path"), str):
         from .capture import images as cimages
