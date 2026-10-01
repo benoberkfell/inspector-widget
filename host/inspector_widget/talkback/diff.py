@@ -73,7 +73,15 @@ FIXES = {
     "tb.escape": "Use a real Dialog / ModalBottomSheet, or hide the content behind the overlay while "
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
+    "tb.covered_stop": "While the overlay is shown, hide what it covers from accessibility "
+                       "(View: importantForAccessibility=noHideDescendants on the covered "
+                       "View, restored when it goes; Compose: hideFromAccessibility), and move "
+                       "accessibility focus into the overlay; or let the overlay replace it in "
+                       "the hierarchy (an action mode without windowActionModeOverlay).",
 }
+#: the overlays focus can be inside of and walk out of (tb.escape); the rest only cover
+#: (tb.covered_stop: an action-mode bar over the toolbar)
+ESCAPE_KINDS = ("scrim", "sheet", "drawer", None)
 # tb.double_stop where both stops are Views / Compose nodes (FIXES names both).
 FIX_DOUBLE_VIEW = ("Make one of the two the stop: expose the inner control as an "
                    "AccessibilityAction on the row (ViewCompat.addAccessibilityAction) and set "
@@ -406,9 +414,7 @@ def _ghost_reasons(s: Dict[str, Any], density: int) -> List[str]:
             reasons.append("sliver")
     if s.get("under_system_bar"):
         reasons.append("under a system bar")  # outside the window's interactive region
-    cov = s.get("covered_by")
-    if cov and not s.get("_escape"):
-        reasons.append(f"occluded by {cov.get('ref') or cov.get('overlay')}")
+    # drawn under an overlay: tb.covered_stop (or tb.escape) says so, with the overlay's fix
     return reasons
 
 
@@ -490,7 +496,7 @@ def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
             why, first = ("window", s["window_covered_by"]), s
         else:
             cov = s.get("covered_by")
-            if not cov or not cov.get("rect"):
+            if not cov or not cov.get("rect") or cov.get("kind") not in ESCAPE_KINDS:
                 continue
             orect = tuple(cov["rect"])
             inside = [m for m in moves[:j] if not m.get("covered_by") and _rect(m)
@@ -524,6 +530,41 @@ def _check_escape(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
         f = _finding("tb.escape", "error", msg, steps)
         f["overlay"] = cov.get("ref") or cov.get("overlay")
         f["from"] = first.get("ref")
+        out.append(f)
+    return out[:5]
+
+
+def _check_covered(walk: Dict[str, Any], escapes: Sequence[Dict[str, Any]] = ()
+                   ) -> List[Dict[str, Any]]:
+    """tb.covered_stop: stops something in their own window draws over (an action-mode bar
+    over the toolbar, a sheet the walk never was inside of) that TalkBack read anyway: one
+    finding per overlay, every step named. An overlay focus escaped (tb.escape) is that
+    finding's: the stops behind it read before going in are the same defect."""
+    escaped = {f.get("overlay") for f in escapes}
+    groups: Dict[Any, List[Dict[str, Any]]] = {}
+    for s in _moves(walk["steps"]):
+        cov = s.get("covered_by")
+        if not cov or s.get("_escape") or s.get("window_covered_by") is not None:
+            continue
+        over = cov.get("ref") or cov.get("overlay")
+        if over in escaped:
+            continue
+        groups.setdefault(over, []).append(s)
+    out = []
+    for overlay, steps in groups.items():
+        cov = steps[0]["covered_by"]
+        seen: List[Dict[str, Any]] = []
+        for s in steps:  # a stop read again (a wrap) is the same covered stop
+            if _pk(s) not in [_pk(x) for x in seen]:
+                seen.append(s)
+        a, b = seen[0], seen[-1]
+        at = f"step {a['i']}" if a is b else f"steps {a['i']}-{b['i']}"
+        what = cov.get("kind") or "overlay"
+        f = _finding("tb.covered_stop", "warn",
+                     f"{at}: TalkBack read {len(seen)} stop(s) that {overlay} ({cov.get('cls')}, "
+                     f"a {what}) draws over, first {_name(a)}: hidden on screen, reachable "
+                     f"only by swiping", seen)
+        f["overlay"] = overlay
         out.append(f)
     return out[:5]
 
@@ -876,7 +917,9 @@ def analyze(walk: Dict[str, Any], expect: Optional[Sequence[str]] = None) -> Dic
     findings += _check_cut_off_end(walk)
     findings += _check_window_order(walk)
     findings += _check_orphans(walk)
-    findings += _check_escape(walk)
+    escapes = _check_escape(walk)
+    findings += escapes
+    findings += _check_covered(walk, escapes)
     findings += _check_skipped(walk)
     findings += _check_ghosts(walk)
     findings += _check_double(walk)

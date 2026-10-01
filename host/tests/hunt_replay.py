@@ -157,7 +157,7 @@ def replay(name: str, *, analyze: bool = True) -> Dict[str, Any]:
                     None)
     rec: Dict[str, Any] = {
         "steps": records, "predicted": predicted, "model": model.source,
-        "ended": e.get("ended") or "max_steps", "direction": direction, "until": "steps",
+        "ended": e.get("ended") or _ended(e["steps"]), "direction": direction, "until": "steps",
         "cycle": [], "edge": walk._edge_info(idx, last.node, direction) if last else None,
         "density": int(e.get("density") or 480), "legacy_ids": legacy,
         "walk": e.get("walk") or name, "package": None,
@@ -170,6 +170,19 @@ def replay(name: str, *, analyze: bool = True) -> Dict[str, Any]:
         res = diff.analyze(rec)
         rec["findings"], rec["vs_model"] = res["findings"], res["vs_model"]
     return rec
+
+
+def _ended(steps: List[Any]) -> str:
+    """How an entry without ``ended`` ended: a wrap when a move after an edge reads a stop
+    read before, else at its last press."""
+    seen, edge = set(), False
+    for moved, key, _label, _said in steps:
+        if not moved:
+            edge = True
+        elif edge and key in seen:
+            return "wrap"
+        seen.add(key)
+    return "max_steps"
 
 
 @lru_cache(maxsize=None)

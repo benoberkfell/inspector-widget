@@ -947,6 +947,9 @@ def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None =
         tb_pairs, tb_diags = _tb_issues(ix, src, density)
         lint_pairs.extend(tb_pairs)
         diags.extend(tb_diags)
+        from .tb import cover_lint
+
+        cover_lint(lint_pairs)  # findings under a same-window overlay: counted apart
 
     for n in ix.nodes.values():
         if n.issues:

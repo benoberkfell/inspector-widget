@@ -29,9 +29,16 @@ Codes, with what each looks at:
     A same-window scrim (a clickable node over most of the window) with stops drawn under
     it that TalkBack still reaches: focus walks out of the dialog or sheet. Or, with no
     scrim, a View over most of the window that holds stops and is drawn over others (an
-    expanded persistent bottom sheet, a fragment added over another). Needs to know
-    what is drawn above what (``drawn_above``, from the capture's View tree); without it
-    the rule says nothing.
+    expanded persistent bottom sheet, a fragment added over another), or an open drawer
+    whose content TalkBack still gets. What covers what is :mod:`.occlusion`'s (a View
+    covers only where it draws: AntennaPod's empty loading frame covers nothing). Needs to
+    know what is drawn above what (``drawn_above``, from the capture's View tree); without
+    it the rule says nothing.
+``tb.covered_stop``
+    A stop something smaller in its own window draws over, which TalkBack still reads by
+    swiping: Thunderbird's toolbar under the action-mode bar (TB-4). A tb.out_of_order on
+    the overlay's own stops (read last: it is added at the end of the View tree) says
+    ``why: in_overlay`` and names the overlay, once for its whole run of stops.
 ``tb.window_order``
     A window TalkBack reads after the window under it although it sits over that window's
     content (a non-focusable popup sorted by its top edge, WindowTraversal.java:52).
@@ -65,14 +72,15 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set,
 from . import rules as R
 from .diff import with_abbreviations
 from .explain import ghost_reasons
+from .occlusion import Cover, DictAccess, Occlusion
 from .order import Navigator
 from .speech import Announcement, SpeechState, announce
 from .tree import Rect, TbNode, TbWindow
 from .visual import cut_order, order_items
 
 CODES = ("tb.double_stop", "tb.ghost_stop", "tb.out_of_order", "tb.boundary_jump",
-         "tb.escape", "tb.window_order", "tb.wrong_announcement", "tb.edge_stuck",
-         "tb.skipped", "tb.custom_action_missing")
+         "tb.escape", "tb.covered_stop", "tb.window_order", "tb.wrong_announcement",
+         "tb.edge_stuck", "tb.skipped", "tb.custom_action_missing")
 DOUBLE_STOP_OVERLAP = 0.6  # share of the inner stop's words the outer one already says
 SCRIM_AREA = 0.6           # a scrim covers at least this share of its window
 TINY_DP = 4                # a stop thinner than this has no visible area
@@ -85,6 +93,8 @@ _ROLE_STATE = {"button", "switch", "check", "box", "checkbox", "image", "edit", 
 
 #: drawn_above(a, b): True when ``a`` is drawn over ``b``, False when under, None unknown.
 DrawnAbove = Callable[[Any, Any], Optional[bool]]
+#: props(view id): the capture's View properties ({name: value}), for what a View paints.
+Props = Callable[[int], Any]
 #: view_chain(view id): the View's ancestors in the app's View hierarchy, nearest first, as
 #: (view id, (x, y, w, h)); the accessibility dump leaves out the Views TalkBack never gets.
 ViewChain = Callable[[int], List[Tuple[int, Tuple[int, int, int, int]]]]
@@ -105,13 +115,15 @@ class Finding:
 
 class _Ctx:
     def __init__(self, nav: Navigator, density: int, drawn_above: Optional[DrawnAbove],
-                 view_chain: Optional[ViewChain] = None):
+                 view_chain: Optional[ViewChain] = None, props: Optional[Props] = None):
         self.nav = nav
         self.rules = nav.rules
         self.tree = nav.tree
         self.density = max(1, int(density or 420))
         self.drawn_above = drawn_above
         self.view_chain = view_chain
+        self.props = props
+        self._covers: Optional[Dict[int, Cover]] = None
         self.stops: List[TbNode] = nav.linear()
         self.stop_ids: Set[int] = {id(n) for n in self.stops}
         self._own: Dict[int, Announcement] = {}
@@ -152,6 +164,14 @@ class _Ctx:
 
     def dp(self, px: float) -> float:
         return px * 160.0 / self.density
+
+    def covers(self) -> Dict[int, Cover]:
+        """``{id(dump node): Cover}`` (:mod:`.occlusion`) for the stops and dump nodes a
+        same-window overlay covers; empty when what is drawn above what is unknown."""
+        if self._covers is None:
+            self._covers = covers(self.nav, self.drawn_above, self.props) \
+                if self.drawn_above is not None else {}
+        return self._covers
 
 
 
@@ -306,25 +326,28 @@ def _group(n: TbNode) -> str:
 
 
 def _layers(cx: _Ctx, w: TbWindow, stops: List[TbNode]) -> Optional[List[List[TbNode]]]:
-    """The window's stops split by what a same-window scrim covers (under it / over it), so
-    each layer is ordered on its own; None when a scrim is there and what is drawn above
+    """The window's stops split by what a same-window overlay covers (the rest / under it),
+    so each layer is ordered on its own; None when a scrim is there and what is drawn above
     what is unknown (a reading order across layers means nothing)."""
-    scrims = _scrims(cx, w)
-    if not scrims:
-        return [stops]
-    sc = max(scrims, key=lambda r: _area(_rect_of(r)))
-    inside = _subtree_ids(sc)
-    over: List[TbNode] = []
-    under: List[TbNode] = []
-    for s in stops:
-        if id(s.raw) in inside:
-            over.append(s)
-            continue
-        above = cx.drawn_above(sc, s.raw) if cx.drawn_above is not None else None
-        if above is None:
-            return None
-        (under if above else over).append(s)
+    if cx.drawn_above is None:
+        return None if _scrims(cx, w) else [stops]
+    cov = cx.covers()
+    under = [s for s in stops if id(s.raw) in cov]
+    over = [s for s in stops if id(s.raw) not in cov]
     return [x for x in (over, under) if x]
+
+
+def _overlay_of(cx: _Ctx, n: TbNode) -> Optional[Any]:
+    """The overlay ``n`` sits inside when that overlay covers stops read before it: why an
+    action-mode bar (or a sheet) added at the end of the View tree is read last."""
+    cov = cx.covers()
+    if not cov:
+        return None
+    anc = cx.raw_ancestors(n.raw) | {id(n.raw)}
+    for c in cov.values():
+        if id(c.overlay) in anc:
+            return _node_of(cx, c.overlay)
+    return None
 
 
 def _orders(cx: _Ctx) -> Iterator[Finding]:
@@ -473,16 +496,29 @@ def _order_layer(cx: _Ctx, stops: List[TbNode]) -> Iterator[Finding]:
     visual = _visual(cx, items)
     rank = {id(n): i for i, n in enumerate(visual)}
     keep = _lis([rank[id(n)] for n in items])
+    run: Optional[Finding] = None  # the out-of-order stops of one overlay, read in a row
     for i, n in enumerate(items):
         if i in keep or _authored(cx, n):
+            run = None
             continue
         prev = items[i - 1] if i > 0 else None
         nxt = items[i + 1] if i + 1 < len(items) else None
         crosses = any(o is not None and _group(o) != _group(n) for o in (prev, nxt))
-        yield Finding("tb.boundary_jump" if crosses else "tb.out_of_order", "warn", n,
-                      [prev] if prev is not None else [],
-                      {"read": i + 1, "visual": rank[id(n)] + 1, "of": len(items)},
-                      conf="heuristic")
+        others = [prev] if prev is not None else []
+        ev: Dict[str, Any] = {"read": i + 1, "visual": rank[id(n)] + 1, "of": len(items)}
+        overlay = _overlay_of(cx, n)
+        if overlay is not None:
+            # drawn over stops read before it and added at the end of the View tree (an
+            # action-mode bar over the toolbar): its stops are read last, one misplacement
+            if run is not None and run.others and run.others[-1] is overlay:
+                run.evidence["stops"] = run.evidence.get("stops", 1) + 1
+                continue
+            ev["why"] = "in_overlay"
+            others.append(overlay)
+        f = Finding("tb.boundary_jump" if crosses else "tb.out_of_order", "warn", n,
+                    others, ev, conf="heuristic")
+        run = f if overlay is not None else None
+        yield f
 
 
 # ------------------------------------------------------------------------------------------
@@ -544,86 +580,70 @@ def _center_in(r: Rect, o: Rect) -> bool:
     return o.left <= cx < o.right and o.top <= cy < o.bottom
 
 
-def _under(cx: _Ctx, scrim: Dict[str, Any], raws: Sequence[Dict[str, Any]]) -> List[Any]:
-    """The dump nodes of ``raws`` drawn under ``scrim`` (their centre inside it), as far as
-    ``drawn_above`` can tell; empty without it."""
-    if cx.drawn_above is None:
-        return []
-    inside = _subtree_ids(scrim)
-    above_it = cx.raw_ancestors(scrim)
-    sr = _rect_of(scrim)
-    out = []
-    for raw in raws:
-        if id(raw) in inside or id(raw) in above_it or not _center_in(_rect_of(raw), sr):
-            continue
-        if cx.drawn_above(scrim, raw) is True:
-            out.append(raw)
+def covers(nav: Navigator, drawn_above: Optional[DrawnAbove] = None,
+           props: Optional[Props] = None) -> Dict[int, Cover]:
+    """What a same-window overlay covers (:mod:`.occlusion`), by ``id`` of the dump node: every
+    stop under an overlay, and every dump node under a scrim, a sheet or an open drawer (what
+    a modal surface hides). ``drawn_above`` (the capture's View tree) orders Views; where it
+    cannot tell, the dump's drawing order does."""
+    tree = nav.tree
+    roots = [w.root.raw for w in tree.windows if w.root is not None and w.reported]
+    acc = DictAccess(roots, props)
+    frames = {id(w.root.raw): (w.bounds.left, w.bounds.top, w.bounds.width, w.bounds.height)
+              for w in tree.windows if w.root is not None}
+    occ = Occlusion(acc, drawn_above=drawn_above)
+    occ._window_rect = lambda n: frames.get(id(occ.root(n)))  # type: ignore[assignment]
+    stops = {id(n.raw) for n in nav.linear()}
+    out: Dict[int, Cover] = {}
+    for r in roots:
+        stack = [r]
+        while stack:
+            raw = stack.pop()
+            stack.extend(raw.get("children") or ())
+            if not (raw.get("text") or raw.get("content_description")
+                    or id(raw) in stops or set(raw.get("flags") or ()) & {"clickable",
+                                                                         "focusable"}):
+                continue  # nothing to hear or act on: no matter what is over it
+            c = occ.covered_by(raw)
+            if c is not None and (id(raw) in stops or c.kind != "bar"):
+                out[id(raw)] = c
     return out
 
 
+def _node_of(cx: _Ctx, raw: Dict[str, Any]) -> Any:
+    return cx.tree.by_raw.get(id(raw)) or cx.tree.excluded_by_raw.get(id(raw))
+
+
 def _overlays(cx: _Ctx) -> Iterator[Tuple[Any, List[TbNode], int]]:
-    """``(overlay node, the stops drawn under it, its % of the window)`` for every scrim
-    with a dialog or sheet over it (tb.escape's overlays)."""
-    for w in cx.nav.windows:
-        if not w.reported:
-            continue
-        stops = [n for n in cx.stops if n.window is w]
-        for scrim in _scrims(cx, w):
-            under = _under(cx, scrim, [n.raw for n in stops])
-            if not under:
-                continue
-            inside = _subtree_ids(scrim)
-            if not any(n.raw is not scrim and (id(n.raw) in inside
-                                               or cx.drawn_above(n.raw, scrim) is True)
-                       for n in stops):
-                continue  # nothing over the scrim: no dialog or sheet to walk out of
-            node = cx.tree.by_raw.get(id(scrim)) or cx.tree.excluded_by_raw.get(id(scrim))
-            if node is None:
-                continue
-            pct = round(100 * _area(_rect_of(scrim).intersect(w.bounds))
-                        / max(1, _area(w.bounds)))
-            yield node, [cx.tree.by_raw[id(r)] for r in under], pct
-        yield from _sheets(cx, w, stops)
-
-
-def _sheets(cx: _Ctx, w: TbWindow, stops: List[TbNode]
-            ) -> Iterator[Tuple[Any, List[TbNode], int]]:
-    """Overlays with no scrim: a View over most of the window that holds stops of its own and
-    is drawn over other stops (their centre inside it), which TalkBack still reaches. An
-    expanded persistent bottom sheet (AntennaPod's player: BottomSheetBehavior hides nothing
-    when it is not modal) or a fragment added over another one; focus walks out of it into
-    the screen it covers. Only Views (a Compose host drawn over Views is often a transparent
-    overlay), not scrollables (a list laid over a header), not the window root, and the
-    outermost such View; a scrim's dialog is :func:`_overlays`' own case."""
-    if cx.drawn_above is None:
+    """``(overlay node, the stops drawn under it, its % of the window)`` for every scrim with
+    a dialog or sheet over it, every surface with stops of its own drawn over others (an
+    expanded persistent bottom sheet: BottomSheetBehavior hides nothing when it is not modal;
+    a fragment added over another) and every open drawer whose content TalkBack still gets:
+    tb.escape's overlays, focus walks out of them into the screen they cover. A Compose host
+    drawn over Views is often a transparent overlay (a snackbar host): only its scrim counts."""
+    cov = cx.covers()
+    if not cov:
         return
-    area = max(1, _area(w.bounds))
-    stop_raw = [n.raw for n in stops]
-    scrims = {id(r) for r in _scrims(cx, w)}
-    taken: Set[int] = set()  # the subtrees of sheets already reported
-    for raw, parent in _raw_nodes(w):
-        if parent is None or id(raw) in taken or "visible_to_user" not in (raw.get("flags") or ()):
-            continue
-        if int(raw.get("virtual_id", -1)) != -1 or "scrollable" in (raw.get("flags") or ()) \
-                or raw.get("provider_class"):
-            continue
-        if _area(_rect_of(raw).intersect(w.bounds)) < SCRIM_AREA * area:
-            continue
-        inside = _subtree_ids(raw)
-        if inside & scrims:
-            continue
-        own = [n for n in stops if id(n.raw) in inside]
-        if len(own) < 2:
-            continue
-        under = _under(cx, raw, stop_raw)
-        if not under:
-            continue
-        node = cx.tree.by_raw.get(id(raw)) or cx.tree.excluded_by_raw.get(id(raw))
+    groups: Dict[int, Tuple[Cover, List[TbNode]]] = {}
+    for n in cx.stops:
+        c = cov.get(id(n.raw))
+        if c is not None and c.kind in ("scrim", "sheet", "drawer"):
+            groups.setdefault(id(c.overlay), (c, []))[1].append(n)
+    for _k, (c, under) in groups.items():
+        o = c.overlay
+        inside = _subtree_ids(o)
+        own = [n for n in cx.stops if id(n.raw) in inside]
+        if c.kind == "scrim":
+            if not any(n.raw is not o and (id(n.raw) in inside
+                                           or cx.drawn_above(n.raw, o) is True)  # type: ignore[misc]
+                       for n in cx.stops if n.window is under[0].window):
+                continue  # nothing over the scrim: no dialog or sheet to walk out of
+        elif c.kind == "sheet" and len(own) < 2:
+            continue  # a cover, not a sheet to be inside of (tb.covered_stop)
+        node = _node_of(cx, o)
         if node is None:
             continue
-        taken |= inside
-        pct = round(100 * _area(_rect_of(raw).intersect(w.bounds)) / area)
-        yield node, [cx.tree.by_raw[id(r)] for r in under], pct
+        yield node, under, round(100 * c.area)
 
 
 def _escapes(cx: _Ctx) -> Iterator[Finding]:
@@ -632,18 +652,41 @@ def _escapes(cx: _Ctx) -> Iterator[Finding]:
                       {"under": len(others), "area_pct": pct})
 
 
-def covered(nav: Navigator, drawn_above: Optional[DrawnAbove]) -> Optional[Dict[str, Any]]:
+def _covered_stops(cx: _Ctx) -> Iterator[Finding]:
+    """tb.covered_stop: a stop something drawn over it hides, which TalkBack still reaches by
+    swiping (not by touch): Thunderbird's toolbar under the action-mode bar (TB-4). Stops a
+    tb.escape already names (under a dialog's scrim, a sheet, a drawer) are left to it."""
+    cov = cx.covers()
+    if not cov:
+        return
+    escaped = {id(n) for _o, under, _p in _overlays(cx) for n in under}
+    for n in cx.stops:
+        c = cov.get(id(n.raw))
+        if c is None or id(n) in escaped:
+            continue
+        node = _node_of(cx, c.overlay)
+        yield Finding("tb.covered_stop", "warn", n, [node] if node is not None else [],
+                      {"kind": c.kind, "by": c.cls, "area_pct": round(100 * c.area)})
+
+
+def covered(nav: Navigator, drawn_above: Optional[DrawnAbove],
+            props: Optional[Props] = None) -> Optional[Dict[str, Any]]:
     """The stops drawn under a same-window overlay, by node key: ``{key: (overlay node,
-    its % of the window)}``, as tb.escape sees them; None when what is drawn above what is
-    unknown (no View tree). A walk bound to captures takes its "behind the overlay" from
-    here, so the lint and the walk agree on what an overlay covers."""
+    its % of the window, kind)}`` (:func:`covers`: ``scrim``, ``sheet``, ``drawer``,
+    ``bar``); None when what is drawn above what is unknown (no View tree). A walk bound to
+    captures takes its "behind the overlay" from here, so the lint and the walk agree on what
+    an overlay covers."""
     if drawn_above is None:
         return None
-    cx = _Ctx(nav, 420, drawn_above)
     out: Dict[str, Any] = {}
-    for node, under, pct in _overlays(cx):
-        for n in under:
-            out.setdefault(n.key, (node, pct))
+    stops = {id(n.raw): n for n in nav.linear()}
+    for rid, c in covers(nav, drawn_above, props).items():
+        n = stops.get(rid)
+        if n is None:
+            continue
+        node = nav.tree.by_raw.get(id(c.overlay)) or nav.tree.excluded_by_raw.get(id(c.overlay))
+        if node is not None:
+            out.setdefault(n.key, (node, round(100 * c.area), c.kind))
     return out
 
 
@@ -956,14 +999,15 @@ def _pagers(cx: _Ctx) -> Iterator[Finding]:
 # ------------------------------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------------------------------
-_CHECKS = (_double_stops, _ghosts, _orders, _escapes, _skipped, _unspoken, _window_orders,
-           _speech_order, _positions, _past_edge, _pagers)
+_CHECKS = (_double_stops, _ghosts, _orders, _escapes, _covered_stops, _skipped, _unspoken,
+           _window_orders, _speech_order, _positions, _past_edge, _pagers)
 
 
 def findings(nav: Navigator, *, density: int = 420,
              drawn_above: Optional[DrawnAbove] = None,
              view_chain: Optional[ViewChain] = None,
-             codes: Optional[Sequence[str]] = None) -> List[Finding]:
+             codes: Optional[Sequence[str]] = None,
+             props: Optional[Props] = None) -> List[Finding]:
     """Every static finding over ``nav``'s TalkBack view.
 
     ``density``: the device dpi (sizes in dp). ``drawn_above(a, b)``: True when dump node
@@ -971,8 +1015,10 @@ def findings(nav: Navigator, *, density: int = 420,
     ``capture/tb.py``), else False/None; without it ``tb.escape`` stays silent.
     ``view_chain(view id)``: the View's ancestors (the capture's View tree), so the visual
     order keeps a column or row of Views together even when the dump leaves the
-    container out. ``codes``: only these rules."""
-    cx = _Ctx(nav, density, drawn_above, view_chain)
+    container out. ``codes``: only these rules. ``props(view id)``: the capture's View
+    properties, so an overlay with a background counts as drawn where it has no children
+    (:mod:`.occlusion`)."""
+    cx = _Ctx(nav, density, drawn_above, view_chain, props)
     want = set(codes) if codes else None
     out: List[Finding] = []
     for check in _CHECKS:
@@ -982,5 +1028,5 @@ def findings(nav: Navigator, *, density: int = 420,
     return out
 
 
-__all__ = ["CODES", "Finding", "covered", "findings", "ghost", "show_on_screen",
+__all__ = ["CODES", "Finding", "covered", "covers", "findings", "ghost", "show_on_screen",
            "visual_ranks"]

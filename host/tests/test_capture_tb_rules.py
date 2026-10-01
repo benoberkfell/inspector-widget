@@ -160,8 +160,11 @@ def test_the_default_lint_reports_the_precise_tb_rules():
     esc = rules["tb.escape"]
     assert esc["sev"] == "error" and esc["fix"].startswith("A real Dialog")
     assert esc["nodes"] == ["view:12 View 9 stops under it (90% of the window), e.g. view:3 view:4"]
+    # the touch-target findings on the 8 buttons the scrim covers are counted apart, as they
+    # are under a dialog window (G5)
     assert analyzers.lint_summary(ix)["lint"] == (
-        "2 error 10 warn: 10 touch_target, 1 label_missing, 1 escape (contrast not run)")
+        "2 error 2 warn: 2 touch_target, 1 label_missing, 1 escape; +8 under an open dialog "
+        "(contrast not run)")
 
 
 def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():

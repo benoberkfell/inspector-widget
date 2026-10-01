@@ -160,7 +160,11 @@ _CATALOG: tuple[Rule, ...] = (
        "Check its size modifiers or layout params"),
     _r("render.text_overflow", "warn", "Text is cut off or ellipsized.",
        "Allow more lines or room", planned=True),
-    _r("render.covered", "warn", "Drawn under another node.", planned=True),
+    _r("render.covered", "info",
+       "Drawn under a same-window overlay (a scrim, a sheet, an open drawer, an action-mode "
+       "bar): hidden on screen; its lint findings are counted apart.",
+       "Hide what the overlay covers from accessibility while it is shown (View "
+       "noHideDescendants, Compose hideFromAccessibility)"),
     _r("render.drawn_mismatch", "info", "Drawn pixels differ from the declared bounds.",
        planned=True),
     # TalkBack navigation, from the TalkBack model (capture/tb.py, talkback/static.py).
@@ -207,6 +211,11 @@ _CATALOG: tuple[Rule, ...] = (
        "A gesture-only action (swipe to dismiss, drag) has no accessibility action.",
        "Modifier.semantics { customActions = listOf(CustomAccessibilityAction(\"Delete\") "
        "{ … }) }; View: ViewCompat.addAccessibilityAction"),
+    _r("tb.covered_stop", "warn",
+       "A stop something in its own window draws over (an action-mode bar over the toolbar): "
+       "hidden on screen, TalkBack still reads it by swiping.",
+       "While the overlay shows, importantForAccessibility=noHideDescendants on what it "
+       "covers (Compose hideFromAccessibility), restored after; focus the overlay"),
 )
 
 _CATALOG = _unique_shorts(_CATALOG)

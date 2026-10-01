@@ -217,10 +217,19 @@ def test_escape_from_an_overlay_and_from_a_modal_window():
     assert esc["refs"] == ["view:61"] and esc["steps"] == [2]
     assert esc["overlay"] == "view:70" and esc["from"] == "view:72"
     assert "tb.ghost_stop" not in codes(res)  # an escape is not also reported as occluded
-    # Covered but never inside the overlay: an occluded ghost stop instead.
+    # Covered but never inside the overlay: a covered stop (TB-4's toolbar under the
+    # action-mode bar), not a ghost
     res = diff.analyze(record([step(0, "view:61", (20, 250, 320, 60), "Behind", via="start",
                                     covered_by=overlay)], ended="max_steps"))
-    assert codes(res) == ["tb.ghost_stop"]
+    assert codes(res) == ["tb.covered_stop"]
+    f = res["findings"][0]
+    assert f["overlay"] == "view:70" and f["steps"] == [0] and f["fix"].startswith("While")
+    # a bar (not a surface focus can be inside of) never makes an escape
+    bar = dict(overlay, kind="bar")
+    res = diff.analyze(record([step(0, "view:71", (20, 100, 320, 60), "OK", via="start"),
+                               step(1, "view:61", (20, 250, 320, 60), "Behind",
+                                    covered_by=bar)], ended="max_steps"))
+    assert codes(res) == ["tb.covered_stop"]
     modal = [step(0, "view:5", (0, 0, 100, 100), "Behind a dialog", via="start",
                   window_covered_by=77)]
     assert codes(diff.analyze(record(modal, ended="max_steps"))) == ["tb.escape"]

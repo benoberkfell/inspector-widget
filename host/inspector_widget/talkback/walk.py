@@ -1624,56 +1624,22 @@ def _inside(r: Rect, o: Rect) -> bool:
     return w > 0 and h > 0 and ox <= x and oy <= y and x + w <= ox + ow and y + h <= oy + oh
 
 
-def _covers(o: Node, cx: float, cy: float, win_area: int) -> bool:
-    ox, oy, ow, oh = o.bounds
-    return ow * oh >= 0.4 * win_area and ox <= cx < ox + ow and oy <= cy < oy + oh \
-        and "visible_to_user" in o.flags
-
-
-def _holds_scrim(o: Node, cx: float, cy: float, win_area: int) -> bool:
-    """A clickable node in o's subtree that covers the point and most of the window."""
-    stack = [o]
-    while stack:
-        m = stack.pop()
-        if "clickable" in m.flags and _covers(m, cx, cy, win_area):
-            return True
-        stack.extend(m.children)
-    return False
-
-
 def _covered_by(n: Node) -> Optional[Dict[str, Any]]:
-    """A later-drawn sibling subtree (of the node or an ancestor) that covers the
-    node's centre and a large part of the window: a same-window overlay.
+    """What draws over the node in its own window (:mod:`.occlusion`: a scrim, a sheet, an
+    open drawer, or a bar such as the action-mode bar over the toolbar), as the step record
+    keeps it: ``{"overlay", "kind", "cls", "pane_title", "area", "rect"}``; None when nothing
+    does. Only what draws counts: an empty full-screen FrameLayout drawn last (AntennaPod's
+    loading frame, its only child GONE) covers nothing. The walk's dump has no View
+    properties, so a View draws its whole box when it takes touches over most of the window
+    or is a surface (most of the window, with content of its own), else only where its
+    children draw."""
+    from .occlusion import NodeAccess, Occlusion
 
-    A Compose host reports drawing order 0 (Compose builds the host's node
-    itself), so among siblings with a known order it counts as drawn later when
-    it holds a clickable scrim over the node (a ComposeView "dialog" over Views)."""
-    x, y, w, h = n.bounds
-    cx, cy = x + w / 2, y + h / 2
-    root = n
-    for a in n.ancestors():
-        root = a
-    rx, ry, rw, rh = root.bounds
-    win_area = max(1, rw * rh)
-    child = n
-    for parent in n.ancestors():
-        sibs = parent.children
-        try:
-            pos = next(i for i, c in enumerate(sibs) if c is child)
-        except StopIteration:
-            pos = len(sibs)
-        later = sibs[pos + 1:]
-        if any(c.drawing_order for c in sibs):
-            later = [c for c in sibs if c is not child and (
-                c.drawing_order > child.drawing_order
-                or (not c.drawing_order and child.drawing_order and _holds_scrim(c, cx, cy, win_area)))]
-        for o in later:
-            ox, oy, ow, oh = o.bounds
-            if _covers(o, cx, cy, win_area):
-                return {"overlay": o.key, "cls": o.simple_cls, "pane_title": o.pane_title or None,
-                        "area": round(ow * oh / win_area, 2), "rect": list(o.bounds)}
-        child = parent
-    return None
+    c = Occlusion(NodeAccess()).covered_by(n)
+    if c is None:
+        return None
+    return {"overlay": c.key, "kind": c.kind, "cls": c.cls, "pane_title": c.pane_title,
+            "area": round(c.area, 2), "rect": list(c.rect)}
 
 
 def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: List[str],
@@ -1872,6 +1838,9 @@ def orphan_text(idx: DumpIndex, records: List[Dict[str, Any]], legacy: bool = Fa
             continue
         toks = diff._tokens(words)
         if toks and not (toks & spoken):
+            cov = _covered_by(n) if isinstance(n, Node) else None
+            if cov is not None and cov.get("kind") != "bar":
+                continue  # behind a drawer's scrim, a sheet or a dialog: nobody sees it
             out.append({"key": n.key if not legacy else None, "text": words[:60], "bounds": list(n.bounds)})
             if len(out) >= limit:
                 break

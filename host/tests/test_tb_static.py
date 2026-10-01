@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from inspector_widget import talkback as tb
 from inspector_widget.talkback import rules as R
-from inspector_widget.talkback import static
+from inspector_widget.talkback import occlusion, static
 
 from test_tb_rules import CLICK, FOCUS, SRF, c, compose_host, n, root
 
@@ -334,3 +334,103 @@ def test_focus_walking_out_of_an_expanded_sheet_with_no_scrim_is_an_escape():
     r2, sheet2 = _player_over_feed({"provider_class": "AndroidComposeView"})
     assert findings(r2, drawn_above=lambda a, b: True if a is sheet2 else None,
                     codes=["tb.escape"]) == []
+
+
+# ------------------------------------------------------------------- G5: one occlusion model
+def _action_mode(bar_kw=None):
+    """Thunderbird in selection mode (TB-4): AppCompat's ActionBarContextView (a11y class
+    ViewGroup) drawn over the MaterialToolbar (windowActionModeOverlay), the list below."""
+    toolbar = n(22, cls="android.view.ViewGroup", b=(0, 156, 1280, 192), children=[
+        n(32, cls="android.widget.ImageButton", cd="Navigate up", flags=FOCUS, actions=[CLICK],
+          b=(0, 168, 168, 168)),
+        n(24, cls="android.widget.TextView", text="Inbox", b=(168, 208, 162, 88)),
+        n(86, cls="android.widget.ImageView", cd="Search", flags=FOCUS, actions=[CLICK],
+          b=(872, 180, 144, 144))])
+    toolbar.pop("important_for_accessibility")
+    rows = [n(40 + i, cls="android.widget.TextView", text=f"Message {i}", flags=FOCUS,
+              actions=[CLICK], b=(0, 400 + 200 * i, 1280, 200)) for i in range(5)]
+    content = n(20, cls="android.widget.RelativeLayout", b=(0, 0, 1280, 2856),
+                children=[toolbar, *rows], drawing_order=1)
+    bar = n(236, cls="android.view.ViewGroup", b=(0, 156, 1280, 192), drawing_order=2,
+            children=[n(237, cls="android.widget.ImageView", cd="Done", flags=FOCUS,
+                        actions=[CLICK], b=(0, 180, 168, 144)),
+                      n(255, cls="android.widget.TextView", text="1 selected",
+                        b=(216, 208, 302, 88)),
+                      n(244, cls="android.widget.Button", cd="Delete", flags=FOCUS,
+                        actions=[CLICK], b=(872, 180, 144, 144))], **(bar_kw or {}))
+    return root(content, bar, b=(0, 0, 1280, 2856)), bar
+
+
+def test_the_toolbar_under_an_action_mode_bar_is_covered():
+    # TB-4: TalkBack reads the toolbar the action-mode bar hides first and the bar last
+    r, bar = _action_mode()
+
+    def above(a, b):
+        return True if a is bar else (False if b is bar else None)
+
+    fs = findings(r, drawn_above=above, codes=["tb.covered_stop", "tb.out_of_order"])
+    cov = [f for f in fs if f.code == "tb.covered_stop"]
+    assert [f.node.key for f in cov] == ["view:32", "view:24", "view:86"]
+    assert all(f.others[0].key == "view:236" and f.evidence["kind"] == "bar" for f in cov)
+    # the bar's stops are read last: one out-of-order finding for the whole bar, which says why
+    order = [f for f in fs if f.code == "tb.out_of_order"]
+    assert [(f.node.key, f.evidence.get("why"), f.evidence.get("stops")) for f in order] == [
+        ("view:237", "in_overlay", 3)]
+    assert order[0].others[-1].key == "view:236"
+    # the same from the dump's own drawing order, as a walk sees it (no View tree)
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert occ.covered_by(r["children"][0]["children"][0]["children"][0]).key == "view:236"
+
+
+def test_an_empty_frame_drawn_last_covers_nothing():
+    # AP-4: AntennaPod's loading FrameLayout (no background, its only child GONE) over the
+    # episode page was taken for an overlay (tb.escape, ghost "occluded by view:898")
+    page = [n(876, cls="android.widget.ImageView", cd="Open podcast", flags=FOCUS,
+              actions=[CLICK], b=(48, 410, 168, 168)),
+            n(885, cls="android.widget.TextView", text="Stream", flags=FOCUS, actions=[CLICK],
+              b=(48, 641, 592, 144))]
+    frame = n(898, cls="android.widget.FrameLayout", b=(0, 348, 1280, 2052), drawing_order=3)
+    frame.pop("important_for_accessibility")
+    r = root(*page, frame, b=(0, 0, 1280, 2856))
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert [occ.covered_by(p) for p in page] == [None, None]
+    # with a background (the capture's View properties) it does cover them
+    occ, _roots = occlusion.for_dump(
+        {"windows": [{"root_view_id": 1, "root": r}]},
+        props=lambda vid: {"background": "#FFFFFFFF"} if vid == 898 else {})
+    assert occ.covered_by(page[0]).kind == "sheet"
+    assert occlusion.paints("#00000000") is False and occlusion.paints("RippleDrawable") is False
+
+
+def test_a_touch_area_over_its_icon_covers_nothing():
+    # Thunderbird's star_click_area: a transparent clickable View over the star image
+    star = n(463, cls="android.widget.ImageView", cd="Star", b=(1160, 1737, 72, 72))
+    area = n(470, cd="Add star", flags=FOCUS, actions=[CLICK], b=(1136, 1618, 144, 279))
+    r = root(n(450, cls="android.widget.FrameLayout", b=(0, 1618, 1280, 279),
+               children=[star, area]), b=(0, 0, 1280, 2856))
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert occ.covered_by(star) is None
+
+
+def test_an_open_drawer_covers_all_of_the_content():
+    # DrawerLayout's scrim covers the content where the drawer does not reach too (the
+    # strip right of a 1080px drawer); the content is hidden from accessibility as well, so
+    # its texts are no text TalkBack skipped (Thunderbird's drawer, wmuvqax)
+    content = n(250, cls="android.widget.RelativeLayout", b=(0, 0, 1280, 2856),
+                important_for_accessibility="NO_HIDE_DESCENDANTS",
+                children=[n(254, cls="android.widget.TextView", text="Inbox",
+                            b=(168, 208, 162, 88)),
+                          n(312, cls="android.widget.ImageView", cd="More options",
+                            flags=FOCUS, actions=[CLICK], b=(1160, 180, 120, 144))])
+    drawer = n(261, cls="androidx.compose.ui.platform.ComposeView", b=(0, 0, 1080, 2856),
+               children=[n(262, cls="android.widget.TextView", text="Outbox", flags=FOCUS,
+                           actions=[CLICK], b=(36, 591, 1008, 168))])
+    dl = n(249, cls="androidx.drawerlayout.widget.DrawerLayout", b=(0, 0, 1280, 2856),
+           children=[content, drawer])
+    nav = tb.Navigator(tb.build([root(dl, b=(0, 0, 1280, 2856))]))
+    cov = static.covers(nav)
+    kinds = {c.overlay["node_key"]: c.kind for c in cov.values()}
+    assert kinds == {"view:261": "drawer"} and len(cov) == 2  # "Inbox" and "More options"
+    # nothing to report: the app hides the content (that is the fix)
+    assert findings(root(dl, b=(0, 0, 1280, 2856)), drawn_above=lambda a, b: None,
+                    codes=["tb.covered_stop", "tb.escape", "tb.skipped"]) == []
