@@ -782,7 +782,8 @@ def _cut_raw(raw: RawCapture) -> tuple[RawCapture, int, int]:
     out.views = views.SerializeToString()
     comp = pb.DumpComposeResponse.FromString(raw.compose_sem)
     comp.diagnostics = (comp.diagnostics + "; semantics_truncated: view#7 depth>80 subtrees=2; "
-                        "semantics_failed: view#9 owner_unreachable")
+                        "semantics_failed: view#9 owner_unreachable; "
+                        "redaction_unverified: view#9 (password fields cannot be identified)")
     out.compose_sem = comp.SerializeToString()
     a11y = pb.DumpA11yResponse.FromString(raw.a11y)
     a11y.diagnostics = (a11y.diagnostics or "nodes=1") + "; depth-truncated=4 (children below " \
@@ -797,11 +798,12 @@ def test_the_index_reports_what_the_agent_cut(viewscreen_raw):
     truncated / redacted (flags and view facet)."""
     raw, cut, red = _cut_raw(viewscreen_raw)
     ix = cx.build_index(raw)
-    assert ix.diagnostics[:6] == [
+    assert ix.diagnostics[:7] == [
         "views: depth-truncated=3 (children below 80 levels not sent)",
         "views: properties-failed=2",
         "compose: semantics_truncated: view#7 depth>80 subtrees=2",
         "compose: semantics_failed: view#9 owner_unreachable",
+        "compose: redaction_unverified: view#9 (password fields cannot be identified)",
         "a11y: depth-truncated=4 (children below 80 levels not sent)",
         'views: 1 View(s) have children the agent did not send (depth cap): '
         'find(flags=["truncated"])']

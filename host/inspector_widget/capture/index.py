@@ -1671,6 +1671,11 @@ INCOMPLETE_TOKENS = (
     "properties-changed", "compose_obfuscated", "semantics_failed", "semantics_unmerged",
     "semantics_partial", "semantics_truncated", "slot_failed", "slot_partial", "slot_truncated",
 )
+#: Tokens that say password redaction failed closed (CONTRACT §5): editable text
+#: whose password status the agent could not determine went out masked
+#: (redaction_masked), and the ComposeViews whose password fields it cannot
+#: identify (redaction_unverified). The dots an agent then reads are explained.
+REDACTION_TOKENS = ("redaction_unverified", "redaction_masked")
 #: RawCapture field -> the facet name a token is reported under.
 _DIAG_FACETS = (("views", "views", pb.DumpTreeResponse),
                 ("compose_sem", "compose", pb.DumpComposeResponse),
@@ -1680,8 +1685,9 @@ _DIAG_FACETS = (("views", "views", pb.DumpTreeResponse),
 
 def agent_diagnostics(raw: RawCapture) -> list[str]:
     """``facet: token`` for every token of the agent's per-facet diagnostics that
-    says the facet is incomplete (:data:`INCOMPLETE_TOKENS`), in facet order,
-    each once: a capture never presents a cut tree as a complete one."""
+    says the facet is incomplete (:data:`INCOMPLETE_TOKENS`) or that redaction
+    failed closed (:data:`REDACTION_TOKENS`), in facet order, each once: a
+    capture never presents a cut tree as a complete one."""
     out: list[str] = []
     for attr, facet, msg_type in _DIAG_FACETS:
         data = getattr(raw, attr, None)
@@ -1693,7 +1699,7 @@ def agent_diagnostics(raw: RawCapture) -> list[str]:
             continue
         for tok in text.split(";"):
             tok = tok.strip()
-            if tok.startswith(INCOMPLETE_TOKENS):
+            if tok.startswith(INCOMPLETE_TOKENS + REDACTION_TOKENS):
                 line = f"{facet}: {tok}"
                 if line not in out:
                     out.append(line)

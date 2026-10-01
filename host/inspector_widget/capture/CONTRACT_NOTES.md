@@ -783,7 +783,9 @@ with every consumer.
   - `diagnostics` starts with the agent's own incomplete-data tokens, one
     `facet: token` line each (`views: depth-truncated=3 (...)`, `compose:
     semantics_failed: view#9 ...`, `a11y: node-cap=...`; the prefixes are
-    `index.INCOMPLETE_TOKENS`, the list correlate's `summary["incomplete"]` uses),
+    `index.INCOMPLETE_TOKENS`, the list correlate's `summary["incomplete"]` uses,
+    plus `index.REDACTION_TOKENS`: `redaction_unverified` / `redaction_masked`,
+    which say editable text went out masked because redaction failed closed),
     then a count of the `truncated` Views with the `find` call that lists them.
     `fetch` marks the compose facet `unavailable` ("obfuscated: ...") when the
     agent reports `compose_obfuscated`, or the first `semantics_failed` token
