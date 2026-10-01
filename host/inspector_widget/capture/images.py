@@ -576,6 +576,11 @@ def overlay(loaded: Any, ix: Index, kind: str = "marks", marks: Any = "auto", *,
         base, bw, bh, f, (ox, oy) = _base(loaded, ix, wins, max_side)
 
     ids = {w.node.id for w in wins}
+    if kind == "lint" and target is None and not window:
+        # as the a11y overlay: a window under an open dialog is not drawn over the dialog
+        from .analyzers import covered_windows
+
+        ids -= set(covered_windows(ix, loaded))
     scope = [n for n, _ in ix.walk("ui") if n.window in ids and _visible(n)]
     if target is not None:
         tr = _rect(target.b) or (0, 0, 0, 0)

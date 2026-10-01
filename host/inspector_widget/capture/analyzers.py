@@ -64,6 +64,7 @@ from .model import (
     a11y_path_key,
     sem_key,
     view_key,
+    window_key,
 )
 from .rules import ALIASES, RULES
 
@@ -85,7 +86,8 @@ LINT_LIMIT = 30
 PER_RULE = 3
 #: bump when the cached lint shape or its input changes (derived/lint.<hash>.json);
 #: 2: the unified a11y tree replaced Compose semantics as the lint input
-LINT_CACHE_VERSION = 2
+#: 3: evidence ``covered_by`` (a finding under an open dialog)
+LINT_CACHE_VERSION = 3
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
 _EDGE_SLOP = 1
@@ -685,6 +687,10 @@ def _map_findings(report: Any, dump: _A11yDump, ix: Index, res: _LintResult,
             continue
         ev = _evidence(f, nid, dump, lookup)
         conf = "inferred" if ev.pop("low_confidence", False) else "exact"
+        cov = (getattr(f, "window", None) or {}).get("covered_by")
+        if cov is not None:
+            # on a window under an open dialog: the dialog's window, counted apart (_covered)
+            ev["covered_by"] = ix.resolve_id(window_key(int(cov))) or window_key(int(cov))
         res.issues.append((nid, Issue(f.rule, f.severity, ev, conf)))
     res.errors.extend(str(d.get("message")) for d in report.diagnostics
                       if d.get("code") == "rule.error")
@@ -963,14 +969,21 @@ def lint_summary(ix: Index) -> dict[str, str]:
                 sev_by[iss.sev] += 1
             elif iss.id.startswith("render."):
                 render_by.setdefault(R.short(iss.id), []).append(n.ref or n.id)
+    # findings under an open dialog are counted apart, as a11y_lint's summary does
+    covered = [i for n in ix.nodes.values() for i in n.issues if _covered(i)]
+    for iss in covered:
+        a11y_by[R.short(iss.id)] -= 1
+        sev_by[iss.sev] -= 1
+    a11y_by = +a11y_by
+    under = f"; +{len(covered)} under an open dialog" if covered else ""
     out: dict[str, str] = {}
     contrast = "contrast sampled" if _contrast_ran(ix) else "contrast not run"
     if a11y_by:
-        sevs = " ".join(f"{sev_by[s]} {s}" for s in R.SEVERITIES if sev_by[s])
+        sevs = " ".join(f"{sev_by[s]} {s}" for s in R.SEVERITIES if sev_by[s] > 0)
         rules = ", ".join(f"{c} {k}" for k, c in a11y_by.most_common())
-        out["lint"] = f"{sevs}: {rules} ({contrast})"
+        out["lint"] = f"{sevs}: {rules}{under} ({contrast})"
     else:
-        out["lint"] = f"no findings ({contrast})"
+        out["lint"] = f"no findings{under} ({contrast})"
     if render_by:
         parts = []
         for k, refs in sorted(render_by.items(), key=lambda kv: -len(kv[1])):
@@ -982,6 +995,44 @@ def lint_summary(ix: Index) -> dict[str, str]:
 
 def _contrast_ran(ix: Index) -> bool:
     return any(d.startswith("contrast: sampled") for d in ix.diagnostics)
+
+
+def _covered(iss: Issue) -> bool:
+    """A lint finding on a window under an open dialog or sheet (evidence ``covered_by``,
+    the dialog's window): TalkBack cannot reach it until the dialog closes."""
+    return bool((iss.evidence or {}).get("covered_by"))
+
+
+def covered_windows(ix: Index, loaded: Any) -> dict[str, str | None]:
+    """``{window id: the id of the modal window over it}`` for every window the stored
+    a11y tree puts under an open dialog or sheet (``covered_by``); empty without one."""
+    src = loaded if isinstance(loaded, _Src) else _Src(loaded)
+    dump = src.a11y_dump()
+    out: dict[str, str | None] = {}
+    for w in (dump.data.get("windows") or []) if dump is not None else []:
+        if w.get("covered_by") is None or w.get("root_view_id") is None:
+            continue
+        nid = ix.resolve_id(window_key(int(w["root_view_id"])))
+        if nid is not None:
+            out[nid] = ix.resolve_id(window_key(int(w["covered_by"])))
+    return out
+
+
+def _covered_out(ix: Index, covered: list[tuple[str, Issue]]) -> dict[str, Any]:
+    """lint()'s ``covered``: how many findings sit under an open dialog, on which windows,
+    under which dialog."""
+    wins: list[str] = []
+    by: list[str] = []
+    for nid, iss in covered:
+        w = ix.nodes[nid].window
+        wn = ix.nodes.get(w) if w else None
+        if wn is not None and _ref(wn) not in wins:
+            wins.append(_ref(wn))
+        dn = ix.get(str(iss.evidence.get("covered_by")))
+        d = _ref(dn) if dn is not None else str(iss.evidence.get("covered_by"))
+        if d not in by:
+            by.append(d)
+    return {"n": len(covered), "windows": wins, "by": by}
 
 
 # --------------------------------------------------------------------------- #
@@ -1191,6 +1242,11 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
             if wanted(iss.id) and R.at_least(iss.sev, severity)
             and (scope is None or nid in scope)]
     kept.sort(key=lambda p: (order.get(p[0], 1 << 30), p[1].id))
+    # Findings under an open dialog are counted apart (``covered``), as a11y_lint does, unless
+    # ``within`` asks for that part of the screen.
+    covered = [p for p in kept if _covered(p[1])]
+    if scope is None:
+        kept = [p for p in kept if not _covered(p[1])]
     counts = {s: 0 for s in R.SEVERITIES}
     for _, iss in kept:
         counts[iss.sev] = counts.get(iss.sev, 0) + 1
@@ -1200,6 +1256,8 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
         out["contrast"] = contrast_status
     if within:
         out["within"] = within
+    if covered:
+        out["covered"] = dict(_covered_out(ix, covered), listed=scope is not None)
     if unmapped:
         out["unmapped"] = len(unmapped)
     available = set(getattr(a11y_lint, "ALL_RULE_IDS", ())) | {
@@ -1244,6 +1302,8 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if not explicit and any(i.id.startswith("render.") for n in ix.nodes.values()
                             for i in n.issues):
         nxt.append('find(issue="render.")')
+    if covered and scope is None and out["covered"]["windows"]:
+        nxt.append(f'lint(within="{out["covered"]["windows"][0]}")')
     nxt = next_hints(nxt)
     if nxt:
         out["next"] = nxt

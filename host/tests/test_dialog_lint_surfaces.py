@@ -98,3 +98,41 @@ def test_inspect_node_counts_a_covered_finding_apart(nia):
     assert (s["error"], s["warn"], s["info"], s["total"]) == (0, 0, 0, 0)
     assert s["covered"] == {"error": 0, "warn": 0, "info": len(d["lint"]),
                             "total": len(d["lint"]), "windows": [DIALOG]}
+
+
+# ------------------------------------------------------------------------- the capture lint
+def test_the_capture_lint_counts_findings_under_the_dialog_apart(nia):
+    cap = nia.capture()
+    assert cap["lint"] == f"no findings; +{COVERED} under an open dialog (contrast not run)"
+    ix = nia.index(cap["capture"])
+    dialog = ix.get(f"w:{DIALOG}")
+    behind = [(n, i) for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y.")]
+    assert len(behind) == COVERED
+    assert all(i.evidence["covered_by"] == dialog.id for _n, i in behind)
+    win = ix.nodes[behind[0][0].window]
+    assert all(n.window == win.id for n, _i in behind)
+    for args in ({}, {"wcag": True}, {"group": "none"}):  # wcag re-lints through the cache
+        lint = run(nia.ctx, "lint", **args)
+        assert lint["counts"] == {"error": 0, "warn": 0, "info": 0}, args
+        assert lint["covered"] == {"n": COVERED, "windows": [win.ref], "by": [dialog.ref],
+                                   "listed": False}
+        assert not (lint.get("rules") or lint.get("lines"))
+        # no node( hint to a node behind the dialog; one to lint that window instead
+        assert lint["next"][-1] == f'lint(within="{win.ref}")'
+        assert not any(h.startswith("node(") for h in lint["next"])
+    inside = run(nia.ctx, "lint", within=win.ref, group="none")
+    assert inside["counts"]["info"] == COVERED and len(inside["lines"]) == COVERED
+    assert inside["covered"]["listed"] is True
+
+
+def test_the_capture_lint_overlay_does_not_draw_the_window_under_the_dialog(nia):
+    pytest.importorskip("PIL")
+    cap = nia.capture()
+    ix = nia.index(cap["capture"])
+    dialog = ix.get(f"w:{DIALOG}")
+    screen = run(nia.ctx, "image", overlay="lint")
+    only_dialog = run(nia.ctx, "image", overlay="lint", window=dialog.ref)
+    assert screen["window"] == "screen" and screen["marks"] == only_dialog["marks"]
+    win = next(w for w in ix.windows() if w.id != dialog.id)
+    behind = run(nia.ctx, "image", overlay="lint", window=win.ref)  # asked for: drawn
+    assert behind["marks"] > 0
