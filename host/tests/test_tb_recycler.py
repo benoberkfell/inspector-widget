@@ -113,3 +113,52 @@ def test_a_horizontal_list_counts_columns():
     tree = tb.build([root(_list(1, cols=12, items=cells, header=False))], services="off")
     assert [tree.node(f"view:{11 + i}").get("collection_item_info")["column_index"]
             for i in range(3)] == [0, 1, 2]
+
+
+def _info(tree, i):
+    return tree.node(f"view:{11 + i}").get("collection_item_info")
+
+
+def test_a_horizontal_grid_gets_no_invented_positions():
+    # GridLayoutManager(2, HORIZONTAL), 5 span groups, 2.5 on screen: its item info is
+    # (row = span index, column = span group), which x / (width / 5) does not give
+    cells = [n(11 + i, cls="android.widget.TextView", text=f"Tile {i}", flags=FOCUS,
+               actions=[CLICK], b=((i // 2) * 432, 200 + (i % 2) * 1000, 432, 1000))
+             for i in range(6)]
+    tree = tb.build([root(_list(2, cols=5, items=cells, header=False))], services="off")
+    assert [_info(tree, i) for i in range(6)] == [None] * 6
+    assert [d["kind"] for d in tree.diagnostics] == ["recycler_layout_unknown"]
+    assert _said(tree, "view:13") == "Tile 2. In grid. 2 rows. 5 columns"
+    # the same with the bounds clipped to the list, as a dump has them: its sideways scroll
+    # action gives it away
+    cells[4]["bounds"]["layout"]["w"] = cells[5]["bounds"]["layout"]["w"] = 216
+    sideways = (SCROLL_FWD, {"id": 0x0102003B})  # ACTION_SCROLL_RIGHT
+    tree = tb.build([root(_list(2, cols=5, items=cells, header=False, actions=sideways))],
+                    services="off")
+    assert [_info(tree, i) for i in range(6)] == [None] * 6
+
+
+def test_a_staggered_grid_gets_no_invented_rows():
+    # StaggeredGridLayoutManager(2, VERTICAL): rows = item count, columns = spans; the
+    # columns do not form rows, and its real item info has no row (-1)
+    tops, cells = [200, 200], []
+    for i, h in enumerate([300, 500, 450, 250, 400, 350]):
+        col = 0 if tops[0] <= tops[1] else 1
+        cells.append(n(11 + i, cls="android.widget.TextView", text=f"Photo {i}", flags=FOCUS,
+                       actions=[CLICK], b=(col * 540, tops[col], 540, h)))
+        tops[col] += h
+    tree = tb.build([root(_list(20, cols=2, items=cells, header=False))], services="off")
+    assert [_info(tree, i) for i in range(6)] == [None] * 6
+    assert [d["kind"] for d in tree.diagnostics] == ["recycler_layout_unknown"]
+
+
+def test_a_vertical_grid_with_margins_and_a_full_span_header_is_still_modelled():
+    cells = [n(11, cls="android.widget.TextView", text="Header", flags=FOCUS,
+               actions=[CLICK], b=(16, 216, 1048, 100))]
+    cells += [n(12 + i, cls="android.widget.TextView", text=f"Cell {i}", flags=FOCUS,
+                actions=[CLICK], b=(16 + (i % 2) * 540, 332 + (i // 2) * 300, 508, 284))
+              for i in range(4)]
+    tree = tb.build([root(_list(3, cols=2, items=cells, header=False))], services="off")
+    got = [(_info(tree, i)["row_index"], _info(tree, i)["column_index"],
+            _info(tree, i)["column_span"]) for i in range(5)]
+    assert got == [(0, 0, 2), (1, 0, 1), (1, 1, 1), (2, 0, 1), (2, 1, 1)]

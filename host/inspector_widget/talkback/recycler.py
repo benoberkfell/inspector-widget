@@ -25,7 +25,15 @@ offers no backward scroll) or holds every item as a child (as many as its count)
 list scrolled away from its start gets no item info and a diagnostic instead (the adapter
 position of its first child is not in the dump). A list whose
 row or column count is unknown (-1, as A11yProbe S1 reports with TalkBack on or off) is left
-alone, as is a horizontal grid.
+alone. A grid (rows and columns both over 1) is modelled only when its geometry is clearly
+a vertical GridLayoutManager's: no horizontal scroll action, no child past its left or right
+edge, rows stacked (each row band ends before the next begins, which a
+StaggeredGridLayoutManager's columns do not, whose items TalkBack hears with no row at all)
+and each band's cells on its column grid; anything else (a horizontal grid, whose rows are
+the span index and columns the span group; a staggered grid) gets no item info and a
+``recycler_layout_unknown`` diagnostic. A reverse layout cannot be told from the dump (its
+children are in visual order but count down); at rest at its start it offers backward scroll
+and so gets no positions, unless it holds every item.
 """
 
 from __future__ import annotations
@@ -34,6 +42,9 @@ from typing import Any, Dict, List, Optional
 
 ITEM_PARENTS = ("RecyclerView", "WearableRecyclerView")  # a11y._ITEM_PARENTS
 _BACKWARD = (0x00002000, 0x01020038, 0x01020039, 0x01020046, 0x01020048)
+#: SCROLL_LEFT, SCROLL_RIGHT, PAGE_LEFT, PAGE_RIGHT: a list that scrolls sideways
+_SIDEWAYS = (0x01020039, 0x0102003B, 0x01020048, 0x01020049)
+_TOL = 2  # px
 #: ``TbNode.corrections`` mark on an item given the delegate's info
 CORRECTION = "recycler_item_info"
 
@@ -42,9 +53,10 @@ def _simple(cls: str) -> str:
     return (cls or "").rsplit(".", 1)[-1]
 
 
-def _lists(tree: Any) -> List[Any]:
+def _lists(tree: Any, unknown: Optional[List[str]] = None) -> List[Any]:
     """``(RecyclerView, its item nodes, their item info)`` for every RecyclerView whose
-    layout is modelled (row and column counts known) and whose items carry no item info."""
+    layout is modelled (row and column counts known) and whose items carry no item info;
+    ``unknown`` collects the keys of grids whose layout is not one modelled."""
     out = []
     for n in tree.nodes:
         if n.facet not in ("view", "interop") or _simple(n.class_name) not in ITEM_PARENTS:
@@ -57,7 +69,43 @@ def _lists(tree: Any) -> List[Any]:
         infos = _infos(n, kids)
         if infos is not None:
             out.append((n, kids, infos))
+        elif unknown is not None and _is_grid(n):
+            unknown.append(n.key)
     return out
+
+
+def _is_grid(rv: Any) -> bool:
+    ci = rv.get("collection_info") or {}
+    return int(ci.get("row_count", -1)) > 1 and int(ci.get("column_count", -1)) > 1
+
+
+def _vertical_grid(rv: Any, kids: List[Any], cols: int, cell: float,
+                   band: Dict[int, int]) -> bool:
+    """Whether the attached items lie as a vertical GridLayoutManager lays them out."""
+    if rv.supports(*_SIDEWAYS):
+        return False  # it scrolls sideways: a horizontal grid
+    left, right = rv.rect.left, rv.rect.right
+    if any(k.rect.left < left - _TOL or k.rect.right > right + _TOL for k in kids):
+        return False  # a child past a side edge: the grid scrolls sideways
+    rows: Dict[int, List[Any]] = {}
+    for k in kids:
+        rows.setdefault(band[k.rect.top], []).append(k)
+    order = sorted(rows)
+    for i, b in enumerate(order[:-1]):
+        nxt = min(k.rect.top for k in rows[order[i + 1]])
+        if any(k.rect.bottom > nxt + _TOL for k in rows[b]):
+            return False  # columns not in rows: a staggered grid
+    for b in order:
+        spans = 0
+        for k in rows[b]:
+            w = k.rect.width / cell
+            edge = k.rect.left <= left + _TOL or k.rect.right >= right - _TOL
+            if not edge and abs(w - round(w)) > 0.25:
+                return False  # a cell off the column grid
+            spans += max(1, int(round(w)))
+        if spans > cols:
+            return False
+    return True
 
 
 def _bands(vals: List[int], tol: int = 2) -> Dict[int, int]:
@@ -91,6 +139,8 @@ def _infos(rv: Any, kids: List[Any]) -> Optional[List[Dict[str, Any]]]:
             return None
         cell = width / cols
         band = _bands([k.rect.top for k in kids])
+        if not _vertical_grid(rv, kids, cols, cell, band):
+            return None  # horizontal or staggered: not modelled
         out = []
         for k in kids:
             col = max(0, min(cols - 1, int((k.rect.left - rv.rect.left + cell / 2) // cell)))
@@ -114,7 +164,16 @@ def apply_item_info(tree: Any) -> None:
     """Give RecyclerView items the item info TalkBack gets (``tree.services == "off"``), or
     say why a service-on dump has none. The dump is not modified: a corrected item's
     ``raw`` becomes a copy (``tree.by_raw`` knows it under both)."""
-    found = _lists(tree)
+    unknown: List[str] = []
+    found = _lists(tree, unknown)
+    if unknown and tree.services == "off":
+        tree.diagnostics.append({
+            "kind": "recycler_layout_unknown", "count": len(unknown), "keys": unknown[:10],
+            "message": (f"{len(unknown)} RecyclerView grid(s) not laid out as a vertical "
+                        "grid (a horizontal or staggered one): the model gives their items "
+                        "no row/column (\"Row 1. Column 2\"), which TalkBack would hear "
+                        "while it runs."),
+        })
     if not found:
         return
     if tree.services == "on":
