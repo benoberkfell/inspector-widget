@@ -1455,30 +1455,33 @@ def _find_predicates(ix: Index, params: Mapping[str, Any], props_on: bool
             raise _bad(f"text_re is not a valid regex: {e}") from None
         preds.append(lambda n: any(rx.search(s) for s in _text_fields(n)))
         norm["text_re"] = text_re
+    # Every glob is bound by a default argument: the filters are ANDed, so a
+    # later filter must not rebind an earlier predicate's glob.
     typ = _str("type", params.get("type"))
     if typ:
-        g = _glob(typ)
-        preds.append(lambda n: any(g(s) for s in type_names(n)))
+        g_type = _glob(typ)
+        preds.append(lambda n, g=g_type: any(g(s) for s in type_names(n)))
         norm["type"] = typ
     for name, getter in (("rid", lambda n: n.rid), ("tag", lambda n: n.tag)):
         pat = _str(name, params.get(name))
         if pat:
-            g = _glob(pat, case=True)
-            preds.append(lambda n, g=g, getter=getter: g(getter(n)))
+            g_id = _glob(pat, case=True)
+            preds.append(lambda n, g=g_id, getter=getter: g(getter(n)))
             norm[name] = pat
     src = _str("src", params.get("src"))
     if src:
+        g_src = _glob(src, case=True)
         if ":" in src:
-            g = _glob(src, case=True)
-            preds.append(lambda n: g(n.src))
+            preds.append(lambda n, g=g_src: g(n.src))
         else:
-            g = _glob(src, case=True)
-            preds.append(lambda n: bool(n.src) and g(n.src.split(":", 1)[0].rsplit("/", 1)[-1]))
+            preds.append(lambda n, g=g_src: bool(n.src)
+                         and g(n.src.split(":", 1)[0].rsplit("/", 1)[-1]))
         norm["src"] = src
     role = _str("role", params.get("role"))
     if role:
-        g = _glob(role)
-        preds.append(lambda n: g(n.role) or g((n.facets.get("a11y") or {}).get("role")))
+        g_role = _glob(role)
+        preds.append(lambda n, g=g_role: g(n.role)
+                     or g((n.facets.get("a11y") or {}).get("role")))
         norm["role"] = role
     for name, want_all in (("flags", True), ("any_flags", False)):
         fl = _str_list(name, params.get(name))

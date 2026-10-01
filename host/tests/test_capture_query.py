@@ -567,6 +567,31 @@ def test_find_role():
     assert fids(q.find(ix, role="Sw*")) == ["n3"]
 
 
+def test_find_type_ands_with_rid_tag_src_role():
+    """Every glob filter keeps its own pattern when ANDed with another (the
+    predicates once shared one late-bound glob: type="Button" + tag="delete"
+    found nothing, type="Checkbox" + role="Button" matched every Button)."""
+    b = IndexBuilder()
+    w = b.window("n1")
+    b.view(w, "n2", "Button", (0, 0, 10, 10), tag="delete", role="Button",
+           src="Cells.kt:40")
+    b.view(w, "n3", "Button", (0, 10, 10, 10), tag="archive", role="Button",
+           src="Cells.kt:52")
+    b.view(w, "n4", "MaterialTextView", (0, 20, 10, 10), rid="preview", src="Row.kt:7")
+    b.view(w, "n5", "Checkbox", (0, 30, 10, 10), tag="delete", role="Checkbox",
+           src="Row.kt:9")
+    ix = b.build()
+    assert fids(q.find(ix, type="Button", tag="delete")) == ["n2"]
+    assert fids(q.find(ix, type="*TextView", rid="preview")) == ["n4"]
+    assert fids(q.find(ix, type="Button", src="Cells.kt")) == ["n2", "n3"]
+    assert fids(q.find(ix, type="Button", src="Cells.kt:5?")) == ["n3"]
+    assert fids(q.find(ix, type="Checkbox", role="Button")) == []
+    assert fids(q.find(ix, type="Button", role="Button", tag="arch*")) == ["n3"]
+    assert fids(q.find(ix, src="Row.kt", role="Checkbox")) == ["n5"]
+    assert fids(q.find(ix, src="Row.kt:7", role="Checkbox")) == []
+    assert fids(q.find(ix, tag="delete", rid="preview")) == []
+
+
 def test_find_flags_all_and_any(launcher):
     assert q.find(launcher, flags=["click"])["total"] == 12
     assert q.find(launcher, flags="click,scroll")["total"] == 0
