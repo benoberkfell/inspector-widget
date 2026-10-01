@@ -39,7 +39,7 @@ pytestmark = [pytest.mark.device, pytest.mark.talkback]
 
 DATA = Path(__file__).parent / "data"
 EXPECTED = json.loads((DATA / "tb_corpus_expected.json").read_text())
-SERIAL = os.environ.get("INSPECTOR_WIDGET_TB_DEVICE")
+SERIAL = __import__("conftest").tb_device_serial()  # opt-in; =1 means ANDROID_SERIAL
 RECORD = os.environ.get("INSPECTOR_WIDGET_TB_RECORD")
 PKG = "com.oberkfell.a11yprobe"
 

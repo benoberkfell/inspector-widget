@@ -1,21 +1,21 @@
 """End-to-end smoke test against a live emulator (opt-in, auto-skipping).
 
 Marked ``device`` so the default run (``pytest -m 'not device'``) never touches
-adb. When an ``emulator-5554`` device with the A11yProbe app is present, this
-attaches, dumps the a11y tree, and runs the lint — proving the whole host stack
-works against a real agent.
+adb. When the device (``$ANDROID_SERIAL``, else ``emulator-5554``: conftest.device_serial)
+with the A11yProbe app is present, this attaches, dumps the a11y tree, and runs the lint —
+proving the whole host stack works against a real agent.
 
 Run it explicitly with:
     host/.venv/bin/pytest host/tests -m device
+    ANDROID_SERIAL=emulator-5556 host/.venv/bin/pytest host/tests -m device
 """
 
 from __future__ import annotations
 
 import pytest
 
-from conftest import device_present
+from conftest import device_present, device_serial
 
-SERIAL = "emulator-5554"
 PACKAGE = "com.oberkfell.a11yprobe"
 
 pytestmark = pytest.mark.device
@@ -23,22 +23,23 @@ pytestmark = pytest.mark.device
 
 @pytest.fixture
 def session():
-    if not device_present(SERIAL):
-        pytest.skip(f"no live {SERIAL} device/adb present")
+    serial = device_serial()
+    if not device_present(serial):
+        pytest.skip(f"no live {serial} device/adb present")
     import inspector_widget
 
     devices = {d["serial"] for d in inspector_widget.list_devices()}
-    if SERIAL not in devices:
-        pytest.skip(f"{SERIAL} not in adb device list")
+    if serial not in devices:
+        pytest.skip(f"{serial} not in adb device list")
 
-    packages = {p["package"] for p in inspector_widget.list_processes(SERIAL)}
+    packages = {p["package"] for p in inspector_widget.list_processes(serial)}
     if PACKAGE not in packages:
-        pytest.skip(f"{PACKAGE} not installed/debuggable on {SERIAL}")
+        pytest.skip(f"{PACKAGE} not installed/debuggable on {serial}")
 
     # Other device tests (the a11y goldens) force-stop the app when they finish.
     from inspector_widget import adb
-    adb.shell(SERIAL, f"am start -W -n {PACKAGE}/.MainActivity", check=False)
-    sess = inspector_widget.attach(SERIAL, PACKAGE)
+    adb.shell(serial, f"am start -W -n {PACKAGE}/.MainActivity", check=False)
+    sess = inspector_widget.attach(serial, PACKAGE)
     try:
         yield sess
     finally:

@@ -204,11 +204,33 @@ def packed_a11y_id(host_view_id: int, virtual_id: int) -> int:
 # --------------------------------------------------------------------------- #
 # Device detection for the optional smoke test.
 # --------------------------------------------------------------------------- #
+#: The device the device tests use when ANDROID_SERIAL names none.
+DEFAULT_DEVICE_SERIAL = "emulator-5554"
+
+
 def adb_available() -> bool:
     return shutil.which("adb") is not None
 
 
-def device_present(serial: str = "emulator-5554") -> bool:
+def device_serial() -> str:
+    """The serial the device tests target: ``$ANDROID_SERIAL`` (what adb itself honours),
+    else emulator-5554. Read at call time, so a test can set the environment first."""
+    return (os.environ.get("ANDROID_SERIAL") or "").strip() or DEFAULT_DEVICE_SERIAL
+
+
+def tb_device_serial() -> Optional[str]:
+    """The serial test_device_talkback.py turns TalkBack on for, or None: that module stays
+    opt-in (TalkBack is device-wide). ``INSPECTOR_WIDGET_TB_DEVICE=<serial>`` names the
+    device; ``INSPECTOR_WIDGET_TB_DEVICE=1`` (or true/yes) opts in on :func:`device_serial`."""
+    v = (os.environ.get("INSPECTOR_WIDGET_TB_DEVICE") or "").strip()
+    if not v or v.lower() in ("0", "false", "no", "off"):
+        return None
+    return device_serial() if v.lower() in ("1", "true", "yes", "on") else v
+
+
+def device_present(serial: Optional[str] = None) -> bool:
+    """Is ``serial`` (default :func:`device_serial`) attached and in the ``device`` state?"""
+    serial = serial or device_serial()
     if not adb_available():
         return False
     try:
