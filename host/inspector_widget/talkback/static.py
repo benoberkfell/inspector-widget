@@ -819,24 +819,38 @@ _FORWARD_ACTIONS = (R.ACTION_SCROLL_FORWARD, R.ACTION_SCROLL_DOWN, R.ACTION_SCRO
                     R.ACTION_PAGE_DOWN, R.ACTION_PAGE_RIGHT)
 
 
+def _in_web(n: TbNode) -> bool:
+    """Web content: a WebView or a node under one. Chromium moves its own focus through the
+    page and scrolls it there (TalkBack never auto-scrolls web content)."""
+    return any(str(x.raw.get("class_name") or "") == _WEBVIEW for x in [n, *n.ancestors()])
+
+
+_WEBVIEW = "android.webkit.WebView"
+
+
 def _past_edge(cx: _Ctx) -> Iterator[Finding]:
     """Content clipped at a container's edge (no area there), in a container nothing
-    TalkBack scrolls: rows moved by translation, a scroller without scroll actions."""
+    TalkBack scrolls: rows moved by translation, a scroller without scroll actions. Content
+    TalkBack reaches anyway (a stop, or a stop inside it) is not cut off, and neither is a
+    page in a WebView: AntennaPod's show notes run 45 nodes past the player's edge, and
+    TalkBack reads every one of them as the WebView scrolls itself."""
     for p in cx.tree.nodes:
-        if not p.window.reported or not p.visible or p.rect.is_empty():
+        if not p.window.reported or not p.visible or p.rect.is_empty() or _in_web(p):
             continue
         kids = p.children
         shown = [k for k in kids if k.visible and not k.rect.is_empty()
                  and (k.text or k.content_description or id(k) in cx.stop_ids)]
         cut = [k for k in kids if not k.visible and (k.text or k.content_description)
                and (k.rect.is_empty() or not k.rect.intersects(p.rect))
-               and k.rect.top >= p.rect.bottom - 2]
+               and k.rect.top >= p.rect.bottom - 2
+               and not any(id(x) in cx.stop_ids for x in k.iter())]
         if len(cut) < 2 or len(shown) < 2:
             continue
         if any(cx.rules.filter_auto_scroll(a) for a in [p, *p.ancestors()]):
             continue  # TalkBack scrolls it in
+        texts = [t for t in ((k.text or k.content_description or "").strip() for k in cut) if t]
         yield Finding("tb.edge_stuck", "warn", p, [], {
-            "past_edge": len(cut), "first": (cut[0].text or cut[0].content_description)[:40],
+            "past_edge": len(cut), "first": (texts[0] if texts else "")[:40],
             "why": "no_scroll_action"})
 
 

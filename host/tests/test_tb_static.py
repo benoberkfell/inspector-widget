@@ -262,3 +262,28 @@ def test_antennapod_episode_rows_read_in_screen_order():
     # (walk wnq20pl). The XY-cut once fell back to column order and flagged every row.
     fs = static.findings(tb.Navigator(_realapp("antennapod_episodes")), density=480)
     assert "tb.wrong_announcement" not in [f.code for f in fs]
+
+
+def _past_edge_screen(cls):
+    shown = [n(2 + i, cls="android.widget.TextView", text=t, b=(0, 500 * i, 1080, 400))
+             for i, t in enumerate(("One", "Two"))]
+    cut = [n(5 + i, cls="android.widget.TextView", text=t, flags=("enabled",),
+             b=(0, 1000 + 200 * i, 1080, 200)) for i, t in enumerate(("\n", "Rows below"))]
+    return root(n(9, cls=cls, b=(0, 0, 1080, 1000), children=shown + cut))
+
+
+def test_content_past_an_edge_nothing_scrolls_quotes_its_first_words():
+    fs = [f for f in findings(_past_edge_screen("android.widget.LinearLayout"))
+          if f.code == "tb.edge_stuck"]
+    assert [f.node.key for f in fs] == ["view:9"]
+    assert fs[0].evidence["first"] == "Rows below"  # not the bare newline before it
+
+
+def test_a_web_page_past_its_edge_is_not_stuck():
+    # Chromium scrolls the page itself as TalkBack moves through it: AntennaPod's expanded
+    # player has 45 show-notes nodes past its edge, and TalkBack read all of them (wp8mw23)
+    assert [f for f in findings(_past_edge_screen("android.webkit.WebView"))
+            if f.code == "tb.edge_stuck"] == []
+    for name in ("antennapod_player_expanded", "antennapod_player_expanded_tb_on"):
+        fs = static.findings(tb.Navigator(_realapp(name)), density=480)
+        assert "tb.edge_stuck" not in [f.code for f in fs], name
