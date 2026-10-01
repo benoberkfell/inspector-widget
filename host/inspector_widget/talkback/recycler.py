@@ -20,9 +20,10 @@ index), which TalkBack speaks as "2 of 21". Measured on TalkBack 17.0 / API 37
   misses the "N of M" a TalkBack user hears, and how to see it (start the app with TalkBack
   on).
 
-Positions count from the first child. They are exact only when the list is at its start
-(it offers no backward scroll); a list scrolled away from its start gets no item info and a
-diagnostic instead (the adapter position of its first child is not in the dump). A list whose
+Positions count from the first child. They are exact when the list is at its start (it
+offers no backward scroll) or holds every item as a child (as many as its count); any other
+list scrolled away from its start gets no item info and a diagnostic instead (the adapter
+position of its first child is not in the dump). A list whose
 row or column count is unknown (-1, as A11yProbe S1 reports with TalkBack on or off) is left
 alone, as is a horizontal grid.
 """
@@ -99,6 +100,16 @@ def _infos(rv: Any, kids: List[Any]) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+def _all_attached(rv: Any, kids: List[Any]) -> bool:
+    """Every adapter item is a child (a list as long as its count): the first child is
+    position 0 even though the list can scroll back (Thunderbird's message list, whose
+    empty header item sits scrolled off its top)."""
+    ci = rv.get("collection_info") or {}
+    rows, cols = int(ci.get("row_count", -1)), int(ci.get("column_count", -1))
+    count = rows if cols == 1 else cols if rows == 1 else -1
+    return count > 0 and len(kids) == count
+
+
 def apply_item_info(tree: Any) -> None:
     """Give RecyclerView items the item info TalkBack gets (``tree.services == "off"``), or
     say why a service-on dump has none. The dump is not modified: a corrected item's
@@ -122,7 +133,7 @@ def apply_item_info(tree: Any) -> None:
         return
     added, scrolled = 0, []
     for rv, kids, infos in found:
-        if rv.supports(*_BACKWARD):
+        if rv.supports(*_BACKWARD) and not _all_attached(rv, kids):
             scrolled.append(rv.key)
             continue
         for k, inf in zip(kids, infos):

@@ -74,7 +74,10 @@ WALK_ONLY = {"tb.trap", "tb.loop"}
 EXTRA_TRUTH = {"tb_c11_bad_slots": {"tb.custom_action_missing"}}
 #: tb.* counts on each live capture: the derived corpus table, plus C11 with slots
 LIVE_TABLE = {f"{k.replace('-', '_')}": v for k, v in TABLE.items()}
+#: live captures of real apps beside the corpus
+REAL_APPS = {"thunderbird_list_tb_off"}
 LIVE_TABLE.update({
+    "thunderbird_list_tb_off": {"tb.double_stop": 6, "tb.wrong_announcement": 1},
     "tb_c11_bad_slots": {"tb.custom_action_missing": 3},
     # GOOD's fix is unreachable for TalkBack (module docstring): the evidence says so
     "tb_c11_good_slots": {"tb.custom_action_missing": 3},
@@ -96,10 +99,12 @@ def _entry(name: str) -> dict | None:
 def test_every_corpus_screen_has_a_live_capture():
     want = {f"{e['scenario']}_{e['variant']}" for e in F.WALK_ENTRIES}
     names = set(F.live_names())
-    assert want <= names and names - want == {"tb_c11_bad_slots", "tb_c11_good_slots"}
+    assert want <= names
+    assert names - want == {"tb_c11_bad_slots", "tb_c11_good_slots"} | REAL_APPS
     for name in names:  # real captures: the View tree and the a11y tree, Compose's too
         _ix, raw = F.live_capture(name)
-        assert raw.views and raw.a11y and raw.meta.lineage[1] == F.PACKAGE
+        assert raw.views and raw.a11y
+        assert raw.meta.lineage[1] == F.PACKAGE or name in REAL_APPS
         assert not raw.shots  # recorded without screenshots: kept small
 
 
@@ -121,7 +126,7 @@ def test_live_captures_agree_with_the_captures_derived_from_the_walks():
 
 def test_precision_and_recall_on_the_corpus():
     tp = fn = fp_good = fp_bad = 0
-    for name in F.live_names():
+    for name in sorted(set(F.live_names()) - REAL_APPS):
         e = _entry(name)
         got = set(_tb(F.live_capture(name)[0]))
         if e["variant"] != "bad":
@@ -182,6 +187,22 @@ def test_a_capture_with_talkback_on_over_a_list_bound_before_says_why_positions_
     notes = [d for d in ix.diagnostics if d.startswith("tb: ")]
     assert len(notes) == 1 and "bound before it started" in notes[0], notes
     assert "tb.wrong_announcement" not in _tb(ix)
+
+
+def test_thunderbird_counts_its_empty_header_scrolled_off_the_top():
+    """Thunderbird's message list with TalkBack off: no item info, and the list can scroll
+    back (its empty header item sits above the top). All 7 items are children, so the
+    positions are exact: TalkBack on before the app said "... Star. 2 of 7. In list. 7
+    items" on the first row (live walk, emulator-5556), and so does the model."""
+    ix, raw = F.live_capture("thunderbird_list_tb_off")
+    tbc = T.TbCapture.of(ix, raw)
+    first = next(n for n in ix.nodes.values()
+                 if n.stop is not None and (n.label or "").startswith("unread, Localpart"))
+    said = tbc.walk_speech(tbc.node(first.id)).text
+    assert said.endswith("Star. 2 of 7. In list. 7 items"), said
+    wa = [i for n in ix.nodes.values() for i in n.issues if i.id == "tb.wrong_announcement"]
+    assert len(wa) == 1 and wa[0].evidence["why"] == "position_counts_silent_item"
+    assert not [d for d in ix.diagnostics if d.startswith("tb: ")]
 
 
 def test_the_fixtures_stay_small():

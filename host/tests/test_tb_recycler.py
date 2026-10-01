@@ -79,6 +79,16 @@ def test_a_list_scrolled_from_its_start_gets_no_guessed_positions():
     assert [d["kind"] for d in tree.diagnostics] == ["recycler_positions_unknown"]
 
 
+def test_a_list_holding_every_item_is_exact_even_when_it_can_scroll_back():
+    # Thunderbird's message list (live, emulator-5556): 7 items, all attached, the empty
+    # header scrolled off the top; TalkBack (on before the app) says "2 of 7" on the first row
+    rv = _list(4, actions=(SCROLL_FWD, BACK))
+    rv["children"][0]["bounds"]["layout"]["y"] = 190
+    tree = tb.build([root(rv)], services="off")
+    assert _said(tree, "view:11") == "Message 1. 2 of 4. In list. 4 items"
+    assert [d["kind"] for d in tree.diagnostics] == ["recycler_item_info"]
+
+
 def test_unknown_counts_and_unknown_service_state_are_not_modelled():
     # A11yProbe S1 reports row and column counts of -1, with TalkBack on or off
     assert tb.build([root(_list(-1, cols=-1))], services="off").diagnostics == []

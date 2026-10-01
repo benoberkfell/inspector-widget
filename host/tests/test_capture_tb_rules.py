@@ -88,7 +88,8 @@ STATIC_EXCEPTIONS = {
     "tb_v3-bad-walk": "the author's intended order (expect) is not in the capture",
 }
 #: the tb.* issues on the recorded real captures: unlabelled controls (a11y.label.missing
-#: says so too) and rows or cards with their own inline controls; none is a default rule
+#: says so too), rows or cards with their own inline controls, and Thunderbird's counted
+#: empty header (the one default rule among them, confirmed by a real walk)
 REAL = {
     "a11yprobe_all": {"tb.ghost_stop": 1},
     "a11yprobe_d1": {"tb.ghost_stop": 2},
@@ -101,7 +102,9 @@ REAL = {
     "nia_foryou": {"tb.double_stop": 3},
     "nia_settings": {},
     "thunderbird_list_compose": {"tb.double_stop": 6, "tb.ghost_stop": 6},
-    "thunderbird_list_views": {"tb.double_stop": 6},
+    # its empty header item counts: TalkBack (on before the app) says "2 of 7" on the first
+    # row, live on emulator-5556; the item is scrolled off the top (talkback/recycler.py)
+    "thunderbird_list_views": {"tb.double_stop": 6, "tb.wrong_announcement": 1},
 }
 
 
@@ -136,9 +139,10 @@ def test_the_capture_sees_what_the_corpus_says_the_model_sees(entry):
 def test_real_captures_raise_only_the_known_tb_findings(name):
     ix, raw = F.fixture_capture(name)
     assert _tb(ix) == REAL[name]
-    # none of them is a default-lint rule: the default lint of a real app stays the a11y lint
+    # the default lint shows only the precise rules: Thunderbird's "2 of 7", nothing else
     out = analyzers.lint_view(ix, raw, max_bytes=0)
-    assert not [r for r in out["rules"] if r["rule"].startswith("tb.")]
+    assert {r["rule"] for r in out["rules"] if r["rule"].startswith("tb.")} == \
+        set(REAL[name]) & set(R.DEFAULT_TB)
 
 
 def test_the_default_lint_reports_the_precise_tb_rules():

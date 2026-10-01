@@ -632,6 +632,11 @@ def _speech_order(cx: _Ctx) -> Iterator[Finding]:
                            "why": "speech_order"})
 
 
+def _actionable(n: TbNode) -> bool:
+    return any(n.has(f) for f in ("clickable", "long_clickable", "focusable",
+                                  "screen_reader_focusable"))
+
+
 def _positions(cx: _Ctx) -> Iterator[Finding]:
     for c in cx.tree.nodes:
         ci = c.get("collection_info")
@@ -641,7 +646,10 @@ def _positions(cx: _Ctx) -> Iterator[Finding]:
         stops = [k for k in items if id(k) in cx.stop_ids]
         if not stops:
             continue
-        silent = [k for k in items if id(k) not in cx.stop_ids and k.visible
+        # An item TalkBack never stops on still counts in "N of M", on screen or not (an
+        # empty header scrolled off the top: Thunderbird's message list says "2 of 7").
+        silent = [k for k in items if id(k) not in cx.stop_ids
+                  and (k.visible or not any(_actionable(d) for d in k.iter()))
                   and not any(id(d) in cx.stop_ids for d in k.iter())
                   and not any(d.text or d.content_description for d in k.iter())]
         if not silent:
