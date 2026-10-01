@@ -18,6 +18,10 @@ against TalkBack 17.0.0 on emulator-5554 (the default wording, :data:`VERSIONS`)
 * :mod:`.static`: what the model alone can tell is wrong with a screen (the static
   ``tb.*`` findings: double and ghost stops, order, escape, ...); the capture lint's
   TalkBack rules (``capture/tb.py``).
+* :mod:`.occlusion`: what a same-window overlay draws over (a scrim, a sheet, an open
+  drawer, an action-mode bar), one model for the static rules, the walk and the capture.
+* :mod:`.windows`: a window of another app over the app (a system dialog), from the window
+  manager's list (its :func:`~.windows.foreign_cover` runs adb; nothing here imports it).
 
 :meth:`Navigator.initial_focus` gives the focus a window gets when it appears (simulate's
 ``start="initial"``); :attr:`TbNode.signature` identifies a node across captures without ids

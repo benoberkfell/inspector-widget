@@ -118,6 +118,42 @@ def test_non_focusable_children_only():
     assert say(card).text == "Title"
 
 
+def test_a_lone_symbol_is_spoken_by_its_name():
+    # G26: SpeechCleanupUtils.cleanUp names a text that is a single symbol. TalkBack 17.0 on
+    # AntennaPod's show notes: "• " -> "Bullet. 1 of 19. In list. 19 items"; a "." -> "Period".
+    assert say(n(2, cls="android.widget.TextView", text="• ", flags=FOCUS)).text == "Bullet"
+    assert say(n(2, cls="android.widget.TextView", text=".", flags=FOCUS)).text == "Period"
+    row = n(2, flags=FOCUS, b=(0, 0, 1080, 200), children=[
+        n(3, cls="android.widget.TextView", text="•", b=(0, 0, 40, 80)),
+        n(4, cls="android.widget.TextView", text="Item", b=(60, 0, 500, 80))])
+    assert say(row).text == "Bullet. Item"  # a child's lone symbol too
+    # more than one character is read as it is
+    assert say(n(2, cls="android.widget.TextView", text="••", flags=FOCUS)).text == "••"
+
+
+def test_symbol_names_are_talkbacks_own():
+    # TALKBACK_PUNCTUATION_AND_SYMBOL (SpeechCleanupUtils) with strings_symbols.xml's English
+    # names; the table had made-up names for these, and a "+" TalkBack does not name
+    from inspector_widget.talkback.speech import SYMBOL_NAMES, spoken_text
+
+    assert {c: spoken_text(c) for c in "$=|£°§¶×÷"} == {
+        "$": "Dollar sign", "=": "Equal sign", "|": "Vertical line",
+        "£": "Pound currency sign", "°": "Degree sign", "§": "Section sign",
+        "¶": "Paragraph mark", "×": "Multiplication sign", "÷": "Division sign"}
+    assert spoken_text("+") == "+" and "+" not in SYMBOL_NAMES
+    # keys it has that the table lacked
+    assert [spoken_text(c) for c in "\"()[]{}<>¢`✓"] == [
+        "Quote", "Left paren", "Right paren", "Left square bracket", "Right square bracket",
+        "Left curly bracket", "Right curly bracket", "Less than sign", "Greater than sign",
+        "Cent sign", "Grave accent", "Check mark"]
+    assert len(SYMBOL_NAMES) == 150
+    # cleanUp: trimmed of Java whitespace; whitespace only is the name of its first
+    # character; a no-break space is no Java whitespace, so alone it is a symbol
+    assert spoken_text(" ") == "Space" and spoken_text("\n") == "New line"
+    assert spoken_text("\u00a0") == "Space" and spoken_text(" . ") == "Period"
+    assert spoken_text("\u00a0.") == "\u00a0." and spoken_text("Go") == "Go"
+
+
 # ------------------------------------------------------------------------------------- Unlabelled
 def test_unlabelled_leaf_says_its_role_or_unlabelled():
     # getUnlabelledNodeDescription (TB/compositor/AccessibilityNodeFeedbackUtils.java:300):

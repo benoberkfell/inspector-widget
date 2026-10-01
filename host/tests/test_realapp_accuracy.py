@@ -294,8 +294,7 @@ def test_going_back_into_a_page_nobody_can_see_reads_it_and_says_so():
                                                   if moved]
     said = [s for _m, _k, _l, s in walk["steps"]]
     model = [m["speak"] for m in back.steps]
-    assert model[:-1] == said[:-1]
-    assert (model[-1], said[-1]) == (".", "Period")  # a lone "." is spoken by its name
+    assert model == said  # a lone "." is spoken by its name: "Period" (speech.SYMBOL_NAMES)
     hidden = [h for h in back.hints if h["kind"] == "web_hidden_page"]
     assert [(h["web_root"], h["trap"], h["before"]) for h in hidden] == [
         ("virtual:695:23", False, "view:289")]
@@ -323,10 +322,14 @@ def test_the_model_says_what_auto_scroll_reads_before_the_next_control():
 
 # ------------------------------------------------------------- the default tb.* rules
 #: what the default tb.* rules (capture/rules.py DEFAULT_TB) report on each recorded real
-#: screen: only Thunderbird's counted empty header ("2 of 7"), which a real walk confirmed.
-#: AntennaPod's rows (speech_order), its show notes (past an edge) and Thunderbird's message
-#: pager were false positives the walks disproved.
-REAL_DEFAULT_TB = {"thunderbird_list_views": {"tb.wrong_announcement": 1}}
+#: screen: only Thunderbird's counted empty header ("2 of 7"), which a real walk confirmed,
+#: on View rows and (TB-1, wcw61ax "2 of 6": the stops are inside each row's ComposeView cell)
+#: on Compose rows; with TalkBack started after the app (_tb_later) the rows have no
+#: positions to get wrong. AntennaPod's rows (speech_order), its show notes (past an edge) and
+#: Thunderbird's message pager were false positives the walks disproved.
+REAL_DEFAULT_TB = {"thunderbird_list_views": {"tb.wrong_announcement": 1},
+                   "thunderbird_list_compose": {"tb.wrong_announcement": 1},
+                   "thunderbird_list_compose_tb_first": {"tb.wrong_announcement": 1}}
 
 
 @pytest.mark.parametrize("name", sorted(p.name.split(".")[0] for p in DATA.glob("*.a11y.json.gz")))

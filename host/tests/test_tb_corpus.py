@@ -130,3 +130,22 @@ def test_a_stop_talkback_called_unlabelled_is_an_r1_error(entry):
     unlabelled = [s["key"] for s in _first_screen(rec["steps"])
                   if s.get("key") and "Unlabelled" in (s.get("speak") or "")]
     assert {k: r1.get(k) for k in unlabelled} == {k: "error" for k in unlabelled}
+
+
+def _entry(scenario, variant):
+    return next(e for e in WALK_ENTRIES if (e["scenario"], e["variant"]) == (scenario, variant))
+
+
+@pytest.mark.parametrize("scenario,variant,sev", [
+    ("tb_c1", "bad", "warn"),   # a card with its own Checkbox: the canonical double stop
+    ("tb_v4", "bad", "warn"),   # a row with its own Switch
+    ("tb_c15", "bad", "info"),  # a card with a Bookmark button: a secondary action
+])
+def test_a_double_stop_on_a_state_control_is_a_warning_in_the_walk_as_in_the_lint(
+        scenario, variant, sev):
+    # The walk said info for every pair of clickable stops whose words differ, while the
+    # capture lint says warn on the same screen: an inner Checkbox / Switch is the defect the
+    # corpus pins (one toggleable row fixes it); an inner action with its own verb is not.
+    rec, _resp = _load(_entry(scenario, variant))
+    sevs = {f["sev"] for f in diff.analyze(rec)["findings"] if f["code"] == "tb.double_stop"}
+    assert sevs == {sev}

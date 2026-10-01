@@ -217,10 +217,19 @@ def test_escape_from_an_overlay_and_from_a_modal_window():
     assert esc["refs"] == ["view:61"] and esc["steps"] == [2]
     assert esc["overlay"] == "view:70" and esc["from"] == "view:72"
     assert "tb.ghost_stop" not in codes(res)  # an escape is not also reported as occluded
-    # Covered but never inside the overlay: an occluded ghost stop instead.
+    # Covered but never inside the overlay: a covered stop (TB-4's toolbar under the
+    # action-mode bar), not a ghost
     res = diff.analyze(record([step(0, "view:61", (20, 250, 320, 60), "Behind", via="start",
                                     covered_by=overlay)], ended="max_steps"))
-    assert codes(res) == ["tb.ghost_stop"]
+    assert codes(res) == ["tb.covered_stop"]
+    f = res["findings"][0]
+    assert f["overlay"] == "view:70" and f["steps"] == [0] and f["fix"].startswith("While")
+    # a bar (not a surface focus can be inside of) never makes an escape
+    bar = dict(overlay, kind="bar")
+    res = diff.analyze(record([step(0, "view:71", (20, 100, 320, 60), "OK", via="start"),
+                               step(1, "view:61", (20, 250, 320, 60), "Behind",
+                                    covered_by=bar)], ended="max_steps"))
+    assert codes(res) == ["tb.covered_stop"]
     modal = [step(0, "view:5", (0, 0, 100, 100), "Behind a dialog", via="start",
                   window_covered_by=77)]
     assert codes(diff.analyze(record(modal, ended="max_steps"))) == ["tb.escape"]
@@ -291,6 +300,23 @@ def test_double_stop_from_speech_not_from_the_containers_child_texts():
     res = diff.analyze(record([row, box], ended="max_steps"))
     f = next(f for f in res["findings"] if f["code"] == "tb.double_stop")
     assert "both clickable stops" in f["msg"] and f["refs"] == ["compose:14:3", "compose:14:5"]
+    assert f["sev"] == "warn"  # its own Checkbox: the row should be the one toggleable stop
+
+
+def test_a_double_stop_is_a_warning_on_a_state_control_and_info_on_a_secondary_action():
+    def pair(inner_cls, inner_speak, label):
+        row = step(0, "compose:14:3", (0, 300, 1280, 190), "Wi-Fi", via="start",
+                   flags=["clickable", "focusable"])
+        inner = step(1, "compose:14:5", (900, 330, 120, 120), label, speak=inner_speak,
+                     cls=inner_cls, flags=["clickable", "focusable"])
+        res = diff.analyze(record([row, inner], ended="max_steps"))
+        return [f["sev"] for f in res["findings"] if f["code"] == "tb.double_stop"]
+
+    assert pair("Switch", "ON. Switch", "") == ["warn"]
+    assert pair("View", "ON. Switch", "") == ["warn"]  # the role TalkBack spoke says so
+    assert pair("RadioButton", "Not selected. Radio button", "") == ["warn"]
+    assert pair("Button", "Play. Button", "Play") == ["info"]
+    assert pair("Button", "Switch account. Button", "Switch account") == ["info"]
 
 
 def test_a_walk_from_the_middle_to_the_edge_covers_only_that_part():
@@ -461,3 +487,82 @@ def test_a_compose_key_is_one_node_whatever_its_list_item_shows_now():
                    ctx="We launched Compose Camp") is chip
     assert m.match("view:15", "Button|Archive", (900, 1530, 120, 120), ctx="Mail 31") is None
     assert m.match("view:15", "Button|Archive", (900, 1530, 120, 120), ctx="Mail 3") is archive
+
+
+# --------------------------------------------------------------------------- #
+# The real-app hunt's walk checks (G7, G8, G22, L4)
+# --------------------------------------------------------------------------- #
+def _row(i, key, y, speak, container="view:39", **kw):
+    return step(i, key, (0, y, 1280, 200), speak.split(".")[0], speak=speak, utt="logcat",
+                container=container, container_rect=[0, 300, 1280, 2000],
+                ancestors=[f"{key}-cell", container, "view:1"], **kw)
+
+
+def test_in_list_n_items_against_the_items_a_lap_reached():
+    steps = [step(0, "view:2", (0, 100, 1280, 100), "Inbox", via="start"),
+             _row(1, "view:11", 300, "Message 1. In list. 6 items"),
+             _row(2, "view:12", 500, "Message 2"),
+             step(3, "view:9", (0, 2400, 1280, 100), "Compose", speak="Compose. Out of list"),
+             edge(4, "view:9"), step(5, "view:2", (0, 100, 1280, 100), "Inbox", via="wrap")]
+    res = diff.analyze(record(steps))
+    f = next(f for f in res["findings"] if f["code"] == "tb.wrong_announcement")
+    assert '"In list. 6 items"' in f["msg"] and "reached 2 item(s)" in f["msg"]
+    # a lap that stopped inside the list cannot tell
+    res = diff.analyze(record(steps[:3], ended="max_steps"))
+    assert "tb.wrong_announcement" not in codes(res)
+    # the count matches: nothing
+    steps[1]["speak"] = "Message 1. In list. 2 items"
+    assert "tb.wrong_announcement" not in codes(diff.analyze(record(steps)))
+
+
+def test_stuck_before_a_webview_names_it():
+    steps = [step(0, "view:885", (48, 641, 592, 144), "Stream", via="start"),
+             step(1, "view:888", (640, 641, 592, 144), "Download", container="view:863",
+                  container_cls="RecyclerView"),
+             edge(2, "view:888"), edge(3, "view:888")]
+    pred = [pstop("view:885", (48, 641, 592, 144), "Stream"),
+            pstop("view:888", (640, 641, 592, 144), "Download"),
+            dict(pstop("virtual:897:278", (0, 788, 1280, 1613), "If your fridge…"),
+                 cls="WebView")]
+    res = diff.analyze(record(steps, pred, ended="stuck"))
+    f = next(f for f in res["findings"] if f["code"] == "tb.webview_block")
+    assert f["webview"] == "virtual:897:278" and f["sev"] == "error" and f["steps"] == [1]
+    assert "tb.edge_stuck" not in codes(res)
+    # a page that holds the WebView, next: the same
+    pred.insert(2, pstop("view:872", (0, 348, 1280, 2052), "Page"))
+    res = diff.analyze(record(steps, pred, ended="stuck"))
+    assert [f["webview"] for f in res["findings"] if f["code"] == "tb.webview_block"] == [
+        "virtual:897:278"]
+
+
+def test_a_stop_the_model_learned_of_after_the_walk_passed_it_is_not_skipped():
+    # L4: a collapsing toolbar's title appears once the list scrolls; the re-model puts it
+    # before the stops the walk already read
+    steps = [step(0, "view:1", (0, 300, 1280, 100), "Row 1", via="start"),
+             step(1, "view:2", (0, 400, 1280, 100), "Row 2"),
+             step(2, "view:3", (0, 500, 1280, 100), "Row 3", via="autoscroll", remodel=True),
+             step(3, "view:4", (0, 600, 1280, 100), "Row 4")]
+    pred = [pstop("view:1", (0, 300, 1280, 100)), dict(pstop("view:9", (0, 150, 1280, 80),
+                                                             "Podcast title"), added=1),
+            pstop("view:2", (0, 400, 1280, 100)), pstop("view:3", (0, 500, 1280, 100)),
+            pstop("view:4", (0, 600, 1280, 100))]
+    res = diff.analyze(record(steps, pred, ended="max_steps"))
+    sk = [f for f in res["findings"] if f["code"] == "tb.skipped"]
+    assert [(f["sev"], f["basis"]) for f in sk] == [("info", "model")]
+    # the same stop known from the start is a real skip
+    del pred[1]["added"]
+    sk = [f for f in diff.analyze(record(steps, pred, ended="max_steps"))["findings"]
+          if f["code"] == "tb.skipped"]
+    assert [(f["sev"], f["basis"]) for f in sk] == [("warn", "walk")]
+
+
+def test_a_partial_walk_that_wrapped_claims_no_full_lap():
+    steps = [step(0, "view:1", (0, 300, 1280, 100), "A", via="start"),
+             step(1, "view:2", (0, 400, 1280, 100), "B"), edge(2, "view:2"),
+             step(3, "view:0", (0, 100, 1280, 100), "Top", via="wrap")]
+    pred = [pstop(f"view:{i}", (0, 100 * (i + 1), 1280, 100), f"S{i}") for i in range(6)]
+    pred[1], pred[2] = pstop("view:1", (0, 300, 1280, 100), "A"), pstop(
+        "view:2", (0, 400, 1280, 100), "B")
+    res = diff.analyze(record(steps, pred, ended="max_steps"))
+    msgs = [f["msg"] for f in res["findings"] if f["code"] == "tb.skipped"]
+    assert msgs and "full lap" not in msgs[0] and "round again" in msgs[0]

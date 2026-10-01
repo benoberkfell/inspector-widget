@@ -220,8 +220,10 @@ def _capture(name, package="app"):
 
 @pytest.mark.parametrize("name,rules,limit,want", [
     # (the capture lint an agent reads: rules, its byte cap, the lines it must show)
-    ("thunderbird_list_compose_tb_first", None, 1500,
-     ['reads \\"[conversation_counter]\\" in 1 row(s)']),
+    # (+ TB-1's static list count from the occlusion model: the 0x0 banner it counts)
+    ("thunderbird_list_compose_tb_first", None, 1900,
+     ['reads \\"[conversation_counter]\\" in 1 row(s)',
+      'says \\"2 of 6\\": counts 1 silent item(s), e.g. view:57']),
     ("thunderbird_list_compose", ["R19"], 800,
      ['reads \\"[attachment_icon]\\" in 1 row(s)', 'reads \\"[conversation_counter]\\"']),
     ("thunderbird_settings", None, 1500,

@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from inspector_widget import talkback as tb
 from inspector_widget.talkback import rules as R
-from inspector_widget.talkback import static
+from inspector_widget.talkback import occlusion, static
 
-from test_tb_rules import CLICK, FOCUS, SRF, c, compose_host, n, root
+from test_tb_rules import CLICK, FOCUS, SRF, VIS, c, compose_host, n, root
 
 
 def findings(*roots, **kw):
@@ -334,3 +334,213 @@ def test_focus_walking_out_of_an_expanded_sheet_with_no_scrim_is_an_escape():
     r2, sheet2 = _player_over_feed({"provider_class": "AndroidComposeView"})
     assert findings(r2, drawn_above=lambda a, b: True if a is sheet2 else None,
                     codes=["tb.escape"]) == []
+
+
+# ------------------------------------------------------------------- G5: one occlusion model
+def _action_mode(bar_kw=None):
+    """Thunderbird in selection mode (TB-4): AppCompat's ActionBarContextView (a11y class
+    ViewGroup) drawn over the MaterialToolbar (windowActionModeOverlay), the list below."""
+    toolbar = n(22, cls="android.view.ViewGroup", b=(0, 156, 1280, 192), children=[
+        n(32, cls="android.widget.ImageButton", cd="Navigate up", flags=FOCUS, actions=[CLICK],
+          b=(0, 168, 168, 168)),
+        n(24, cls="android.widget.TextView", text="Inbox", b=(168, 208, 162, 88)),
+        n(86, cls="android.widget.ImageView", cd="Search", flags=FOCUS, actions=[CLICK],
+          b=(872, 180, 144, 144))])
+    toolbar.pop("important_for_accessibility")
+    rows = [n(40 + i, cls="android.widget.TextView", text=f"Message {i}", flags=FOCUS,
+              actions=[CLICK], b=(0, 400 + 200 * i, 1280, 200)) for i in range(5)]
+    content = n(20, cls="android.widget.RelativeLayout", b=(0, 0, 1280, 2856),
+                children=[toolbar, *rows], drawing_order=1)
+    bar = n(236, cls="android.view.ViewGroup", b=(0, 156, 1280, 192), drawing_order=2,
+            children=[n(237, cls="android.widget.ImageView", cd="Done", flags=FOCUS,
+                        actions=[CLICK], b=(0, 180, 168, 144)),
+                      n(255, cls="android.widget.TextView", text="1 selected",
+                        b=(216, 208, 302, 88)),
+                      n(244, cls="android.widget.Button", cd="Delete", flags=FOCUS,
+                        actions=[CLICK], b=(872, 180, 144, 144))], **(bar_kw or {}))
+    return root(content, bar, b=(0, 0, 1280, 2856)), bar
+
+
+def test_the_toolbar_under_an_action_mode_bar_is_covered():
+    # TB-4: TalkBack reads the toolbar the action-mode bar hides first and the bar last
+    r, bar = _action_mode()
+
+    def above(a, b):
+        return True if a is bar else (False if b is bar else None)
+
+    fs = findings(r, drawn_above=above, codes=["tb.covered_stop", "tb.out_of_order"])
+    cov = [f for f in fs if f.code == "tb.covered_stop"]
+    assert [(f.node.key, [o.key for o in f.others]) for f in cov] == [
+        ("view:236", ["view:32", "view:24", "view:86"])]
+    assert cov[0].evidence == {"covers": 3, "kind": "bar", "area_pct": 7}
+    # the bar's stops are read last: one out-of-order finding for the whole bar, which says why
+    order = [f for f in fs if f.code == "tb.out_of_order"]
+    assert [(f.node.key, f.evidence.get("why"), f.evidence.get("stops")) for f in order] == [
+        ("view:237", "in_overlay", 3)]
+    assert order[0].others[-1].key == "view:236"
+    # the same from the dump's own drawing order, as a walk sees it (no View tree)
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert occ.covered_by(r["children"][0]["children"][0]["children"][0]).key == "view:236"
+
+
+def test_an_empty_frame_drawn_last_covers_nothing():
+    # AP-4: AntennaPod's loading FrameLayout (no background, its only child GONE) over the
+    # episode page was taken for an overlay (tb.escape, ghost "occluded by view:898")
+    page = [n(876, cls="android.widget.ImageView", cd="Open podcast", flags=FOCUS,
+              actions=[CLICK], b=(48, 410, 168, 168)),
+            n(885, cls="android.widget.TextView", text="Stream", flags=FOCUS, actions=[CLICK],
+              b=(48, 641, 592, 144))]
+    frame = n(898, cls="android.widget.FrameLayout", b=(0, 348, 1280, 2052), drawing_order=3)
+    frame.pop("important_for_accessibility")
+    r = root(*page, frame, b=(0, 0, 1280, 2856))
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert [occ.covered_by(p) for p in page] == [None, None]
+    # with a background (the capture's View properties) it does cover them
+    occ, _roots = occlusion.for_dump(
+        {"windows": [{"root_view_id": 1, "root": r}]},
+        props=lambda vid: {"background": "#FFFFFFFF"} if vid == 898 else {})
+    assert occ.covered_by(page[0]).kind == "sheet"
+    assert occlusion.paints("#00000000") is False and occlusion.paints("RippleDrawable") is False
+
+
+def test_a_touch_area_over_its_icon_covers_nothing():
+    # Thunderbird's star_click_area: a transparent clickable View over the star image
+    star = n(463, cls="android.widget.ImageView", cd="Star", b=(1160, 1737, 72, 72))
+    area = n(470, cd="Add star", flags=FOCUS, actions=[CLICK], b=(1136, 1618, 144, 279))
+    r = root(n(450, cls="android.widget.FrameLayout", b=(0, 1618, 1280, 279),
+               children=[star, area]), b=(0, 0, 1280, 2856))
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert occ.covered_by(star) is None
+
+
+def _welcome():
+    # a labelled hero image and, drawn after it, a full-screen column holding a title and
+    # two buttons over the lower part of the image
+    hero = n(2, cls="android.widget.ImageView", cd="A mountain lake at sunrise",
+             b=(0, 0, 1080, 2400))
+    col = n(3, cls="android.widget.LinearLayout", b=(0, 0, 1080, 2400), children=[
+        n(4, cls="android.widget.TextView", text="Welcome", b=(80, 1500, 920, 120)),
+        n(5, cls="android.widget.Button", text="Sign in", flags=FOCUS, actions=[CLICK],
+          b=(80, 1800, 920, 160)),
+        n(6, cls="android.widget.Button", text="Create account", flags=FOCUS,
+          actions=[CLICK], b=(80, 2000, 920, 160))])
+    return root(hero, col), hero, col
+
+
+def test_a_column_the_view_properties_say_is_transparent_covers_only_its_controls():
+    # The column paints nothing of its own (no background, no foreground): it draws where
+    # its title and buttons are, so the image under it is no stop behind a sheet. It was
+    # taken for a surface whatever the properties said (tb.escape, an error).
+    r, hero, col = _welcome()
+
+    def above(a, b):
+        return True if a is col else (False if b is col else None)
+
+    props = {3: {"background": None, "foreground": None}, 2: {"background": None}}
+    assert findings(r, drawn_above=above, props=lambda vid: props.get(vid),
+                    codes=["tb.escape", "tb.covered_stop"]) == []
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]},
+                                     props=lambda vid: props.get(vid), drawn_above=above)
+    assert occ.whole(col) is None and occ.covered_by(hero) is None
+    # without View properties it is a surface still (a sheet's root is one): the guess
+    assert codes(findings(r, drawn_above=above, codes=["tb.escape"])) == [
+        ("tb.escape", "view:3")]
+    # with a background it draws its whole box
+    props[3] = {"background": "#FFFFFFFF"}
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]},
+                                     props=lambda vid: props.get(vid), drawn_above=above)
+    assert occ.covered_by(hero).kind == "sheet"
+
+
+def _list_over_toolbar():
+    # a Toolbar, and a full-screen RecyclerView drawn after it (paddingTop, no background)
+    # whose rows start below the toolbar; RecyclerView is focusable and scrollable
+    up = n(3, cls="android.widget.ImageButton", cd="Navigate up", flags=FOCUS,
+           actions=[CLICK], b=(0, 0, 160, 160))
+    title = n(4, cls="android.widget.TextView", text="Inbox", b=(180, 40, 400, 80))
+    bar = n(2, cls="androidx.appcompat.widget.Toolbar", b=(0, 0, 1080, 160),
+            children=[up, title], drawing_order=1)
+    rows = [n(10 + i, cls="android.widget.TextView", text=f"Mail {i}", flags=FOCUS,
+              actions=[CLICK], b=(0, 200 + 300 * i, 1080, 280)) for i in range(6)]
+    rv = n(5, cls="androidx.recyclerview.widget.RecyclerView",
+           flags=VIS + ("focusable", "scrollable"), b=(0, 0, 1080, 2400), children=rows,
+           drawing_order=2)
+    return root(bar, rv), up, title
+
+
+def test_a_list_over_the_toolbar_covers_it_only_where_its_rows_are():
+    # A focusable list is no scrim: it covers the toolbar only where its rows draw (none
+    # there). It was "touch" (focusable over most of the window), a scrim over Navigate up.
+    r, up, title = _list_over_toolbar()
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r}]})
+    assert occ.covered_by(up) is None and occ.covered_by(title) is None
+    assert findings(r, codes=["tb.escape", "tb.covered_stop"]) == []
+    # a clickable full-screen View with no text over it is a scrim
+    r2, up2, _title = _list_over_toolbar()
+    r2["children"] = [*r2["children"], n(9, flags=FOCUS, actions=[CLICK], b=(0, 0, 1080, 2400))]
+    occ, _roots = occlusion.for_dump({"windows": [{"root_view_id": 1, "root": r2}]})
+    assert occ.covered_by(up2).kind == "scrim"
+
+
+def test_the_walk_takes_no_list_over_the_toolbar_for_an_overlay():
+    # the walk's own nodes (no View properties): a lap that wraps from the rows to the
+    # toolbar was "focus left the overlay view:5 (RecyclerView)" (tb.escape, an error)
+    from inspector_widget.talkback import diff, walk
+
+    from test_tb_diff import record, step
+
+    def node(key, cls, bounds, flags=(), text="", cd="", order=0, parent=None):
+        x = walk.Node()
+        x.key, x.window, x.host, x.virtual, x.cls = key, 0, 0, -1, cls
+        x.label, x.text, x.cd, x.bounds = cd or text, text, cd, bounds
+        x.flags = set(flags) | {"visible_to_user", "enabled"}
+        x.actions, x.drawing_order, x.pane_title, x.parent = set(), order, None, parent
+        if parent is not None:
+            parent.children.append(x)
+        return x
+
+    top = node("view:1", "android.widget.FrameLayout", (0, 0, 1080, 2400))
+    bar = node("view:2", "androidx.appcompat.widget.Toolbar", (0, 0, 1080, 160), order=1,
+               parent=top)
+    up = node("view:3", "android.widget.ImageButton", (0, 0, 160, 160),
+              {"clickable", "focusable"}, cd="Navigate up", order=1, parent=bar)
+    title = node("view:4", "android.widget.TextView", (180, 40, 400, 80), text="Inbox",
+                 order=2, parent=bar)
+    rv = node("view:5", "androidx.recyclerview.widget.RecyclerView", (0, 0, 1080, 2400),
+              {"focusable", "scrollable"}, order=2, parent=top)
+    for i in range(6):
+        node(f"view:{10 + i}", "android.widget.TextView", (0, 200 + 300 * i, 1080, 280),
+             {"clickable", "focusable"}, text=f"Mail {i}", order=i + 1, parent=rv)
+    assert walk._covered_by(up) is None and walk._covered_by(title) is None
+    steps = [step(0, "view:10", (0, 200, 1080, 280), "Mail 0", via="start"),
+             step(1, "view:11", (0, 500, 1080, 280), "Mail 1"),
+             step(2, "view:3", (0, 0, 160, 160), "Navigate up", via="wrap",
+                  covered_by=walk._covered_by(up)),
+             step(3, "view:4", (180, 40, 400, 80), "Inbox",
+                  covered_by=walk._covered_by(title))]
+    assert [f["code"] for f in diff.analyze(record(steps))["findings"]
+            if f["code"] in ("tb.escape", "tb.covered_stop")] == []
+
+
+def test_an_open_drawer_covers_all_of_the_content():
+    # DrawerLayout's scrim covers the content where the drawer does not reach too (the
+    # strip right of a 1080px drawer); the content is hidden from accessibility as well, so
+    # its texts are no text TalkBack skipped (Thunderbird's drawer, wmuvqax)
+    content = n(250, cls="android.widget.RelativeLayout", b=(0, 0, 1280, 2856),
+                important_for_accessibility="NO_HIDE_DESCENDANTS",
+                children=[n(254, cls="android.widget.TextView", text="Inbox",
+                            b=(168, 208, 162, 88)),
+                          n(312, cls="android.widget.ImageView", cd="More options",
+                            flags=FOCUS, actions=[CLICK], b=(1160, 180, 120, 144))])
+    drawer = n(261, cls="androidx.compose.ui.platform.ComposeView", b=(0, 0, 1080, 2856),
+               children=[n(262, cls="android.widget.TextView", text="Outbox", flags=FOCUS,
+                           actions=[CLICK], b=(36, 591, 1008, 168))])
+    dl = n(249, cls="androidx.drawerlayout.widget.DrawerLayout", b=(0, 0, 1280, 2856),
+           children=[content, drawer])
+    nav = tb.Navigator(tb.build([root(dl, b=(0, 0, 1280, 2856))]))
+    cov = static.covers(nav)
+    kinds = {c.overlay["node_key"]: c.kind for c in cov.values()}
+    assert kinds == {"view:261": "drawer"} and len(cov) == 2  # "Inbox" and "More options"
+    # nothing to report: the app hides the content (that is the fix)
+    assert findings(root(dl, b=(0, 0, 1280, 2856)), drawn_above=lambda a, b: None,
+                    codes=["tb.covered_stop", "tb.escape", "tb.skipped"]) == []

@@ -61,7 +61,7 @@ SPEAK_SRC_FALLBACK = "ro1"
 #: Model diagnostics a capture reports (``tb: ...``): why the model's "N of M" for RecyclerView
 #: items is missing or differs from a walk's (talkback/recycler.py).
 SURFACED_DIAGNOSTICS = frozenset({"recycler_bound_before_service", "recycler_positions_unknown",
-                                  "recycler_layout_unknown"})
+                                  "recycler_layout_unknown", "web_content_not_exposed"})
 
 #: The attribute an Index carries its binding under (Index is unhashable, so no weak map).
 _CACHE_ATTR = "_tb_capture"
@@ -650,7 +650,20 @@ class TbCapture:
             if own.text and ex.get("why_not", "").startswith("merged_into"):
                 out["speak_in"] = own.text  # what this node adds to the stop that reads it
         out["reachable"] = ex.get("reachable", "not")
+        cov = self.covered_by(nid)
+        if cov is not None:
+            out["covered_by"] = cov  # drawn under a same-window overlay: hidden on screen
         return out
+
+    def covered_by(self, nid: str) -> str | None:
+        """``"<overlay id> (<kind>)"`` when a same-window overlay draws over the node (its
+        ``render.covered`` issue: talkback/occlusion.py), else None."""
+        node = self.ix.nodes.get(nid) if self.ix is not None else None
+        for iss in (node.issues if node is not None else ()):
+            if iss.id == "render.covered":
+                ov = (iss.evidence.get("node_ids") or ["?"])[0]
+                return f"{ov} ({iss.evidence.get('kind') or 'overlay'})"
+        return None
 
     def _part(self, p: Mapping[str, Any]) -> dict[str, Any]:
         src = self.by_key(p.get("from") or "")
@@ -897,9 +910,10 @@ def issues(ix: Index, loaded: Any, *, density: int | None = None,
         return [], []
     out: list[tuple[str, Issue]] = []
     unmapped = 0
-    for f in static.findings(tbc.nav, density=density or 420,
-                             drawn_above=drawn_above(ix, props_of(loaded)),
-                             view_chain=view_chain(ix)):
+    props = props_of(loaded)
+    above = drawn_above(ix, props)
+    for f in static.findings(tbc.nav, density=density or 420, drawn_above=above,
+                             view_chain=view_chain(ix), props=props):
         nid = tbc.nid(f.node)
         if nid is None:
             unmapped += 1
@@ -911,10 +925,75 @@ def issues(ix: Index, loaded: Any, *, density: int | None = None,
         out.append((nid, Issue(f.code, f.sev, ev,
                                "inferred" if f.conf == "heuristic" else "exact")))
     out.extend(_custom_actions_missing(ix, tbc))
+    out.extend(_covered_marks(tbc, above, props))
+    out.extend(_offscreen_marks(tbc))
     diags = [f"tb: {unmapped} TalkBack findings not mapped to nodes"] if unmapped else []
     diags.extend(f"tb: {d['message']}" for d in tbc.tree.diagnostics
                  if d.get("kind") in SURFACED_DIAGNOSTICS)
     return out, diags
+
+
+def _covered_marks(tbc: TbCapture, above: Any, props: Any) -> list[tuple[str, Issue]]:
+    """``render.covered`` on every node a same-window overlay draws over
+    (:func:`inspector_widget.talkback.static.covers`): each stop under an overlay, and each
+    node with content under a scrim, a sheet or an open drawer. Evidence: the overlay
+    (``node_ids``) and its kind. :func:`cover_lint` then counts the lint findings on those
+    nodes apart, as it does a window under a dialog."""
+    from ..talkback import static
+
+    out: list[tuple[str, Issue]] = []
+    tree = tbc.tree
+    for rid, c in static.covers(tbc.nav, above, props).items():
+        n = tree.by_raw.get(rid) or tree.excluded_by_raw.get(rid)
+        nid = tbc.nid(n) if n is not None else None
+        if nid is None:
+            continue
+        ov = tree.by_raw.get(id(c.overlay)) or tree.excluded_by_raw.get(id(c.overlay))
+        oid = tbc.nid(ov) if ov is not None else None
+        ev: dict[str, Any] = {"kind": c.kind}
+        if oid and oid != nid:
+            ev["node_ids"] = [oid]
+        out.append((nid, Issue("render.covered", "info", ev, "inferred")))
+    return out
+
+
+def _offscreen_marks(tbc: TbCapture) -> list[tuple[str, Issue]]:
+    """``render.offscreen`` on every web stop TalkBack reads where nobody can see it: 0 px
+    tall below the screen, or clipped away with its WebView (the page of a pager or sheet
+    that is not shown: AntennaPod's collapsed player reads 66 such stops before the mini
+    player, AP-1). The render signals leave out what a scrolled-out container holds; these
+    are stops TalkBack still reaches, so the capture's summary lists them."""
+    from ..talkback.static import ghost
+
+    out: list[tuple[str, Issue]] = []
+    for n in tbc.linear():
+        if n.facet != "virtual":
+            continue
+        why = [g for g in ghost(tbc.nav, n, tbc.density) if g in ("offscreen", "zero_size")]
+        nid = tbc.nid(n) if why else None
+        if nid is None:
+            continue
+        r = n.rect
+        out.append((nid, Issue("render.offscreen", "info",
+                               {"rect": [r.left, r.top, r.width, r.height],
+                                "outside": "viewport" if why[0] == "offscreen" else "zero_size",
+                                "stop": tbc.stop_no(n)}, "inferred")))
+    return out
+
+
+def cover_lint(pairs: list[tuple[str, Issue]]) -> None:
+    """Mark the lint findings (``a11y.*``) on the nodes a ``render.covered`` issue in
+    ``pairs`` covers: evidence ``covered_by`` (the overlay), so the lint summary counts them
+    apart (``summary.covered``) as it does those on a window under a dialog. In place."""
+    under: dict[str, str] = {}
+    for nid, iss in pairs:
+        if iss.id == "render.covered" and iss.evidence.get("node_ids"):
+            under[nid] = iss.evidence["node_ids"][0]
+    if not under:
+        return
+    for nid, iss in pairs:
+        if nid in under and iss.id.startswith("a11y.") and not iss.evidence.get("covered_by"):
+            iss.evidence["covered_by"] = under[nid]
 
 
 def fallback_reading(ix: Index, *, granularity: str = "default", start: str | None = None,
@@ -941,5 +1020,5 @@ def tb_of(ix: Index, loaded: Any) -> TbCapture | None:
 
 
 __all__ = ["DIRECTIONS", "GESTURE_COMPOSABLES", "GRANULARITIES", "NAME_KINDS", "ReadItem",
-           "StopSpeech", "TbCapture", "drawn_above", "fallback_reading", "issues", "name_of",
-           "stop_speech", "tb_of"]
+           "StopSpeech", "TbCapture", "cover_lint", "drawn_above", "fallback_reading", "issues",
+           "name_of", "stop_speech", "tb_of"]

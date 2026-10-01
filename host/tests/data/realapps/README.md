@@ -40,5 +40,10 @@ from the same dump as `nia_onboarding_grid` (`"dump"`). Each entry has the same 
   n is `steps[n-1]`.
 - `said` is null where TalkBack's speech was not logged or focus did not move.
 
-No test uses these yet. They pin the app bugs and the tool gaps in `docs/realapp-findings.md`,
-and are inputs for the next round's tests.
+They pin the app bugs and the tool gaps in `docs/realapp-findings.md`.
+`tests/test_realapp_hunt_walks.py` replays them (`tests/hunt_replay.py`), with
+`talkback17_hunt_records.json.gz` (the walk records the hunt saved, trimmed of findings and
+timings), `talkback17_occlusion_walks.json.gz` (the occlusion-model round's live walks on
+emulator-5554, each with a `note`) and `windows_nia_*.txt` (the window manager's list, trimmed,
+with Now in Android under the 16 KB compatibility dialog and the notification permission
+request, and in split screen beside a focused Settings, which covers none of it).

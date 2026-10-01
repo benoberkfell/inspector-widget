@@ -110,7 +110,10 @@ REAL = {
     "a11yprobe_viewscreen": {"tb.ghost_stop": 3},
     "nia_foryou": {"tb.double_stop": 3},
     "nia_settings": {},
-    "thunderbird_list_compose": {"tb.double_stop": 6, "tb.ghost_stop": 6},
+    # TB-1 on Compose rows: the empty banner ComposeView at position 0 counts; the first
+    # message is "2 of 7" (each row's stops are inside its ComposeView cell)
+    "thunderbird_list_compose": {"tb.double_stop": 6, "tb.ghost_stop": 6,
+                                 "tb.wrong_announcement": 1},
     # its empty header item counts: TalkBack (on before the app) says "2 of 7" on the first
     # row, live on emulator-5556; the item is scrolled off the top (talkback/recycler.py)
     "thunderbird_list_views": {"tb.double_stop": 6, "tb.wrong_announcement": 1},
@@ -160,15 +163,18 @@ def test_the_default_lint_reports_the_precise_tb_rules():
     esc = rules["tb.escape"]
     assert esc["sev"] == "error" and esc["fix"].startswith("A real Dialog")
     assert esc["nodes"] == ["view:12 View 9 stops under it (90% of the window), e.g. view:3 view:4"]
+    # the touch-target findings on the 8 buttons the scrim covers are counted apart, as they
+    # are under a dialog window (G5), under the scrim's name: it is no dialog window
     assert analyzers.lint_summary(ix)["lint"] == (
-        "2 error 10 warn: 10 touch_target, 1 label_missing, 1 escape (contrast not run)")
+        "2 error 2 warn: 2 touch_target, 1 label_missing, 1 escape; +8 under view:12 (scrim) "
+        "(contrast not run)")
 
 
 def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():
     ix, raw = F.fixture_capture("thunderbird_list_compose")
     out = analyzers.lint_view(ix, raw, rules=["tb"])
     by = {r["rule"]: r for r in out["rules"]}
-    assert set(by) == {"tb.double_stop", "tb.ghost_stop"}
+    assert set(by) == {"tb.double_stop", "tb.ghost_stop", "tb.wrong_announcement"}
     assert by["tb.double_stop"]["nodes"] == [
         "×6 in #message_list cells: sem:785:838 sem:795:861 sem:805:886 +3"]
     assert by["tb.ghost_stop"]["nodes"] == [
@@ -177,6 +183,27 @@ def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():
     assert out["next"][-1] == 'node("sem:785:838",facets="tb,issues")'
     assert R.resolve(["tb"]) == [r.id for r in R.RULES.values() if r.family == "tb"]
     assert R.resolve("double_stop") == ["tb.double_stop"]
+
+
+def test_the_codes_the_occlusion_work_added_are_all_known_to_the_catalog():
+    # tb.interleaved and tb.autoscroll_row_skip were walk findings the catalog did not know
+    # (lint(rules=["interleaved"]) was bad_args) next to tb.webview_block and
+    # tb.covered_stop, which it did
+    for code in ("tb.webview_block", "tb.covered_stop", "tb.interleaved",
+                 "tb.autoscroll_row_skip"):
+        assert R.is_known(code), code
+        assert R.resolve(code.split(".", 1)[1]) == [code]
+    ix, raw = F.fixture_capture("thunderbird_list_compose")
+    out = analyzers.lint_view(ix, raw, rules=["interleaved"])
+    assert out["rules"] == [] and "only in a walk" in out["note"]
+    # a fix names no parameter the tools do not have (tb_walk's relaunch came later)
+    from inspector_widget import surface
+    from inspector_widget.talkback import diff
+
+    params = {p.name for t in surface.SPECS for p in t.params}
+    for code in ("tb.webview_block", "tb.interleaved", "tb.autoscroll_row_skip"):
+        for fix in (R.RULES[code].fix, diff.FIXES[code]):
+            assert "relaunch" in params or "relaunch" not in fix, (code, fix)
 
 
 def test_finding_details_name_the_other_nodes():

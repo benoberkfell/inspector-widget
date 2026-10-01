@@ -988,6 +988,9 @@ def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None =
         tb_pairs, tb_diags = _tb_issues(ix, src, density)
         lint_pairs.extend(tb_pairs)
         diags.extend(tb_diags)
+        from .tb import cover_lint
+
+        cover_lint(lint_pairs)  # findings under a same-window overlay: counted apart
 
     for n in ix.nodes.values():
         if n.issues:
@@ -1036,13 +1039,14 @@ def lint_summary(ix: Index) -> dict[str, str]:
                 sev_by[iss.sev] += 1
             elif iss.id.startswith("render."):
                 render_by.setdefault(R.short(iss.id), []).append(n.ref or n.id)
-    # findings under an open dialog are counted apart, as a11y_lint's summary does
-    covered = [i for n in ix.nodes.values() for i in n.issues if _covered(i)]
-    for iss in covered:
+    # findings under an open dialog (or a same-window overlay) are counted apart, as
+    # a11y_lint's summary does
+    covered = [(n.id, i) for n in ix.nodes.values() for i in n.issues if _covered(i)]
+    for _nid, iss in covered:
         a11y_by[R.short(iss.id)] -= 1
         sev_by[iss.sev] -= 1
     a11y_by = +a11y_by
-    under = f"; +{len(covered)} under an open dialog" if covered else ""
+    under = _under(ix, covered)
     out: dict[str, str] = {}
     contrast = "contrast sampled" if _contrast_ran(ix) else "contrast not run"
     if a11y_by:
@@ -1066,8 +1070,46 @@ def _contrast_ran(ix: Index) -> bool:
 
 def _covered(iss: Issue) -> bool:
     """A lint finding on a window under an open dialog or sheet (evidence ``covered_by``,
-    the dialog's window): TalkBack cannot reach it until the dialog closes."""
+    the dialog's window), or on a node a same-window overlay draws over (``covered_by``,
+    the overlay: capture/tb.py ``cover_lint``): hidden until it closes."""
     return bool((iss.evidence or {}).get("covered_by"))
+
+
+def _overlay(ix: Index, nid: str, iss: Issue) -> tuple[str, str] | None:
+    """``(overlay id, kind)`` when ``iss`` is counted apart because a same-window overlay
+    (a scrim, a sheet, a drawer, an action-mode bar) draws over its node: the node's
+    ``render.covered`` names the same overlay. None for a window under a dialog."""
+    by = str((iss.evidence or {}).get("covered_by") or "")
+    n = ix.nodes.get(nid)
+    for i in n.issues if n is not None else ():
+        ev = i.evidence or {}
+        if i.id == "render.covered" and by in (ev.get("node_ids") or ()):
+            return by, str(ev.get("kind") or "overlay")
+    return None
+
+
+def _under(ix: Index, covered: list[tuple[str, Issue]]) -> str:
+    """The summary's ``; +N under …``: the findings under an open dialog (a window over
+    theirs), and those under a same-window overlay by the overlay (``+2 under n236 (bar)``;
+    ``+N under K overlays`` for several)."""
+    dialog = 0
+    over: dict[str, str] = {}
+    n_over = 0
+    for nid, iss in covered:
+        ov = _overlay(ix, nid, iss)
+        if ov is None:
+            dialog += 1
+        else:
+            over.setdefault(*ov)
+            n_over += 1
+    parts = [f"+{dialog} under an open dialog"] if dialog else []
+    if len(over) == 1:
+        oid, kind = next(iter(over.items()))
+        on = ix.get(oid)
+        parts.append(f"+{n_over} under {_ref(on) if on is not None else oid} ({kind})")
+    elif over:
+        parts.append(f"+{n_over} under {len(over)} overlays")
+    return "; " + ", ".join(parts) if parts else ""
 
 
 def covered_windows(ix: Index, loaded: Any) -> dict[str, str | None]:
@@ -1087,16 +1129,20 @@ def covered_windows(ix: Index, loaded: Any) -> dict[str, str | None]:
 
 def _covered_out(ix: Index, covered: list[tuple[str, Issue]]) -> dict[str, Any]:
     """lint()'s ``covered``: how many findings sit under an open dialog, on which windows,
-    under which dialog."""
+    under which dialog; a same-window overlay is named with its kind (``n236 (bar)``) and
+    adds no window (its own window is the screen the lint already covers)."""
     wins: list[str] = []
     by: list[str] = []
     for nid, iss in covered:
+        ov = _overlay(ix, nid, iss)
         w = ix.nodes[nid].window
-        wn = ix.nodes.get(w) if w else None
+        wn = ix.nodes.get(w) if w and ov is None else None
         if wn is not None and _ref(wn) not in wins:
             wins.append(_ref(wn))
         dn = ix.get(str(iss.evidence.get("covered_by")))
         d = _ref(dn) if dn is not None else str(iss.evidence.get("covered_by"))
+        if ov is not None:
+            d = f"{d} ({ov[1]})"
         if d not in by:
             by.append(d)
     return {"n": len(covered), "windows": wins, "by": by}
@@ -1216,7 +1262,13 @@ def _tb_detail(iss: Issue) -> str:
         return f"{ev.get('why', '')}: says {_quote(ev.get('said') or '', 24)}"
     if rid in ("tb.out_of_order", "tb.boundary_jump"):
         after = f" after {others[0]}" if others else ""
+        if ev.get("why") == "in_overlay" and len(others) > 1:  # talkback/static.py
+            return (f"read {ev.get('read')}{after}: {ev.get('stops', 1)} stop(s) of "
+                    f"{others[-1]}, drawn over what is read before it")
         return f"read {ev.get('read')}{after}, seen {ev.get('visual')} of {ev.get('of')}"
+    if rid == "tb.covered_stop":  # talkback/occlusion.py
+        ex = " ".join(others[:2]) + (f" +{len(others) - 2}" if len(others) > 2 else "")
+        return f"draws over {ev.get('covers')} stop(s) TalkBack reads ({ev.get('kind')}): {ex}"
     if rid == "tb.escape":
         ex = " ".join(others[:2])
         return (f"{ev.get('under')} stops under it ({ev.get('area_pct')}% of the window), "
@@ -1472,11 +1524,14 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if not explicit and any(i.id.startswith("render.") for n in ix.nodes.values()
                             for i in n.issues):
         nxt.append('find(issue="render.")')
-    if covered and scope is None and out["covered"]["windows"]:
-        # ahead of find(issue="render."): what a dialog hides matters more (3 hints at most)
+    if covered and scope is None:
+        # ahead of find(issue="render."): what a dialog hides matters more (3 hints at most);
+        # what a same-window overlay draws over is listed by its render.covered marks (the
+        # window it is in is the whole screen again)
         render = 'find(issue="render.")'
-        nxt.insert(nxt.index(render) if render in nxt else len(nxt),
-                   f'lint(within="{out["covered"]["windows"][0]}")')
+        wins = out["covered"]["windows"]
+        hint = f'lint(within="{wins[0]}")' if wins else 'find(issue="render.covered")'
+        nxt.insert(nxt.index(render) if render in nxt else len(nxt), hint)
     if explicit and not kept and any(r.startswith("tb.") for r in selected_set):
         # nothing static: traps, loops and focus after an action or a list update show
         # only on the device

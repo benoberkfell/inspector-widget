@@ -58,6 +58,8 @@ CLASSES = {
     "tb.loop": "loop", "tb.trap": "trap", "tb.escape": "escape", "tb.edge_stuck": "stuck",
     "tb.focus_lost": "lost", "tb.ghost_stop": "ghost", "tb.revisit": "revisit",
     "tb.window_order": "window_order", "tb.wrong_announcement": "speech",
+    "tb.covered_stop": "covered", "tb.webview_block": "stuck", "tb.interleaved": "interleaved",
+    "tb.autoscroll_row_skip": "row_skip",
 }
 
 Rect = tuple[int, int, int, int]
@@ -272,6 +274,8 @@ class _CaptureKeys:
         self.sigs: list[tuple[str, Rect, str]] = []
         self.windows: dict[int, str] = {}
         self._covered: dict[str, dict[str, Any]] | None | bool = False
+        self._unseen: set[str] | None = None
+        self._items: dict[str, int] | None = None
         self._ranks: dict[str, list[Any]] | None = None
         from .tb import TbCapture, _iter_paths, props_of
 
@@ -340,21 +344,66 @@ class _CaptureKeys:
                 from ..talkback import static
                 from .tb import drawn_above
 
-                found = static.covered(self._tbc.nav, drawn_above(self.ix, self._props))
+                found = static.covered(self._tbc.nav, drawn_above(self.ix, self._props),
+                                       self._props)
                 if found is not None:
                     out: dict[str, dict[str, Any]] = {}
-                    for key, (ov, pct) in found.items():
+                    for key, (ov, pct, kind) in found.items():
                         nid = self.keys.get(key)
                         if nid is None:
                             continue
-                        r = ov.rect if hasattr(ov, "rect") else None
-                        out[nid] = {"overlay": getattr(ov, "key", None),
-                                    "ref": self._tbc.nid(ov),
+                        r = ov.rect if hasattr(ov, "rect") else _rect(ov.raw.get("bounds"))
+                        if r is not None and not isinstance(r, tuple):
+                            r = (r.left, r.top, r.width, r.height)
+                        out[nid] = {"overlay": getattr(ov, "key", None) or ov.raw.get("node_key"),
+                                    "ref": self._tbc.nid(ov), "kind": kind,
                                     "cls": str(ov.raw.get("class_name") or "").rsplit(".", 1)[-1],
                                     "area": round(pct / 100, 2),
-                                    "rect": [r.left, r.top, r.width, r.height] if r else None}
+                                    "rect": list(r) if r else None}
                     self._covered = out
         return self._covered  # type: ignore[return-value]
+
+    def items(self, key: str | None) -> int | None:
+        """How many children (a list's attached items) the node ``key`` has in this
+        capture's dump, or None when it holds no such node."""
+        if self._items is None:
+            self._items = {}
+            if self._tbc is not None:
+                for w in self._tbc.dump.data.get("windows") or []:
+                    stack = [w.get("root")] if w.get("root") else []
+                    while stack:
+                        raw = stack.pop()
+                        kids = raw.get("children") or []
+                        if raw.get("node_key") and raw.get("collection_info"):
+                            self._items[str(raw["node_key"])] = len(kids)
+                        stack.extend(kids)
+        return self._items.get(key) if key else None
+
+    def unseen(self) -> set[str]:
+        """The node keys of this capture TalkBack's user cannot see or reach the text of:
+        hidden from accessibility (noHideDescendants: DrawerLayout hides its content while a
+        drawer is open) or drawn under a scrim, a sheet or an open drawer
+        (talkback/occlusion.py). A lap that never read their text skipped nothing."""
+        if self._unseen is None:
+            self._unseen = set()
+            tbc = self._tbc
+            if tbc is not None:
+                from ..talkback import static
+                from .tb import drawn_above
+
+                tree = tbc.tree
+                for ex in tree.excluded:
+                    if ex.reason == "hidden" and ex.raw.get("node_key"):
+                        self._unseen.add(str(ex.raw["node_key"]))
+                for c_id, c in static.covers(tbc.nav, drawn_above(self.ix, self._props),
+                                             self._props).items():
+                    if c.kind == "bar":
+                        continue
+                    n = tree.by_raw.get(c_id) or tree.excluded_by_raw.get(c_id)
+                    k = n.raw.get("node_key") if n is not None else None
+                    if k:
+                        self._unseen.add(str(k))
+        return self._unseen
 
     def ref(self, key: str | None, sig: str | None = None, bounds: Any = None) -> str | None:
         if key:
@@ -442,6 +491,23 @@ class Binding:
             if c.id == cid:
                 return c.covered()
         return None
+
+    def items(self, key: str | None, at: int | None = None) -> int | None:
+        """The attached items of the list ``key`` in the capture nearest step ``at``."""
+        for c in self._order(at):
+            n = c.items(key)
+            if n is not None:
+                return n
+        return None
+
+    def unseen(self, key: str | None) -> bool:
+        """Whether the latest capture holding ``key`` has it hidden or under an overlay."""
+        if not key:
+            return False
+        for _a, c in reversed(self._caps):
+            if key in c.keys:
+                return key in c.unseen()
+        return False
 
     def speakable(self, ref: str | None, cid: str | None) -> str | None:
         """What the capture's TalkBack model says at ``ref`` (its a11y facet)."""
@@ -531,6 +597,10 @@ def bind_walk(record: dict[str, Any], binding: Binding,
                 s.pop("unbound", None)
             else:
                 s["ref"], s["unbound"] = key, True
+        if s.get("container") and "container_items" not in s:
+            held = binding.items(s["container"], at)
+            if held is not None:
+                s["container_items"] = held  # what a "N items" count is checked against
         for k in ("scrolled", "container"):
             if s.get(k):
                 s[k] = _bind_key(binding, s[k], at)
@@ -569,6 +639,10 @@ def bind_walk(record: dict[str, Any], binding: Binding,
     edge = record.get("edge")
     if isinstance(edge, dict) and edge.get("container"):
         edge["container_ref"] = _bind_key(binding, edge["container"], None)
+    if record.get("orphans"):
+        # text behind a drawer's scrim, a sheet or a dialog, or hidden from accessibility, is
+        # not skipped: nobody sees it (Thunderbird's drawer over the message list, wmuvqax)
+        record["orphans"] = [o for o in record["orphans"] if not binding.unseen(o.get("key"))]
     for o in record.get("orphans") or []:
         if o.get("key"):
             o["ref"] = _bind_key(binding, o["key"], None)

@@ -188,3 +188,67 @@ def test_a_service_off_list_inside_a_scrim_still_escapes_it():
         assert {o.key for o in fs[0].others} == {"view:2", "view:4"}
     # and the corrected items keep the dump's own dicts
     assert tree.node("view:11").raw is r["children"][2]["children"][0]["children"][1]
+
+
+# ------------------------------------------------------------- G20: ViewPager2 and late binding
+VP = "androidx.viewpager.widget.ViewPager"
+
+
+def _pager():
+    """ViewPager2 as the dump holds it: the pager (its node reports ViewPager's class and the
+    RecyclerView's CollectionInfo), its RecyclerView not important, two page roots (plain
+    FrameLayouts, AUTO) each holding a title and a button."""
+    def page(host, x):
+        kids = [n(host + 1, cls="android.widget.TextView", text=f"Title {host}",
+                  b=(x + 10, 300, 500, 80)),
+                n(host + 2, cls="android.widget.Button", text="Play", flags=FOCUS,
+                  actions=[CLICK], b=(x + 10, 400, 300, 120))]
+        p = n(host, cls="android.widget.FrameLayout", b=(x, 200, 1080, 1800), children=kids)
+        p.pop("important_for_accessibility")  # AUTO: nothing makes it important by itself
+        return p
+
+    ci = {"row_count": 1, "column_count": 4, "hierarchical": False, "selection_mode": 0}
+    rv = n(5, cls=RV, flags=("visible_to_user", "scrollable", "focusable"),
+           actions=[SCROLL_FWD], b=(0, 200, 1080, 1800), children=[page(20, 0), page(30, 1080)],
+           collection_info=ci, important_for_accessibility="NO")
+    return n(4, cls=VP, flags=("visible_to_user", "scrollable"), actions=[SCROLL_FWD],
+             b=(0, 200, 1080, 1800), children=[rv], collection_info=dict(ci))
+
+
+def test_viewpager2_pages_get_the_item_info_a_service_adds():
+    # A service-off dump: ViewPager2's RecyclerView is not important, so TalkBack gets the
+    # pages under the pager; they still are its items (column = page index)
+    tree = tb.build([root(_pager())], services="off")
+    assert tree.node("view:20").get("collection_item_info")["column_index"] == 0
+    assert tree.node("view:30").get("collection_item_info")["column_index"] == 1
+    assert [d["kind"] for d in tree.diagnostics] == ["recycler_item_info"]
+    # the page root is a stop of its own ("Page" ...) as for a TalkBack-first user (AP-4)
+    assert "view:20" in tb.simulate(tree).keys()
+
+
+def test_viewpager2_pages_bound_before_the_service_are_no_stops_and_say_why():
+    # AntennaPod's episode pager with TalkBack turned on after the app (G20, w9wtb7e): the
+    # pages carry no item info and stay not important, so TalkBack reads their children
+    tree = tb.build([root(_pager())], services="on")
+    assert tree.node("view:20") is None  # hoisted: its children take its place
+    assert [x.key for x in tree.node("view:4").children][:2] == ["view:21", "view:22"]
+    assert "view:20" not in tb.simulate(tree).keys()
+    d = next(d for d in tree.diagnostics if d["kind"] == "recycler_bound_before_service")
+    assert d["keys"] == ["view:5"] and d["count"] == 1
+
+
+def test_the_episode_pager_both_ways_round():
+    # AP-4 fixtures: the same screen with TalkBack first and later
+    import hunt_replay as H
+
+    first = tb.build(H.dump("antennapod_episode_details_tb_first"))
+    later = tb.build(H.dump("antennapod_episode_details_tb_later"))
+    assert "recycler_bound_before_service" not in [d["kind"] for d in first.diagnostics]
+    assert "recycler_bound_before_service" in [d["kind"] for d in later.diagnostics]
+    assert "view:872" in tb.simulate(first).keys()
+    assert "view:872" not in tb.simulate(later).keys()
+    # press for press: every move of w9wtb7e (the page's texts are stops of their own); the
+    # two presses after Download that move nothing are TalkBack failing to focus a WebView
+    # root that the dump shows exactly as in the TalkBack-first one (G7: tb.webview_block)
+    assert H.agreement("antennapod_episode_details_tb_later") == (8, 10, 8, 8)
+    assert H.agreement("antennapod_episode_details_tb_first") == (14, 14, 14, 14)

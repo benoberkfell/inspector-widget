@@ -491,6 +491,7 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
         })
     _apply_interactive_region(tree)
     _check_web_content(tree)
+    _apply_foreign_window(tree, diag)
     if tree.services == "off":
         holders = [n for n in tree.nodes if n.facet == "interop" and n.visible]
         for n in holders:
@@ -537,6 +538,8 @@ def _project(tree: TbTree, win: TbWindow, root_raw: Dict[str, Any], compose_host
     while stack:
         raw, raw_parent, tb_parent = stack.pop()
         why = _a11y.talkback_exclusion(raw, raw_parent)
+        if why is None and tree.services == "on" and bound_before_service(raw, raw_parent):
+            why = "not_important"
         if why == "hidden":
             _exclude_subtree(tree, win, raw, tb_parent)
             continue
@@ -555,6 +558,27 @@ def _project(tree: TbTree, win: TbWindow, root_raw: Dict[str, Any], compose_host
     return root
 
 
+#: RecyclerView classes whose items get an accessibility delegate (a11y._ITEM_PARENTS).
+ITEM_PARENTS = ("RecyclerView", "WearableRecyclerView")
+
+
+def bound_before_service(raw: Dict[str, Any], raw_parent: Optional[Dict[str, Any]]) -> bool:
+    """A RecyclerView item View bound while no accessibility service ran, in a dump taken
+    with one on: no CollectionItemInfo, and its own mode resolves to not important.
+    RecyclerView makes an item root important (AUTO -> YES) only when it binds it with a
+    service on (attachAccessibilityDelegateOnBind), so until the item is rebound TalkBack
+    does not get it and reads its children in its place: AntennaPod's episode pager page with
+    TalkBack turned on after the app is no "Page" stop (G20; the TalkBack-first dump has it,
+    important and with item info)."""
+    if raw_parent is None or int(raw.get("virtual_id", _a11y.HOST_VIEW_ID)) != _a11y.HOST_VIEW_ID:
+        return False
+    if int(raw_parent.get("virtual_id", _a11y.HOST_VIEW_ID)) != _a11y.HOST_VIEW_ID:
+        return False
+    if (raw_parent.get("class_name") or "").rsplit(".", 1)[-1] not in ITEM_PARENTS:
+        return False
+    return not raw.get("collection_item_info") and not _a11y.view_is_important(raw)
+
+
 def _exclude_subtree(tree: TbTree, win: TbWindow, top: Dict[str, Any], parent: TbNode) -> None:
     stack = [top]
     while stack:
@@ -563,6 +587,24 @@ def _exclude_subtree(tree: TbTree, win: TbWindow, top: Dict[str, Any], parent: T
         tree.excluded.append(ex)
         tree.excluded_by_raw[id(raw)] = ex
         stack.extend(raw.get("children") or ())
+
+
+def _apply_foreign_window(tree: TbTree, diag: str) -> None:
+    """A window of another app over this one (a system dialog: the capture recorded it in
+    the dump's diagnostics, talkback/windows.py): TalkBack gets that window, not these, so
+    none of them is reported (no stops), and a diagnostic says what covers them."""
+    from .windows import from_token, hint, message, name
+
+    cover = from_token(diag)
+    if cover is None:
+        return
+    for w in tree.windows:
+        if w.dropped is None:
+            w.dropped = f"foreign:{name(cover)}"
+    tree.diagnostics.append({
+        "kind": "foreign_window", "window": cover.get("window"), "package": cover.get("package"),
+        "message": f"{message(cover, 'this app')}: no stop of it is on screen. {hint(cover)}",
+    })
 
 
 WEBVIEW_CLASS = "android.webkit.WebView"

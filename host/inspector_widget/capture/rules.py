@@ -183,7 +183,11 @@ _CATALOG: tuple[Rule, ...] = (
        "Check its size modifiers or layout params"),
     _r("render.text_overflow", "warn", "Text is cut off or ellipsized.",
        "Allow more lines or room", planned=True),
-    _r("render.covered", "warn", "Drawn under another node.", planned=True),
+    _r("render.covered", "info",
+       "Drawn under a same-window overlay (a scrim, a sheet, an open drawer, an action-mode "
+       "bar): hidden on screen; its lint findings are counted apart.",
+       "Hide what the overlay covers from accessibility while it is shown (View "
+       "noHideDescendants, Compose hideFromAccessibility)"),
     _r("render.drawn_mismatch", "info", "Drawn pixels differ from the declared bounds.",
        planned=True),
     # TalkBack navigation, from the TalkBack model (capture/tb.py, talkback/static.py).
@@ -230,6 +234,25 @@ _CATALOG: tuple[Rule, ...] = (
        "A gesture-only action (swipe to dismiss, drag) has no accessibility action.",
        "Modifier.semantics { customActions = listOf(CustomAccessibilityAction(\"Delete\") "
        "{ … }) }; View: ViewCompat.addAccessibilityAction"),
+    _r("tb.webview_block", "error",
+       "Focus stops before a WebView: TalkBack cannot move into its page (a walk finding).",
+       "Turn TalkBack on, restart the app and walk again; give the page a native way in (a "
+       "button that focuses the WebView)"),
+    _r("tb.interleaved", "warn",
+       "A card's stop is read after another card's stops (side-by-side cards; a walk "
+       "finding).",
+       "One traversal group per card (Modifier.semantics { isTraversalGroup = true }), or one "
+       "stop per card with its controls as custom actions"),
+    _r("tb.autoscroll_row_skip", "warn",
+       "TalkBack's auto-scroll along a sideways grid's bottom row passes over the rows above "
+       "(a walk finding).",
+       "A vertical layout (FlowRow, rows in a vertical list), or a traversal group with "
+       "traversalIndex = index per item"),
+    _r("tb.covered_stop", "warn",
+       "Draws over stops of its own window (an action-mode bar over the toolbar): hidden, "
+       "TalkBack still reads them.",
+       "While the overlay shows, noHideDescendants on what it covers (Compose "
+       "hideFromAccessibility); focus the overlay"),
 )
 
 _CATALOG = _unique_shorts(_CATALOG)

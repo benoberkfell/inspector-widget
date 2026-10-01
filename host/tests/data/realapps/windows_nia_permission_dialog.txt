@@ -1,0 +1,96 @@
+  Window #0 Window{74ebf33 u0 ScreenDecorOverlayBottom}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=NONE
+    mAttrs={(0,0)(fillxwrap) gr=BOTTOM CENTER_VERTICAL sim={adjust=pan} layoutInDisplayCutoutMode=always ty=NAVIGATION_BAR_PANEL fmt=TRANSLUCENT
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,2623][1280,2856] last=[0,2623][1280,2856] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  Window #1 Window{92fcea0 u0 ScreenDecorOverlay}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=NONE
+    mAttrs={(0,0)(fillxwrap) gr=TOP CENTER_VERTICAL sim={adjust=pan} layoutInDisplayCutoutMode=always ty=NAVIGATION_BAR_PANEL fmt=TRANSLUCENT
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,233] last=[0,0][1280,233] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  Window #2 Window{a8e8bb1 u0 DisplayBackGestureHandler 0}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=NONE
+    mAttrs={(0,0)(315x804) sim={adjust=pan} ty=NAVIGATION_BAR_PANEL fmt=TRANSLUCENT
+    Frames: parent=[0,0][1280,2856] display=[0,156][1280,2856] frame=[482,1026][797,1830] last=[482,1026][797,1830] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #3 Window{43fe17 u0 Taskbar}:
+    mOwnerUid=10197 showForAllUsers=true package=com.google.android.apps.nexuslauncher appop=NONE
+    mAttrs={(0,0)(fillx72) gr=BOTTOM CENTER_VERTICAL sim={adjust=nothing} layoutInDisplayCutoutMode=always ty=NAVIGATION_BAR fmt=TRANSLUCENT receive insets ignoring z-order
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,2784][1280,2856] last=[0,2784][1280,2856] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  Window #4 Window{f94cb17 u0 NotificationShade}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=NONE
+    mAttrs={(0,0)(fillxfill) gr=TOP CENTER_VERTICAL sim={adjust=nothing} layoutInDisplayCutoutMode=always ty=NOTIFICATION_SHADE fmt=TRANSLUCENT
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #5 Window{8eac61e u0 StatusBar}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=NONE
+    mAttrs={(0,0)(fillx156) gr=TOP CENTER_VERTICAL sim={adjust=pan} layoutInDisplayCutoutMode=always ty=STATUS_BAR fmt=TRANSLUCENT
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,156] last=[0,0][1280,156] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  Window #6 Window{add7495 u0 ShellDropTarget}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=SYSTEM_ALERT_WINDOW
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan} layoutInDisplayCutoutMode=always ty=APPLICATION_OVERLAY fmt=TRANSLUCENT
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #7 Window{786f797 u0 InputMethod}:
+    mOwnerUid=10169 showForAllUsers=false package=com.google.android.inputmethod.latin appop=NONE
+    mAttrs={(0,0)(fillxfill) gr=BOTTOM CENTER_VERTICAL sim={adjust=pan} ty=INPUT_METHOD fmt=TRANSPARENT wanim=0x1030056 receive insets ignoring z-order
+    Frames: parent=[0,156][1280,2856] display=[0,156][1280,2856] frame=[0,156][1280,2856] last=[0,156][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #8 Window{e577643 u0 com.google.android.permissioncontroller/com.android.permissioncontroller.permission.ui.GrantPermissionsActivity}:
+    mOwnerUid=10204 showForAllUsers=false package=com.google.android.permissioncontroller appop=NONE
+    mAttrs={(0,0)(wrapxwrap) gr=CENTER sim={state=always_hidden adjust=nothing forwardNavigation} ty=BASE_APPLICATION fmt=TRANSPARENT wanim=0x103030e
+    Frames: parent=[0,156][1280,2784] display=[0,156][1280,2784] frame=[32,1001][1248,1938] last=[32,1001][1248,1938] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  Window #9 Window{29315b6 u0 com.google.samples.apps.nowinandroid.demo.debug/com.google.samples.apps.nowinandroid.MainActivity}:
+    mOwnerUid=10235 showForAllUsers=false package=com.google.samples.apps.nowinandroid.demo.debug appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan forwardNavigation} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION wanim=0x103030d
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  Window #10 Window{9d2e879 u0 com.oberkfell.a11yprobe/com.oberkfell.a11yprobe.MainActivity}:
+    mOwnerUid=10233 showForAllUsers=false package=com.oberkfell.a11yprobe appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan forwardNavigation} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION wanim=0x103030d
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #11 Window{30a4ab5 u0 net.thunderbird.android.debug/com.fsck.k9.activity.MessageHomeActivity}:
+    mOwnerUid=10234 showForAllUsers=false package=net.thunderbird.android.debug appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION wanim=0x103030d
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #12 Window{17b06e7 u0 de.danoeh.antennapod.debug/de.danoeh.antennapod.activity.MainActivity}:
+    mOwnerUid=10237 showForAllUsers=false package=de.danoeh.antennapod.debug appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={state=always_hidden adjust=pan} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION wanim=0x103030d
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #13 Window{7103dba u0 com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity}:
+    mOwnerUid=10197 showForAllUsers=false package=com.google.android.apps.nexuslauncher appop=NONE
+    mAttrs={(0,0)(fillxfill) sim={adjust=nothing} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION fmt=TRANSPARENT wanim=0x1030301
+    Frames: parent=[0,0][1280,2856] display=[0,0][1280,2856] frame=[0,0][1280,2856] last=[0,0][1280,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+  Window #14 Window{a0db881 u0 com.android.systemui.wallpapers.ImageWallpaper}:
+    mOwnerUid=10198 showForAllUsers=true package=com.android.systemui appop=NONE
+    mAttrs={(0,0)(2572x2856) gr=TOP START CENTER layoutInDisplayCutoutMode=always ty=WALLPAPER fmt=RGBX_8888 wanim=0x103031d
+    Frames: parent=[0,0][1280,2856] display=[-100000,-100000][100000,100000] frame=[0,0][2572,2856] last=[0,0][2572,2856] insetsChanged=false
+    isOnScreen=false
+    isVisible=false
+    mOwnerUid=10204 showForAllUsers=false package=com.google.android.permissioncontroller appop=NONE
+    mAttrs={(0,0)(wrapxwrap) gr=CENTER sim={state=always_hidden adjust=nothing forwardNavigation} ty=BASE_APPLICATION fmt=TRANSPARENT wanim=0x103030e
+    Frames: parent=[0,156][1280,2784] display=[0,156][1280,2784] frame=[32,1001][1248,1938] last=[32,1001][1248,1938] insetsChanged=false
+    isOnScreen=true
+    isVisible=true
+  mCurrentFocus=Window{e577643 u0 com.google.android.permissioncontroller/com.android.permissioncontroller.permission.ui.GrantPermissionsActivity}

@@ -180,8 +180,17 @@ def _unlabelled(sig: str) -> bool:
 CTX_LEN = 80
 
 
+#: Scrollers that hold one page of mixed content, not a list of items (a View's
+#: ScrollView / NestedScrollView, which a CoordinatorLayout page also reports): its children
+#: are no items, so they give no item context (AntennaPod's feed: the toolbar in the
+#: scrolling page header would change "item" as the header collapses).
+_PAGE_SCROLLERS = ("android.widget.ScrollView", "android.widget.HorizontalScrollView",
+                   "androidx.core.widget.NestedScrollView")
+
+
 def _node_scrolls(n: "Node") -> bool:
-    return n.cls != _WEBVIEW and ("scrollable" in n.flags or bool(n.actions & set(_SCROLL_ACTIONS)))
+    return n.cls != _WEBVIEW and n.cls not in _PAGE_SCROLLERS and (
+        "scrollable" in n.flags or bool(n.actions & set(_SCROLL_ACTIONS)))
 
 
 def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any], Any],
@@ -190,8 +199,9 @@ def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any],
     """``(ctx, item_root)`` of a node inside a scrolling list: ``ctx`` the first text of
     the innermost list item around it that has one outside the node itself (a card's title,
     a row's sender: what stays put while the item scrolls and its other texts come and go;
-    "" when none has; None when it is in no list), ``item_root`` whether the node is itself
-    a list item (a child of the scrolling container). Two nodes alike in class, label and
+    for an unlabelled list item itself, its own first text; "" when none has; None when it
+    is in no list), ``item_root`` whether the node is itself a list item (a child of the scrolling
+    container). Two nodes alike in class, label and
     screen slot are told apart by it: the HEADLINES chips of two news cards (NiA, after a
     scroll put the second where the first was), a RecyclerView row View rebound to another
     item."""
@@ -209,6 +219,17 @@ def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any],
             if first:
                 item_root = child is n
                 first = False
+                if item_root and not words(n) and not any(words(c) for c in children(n) or ()):
+                    # an unlabelled item (its label comes from its direct children only:
+                    # AntennaPod's feed rows): its own first text says which item it shows
+                    # now, a row View rebound to another episode
+                    stack = [n]
+                    while stack:
+                        x = stack.pop()
+                        w = words(x)
+                        if w:
+                            return w[:CTX_LEN], True
+                        stack.extend(reversed(list(children(x) or ())))
             stack = [child]
             while stack:
                 x = stack.pop()
@@ -225,6 +246,12 @@ def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any],
 def _ctx_ok(a: Optional[str], b: Optional[str]) -> bool:
     """Contexts that do not tell two nodes apart: one unknown, or the same."""
     return a is None or b is None or a == b
+
+
+def _alone(a: Optional[str], b: Optional[str]) -> bool:
+    """Both nodes sit in a list item that has no text but theirs (``ctx`` ""): their own
+    text is all that says which item they show."""
+    return a == "" and b == ""
 
 
 def same_node(key_a: Optional[str], sig_a: str, box_a: Rect,
@@ -723,6 +750,8 @@ class PStop:
     cls: str
     ctx: Optional[str] = None  # item_context: the list item it sits in
     item_root: bool = False
+    #: the re-model (1 = the first) that added it: the model learned of it only then (L4)
+    added: Optional[int] = None
 
     @property
     def sig(self) -> str:
@@ -819,7 +848,7 @@ def predict_initial(resp: Any, window: Optional[int] = None) -> Optional[Dict[st
 
 
 def _dict_scrolls(n: Dict[str, Any]) -> bool:
-    if (n.get("class_name") or "") == _WEBVIEW:
+    if (n.get("class_name") or "") == _WEBVIEW or (n.get("class_name") or "") in _PAGE_SCROLLERS:
         return False
     return "scrollable" in (n.get("flags") or ()) or any(
         isinstance(a, dict) and a.get("id") in _SCROLL_ACTIONS for a in n.get("actions") or ())
@@ -881,7 +910,7 @@ class Model:
         present = {k.key for k in known_of if k is not None}
         keys = [s.key for s in self.stops]
         prev: Optional[str] = None
-        for s, known in zip(new, known_of, strict=True):
+        for j, (s, known) in enumerate(zip(new, known_of, strict=True)):
             if known is not None:
                 if known.key != s.key and "#" not in known.key:
                     self.aliases[s.key] = known.key
@@ -889,7 +918,14 @@ class Model:
                 continue
             if s.key in keys:  # a View (or ComposeView cell) rebound to another item
                 s = replace(s, key=f"{s.key}#{sum(k.split('#')[0] == s.key for k in keys)}")
-            at = keys.index(prev) + 1 if prev in keys else len(keys)
+            s = replace(s, added=self.remodels)
+            if prev is None:
+                # nothing known before it in the new order: it goes before the first known
+                # stop after it (the top of a page), not after everything the model knows
+                nxt = next((k for k in known_of[j + 1:] if k is not None), None)
+                at = keys.index(nxt.key) if nxt is not None and nxt.key in keys else len(keys)
+            else:
+                at = keys.index(prev) + 1 if prev in keys else len(keys)
             while prev in keys and at < len(keys) and keys[at] not in present:
                 at += 1
             keys.insert(at, s.key)
@@ -920,9 +956,12 @@ class Model:
                     continue
                 if not (iou(s.bounds, box) >= 0.5 or _unlabelled(sig) or _unlabelled(s.sig)):
                     continue
-                if (item_root or s.item_root) and key.startswith("view:") and s.sig != sig \
-                        and not _unlabelled(sig) and not _unlabelled(s.sig):
-                    continue  # a recycled item View showing another item
+                if (item_root or s.item_root or _alone(ctx, s.ctx)) and key.startswith("view:") \
+                        and s.sig != sig and not _unlabelled(sig) and not _unlabelled(s.sig):
+                    # a recycled item View showing another item; or a View inside a list item
+                    # whose only text is its own (the item has nothing else to tell them apart
+                    # by: V6 BAD_B's row title), showing another item's text in its old slot
+                    continue
                 return s
             if same:
                 return None
@@ -1389,6 +1428,13 @@ def _seen_again(s: "Step", new: Snapshot) -> bool:
     if s.node is None or f is None:
         return False
     if s.key is not None and s.key == new.key:
+        # a View a list rebound to another item (another label in a list item, or another
+        # item around it) is another stop: no false wrap on a recycled row (L1, V6 BAD_B)
+        if s.key.startswith("view:") and f.ctx is not None and s.node.ctx is not None \
+                and not _unlabelled(f.sig) and not _unlabelled(s.node.sig) \
+                and (not _ctx_ok(s.node.ctx, f.ctx) or (s.node.sig != f.sig and (
+                    f.item_root or s.node.item_root or _alone(s.node.ctx, f.ctx)))):
+            return False
         return True
     if s.key is not None and s.key in new.index.nodes:
         return False
@@ -1624,56 +1670,22 @@ def _inside(r: Rect, o: Rect) -> bool:
     return w > 0 and h > 0 and ox <= x and oy <= y and x + w <= ox + ow and y + h <= oy + oh
 
 
-def _covers(o: Node, cx: float, cy: float, win_area: int) -> bool:
-    ox, oy, ow, oh = o.bounds
-    return ow * oh >= 0.4 * win_area and ox <= cx < ox + ow and oy <= cy < oy + oh \
-        and "visible_to_user" in o.flags
-
-
-def _holds_scrim(o: Node, cx: float, cy: float, win_area: int) -> bool:
-    """A clickable node in o's subtree that covers the point and most of the window."""
-    stack = [o]
-    while stack:
-        m = stack.pop()
-        if "clickable" in m.flags and _covers(m, cx, cy, win_area):
-            return True
-        stack.extend(m.children)
-    return False
-
-
 def _covered_by(n: Node) -> Optional[Dict[str, Any]]:
-    """A later-drawn sibling subtree (of the node or an ancestor) that covers the
-    node's centre and a large part of the window: a same-window overlay.
+    """What draws over the node in its own window (:mod:`.occlusion`: a scrim, a sheet, an
+    open drawer, or a bar such as the action-mode bar over the toolbar), as the step record
+    keeps it: ``{"overlay", "kind", "cls", "pane_title", "area", "rect"}``; None when nothing
+    does. Only what draws counts: an empty full-screen FrameLayout drawn last (AntennaPod's
+    loading frame, its only child GONE) covers nothing. The walk's dump has no View
+    properties, so a View draws its whole box when it takes clicks over most of the window
+    (a scrim; a focusable list does not) or is a surface (most of the window, with content
+    of its own), else only where its children draw."""
+    from .occlusion import NodeAccess, Occlusion
 
-    A Compose host reports drawing order 0 (Compose builds the host's node
-    itself), so among siblings with a known order it counts as drawn later when
-    it holds a clickable scrim over the node (a ComposeView "dialog" over Views)."""
-    x, y, w, h = n.bounds
-    cx, cy = x + w / 2, y + h / 2
-    root = n
-    for a in n.ancestors():
-        root = a
-    rx, ry, rw, rh = root.bounds
-    win_area = max(1, rw * rh)
-    child = n
-    for parent in n.ancestors():
-        sibs = parent.children
-        try:
-            pos = next(i for i, c in enumerate(sibs) if c is child)
-        except StopIteration:
-            pos = len(sibs)
-        later = sibs[pos + 1:]
-        if any(c.drawing_order for c in sibs):
-            later = [c for c in sibs if c is not child and (
-                c.drawing_order > child.drawing_order
-                or (not c.drawing_order and child.drawing_order and _holds_scrim(c, cx, cy, win_area)))]
-        for o in later:
-            ox, oy, ow, oh = o.bounds
-            if _covers(o, cx, cy, win_area):
-                return {"overlay": o.key, "cls": o.simple_cls, "pane_title": o.pane_title or None,
-                        "area": round(ow * oh / win_area, 2), "rect": list(o.bounds)}
-        child = parent
-    return None
+    c = Occlusion(NodeAccess()).covered_by(n)
+    if c is None:
+        return None
+    return {"overlay": c.key, "kind": c.kind, "cls": c.cls, "pane_title": c.pane_title,
+            "area": round(c.area, 2), "rect": list(c.rect)}
 
 
 def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: List[str],
@@ -1696,7 +1708,8 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
 
     records = _build_records(steps, model, tts, ref_of)
     predicted = [{"key": p.key, "ref": ref_of(p.key), "label": p.label, "speak": p.speak,
-                  "bounds": list(p.bounds), "window": p.window, "cls": p.cls} for p in model.stops]
+                  "bounds": list(p.bounds), "window": p.window, "cls": p.cls,
+                  **({"added": p.added} if p.added else {})} for p in model.stops]
     density = _density(drv.serial)
     walk: Dict[str, Any] = {
         "serial": drv.serial, "package": drv.package, "start": start, "direction": direction,
@@ -1872,6 +1885,9 @@ def orphan_text(idx: DumpIndex, records: List[Dict[str, Any]], legacy: bool = Fa
             continue
         toks = diff._tokens(words)
         if toks and not (toks & spoken):
+            cov = _covered_by(n) if isinstance(n, Node) else None
+            if cov is not None and cov.get("kind") != "bar":
+                continue  # behind a drawer's scrim, a sheet or a dialog: nobody sees it
             out.append({"key": n.key if not legacy else None, "text": words[:60], "bounds": list(n.bounds)})
             if len(out) >= limit:
                 break
