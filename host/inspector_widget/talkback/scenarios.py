@@ -182,6 +182,10 @@ _ENDED = re.compile(r"\s{2,}" + _FLAG_WORDS)
 _REASON = re.compile(r"viewAccessibilityFocused:.*?isInitialFocus=(\w+),\s*"
                      r"isRestoreFocusOrEnsureOnScreen=(\w+),\s*isEventNavigateByUser=(\w+)")
 _EDGE = re.compile(r"FocusProcessor-LogicalNav: Reach edge")
+#: What the speech controller really spoke, with the event it spoke for: a window title on
+#: a window-state change ("1 selected": its feedback-provider line logs an empty ttsOutput)
+_SPOKEN = re.compile(r'SpeechControllerImpl: Speaking fragment text="(.*)", utteranceId=.*?'
+                     r'\bsubtype:(\w+)')
 
 
 def parse_line(line: str) -> Optional[Tuple[str, str]]:
@@ -199,6 +203,12 @@ def parse_line(line: str) -> Optional[Tuple[str, str]]:
         if etype == "TYPE_VIEW_CLICKED":
             return ("announce", f"{etype}\t{text}")  # an empty click feedback still counts
         return ("announce", f"{etype}\t{text}") if text else None
+    m = _SPOKEN.search(line)
+    if m:
+        text, etype = m.group(1).strip(), m.group(2)
+        if etype == "TYPE_VIEW_ACCESSIBILITY_FOCUSED" or not text:
+            return None  # a focus utterance: its feedback line said it already
+        return ("announce", f"{etype}\t{text}")
     m = _REASON.search(line)
     if m:
         initial, restore, user = (g == "true" for g in m.groups())
@@ -286,6 +296,20 @@ class SpeechLog:
         with self._lock:
             return any(e[1] in ("tts", "reason", "hint") for e in self.events)
 
+    def settle(self, quiet_s: float = 0.3, max_s: float = 1.2) -> None:
+        """Let TalkBack's speech queue drain: a window title is spoken ~0.6s after its event,
+        behind the focus utterance. Returns once no line came for ``quiet_s`` (at most
+        ``max_s``)."""
+        end = time.monotonic() + max_s
+        last = -1
+        while time.monotonic() < end:
+            with self._lock:
+                n = self.lines
+            if n == last:
+                return
+            last = n
+            time.sleep(quiet_s)
+
     def stop(self) -> None:
         proc, self.proc = self.proc, None
         if proc is None:
@@ -320,7 +344,7 @@ def _said(log: Optional[SpeechLog], t0: float, t1: Optional[float] = None) -> Li
             out.append(e)
         elif kind == "announce":
             etype, _, text = v.partition("\t")
-            if text:
+            if text and not any(e.get("announced") == text and ms - e["t"] < 2000 for e in out):
                 out.append({"t": ms, "announced": text,
                             "event": etype.replace("TYPE_", "").lower()})
     return out
@@ -891,6 +915,7 @@ class Facts:
     model_initial: Optional[str] = None
     opened_between: bool = False
     target_clicks: bool = True
+    first_new: Optional[str] = None  # the first stop of what the action brought on screen
 
 
 def classify(f: Facts) -> Tuple[str, str]:
@@ -916,7 +941,7 @@ def classify(f: Facts) -> Tuple[str, str]:
     if f.closed and f.f1_was_there and f.f1_key != f.first_key:
         return "returned_to_opener", "a window closed; focus went back to a node under it"
     if f.new_screen:
-        if f.f1_key in (f.model_initial, f.first_key):
+        if f.f1_key in (f.model_initial, f.first_key, f.first_new):
             return "initial_ok", "a new screen; focus on its first stop"
         return "elsewhere", "a new screen; focus not on its first stop"
     if f.f1_key == f.first_key:  # (a navigation rail's first tab is the first stop too)
@@ -933,6 +958,18 @@ def _is_nav(n: Optional[Node], stop: Optional[tbselect.Stop]) -> bool:
                              or str(stop.node.get("role_description") or "").lower() == "tab"):
         return True
     return any(_NAV_CLS.search(a.cls or "") for a in [n, *list(n.ancestors())[:4]])
+
+
+def _top_texts(s: Snapshot, window: int, band: float = 0.15) -> set:
+    """The texts a screen shows in the top band of its window that are no controls: its
+    title (a toolbar's, an action mode's)."""
+    win = s.index.window_rect(window)
+    if win is None or win[3] <= 0:
+        return set()
+    top = win[1] + band * win[3]
+    return {n.text for n in s.index.order
+            if n.window == window and n.text and "visible_to_user" in n.flags
+            and not n.actionable() and n.bounds[1] < top and n.bounds[3] < band * win[3]}
 
 
 def _screen_pane(s: Snapshot, title: str) -> bool:
@@ -971,10 +1008,23 @@ def facts(drv: Driver, before: Snapshot, after: Snapshot, top0: Optional[str],
     c0 = before.index.scroll_container(f0) if f0 is not None else None
     container_gone = c0 is not None and c0.key not in after.index.nodes
     kept = sum(1 for s in stops0 if s.key in by_key)
-    new_screen = bool(new_windows) or (top0 != top1 and not left) or bool(new_panes) or (
-        container_gone and kept < len(stops0) / 2)
     node0 = after.index.nodes.get(f0.key) if f0 is not None else None
     target_gone = f0 is not None and (node0 is None or "visible_to_user" not in node0.flags)
+    was = before.index.nodes.get(after.key or "")
+    appeared = [s for s in stops1 if s.key not in {x.key for x in stops0}]
+    # an overlay opened in the same window (a drawer, a sheet): focus is on one of several
+    # stops that were not there, and the target is still there behind it
+    overlay = (f1 is not None and not target_gone and len(appeared) >= 3
+               and (was is None or "visible_to_user" not in was.flags))
+    # a fragment or destination replaced the target's screen in the same window: the top
+    # bar's title is another (Thunderbird: "General settings" -> "Display"). An action
+    # mode's title over a toolbar that still holds its own is no new screen (TB-3).
+    win0 = f0.window if f0 is not None else None
+    tt0 = _top_texts(before, win0) if win0 is not None else set()
+    tt1 = _top_texts(after, win0) if win0 is not None else set()
+    retitled = target_gone and bool(tt1 - tt0) and bool(tt0 - tt1)
+    new_screen = bool(new_windows) or (top0 != top1 and not left) or bool(new_panes) or (
+        container_gone and kept < len(stops0) / 2) or overlay or retitled
     same = f0 is not None and f1 is not None and (f1.key == f0.key or (
         not target_gone and f1.label == f0.label and f1.simple_cls == f0.simple_cls
         and f1.window == f0.window))
@@ -991,6 +1041,7 @@ def facts(drv: Driver, before: Snapshot, after: Snapshot, top0: Optional[str],
         f1_was_there=f1 is not None and f1.key in before.index.nodes, left_app=left,
         first_key=_first_stop(after, legacy, f1.window if f1 is not None else None),
         model_initial=(model or {}).get("key"), opened_between=opened_between,
+        first_new=appeared[0].key if appeared else None,
         target_clicks=f0 is None or bool(f0.actions & {0x10}) or "clickable" in f0.flags)
 
 
@@ -1011,6 +1062,8 @@ def _focus_after(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, l
     top0 = device.top_activity(drv.serial)
     whats, start, after, events, t0, opened = _act_all(drv, cur, acting, wait_s, legacy)
     top1 = device.top_activity(drv.serial)
+    if log is not None:
+        log.settle()
     fx = facts(drv, start, after, top0, top1, legacy, opened)
     verdict, why = classify(fx)
     new_windows = [w for w in _windows(after) if w not in _windows(start)]
@@ -1075,6 +1128,8 @@ def _restore(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, legac
     adb.shell(drv.serial, "input keyevent KEYCODE_BACK")
     ev2, back = timeline(drv, t1, wait_s, True, legacy)
     top2 = device.top_activity(drv.serial)
+    if log is not None:
+        log.settle()
     f2 = back.focus
     c2 = back.index.scroll_container(f2) if f2 is not None else None
     first = _first_stop(back, legacy)
@@ -1123,10 +1178,11 @@ def _restore(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, legac
                "TalkBack had no per-window record to restore (a paneTitle per destination does "
                "not change that on TalkBack 17)" if same_window and top1 == top0
                else "the screen came back as a new window/activity instance")
-        if reason == "initial":
-            why += "; TalkBack placed its initial focus (isInitialFocus): it restored nothing"
+        said_why = ("; TalkBack placed its initial focus (isInitialFocus): it restored nothing"
+                    if reason == "initial" else "")
         res["finding"] = {"code": "tb.restore_failed", "sev": "warn", "basis": "walk",
-                          "msg": f"after back, focus went {verdict} instead of {_ref(f0, legacy)}; {why}",
+                          "msg": f"after back, focus went {verdict} instead of {_ref(f0, legacy)}"
+                                 f"{said_why}; {why}",
                           "fix": FIXES["tb.restore_failed"]}
     if post:
         obs, _cur = _observe(drv, back, post, log, legacy)
@@ -1153,6 +1209,8 @@ def _survive(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, legac
     post = [s for s in steps[last + 1:] if s.kind in OBSERVING]
     whats, cur, after, events, t0, _opened = _act_all(drv, cur, acting, wait_s, legacy,
                                                       quiet=False)
+    if log is not None:
+        log.settle()
     f2 = after.focus
     lost_midway = any("focus" in e and e["focus"] is None for e in events[1:])
     first = _first_stop(after, legacy)

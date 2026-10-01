@@ -896,8 +896,9 @@ def bind_scenario(out: dict[str, Any], binding: Binding, before_at: int,
             st["ref"] = _bind_key(binding, st["ref"], after_at) or st["ref"]
     exp = out.get("expect")
     for e in (exp if isinstance(exp, list) else [exp] if isinstance(exp, dict) else []):
-        if e.get("focus"):
-            e["focus"] = _bind_key(binding, e["focus"], after_at) or e["focus"]
+        for k in ("focus", "label"):  # a label the capture resolved is a node key
+            if e.get(k) and _KEY_IN_TEXT.fullmatch(str(e[k])):
+                e[k] = _bind_key(binding, e[k], after_at) or e[k]
     model = out.get("model")
     if isinstance(model, dict) and model.get("initial"):
         model["initial"] = _bind_key(binding, model["initial"], after_at)

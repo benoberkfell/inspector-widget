@@ -197,6 +197,45 @@ def test_a_dialog_that_opens_on_its_first_stop_is_initial_ok(probe):
     assert "finding" not in res
 
 
+def test_a_drawer_opening_in_the_same_window_is_a_new_screen(probe):
+    """Thunderbird's navigation drawer: no new window, no pane title, the opener (Navigate
+    up) stays; focus goes to the first of the drawer's entries: initial_ok, no finding."""
+    def open_drawer(tb, target):
+        scene = tb.device.live_scene(PKG)
+        entries = [ViewSpec(1100 + i, "TextView", "android.widget", (0, 100 + 60 * i, 200, 48),
+                            text=t, a11y={"class_name": "android.widget.TextView", "text": t,
+                                          "clickable": True, "focusable": True})
+                   for i, t in enumerate(("Account", "Inbox", "Outbox", "Settings"))]
+        drawer = ViewSpec(1099, "NavigationView", "com.google.android.material.navigation",
+                          (0, 0, 220, 640), a11y={"class_name": "android.widget.FrameLayout"},
+                          children=entries)
+        scene.roots[0].children[0].children.append(drawer)
+        tb.order = [(1100 + i, -1) for i in range(4)] + tb.order
+        tb.device.agent(PKG).a11y_tap.record(fakeagent.TYPE_WINDOW_CONTENT_CHANGED, 1001, 1002, -1,
+                                             content_change_types=1)
+        tb.set_focus((1100, -1))
+
+    probe.talkback.on_click = open_drawer
+    res = scenario("focus_after", target="Item 1", action="activate")
+    assert res["verdict"] == "initial_ok" and res["new_screen"] is True, res
+    assert "finding" not in res
+
+
+def test_a_destination_that_replaces_the_list_in_the_same_window_is_a_new_screen(probe):
+    """Thunderbird's General settings > Display: a fragment replaces the list in the same
+    window, the top bar gets another title, and TalkBack puts focus on its first stop."""
+    def open_display(tb, target):
+        views = _views(tb.device.live_scene(PKG))
+        views[1003].text = views[1003].a11y["text"] = "Display"
+        _remove(tb.device, 1021)
+        tb.set_focus(TB_TITLE)
+
+    probe.talkback.on_click = open_display
+    res = scenario("focus_after", target="Item 1", action="activate")
+    assert res["verdict"] == "initial_ok" and res["new_screen"] is True, res
+    assert "finding" not in res
+
+
 def test_back_from_a_sheet_to_its_opener_is_returned_to_opener(probe):
     """AP-9: the filter sheet closes on back and focus goes back to Filter."""
     clear = ViewSpec(2011, "Button", "android.widget", (40, 400, 120, 48), text="Clear",
@@ -277,13 +316,23 @@ def test_the_log_parser_reads_talkback_17_lines():
         "forceFeedbackEvenIfAudioPlaybackActive  forceFeedbackEvenIfPhoneCallActive",
         "         1790848978.694 23067 23067 V talkback: TalkBackFeedbackProvider:  "
         "TYPE_WINDOW_STATE_CHANGED:  ttsOutput= 1 selected  ttsAddToHistory",
+        # what the speech controller spoke: an action mode's title (TB-3, emulator-5556),
+        # whose feedback-provider line had an empty ttsOutput
+        '         1790849879.599 23067 23393 V talkback: SpeechControllerImpl: Speaking fragment '
+        'text="1 selected", utteranceId=talkback_156, TtsSpan=null, locale=null, '
+        'event=type:EVENT_TYPE_ACCESSIBILITY subtype:TYPE_WINDOW_STATE_CHANGED displayId:0 '
+        'time:55259546',
+        '         1790849879.551 23067 23393 V talkback: SpeechControllerImpl: Speaking fragment '
+        'text="SE", utteranceId=talkback_155, TtsSpan=null, locale=null, '
+        'event=type:EVENT_TYPE_ACCESSIBILITY subtype:TYPE_VIEW_ACCESSIBILITY_FOCUSED displayId:0',
     ]
     got = [S.parse_line(x) for x in lines]
     assert got == [("reason", "restore"), ("tts", "Webview. In horizontal pager"),
                    ("hint", "Press select to activate"), None,
                    ("announce", "TYPE_WINDOW_STATE_CHANGED\tThunderbird Debug"),
                    ("announce", "TYPE_VIEW_CLICKED\t"), None,
-                   ("announce", "TYPE_WINDOW_STATE_CHANGED\t1 selected")]
+                   ("announce", "TYPE_WINDOW_STATE_CHANGED\t1 selected"),
+                   ("announce", "TYPE_WINDOW_STATE_CHANGED\t1 selected"), None]
     # a long utterance logcat split over two lines (G24's shape) is joined
     log = S.SpeechLog(SERIAL)
     log.feed("         1.0 1 1 V talkback: TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:"
@@ -495,3 +544,32 @@ def test_cli_and_mcp_give_the_same_ambiguity_and_grammar_errors(probe, run_cli, 
     assert m["error"]["code"] == c["error"]["code"] == "bad_args"
     assert m["error"]["message"] == c["error"]["message"] and S.GRAMMAR in c["error"]["message"]
     assert probe.talkback.presses == []
+
+
+def test_refs_inside_an_action_sequence_resolve_in_the_capture(tb_env, monkeypatch):
+    """On the capture surface: ``long_press:<ref>``, ``expect:<ref>`` and ``tap:<ref>`` inside
+    a sequence name capture refs, and one no capture holds fails before TalkBack is touched."""
+    import mcp_server
+    from inspector_widget import surface
+    monkeypatch.setenv(surface.ENV_TOOLSET, "capture,talkback")
+    monkeypatch.setattr(S, "WINDOW_QUIET_S", 0.1)
+    tb_env.scene_factory = fakeagent.talkback_scene
+    tb_env.talkback.order = list(ORDER)
+    original = dict(tb_env.secure)
+
+    def call(tool, **args):
+        text, is_error = mcp_server._call_tool_text(tool, args)
+        return json.loads(text), is_error
+
+    doc, err = call("capture", serial=SERIAL, package=PKG)
+    assert not err, doc
+    res, err = call("tb_scenario", kind="focus_after", serial=SERIAL, package=PKG, target="n7",
+                    action="activate; walk:1; expect:n8", wait_ms=400, **FAST)
+    assert not err, res
+    assert res["target"].startswith('n7 "Item 1') and res["lines"][0].startswith('1 n8 "Item 2')
+    assert res["expect"] == '"n8" reached (focus)'
+    doc, err = call("tb_scenario", kind="focus_after", serial=SERIAL, package=PKG, target="n7",
+                    action="activate; expect:n999", **FAST)
+    assert err and doc["error"]["code"] == "ref_not_in_capture"
+    assert tb_env.talkback.presses.count("click") == 1  # the second one pressed nothing
+    assert fakeagent.settings_changes(tb_env, original) == {}
