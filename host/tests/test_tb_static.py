@@ -240,3 +240,25 @@ def test_the_real_off_screen_show_notes_are_ghost_stops():
     fs = static.findings(tb.Navigator(_realapp("antennapod_player")))
     off = [f.node.key for f in fs if f.code == "tb.ghost_stop" and f.evidence["why"] == "offscreen"]
     assert off and all(k.startswith("virtual:") for k in off)
+
+
+def test_a_row_read_out_of_order_quotes_where_the_two_orders_part():
+    # Two cut heads of 60 characters (the long title both begin with) read the same; the
+    # evidence names the first part TalkBack reads out of place and what the screen shows there
+    title = "A title long enough that two quotes cut at sixty characters read alike"
+    row = n(4, cls="android.widget.LinearLayout", flags=FOCUS, actions=[CLICK],
+            b=(0, 0, 1080, 300), children=[
+                n(5, cls="android.widget.TextView", text=title, b=(0, 0, 1080, 100)),
+                n(6, cls="android.widget.TextView", text="$5", b=(800, 150, 200, 100)),
+                n(7, cls="android.widget.TextView", text="Socks", b=(0, 150, 400, 100))])
+    fs = [f for f in findings(root(row)) if f.code == "tb.wrong_announcement"]
+    assert len(fs) == 1
+    assert fs[0].evidence["reads"] == "$5" and fs[0].evidence["before"] == "Socks"
+
+
+def test_antennapod_episode_rows_read_in_screen_order():
+    # The title is a full-height strip's contentDescription left of the date, size and
+    # duration; TalkBack 17 says title, date, size, duration, as the screen shows them
+    # (walk wnq20pl). The XY-cut once fell back to column order and flagged every row.
+    fs = static.findings(tb.Navigator(_realapp("antennapod_episodes")), density=480)
+    assert "tb.wrong_announcement" not in [f.code for f in fs]

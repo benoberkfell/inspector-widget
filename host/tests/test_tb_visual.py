@@ -119,3 +119,19 @@ def test_zero_height_item_on_a_row_boundary_terminates():
     """A zero-size gap that would leave one side of the cut empty is skipped, not recursed on."""
     items = [{"key": "a", "bounds": (0, 0, 100, 50)}, {"key": "z", "bounds": (0, 50, 100, 0)}]
     assert sorted(order_items(items)) == ["a", "z"]
+
+
+def test_a_full_height_strip_beside_two_lines_is_read_first_then_line_by_line():
+    """AntennaPod's episode row: the title is the contentDescription of a 12px strip as tall
+    as the row, left of the date and size (one line) and the duration (the next). The strip
+    blocks every horizontal cut and is alone left of the column cut; the rest reads line by
+    line (TalkBack: title, date, size, duration), not column by column."""
+    items = [{"key": "title", "bounds": (36, 354, 12, 279)},
+             {"key": "date", "bounds": (264, 387, 111, 44)},
+             {"key": "size", "bounds": (408, 387, 102, 44)},
+             {"key": "duration", "bounds": (264, 556, 143, 44)}]
+    assert order_items(items) == ["title", "date", "size", "duration"]
+    # a trailing full-height column (a row's action button) is read last
+    trailing = [{"key": "name", "bounds": (0, 0, 300, 40)}, {"key": "sub", "bounds": (0, 60, 300, 40)},
+                {"key": "more", "bounds": (400, 0, 80, 100)}]
+    assert order_items(trailing) == ["name", "sub", "more"]

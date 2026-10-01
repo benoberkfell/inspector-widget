@@ -182,8 +182,10 @@ def test_lint_rules_tb_lists_every_tb_rule_with_template_collapse():
 def test_finding_details_name_the_other_nodes():
     ix, raw = F.corpus_capture("tb_c9-bad-walk")
     out = analyzers.lint_view(ix, raw, rules=["tb"], group="none")
-    assert out["lines"][0] == ('a11y:7:5 "$5, Socks" tb.wrong_announcement warn says '
-                               '"$5. Socks", shown "Socks … $5"')
+    # the first place the spoken and the shown order part, not two cut heads that can
+    # read the same (AntennaPod: both began with the 60-character title)
+    assert out["lines"][0] == ('a11y:7:5 "$5, Socks" tb.wrong_announcement warn reads '
+                               '"$5" before "Socks", which comes first on screen')
     ix, raw = F.corpus_capture("tb_v12-bad-walk")
     line = analyzers.lint_view(ix, raw, rules=["tb"], group="none")["lines"][0]
     # the wrong "N of M" itself (it ends the speech, past what a cut quote keeps) and the

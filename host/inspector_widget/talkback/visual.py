@@ -61,7 +61,34 @@ def _cut(items: List[_Item]) -> List[_Item]:
         right = [it for it in items if it[0].right > at]
         if len(left) >= 2 and len(right) >= 2:
             return _cut(left) + _cut(right)
+    side = _sidebar(items)
+    if side is not None:
+        it, first = side
+        rest = [x for x in items if x is not it]
+        return [it] + _cut(rest) if first else _cut(rest) + [it]
     return sorted(items, key=lambda it: (it[0].left, it[0].top))
+
+
+def _sidebar(items: List[_Item]) -> Optional[Tuple[_Item, bool]]:
+    """An item that spans the band's full height beside all the others (a leading strip or
+    icon, a trailing button column): it blocks every horizontal cut, and a column cut leaves
+    it alone on its side. ``(item, True)`` when it leads (read first), ``(item, False)`` when
+    it trails (read last); None when there is none. AntennaPod's episode row puts its title
+    in a full-height 12px strip's contentDescription, left of the date, size and duration:
+    the band reads the strip, then the rest by its own cuts, not column by column."""
+    top = min(r.top for r, _ in items)
+    bottom = max(r.bottom for r, _ in items)
+    for lead in (True, False):
+        for it in items:
+            r = it[0]
+            if r.top > top or r.bottom < bottom:
+                continue
+            others = [x[0] for x in items if x is not it]
+            if lead and all(o.left >= r.right for o in others):
+                return it, True
+            if not lead and all(o.right <= r.left for o in others):
+                return it, False
+    return None
 
 
 def _container(rules: Rules, n: TbNode, stops: set) -> Optional[TbNode]:

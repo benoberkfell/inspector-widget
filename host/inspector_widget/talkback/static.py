@@ -763,10 +763,14 @@ def _speech_order(cx: _Ctx) -> Iterator[Finding]:
         shown = order_items([{"key": str(i), "bounds": (r.left, r.top, r.width, r.height)}
                              for i, r in enumerate(rects)])
         if shown != [str(i) for i in range(len(parts))]:
+            # the first place the two orders part: TalkBack reads parts[at] where the screen
+            # shows parts[shown[at]] (two strings cut at 60 characters can look the same)
+            at = next(i for i, k in enumerate(shown) if k != str(i))
             yield Finding("tb.wrong_announcement", "warn", n,
                           [parts[int(k)][1] for k in shown][:MAX_OTHERS],
                           {"said": ann.text[:60],
                            "shown": " … ".join(parts[int(k)][0] for k in shown)[:60],
+                           "reads": parts[at][0][:40], "before": parts[int(shown[at])][0][:40],
                            "why": "speech_order"})
 
 

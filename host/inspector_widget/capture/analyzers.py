@@ -1185,6 +1185,9 @@ def _tb_detail(iss: Issue) -> str:
             (others[0] if others else "?")
     if rid == "tb.wrong_announcement":
         if ev.get("why") == "speech_order":
+            if ev.get("reads") and ev.get("before"):  # where the two orders part
+                return (f"reads {_quote(ev['reads'], 24)} before {_quote(ev['before'], 24)}, "
+                        "which comes first on screen")
             return (f"says {_quote(ev.get('said') or '', 24)}, "
                     f"shown {_quote(ev.get('shown') or '', 24)}")
         k = ev.get("silent_items")
