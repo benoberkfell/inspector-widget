@@ -273,7 +273,9 @@ class _CaptureKeys:
         self.windows: dict[int, str] = {}
         self._covered: dict[str, dict[str, Any]] | None | bool = False
         self._ranks: dict[str, list[Any]] | None = None
-        from .tb import TbCapture, _iter_paths
+        from .tb import TbCapture, _iter_paths, props_of
+
+        self._props = props_of(lc)  # each View's Z: what is drawn above what
 
         tbc = self._tbc = TbCapture.of(self.ix, lc)
         if tbc is None:
@@ -318,7 +320,8 @@ class _CaptureKeys:
             from ..talkback import static
             from .tb import drawn_above, view_chain
 
-            ranks = static.visual_ranks(self._tbc.nav, drawn_above=drawn_above(self.ix),
+            ranks = static.visual_ranks(self._tbc.nav,
+                                        drawn_above=drawn_above(self.ix, self._props),
                                         view_chain=view_chain(self.ix))
             self._ranks = {}
             for key, (wi, li, pos) in ranks.items():
@@ -337,7 +340,7 @@ class _CaptureKeys:
                 from ..talkback import static
                 from .tb import drawn_above
 
-                found = static.covered(self._tbc.nav, drawn_above(self.ix))
+                found = static.covered(self._tbc.nav, drawn_above(self.ix, self._props))
                 if found is not None:
                     out: dict[str, dict[str, Any]] = {}
                     for key, (ov, pct) in found.items():

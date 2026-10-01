@@ -286,3 +286,24 @@ def test_a_sliver_talkback_scrolls_in_first_is_no_ghost_not_even_tiny():
     assert static.show_on_screen(tbc.nav, sliver) is not None
     assert static.ghost(tbc.nav, sliver, 390) == [] and tbc.ghost(sliver) == []
     assert not [n for n in ix.nodes.values() for i in n.issues if i.id == "tb.ghost_stop"]
+
+
+def test_elevation_decides_what_is_drawn_above_before_child_order():
+    # Thunderbird's message list (live): CoordinatorLayout[FloatingActionButton (elevation
+    # 18 px), SwipeRefreshLayout (the list)]. The list is the later child, but a ViewGroup
+    # draws by Z first (buildOrderedChildList): the FAB is over the list.
+    ix, raw = F.fixture_capture("tests/fixtures/captures/thunderbird_list_views")
+
+    def dump_node(ref):
+        return {"host_view_id": ix.nodes[ref].ids["view"]}
+
+    fab, row = dump_node("view:222"), dump_node("view:309")
+    exact = T.drawn_above(ix, T.props_of(raw))
+    assert exact(fab, row) is True and exact(row, fab) is False
+    # no properties: child order, except that a View apps commonly elevate drawn earlier
+    # may be over the later one
+    guess = T.drawn_above(ix)
+    assert guess(fab, row) is None and guess(row, fab) is None
+    # equal Z: child order (the RelativeLayout content under the drawer's ComposeView)
+    drawer, content = dump_node("view:218"), dump_node("view:207")
+    assert exact(drawer, content) is True and guess(drawer, content) is True

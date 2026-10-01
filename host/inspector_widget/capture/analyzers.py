@@ -869,7 +869,7 @@ def _tb_issues(ix: Index, src: _Src, density: int) -> tuple[list[tuple[str, Issu
     if dump is None or not dump.has_roots:
         return [], []
     try:
-        return tb.issues(ix, None, density=density, tbc=tb.TbCapture(dump, ix))
+        return tb.issues(ix, src.obj, density=density, tbc=tb.TbCapture(dump, ix))
     except Exception as e:  # noqa: BLE001 - a capture never fails on the TalkBack rules
         return [], [f"tb: not run ({type(e).__name__}: {str(e)[:80]})"]
 

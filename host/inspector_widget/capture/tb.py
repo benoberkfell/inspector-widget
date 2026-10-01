@@ -664,12 +664,47 @@ def stop_speech(resp: Any) -> dict[tuple[int, tuple[int, ...]], StopSpeech]:
     return TbCapture(resp).stop_speech()
 
 
-def drawn_above(ix: Index) -> Any:
+#: View classes apps commonly lift above their siblings with elevation (Material's defaults):
+#: without the capture's properties, such a View drawn earlier may still be drawn later.
+ELEVATED_CLASSES = frozenset({
+    "AppBarLayout", "FloatingActionButton", "ExtendedFloatingActionButton", "CardView",
+    "MaterialCardView", "BottomNavigationView", "BottomAppBar", "NavigationRailView",
+    "NavigationView", "SnackbarLayout", "SnackbarContentLayout", "MaterialToolbar"})
+
+
+def props_of(loaded: Any) -> Any:
+    """The capture's View properties accessor ``props(view udid) -> {name: value}`` (a
+    stored capture's, or decoded from a RawCapture's views facet), or None."""
+    from .model import RawCapture
+
+    fn = getattr(loaded, "props", None)
+    if callable(fn):
+        return fn
+    obj = getattr(loaded, "obj", None)  # analyzers._Src
+    if obj is not None and obj is not loaded:
+        return props_of(obj)
+    if isinstance(loaded, RawCapture) and loaded.views:
+        from .index import FacetReader
+
+        fr = FacetReader(loaded)
+        try:
+            return fr.props if fr.has_props() else None
+        except Exception:  # noqa: BLE001 - no properties: the class heuristic decides
+            return None
+    return None
+
+
+def drawn_above(ix: Index, props: Any = None) -> Any:
     """``drawn_above(a, b)`` for two dump nodes of one capture, from its View tree: True when
-    ``a``'s View is drawn over ``b``'s (at their lowest common ancestor, ``a``'s branch is a
-    later child: View child order is drawing order), False when under, None when the View
-    tree cannot tell (the same View, e.g. two Compose nodes of one ComposeView; one View
-    inside the other; another window; a View the capture lacks)."""
+    ``a``'s View is drawn over ``b``'s, False when under, None when the capture cannot tell
+    (the same View, e.g. two Compose nodes of one ComposeView; one View inside the other;
+    another window; a View the capture lacks).
+
+    At the two Views' lowest common ancestor a ViewGroup draws (and dispatches touches to)
+    its children by Z (elevation + translationZ), then child order (buildOrderedChildList).
+    ``props`` (:func:`props_of`) gives each View's Z; without it, child order decides,
+    except when the earlier child is a View apps commonly elevate (``ELEVATED_CLASSES``: an
+    AppBarLayout, a FAB, a CardView): then it is unknown."""
     tree = ix.tree("views")
     pos: dict[str, int] = {}
     parent: dict[str, str] = {}
@@ -679,12 +714,14 @@ def drawn_above(ix: Index) -> Any:
         for i, c in enumerate(kids):
             pos[c] = i
             parent[c] = p
-    paths: dict[str, list[int] | None] = {}
+    paths: dict[str, list[str] | None] = {}
+    zs: dict[str, float | None] = {}
 
-    def path(nid: str) -> list[int] | None:
+    def path(nid: str) -> list[str] | None:
+        """The View ids from the root down to ``nid``."""
         if nid in paths:
             return paths[nid]
-        out: list[int] = []
+        out: list[str] = []
         cur: str | None = nid
         seen: set[str] = set()
         while cur is not None and cur not in seen:
@@ -692,10 +729,25 @@ def drawn_above(ix: Index) -> Any:
             if cur not in pos:
                 paths[nid] = None
                 return None
-            out.append(pos[cur])
+            out.append(cur)
             cur = parent.get(cur)
         paths[nid] = out[::-1]
         return paths[nid]
+
+    def z(nid: str) -> float | None:
+        if props is None:
+            return None
+        if nid not in zs:
+            zs[nid] = None
+            node = ix.nodes.get(nid)
+            udid = node.ids.get("view") if node is not None else None
+            try:
+                p = props(int(udid)) if udid is not None else None
+                if p and ("elevation" in p or "translationZ" in p):
+                    zs[nid] = float(p.get("elevation") or 0) + float(p.get("translationZ") or 0)
+            except (TypeError, ValueError, OSError):
+                zs[nid] = None
+        return zs[nid]
 
     def view_of(raw: dict[str, Any]) -> str | None:
         host = raw.get("host_view_id")
@@ -709,8 +761,16 @@ def drawn_above(ix: Index) -> Any:
         if not pa or not pb or pa[0] != pb[0]:
             return None
         for x, y in zip(pa, pb):
-            if x != y:
-                return x > y
+            if x == y:
+                continue
+            later = pos[x] > pos[y]
+            za, zb = z(x), z(y)
+            if za is not None and zb is not None:
+                return za > zb if za != zb else later
+            earlier = ix.nodes.get(y if later else x)
+            if earlier is not None and str(earlier.type or "") in ELEVATED_CLASSES:
+                return None  # its elevation may draw it over the later one
+            return later
         return None  # one View holds the other
 
     return above
@@ -817,7 +877,8 @@ def issues(ix: Index, loaded: Any, *, density: int | None = None,
         return [], []
     out: list[tuple[str, Issue]] = []
     unmapped = 0
-    for f in static.findings(tbc.nav, density=density or 420, drawn_above=drawn_above(ix),
+    for f in static.findings(tbc.nav, density=density or 420,
+                             drawn_above=drawn_above(ix, props_of(loaded)),
                              view_chain=view_chain(ix)):
         nid = tbc.nid(f.node)
         if nid is None:
