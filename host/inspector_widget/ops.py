@@ -160,7 +160,6 @@ class OpContext:
     #: This caller's own default session: its last attach or capture. Wins over
     #: the store's shared default (which every caller of the store rewrites).
     session: tuple[str, str] | None = None
-    _metrics: dict[str, dict] = field(default_factory=dict)
 
     def bump_generation(self, serial: str, package: str, pid: int | None) -> None:
         """Record a hot reload that did not go through capture(): semantics ids
@@ -171,15 +170,18 @@ class OpContext:
         self.generations[key] = self.generations.get(key, 0) + 1
 
     def device(self, serial: str) -> dict[str, Any]:
-        """``{dpi, font_scale}`` of the device (the provider's, else adb's), cached."""
-        if serial not in self._metrics:
-            probe = getattr(self.sessions, "device", None)
-            metrics = probe(serial) if callable(probe) else None
-            if not metrics:
-                from . import adb
-                metrics = {"dpi": adb.display_density(serial), "font_scale": adb.font_scale(serial)}
-            self._metrics[serial] = {k: v for k, v in dict(metrics).items() if v is not None}
-        return dict(self._metrics[serial])
+        """``{dpi, font_scale}`` of the device now (the provider's, else adb's).
+
+        Read for every capture, never kept: a11y testing changes the font scale
+        and display size between captures (``settings put system font_scale``,
+        ``wm density``), and a capture must report and lint at the values it
+        was taken with, as a CLI capture at the same moment does."""
+        probe = getattr(self.sessions, "device", None)
+        metrics = probe(serial) if callable(probe) else None
+        if not metrics:
+            from . import adb
+            metrics = {"dpi": adb.display_density(serial), "font_scale": adb.font_scale(serial)}
+        return {k: v for k, v in dict(metrics).items() if v is not None}
 
 
 # --------------------------------------------------------------------------- #

@@ -46,6 +46,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import threading
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -882,21 +883,33 @@ _SCALE = {"type": "number", "default": 1.0, "exclusiveMinimum": 0, "maximum": 1.
 # --------------------------------------------------------------------------- #
 # Accessibility tools (dump / lint / overlay).
 # --------------------------------------------------------------------------- #
+#: How long a density / font-scale probe stays fresh. Short: an agent testing at
+#: a large font or display size changes them between calls (settings put
+#: system font_scale, wm density), and every lint and capture must use the
+#: values the device has now, as the CLI (which probes on every run) does.
+_METRICS_TTL_S = 2.0
+
+
 def _a11y_device_metrics(serial: str):
-    """(density_dpi, font_scale) for the lint, probed once per serial and cached."""
+    """(density_dpi, font_scale) of the device now, for the lint and captures:
+    probed at most once per _METRICS_TTL_S per serial (one tool call's
+    probes share one read; the next call re-reads)."""
     from inspector_widget import adb
     cache = _a11y_device_metrics.__dict__.setdefault("_cache", {})
-    if serial not in cache:
-        try:
-            density = adb.display_density(serial)
-        except Exception:
-            density = None  # the lint assumes 420dpi and says so in its diagnostics
-        try:
-            fscale = adb.font_scale(serial)
-        except Exception:
-            fscale = 1.0
-        cache[serial] = (density, fscale)
-    return cache[serial]
+    now = time.monotonic()
+    hit = cache.get(serial)
+    if hit is not None and len(hit) == 3 and now - hit[2] < _METRICS_TTL_S:
+        return hit[0], hit[1]
+    try:
+        density = adb.display_density(serial)
+    except Exception:
+        density = None  # the lint assumes 420dpi and says so in its diagnostics
+    try:
+        fscale = adb.font_scale(serial)
+    except Exception:
+        fscale = 1.0
+    cache[serial] = (density, fscale, now)
+    return density, fscale
 
 
 def _a11y_lint_rules(rules: Any):

@@ -488,3 +488,41 @@ def test_a_gone_default_app_names_the_running_candidates(tmp_path):
         err = run(ctx, "capture")["error"]
         assert err["code"] == "no_session" and "com.example.gone" in err["message"]
         assert set(err["candidates"]) == {PACKAGE, OTHER}
+
+
+def test_every_capture_reads_the_device_metrics_now(tmp_path):
+    """A font-scale or density change between captures shows in the next one, on
+    the MCP (whose probe is cached for a moment only) as on the CLI."""
+    import mcp_server
+
+    with ch.harness("launcher", str(tmp_path), toolset="capture") as (dev, _scene):
+        dev.font_scale, dev.override_density = "1.0", 480
+        first = json.loads(mcp_server._call_tool_text(
+            "capture", {"serial": SERIAL, "package": PACKAGE})[0])
+        assert first["device"].endswith("480dpi font 1.0")
+        dev.font_scale, dev.override_density = "1.3", 560
+        mcp_server._a11y_device_metrics._cache.clear()  # past the probe's 2 s
+        again = json.loads(mcp_server._call_tool_text("capture", {})[0])
+        assert again["device"].endswith("560dpi font 1.3"), again["device"]
+        cli = ch.ops_context()
+        assert capture(cli)["device"] == again["device"]
+        cli.sessions.close_all()
+
+
+def test_the_mcp_metrics_probe_expires(tmp_path, monkeypatch):
+    """The MCP's a11y_lint and captures share one probe for a moment (a burst of
+    calls), then read the device again: no process-lifetime cache."""
+    import mcp_server
+
+    with ch.harness("launcher", str(tmp_path)) as (dev, _scene):
+        clock = [1000.0]
+        monkeypatch.setattr(mcp_server.time, "monotonic", lambda: clock[0])
+        dev.font_scale = "1.0"
+        assert mcp_server._a11y_device_metrics(SERIAL)[1] == 1.0
+        dev.font_scale = "1.3"
+        clock[0] += 1.0  # within the TTL: the same probe
+        assert mcp_server._a11y_device_metrics(SERIAL)[1] == 1.0
+        clock[0] += mcp_server._METRICS_TTL_S
+        assert mcp_server._a11y_device_metrics(SERIAL)[1] == 1.3
+        probes = [c for c in dev.shell_log() if "font_scale" in c]
+        assert len(probes) == 2
