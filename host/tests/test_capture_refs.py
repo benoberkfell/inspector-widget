@@ -1011,6 +1011,66 @@ def test_a_row_scrolled_away_and_back_keeps_its_ref():
     assert chain.ref("view:100", d) not in {chain.ref("view:100", x) for x in (a, b, c)}
 
 
+def _pager_page(sid, title, *, cid):
+    """A Compose pager (a collection) showing one page: the page (``sid``) holds its title
+    (``sid + 1``), tagged ``page_title`` on every page."""
+    return scene(V("DecorView", 1,
+                   V("AndroidComposeView", 82,
+                     C(1, C(40, C(sid, C(sid + 1, tag="page_title", label=title,
+                                         b=(0, 100, 400, 60)),
+                                    b=(0, 0, 400, 800)),
+                            tag="pager", attrs={"CollectionInfo": "CollectionInfo"},
+                            b=(0, 0, 400, 800)),
+                       b=(0, 0, 400, 800)),
+                     b=(0, 0, 400, 800)),
+                   b=(0, 0, 400, 800)), cid=cid)
+
+
+def test_a_pager_page_never_takes_another_pages_ref_back():
+    # Three pages one after the other: when page 3 shows, page 1's title is a tombstone
+    # with the same @page_title, lone on screen on both sides. It is another page all the
+    # same: a per-cell tag recalls only when the cell shows the same item again.
+    chain = RecallChain()
+    a = chain.publish(_pager_page(10, "Welcome", cid="c00001"))
+    b = chain.publish(_pager_page(20, "Pick a plan", cid="c00002"))
+    c = chain.publish(_pager_page(30, "Payment", cid="c00003"))
+    seen = {a.by_key["sem:82:11"], b.by_key["sem:82:21"]}
+    r = c.by_key["sem:82:31"]
+    assert r not in seen and c.nodes[r].match == "new"
+    d = chain.publish(_pager_page(10, "Welcome", cid="c00004"))  # back to page 1
+    assert d.by_key["sem:82:11"] not in {b.by_key["sem:82:21"], r}
+
+
+def _sectioned(header, items, *, base, cid):
+    """A Compose list (a collection) showing one section header (tagged
+    ``section_header``) and its rows; ``base`` is the first semantics id on screen."""
+    cells = [C(base, C(base + 1, tag="section_header", label=header, b=(0, 0, 400, 60)),
+               b=(0, 0, 400, 60))]
+    for i, label in enumerate(items, 1):
+        cells.append(C(base + 10 * i, C(base + 10 * i + 1, label=label,
+                                        b=(0, 100 * i, 400, 60)),
+                       b=(0, 100 * i, 400, 90)))
+    return scene(V("DecorView", 1,
+                   V("AndroidComposeView", 82,
+                     C(1, C(40, *cells, attrs={"CollectionInfo": "CollectionInfo"},
+                            b=(0, 0, 400, 800)), b=(0, 0, 400, 800)),
+                     b=(0, 0, 400, 800)),
+                   b=(0, 0, 400, 800)), cid=cid)
+
+
+def test_a_lone_section_header_is_another_sections_unless_it_is_the_same_one():
+    chain = RecallChain()
+    a = chain.publish(_sectioned("A", ["Ant", "Ape"], base=100, cid="c00001"))
+    chain.publish(_sectioned("B", ["Bat", "Bee"], base=200, cid="c00002"))
+    c = chain.publish(_sectioned("C", ["Cat", "Cow"], base=300, cid="c00003"))
+    head_a = a.by_key["sem:82:101"]
+    assert c.by_key["sem:82:301"] != head_a  # @section_header, lone both times: not A's
+    assert c.nodes[c.by_key["sem:82:301"]].match == "new"
+    d = chain.publish(_sectioned("A", ["Ant", "Ape"], base=100, cid="c00004"))
+    # the same section back (its cell's identity label "A" again): header A's ref returns
+    assert d.by_key["sem:82:101"] == head_a and d.nodes[head_a].match == "returned"
+
+
 def _dialog_screen(*, cid, dialog=None, pid=100):
     roots = [V("DecorView", 1, V("LinearLayout", 2, V("Button", 3, label="Delete", rid="delete",
                                                          b=(0, 0, 200, 100)),

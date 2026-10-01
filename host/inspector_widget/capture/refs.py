@@ -69,8 +69,9 @@ subtrees are kept out of the geometry pass, so look-alikes are never swapped.
    item): by device identity when the pid and the Compose generation are those of
    the capture it left, inside a collection cell only when the cell shows the same
    item (its identity label) again; else by a unique locator (``#rid`` outside
-   collections, ``@tag`` or uniqueId anywhere), unique on both sides. A tombstone is
-   recalled at most once, and never when two nodes claim it.
+   collections, ``@tag`` or uniqueId), unique on both sides, and inside a collection cell
+   again only when the cell shows the same item (a pager's lone ``@page_title`` names
+   every page). A tombstone is recalled at most once, and never when two nodes claim it.
 
 A first capture (``prev=None``) allocates every ref in pre-order: ui tree first
 (windows in z order), then the slot tree. Allocation is one ``alloc(n)`` call per
@@ -902,10 +903,13 @@ def _recall(matcher: _Matcher, new_meta: Any, tomb: Mapping[str, list]
             return "cell" not in ident
         if "cell" not in ident:
             return False
-        if by_locator is not None and by_locator[0] in ("tag", "uid"):
-            return True  # a per-item testTag or uniqueId names the item itself
+        if by_locator is not None and by_locator[0] not in ("tag", "uid"):
+            return False  # a #rid repeats in every cell
+        # Inside a cell, whatever matched (key, @tag or uniqueId), the cell must show the
+        # same item again: a tag lone on screen on both sides (a pager's @page_title, a
+        # section header) can still be another item's.
         ident_now = _cut(new.item_ident.get(item), _IDENT_LABEL_MAX)
-        return by_locator is None and ident_now is not None and ident_now == ident["cell"]
+        return ident_now is not None and ident_now == ident["cell"]
 
     claims: dict[str, list[str]] = {}
     chosen: dict[str, str] = {}

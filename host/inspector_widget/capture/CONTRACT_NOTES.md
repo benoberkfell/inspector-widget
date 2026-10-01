@@ -891,9 +891,11 @@ with every consumer.
     1-4 that one of them names takes its old ref back (`match: "returned"`): by
     device identity in the same process and Compose generation (inside a
     collection cell only when the cell shows the same item again), else by a
-    locator unique on both sides (`#rid` outside collections, `@tag` or uniqueId
-    anywhere). So a dialog closed and shown again, or a row scrolled away during a
-    walk and back, keeps its ref. A contested tombstone is never recalled.
+    locator unique on both sides (`#rid` outside collections, `@tag` or uniqueId),
+    inside a collection cell again only when the cell shows the same item: a tag
+    lone on screen on both sides (a pager's `@page_title`, a section header) can be
+    another item's. So a dialog closed and shown again, or a row scrolled away during
+    a walk and back, keeps its ref. A contested tombstone is never recalled.
   - Side effect: `assign` writes `match`, `since` and `rebound_of` onto `new`'s
     nodes (`refs.annotate`), so `apply_refs` carries them into the published
     index. `since` is the capture where the ref was first assigned: the prev
