@@ -81,7 +81,7 @@ hint says what to narrow; `max_bytes` exists on `dump_tree`, `get_properties`,
   pixel rule. See **rules.md**.
 - **`a11y_overlay(serial, package, scale=1.0, include_contrast=true,
   wcag_mode=false)`** → `{path, boxes, labels, flagged, flagged_by_bounds,
-  finding_count, findings_covered, covered_windows, summary, ...}`. Screenshot
+  finding_count, covered_windows?, findings_covered?, summary, ...}`. Screenshot
   with every a11y node boxed, each focus stop numbered and labelled with what
   TalkBack says, colored by severity (red=error, amber=warn, blue=info,
   green=clean; a finding that maps to no a11y node is a dashed box at its own

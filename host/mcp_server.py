@@ -996,19 +996,22 @@ def tool_a11y_overlay(
             raise ToolError(str(exc)) from None
         summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings + covered,
                                          scale=base_scale)
-    return {
+    result = {
         "serial": serial, "package": package,
         "path": out, "overlay_path": out,
         "boxes": summary["boxes"], "labels": summary["labels"],
         "flagged": summary["flagged"], "flagged_by_bounds": summary.get("flagged_by_bounds"),
         "size": summary["size"],
         "finding_count": len(findings),
-        "findings_covered": summary.get("findings_covered", 0),
-        "covered_windows": summary.get("covered_windows", 0),
         "summary": lint_out["summary"],
         "lint_diagnostics": lint_out["diagnostics"],
         "diagnostics": a11y_data.get("diagnostics"),
     }
+    if summary.get("covered_windows"):
+        # a window under an open dialog: not drawn, its findings only counted
+        result["covered_windows"] = summary["covered_windows"]
+        result["findings_covered"] = summary.get("findings_covered", 0)
+    return result
 
 
 def _h_dump_accessibility(args: Dict[str, Any]) -> Dict[str, Any]:
