@@ -491,6 +491,7 @@ def build(dump: Any, *, services: Optional[str] = None, diagnostics: Optional[st
         })
     _apply_interactive_region(tree)
     _check_web_content(tree)
+    _apply_foreign_window(tree, diag)
     if tree.services == "off":
         holders = [n for n in tree.nodes if n.facet == "interop" and n.visible]
         for n in holders:
@@ -586,6 +587,24 @@ def _exclude_subtree(tree: TbTree, win: TbWindow, top: Dict[str, Any], parent: T
         tree.excluded.append(ex)
         tree.excluded_by_raw[id(raw)] = ex
         stack.extend(raw.get("children") or ())
+
+
+def _apply_foreign_window(tree: TbTree, diag: str) -> None:
+    """A window of another app over this one (a system dialog: the capture recorded it in
+    the dump's diagnostics, talkback/windows.py): TalkBack gets that window, not these, so
+    none of them is reported (no stops), and a diagnostic says what covers them."""
+    from .windows import from_token, hint, message, name
+
+    cover = from_token(diag)
+    if cover is None:
+        return
+    for w in tree.windows:
+        if w.dropped is None:
+            w.dropped = f"foreign:{name(cover)}"
+    tree.diagnostics.append({
+        "kind": "foreign_window", "window": cover.get("window"), "package": cover.get("package"),
+        "message": f"{message(cover, 'this app')}: no stop of it is on screen. {hint(cover)}",
+    })
 
 
 WEBVIEW_CLASS = "android.webkit.WebView"

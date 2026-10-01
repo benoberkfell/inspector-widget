@@ -450,11 +450,25 @@ def dismiss_talkback_activities(serial: str, top_before: Optional[str] = None) -
     return dismissed
 
 
+def _not_covered(serial: str, package: str, overlays_only: bool = False) -> None:
+    """Raise ``app_left_foreground`` naming the window of another app over ``package``
+    (talkback/windows.py: a permission dialog, the 16 KB compatibility dialog) with a BACK
+    hint; ``overlays_only``: only a window that is no activity (the app is on top)."""
+    from . import windows
+
+    cover = windows.foreign_cover(serial, package)
+    if cover is None or (overlays_only and "/" in str(cover.get("window") or "")):
+        return
+    raise TalkBackError("app_left_foreground", windows.message(cover, "the app"),
+                        hint=windows.hint(cover))
+
+
 def ensure_foreground(serial: str, package: str, top_before: Optional[str] = None) -> Dict[str, Any]:
     """``{}`` when ``package`` is on top; else bring ``top_before`` (its activity
     from before TalkBack started) back to the front and say so."""
     top = top_activity(serial)
     if top and top.startswith(package + "/"):
+        _not_covered(serial, package, overlays_only=True)  # a system dialog over it (16 KB)
         return {}
     if top_before and top_before.startswith(package + "/"):
         adb.shell(serial, f"am start -n {shlex.quote(top_before)} "
@@ -465,6 +479,7 @@ def ensure_foreground(serial: str, package: str, top_before: Optional[str] = Non
             return {"refronted": top_before,
                     "warning_foreground": f"{package} was covered; brought {top_before} "
                                           f"back to the front"}
+    _not_covered(serial, package)  # another app's dialog on top: name it, BACK (G9)
     other = top.split("/", 1)[0] if top else None
     hint = f"Open {package} on the device, then retry."
     if other and other != package and not other.startswith(("com.android.", "android")):

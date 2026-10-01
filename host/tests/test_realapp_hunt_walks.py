@@ -17,6 +17,7 @@ import tb_capture_fixtures as T
 from inspector_widget import talkback as tb
 from inspector_widget.capture import analyzers
 from inspector_widget.output import dumps
+from inspector_widget.proto import view_inspection_pb2 as pb
 from inspector_widget.capture.rules import DEFAULT_TB
 from inspector_widget.talkback import static
 
@@ -294,3 +295,77 @@ def test_l1_a_recycled_rows_only_text_showing_another_mail_is_another_stop():
     assert a.ctx is None
     model.stops = [walk.PStop(a.key, a.label, a.label, a.bounds, 1, "TextView", a.ctx)]
     assert model.match(b.key, b.sig, b.bounds, ctx=b.ctx).key == "view:5"
+
+
+# ------------------------------------------------------------- G9 / L5: system dialogs
+NIA = "com.google.samples.apps.nowinandroid.demo.debug"
+
+
+def _win(name):
+    from inspector_widget.talkback import windows
+
+    return windows.parse((H.DATA / f"windows_{name}.txt").read_text())
+
+
+def test_g9_the_window_list_names_the_system_dialog_over_the_app():
+    from inspector_widget.talkback import windows
+
+    # NiA cold start on emulator-5554 (API 37): the "Android App Compatibility" (16 KB)
+    # dialog, a window of the system (package android) over the app, with input focus
+    wins, focus = _win("nia_16kb_dialog")
+    c = windows.covering(wins, NIA, focus)
+    assert (c.package, c.type, c.title) == ("android", "APPLICATION_OVERLAY", "android")
+    # then the notification permission request: another app's activity on top
+    wins, focus = _win("nia_permission_dialog")
+    c = windows.covering(wins, NIA, focus)
+    assert c.package == "com.google.android.permissioncontroller"
+    cover = {"package": c.package, "window": c.title, "type": c.type}
+    assert windows.name(cover) == ("com.google.android.permissioncontroller/"
+                                   "…GrantPermissionsActivity")
+    # the status bar, the navigation bar, the IME and the app's own splash are no cover
+    assert windows.covering(wins, "com.oberkfell.a11yprobe", focus) is None  # not shown
+    assert windows.covering([w for w in wins if w.package in (NIA, "com.android.systemui")],
+                            NIA) is None
+
+
+def test_g9_a_capture_under_a_system_dialog_shows_no_stop_of_the_app():
+    from inspector_widget.capture import fetch
+    from inspector_widget.talkback import windows
+
+    cover = {"package": "com.google.android.permissioncontroller", "type": "BASE_APPLICATION",
+             "window": "com.google.android.permissioncontroller/com.android.permissioncontroller"
+                       ".permission.ui.GrantPermissionsActivity", "frame": [32, 1001, 1216, 937]}
+    resp = H.to_proto(H.dump("nia_for_you"))
+    raw = T.raw_from_a11y(resp, cid="cforeign", dpi=480)
+    fetch._mark_foreign(raw, dict(cover), NIA)
+    assert raw.meta.device["foreign_window"]["package"] == cover["package"]
+    assert raw.meta.diagnostics[-1].startswith(
+        "covered by another app's window: com.google.android.permissioncontroller/"
+        "…GrantPermissionsActivity; TalkBack reads it")
+    ix = T.build(raw)
+    assert ix.reading == []  # "on screen" lists nothing: TalkBack reads the dialog
+    stored = pb.DumpA11yResponse.FromString(raw.a11y).diagnostics
+    assert windows.from_token(stored)["package"] == cover["package"]
+    tree = tb.build(H.dump("nia_for_you"), diagnostics=windows.token(cover))
+    assert tb.Navigator(tree).linear() == []
+    assert [d["kind"] for d in tree.diagnostics if d["kind"] == "foreign_window"] == [
+        "foreign_window"]
+
+
+def test_g9_tb_walk_fails_fast_naming_the_dialog(monkeypatch):
+    from inspector_widget.output import dumps as js
+    from inspector_widget.talkback import device, windows
+
+    cover = {"package": "android", "type": "APPLICATION_OVERLAY", "window": "android",
+             "frame": [32, 789, 1216, 1361], "focused": True}
+    monkeypatch.setattr(windows, "foreign_cover", lambda serial, package: dict(cover))
+    monkeypatch.setattr(device, "top_activity", lambda serial: f"{NIA}/.MainActivity")
+    with pytest.raises(device.TalkBackError) as e:
+        device.ensure_foreground("emulator-5554", NIA)
+    assert e.value.code == "app_left_foreground"
+    env = {"error": {"code": e.value.code, "message": str(e.value), "hint": e.value.hint}}
+    assert "android (APPLICATION_OVERLAY)" in str(e.value) and "BACK" in e.value.hint
+    assert len(js(env).encode()) <= 300
+    # an activity of another app on top of the app's window (it is on top): no overlay
+    cover["window"] = "com.example/.Other"
+    assert device.ensure_foreground("emulator-5554", NIA) == {}

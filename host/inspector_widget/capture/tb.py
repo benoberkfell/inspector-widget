@@ -61,8 +61,7 @@ SPEAK_SRC_FALLBACK = "ro1"
 #: Model diagnostics a capture reports (``tb: ...``): why the model's "N of M" for RecyclerView
 #: items is missing or differs from a walk's (talkback/recycler.py).
 SURFACED_DIAGNOSTICS = frozenset({"recycler_bound_before_service", "recycler_positions_unknown",
-                                  "recycler_layout_unknown", "web_content_not_exposed",
-                                  "foreign_window"})
+                                  "recycler_layout_unknown", "web_content_not_exposed"})
 
 #: The attribute an Index carries its binding under (Index is unhashable, so no weak map).
 _CACHE_ATTR = "_tb_capture"

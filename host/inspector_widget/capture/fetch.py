@@ -550,7 +550,8 @@ def fetch(session: CaptureSession, opts: CaptureOptions | None = None, *,
           wall_clock: Callable[[], float] = time.time,
           device: Mapping[str, Any] | None = None, retries: int = RETRIES,
           retry_delay_s: float = RETRY_DELAY_S,
-          skp_max_version: int = SKP_MAX_VERSION) -> RawCapture:
+          skp_max_version: int = SKP_MAX_VERSION,
+          foreign: Callable[[], Mapping[str, Any] | None] | None = None) -> RawCapture:
     """Fetch every facet ``opts`` asks for and return the RawCapture (meta.id is
     empty until the store publishes it).
 
@@ -560,7 +561,11 @@ def fetch(session: CaptureSession, opts: CaptureOptions | None = None, *,
     ...}, e.g. from adb) is merged into ``meta.device``; ``screen`` and
     ``orientation`` are derived from the window roots when missing. ``clock``
     times the facets, ``wall_clock`` stamps ``created_at``, ``sleep`` waits
-    between retries and settle polls.
+    between retries and settle polls. ``foreign()``: what window of another app covers the
+    app (default: the window manager's list through adb, :mod:`talkback.windows`); a
+    capture under one says so (a diagnostic, ``meta.device["foreign_window"]``, and a
+    token in the stored accessibility tree's diagnostics, so the TalkBack model reads no
+    stop of the app: TalkBack reads that window).
     """
     opts = (opts or CaptureOptions()).validate()
     t_start = clock()
@@ -613,8 +618,41 @@ def fetch(session: CaptureSession, opts: CaptureOptions | None = None, *,
         meta.device["screen"] = list(screen)
         meta.device.setdefault("orientation",
                                "landscape" if screen[0] > screen[1] else "portrait")
+    cover = _foreign(session) if foreign is None else foreign()
+    if cover:
+        _mark_foreign(raw, dict(cover), session.package)
     meta.took_ms = round((clock() - t_start) * 1000)
     return raw
+
+
+def _foreign(session: CaptureSession) -> Mapping[str, Any] | None:
+    """The window of another app over the session's app now (talkback/windows.py), or None
+    (none, or the window list cannot be read: an in-process fake session)."""
+    serial, package = getattr(session, "serial", None), getattr(session, "package", None)
+    if not isinstance(serial, str) or not isinstance(package, str) or not serial:
+        return None
+    try:
+        from ..talkback import windows
+
+        return windows.foreign_cover(serial, package)
+    except Exception:  # noqa: BLE001 - a capture never fails on this check
+        return None
+
+
+def _mark_foreign(raw: RawCapture, cover: dict[str, Any], package: str) -> None:
+    """Record ``cover`` in the capture: a diagnostic, ``meta.device["foreign_window"]`` and
+    a token in the stored accessibility tree's diagnostics (talkback/windows.py ``token``)."""
+    from ..talkback import windows
+
+    raw.meta.device["foreign_window"] = cover
+    raw.meta.diagnostics.append(f"{windows.message(cover, 'this app')}; BACK dismisses it")
+    if raw.a11y:
+        from ..proto import view_inspection_pb2 as pb
+
+        resp = pb.DumpA11yResponse.FromString(bytes(raw.a11y))
+        tok = windows.token(cover)
+        resp.diagnostics = f"{resp.diagnostics}; {tok}" if resp.diagnostics else tok
+        raw.a11y = resp.SerializeToString()
 
 
 __all__ = [
