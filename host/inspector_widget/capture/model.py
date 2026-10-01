@@ -520,7 +520,7 @@ REF_FIELDS: dict[str, tuple[str, ...]] = {
 }
 #: Issue evidence fields that hold node ids (rewritten by remap_ids too), so the
 #: analyzers can run on a key-space index before refs are assigned.
-EVIDENCE_REF_FIELDS: tuple[str, ...] = ("clipped_by", "children_ids", "node_ids")
+EVIDENCE_REF_FIELDS: tuple[str, ...] = ("clipped_by", "children_ids", "node_ids", "covered_by")
 
 
 @dataclass

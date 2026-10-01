@@ -201,3 +201,27 @@ def test_screen_png_single_window_uses_one_screenshot(tmp_path):
     out = tmp_path / "one.png"
     assert overlay.write_screen_png(conn, {"windows": [_win(2, 0, 0, 10, 10)]}, str(out)) == 1.0
     assert conn.calls == [0]
+
+
+def test_a_window_under_a_dialog_is_not_drawn_over_it(base, tmp_path):
+    # AntennaPod with its filter sheet open: the activity's boxes and its findings used to be
+    # drawn on top of the sheet. The covered window (and every finding on it) is left out.
+    def node(host, x, y, w, h, **kw):
+        d = {"host_view_id": host, "virtual_id": -1, "id": a11y.a11y_key(host, -1),
+             "node_key": f"view:{host}", "class_name": "android.widget.Button",
+             "flags": ["visible_to_user", "enabled", "clickable"],
+             "bounds": {"layout": {"x": x, "y": y, "w": w, "h": h}}}
+        d.update(kw)
+        return d
+    activity = node(2, 0, 0, mf.W, 2400, children=[node(3, 100, 1500, 600, 200, text="Behind")])
+    sheet = node(9, 0, 1200, mf.W, 1200, children=[node(10, 100, 1300, 600, 200, text="Clear")])
+    data = {"windows": [{"root_view_id": 2, "root": activity, "covered_by": 9},
+                        {"root_view_id": 9, "root": sheet}]}
+    behind = {"rule": "a11y.label.missing", "severity": "error", "node_key": "view:3",
+              "node": {"key": "view:3"}, "bounds": {"x": 100, "y": 1500, "w": 600, "h": 200},
+              "window": {"index": 0, "root_view_id": 2, "covered_by": 9}}
+    s = overlay.render_a11y_overlay(base, data, str(tmp_path / "ov.png"), findings=[behind])
+    assert s["boxes"] == 2  # the sheet and its button only
+    assert s["covered_windows"] == 1 and s["findings_covered"] == 1 and s["flagged"] == 0
+    img = Image.open(tmp_path / "ov.png").convert("RGB")
+    assert RED not in _edge_colors(img, 100, 1500, 600, 200)

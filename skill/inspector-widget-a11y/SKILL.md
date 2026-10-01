@@ -127,8 +127,12 @@ Run two tools:
   and `alias` (`R1`..), `severity` (`error` | `warn` | `info`), a typed
   `node_key` (`view:<id>` / `compose:<acvId>:<semId>`), the `node` (label, role,
   class, testTag, source), `bounds` (px) and `bounds_dp` (dp), `window`,
-  `collection` (list/row position; `window.covered_by` when the window is under
-  an open dialog), a remediation `message`, and `evidence` (§2). Read the
+  `collection` (list/row position), a remediation `message`, and `evidence`
+  (§2). `findings`, `by_rule` and the summary counts are what TalkBack can reach
+  now: findings on a window under an open dialog (`window.covered_by`) are
+  counted in `summary.covered` (`error`, `warn`, `info`, `total`, `windows`) and
+  kept apart, in `covered_by_rule` (the shape of `by_rule`) when brief and in
+  full in `covered_findings`. Read the
   `diagnostics` before trusting a clean result. Rules judge what TalkBack
   reads: Views TalkBack never sees are skipped, and focus stops come from the
   reading order. By default it screenshots each window to run the one contrast
@@ -172,8 +176,9 @@ TalkBack reading-order number, color-coded by lint severity:
 - **red** = error, **amber** = warn, **blue** = info, **green** = clean.
 - a **dashed** box (in the severity colour, labelled with the rule) = a finding
   that maps to no a11y node, drawn at the finding's own bounds.
-- Every window is drawn, a dialog over its activity; the numbers are the
-  reading order, so the activity under an open dialog has none.
+- Every window is drawn, a dialog over its activity, except a window under an
+  open dialog: its boxes would cover the dialog, so it is left out and its
+  findings only counted (`findings_covered`). The numbers are the reading order.
 
 It returns the annotated PNG `path` plus the lint `summary`. **Always view this
 image.** It is the single best "show me the a11y problems on screen" view: it
@@ -590,9 +595,9 @@ The CLI has the same tools: `inspector-widget tb-walk --start n14 --json`,
   default. Compose text never reports a size, so Compose contrast uses the
   normal-text threshold and a `diagnostics` entry says so.
 - **Off-screen / below-the-fold nodes are skipped** by the lint (not visible to
-  the user → no meaningful touch target or pixels). A row cut off at a scroll edge
-  gets an `info` touch-target finding saying it is probably clipped. Scroll the
-  content into view, then re-lint.
+  the user → no meaningful touch target or pixels). A row cut off at the edge of
+  a list that scrolls further gets `info` touch-target (and missing-label)
+  findings saying it is clipped. Scroll the content into view, then re-lint.
 - **Compose `file:line` comes from the slot table** (`dump_compose` with
   `include_slot_table=true`), never from `inspect_node` or the lint (their
   `source` is null). The slot table is empty until Compose inspection is
@@ -620,8 +625,12 @@ The CLI has the same tools: `inspector-widget tb-walk --start n14 --json`,
   accessibility; the dump marks it `ignored` and neither the reading order nor
   the lint count it. Its children still count.
 - **Dialogs.** While a modal dialog is open TalkBack cannot reach the activity
-  under it: its window has `covered_by`, no reading order, and its findings carry
-  `window.covered_by` (still real defects, reachable once the dialog closes).
+  under it: its window has `covered_by` and no reading order, and its findings
+  (still real defects, reachable once the dialog closes) are kept out of the
+  summary counts and `findings`: `summary.covered` counts them, `covered_by_rule`
+  (brief) or `covered_findings` (full) lists them, `inspect_node` shows a node's
+  (with `window.covered_by`; its `lint_summary.covered` counts them), and the
+  capture `lint()` reports them as `covered`.
 - **Material 48dp vs WCAG 44dp.** Default touch-target floor is Material 48dp;
   pass `wcag_mode=true` for the WCAG 2.5.8 44dp target (24dp is the hard floor).
 - **Big screens: capture once, then walk.** With `INSPECTOR_WIDGET_TOOLSET=capture`

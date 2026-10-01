@@ -64,6 +64,7 @@ from .model import (
     a11y_path_key,
     sem_key,
     view_key,
+    window_key,
 )
 from .rules import ALIASES, RULES
 
@@ -72,6 +73,7 @@ GROUPS = ("rule", "node", "none")
 DEFAULT_DENSITY = 420
 CONTRAST_RULE = "a11y.contrast.low"
 TOUCH_RULE = "a11y.touch_target.small"
+DUP_RULE = "a11y.duplicate.label"
 CLIPPED = "render.clipped"
 HIDDEN = "render.hidden"
 OFFSCREEN = "render.offscreen"
@@ -85,7 +87,8 @@ LINT_LIMIT = 30
 PER_RULE = 3
 #: bump when the cached lint shape or its input changes (derived/lint.<hash>.json);
 #: 2: the unified a11y tree replaced Compose semantics as the lint input
-LINT_CACHE_VERSION = 2
+#: 3: evidence ``covered_by`` (a finding under an open dialog) and R12's ``name``
+LINT_CACHE_VERSION = 3
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
 _EDGE_SLOP = 1
@@ -661,6 +664,9 @@ def _evidence(f: Any, nid: str, dump: _A11yDump,
             if not v:
                 continue
         ev[k] = v
+    if f.rule == DUP_RULE and (getattr(f, "evidence", None) or {}).get("label"):
+        # the name the nodes share: the node's own label can be its state ("Not selected")
+        ev["name"] = f.evidence["label"]
     return ev
 
 
@@ -685,6 +691,13 @@ def _map_findings(report: Any, dump: _A11yDump, ix: Index, res: _LintResult,
             continue
         ev = _evidence(f, nid, dump, lookup)
         conf = "inferred" if ev.pop("low_confidence", False) else "exact"
+        n = ix.nodes[nid]
+        if ev.get("name") is not None and ev["name"] == (n.label or n.text or n.desc):
+            ev.pop("name")  # R12's shared name is the node's own label: nothing to add
+        cov = (getattr(f, "window", None) or {}).get("covered_by")
+        if cov is not None:
+            # on a window under an open dialog: the dialog's window, counted apart (_covered)
+            ev["covered_by"] = ix.resolve_id(window_key(int(cov))) or window_key(int(cov))
         res.issues.append((nid, Issue(f.rule, f.severity, ev, conf)))
     res.errors.extend(str(d.get("message")) for d in report.diagnostics
                       if d.get("code") == "rule.error")
@@ -982,14 +995,21 @@ def lint_summary(ix: Index) -> dict[str, str]:
                 sev_by[iss.sev] += 1
             elif iss.id.startswith("render."):
                 render_by.setdefault(R.short(iss.id), []).append(n.ref or n.id)
+    # findings under an open dialog are counted apart, as a11y_lint's summary does
+    covered = [i for n in ix.nodes.values() for i in n.issues if _covered(i)]
+    for iss in covered:
+        a11y_by[R.short(iss.id)] -= 1
+        sev_by[iss.sev] -= 1
+    a11y_by = +a11y_by
+    under = f"; +{len(covered)} under an open dialog" if covered else ""
     out: dict[str, str] = {}
     contrast = "contrast sampled" if _contrast_ran(ix) else "contrast not run"
     if a11y_by:
-        sevs = " ".join(f"{sev_by[s]} {s}" for s in R.SEVERITIES if sev_by[s])
+        sevs = " ".join(f"{sev_by[s]} {s}" for s in R.SEVERITIES if sev_by[s] > 0)
         rules = ", ".join(f"{c} {k}" for k, c in a11y_by.most_common())
-        out["lint"] = f"{sevs}: {rules} ({contrast})"
+        out["lint"] = f"{sevs}: {rules}{under} ({contrast})"
     else:
-        out["lint"] = f"no findings ({contrast})"
+        out["lint"] = f"no findings{under} ({contrast})"
     if render_by:
         parts = []
         for k, refs in sorted(render_by.items(), key=lambda kv: -len(kv[1])):
@@ -1001,6 +1021,44 @@ def lint_summary(ix: Index) -> dict[str, str]:
 
 def _contrast_ran(ix: Index) -> bool:
     return any(d.startswith("contrast: sampled") for d in ix.diagnostics)
+
+
+def _covered(iss: Issue) -> bool:
+    """A lint finding on a window under an open dialog or sheet (evidence ``covered_by``,
+    the dialog's window): TalkBack cannot reach it until the dialog closes."""
+    return bool((iss.evidence or {}).get("covered_by"))
+
+
+def covered_windows(ix: Index, loaded: Any) -> dict[str, str | None]:
+    """``{window id: the id of the modal window over it}`` for every window the stored
+    a11y tree puts under an open dialog or sheet (``covered_by``); empty without one."""
+    src = loaded if isinstance(loaded, _Src) else _Src(loaded)
+    dump = src.a11y_dump()
+    out: dict[str, str | None] = {}
+    for w in (dump.data.get("windows") or []) if dump is not None else []:
+        if w.get("covered_by") is None or w.get("root_view_id") is None:
+            continue
+        nid = ix.resolve_id(window_key(int(w["root_view_id"])))
+        if nid is not None:
+            out[nid] = ix.resolve_id(window_key(int(w["covered_by"])))
+    return out
+
+
+def _covered_out(ix: Index, covered: list[tuple[str, Issue]]) -> dict[str, Any]:
+    """lint()'s ``covered``: how many findings sit under an open dialog, on which windows,
+    under which dialog."""
+    wins: list[str] = []
+    by: list[str] = []
+    for nid, iss in covered:
+        w = ix.nodes[nid].window
+        wn = ix.nodes.get(w) if w else None
+        if wn is not None and _ref(wn) not in wins:
+            wins.append(_ref(wn))
+        dn = ix.get(str(iss.evidence.get("covered_by")))
+        d = _ref(dn) if dn is not None else str(iss.evidence.get("covered_by"))
+        if d not in by:
+            by.append(d)
+    return {"n": len(covered), "windows": wins, "by": by}
 
 
 # --------------------------------------------------------------------------- #
@@ -1164,6 +1222,11 @@ def _detail(iss: Issue) -> str:
         bits.append(str(ev["why"]))
     elif iss.id == OFFSCREEN and ev.get("outside"):
         bits.append(f"outside {ev['outside']}")
+    elif iss.id == DUP_RULE and (ev.get("name") or ev.get("node_ids")):
+        others = [str(x) for x in ev.get("node_ids") or []]
+        like = " ".join(others[:2]) + (f" +{len(others) - 2}" if len(others) > 2 else "")
+        named = f"named {_quote(ev['name'], 24)}" if ev.get("name") else ""
+        bits.append(" ".join(x for x in (named, f"like {like}" if like else "") if x))
     note = ev.get("note")
     out = " ".join(bits)
     if note:
@@ -1259,6 +1322,11 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
             if wanted(iss.id) and R.at_least(iss.sev, severity)
             and (scope is None or nid in scope)]
     kept.sort(key=lambda p: (order.get(p[0], 1 << 30), p[1].id))
+    # Findings under an open dialog are counted apart (``covered``), as a11y_lint does, unless
+    # ``within`` asks for that part of the screen.
+    covered = [p for p in kept if _covered(p[1])]
+    if scope is None:
+        kept = [p for p in kept if not _covered(p[1])]
     counts = {s: 0 for s in R.SEVERITIES}
     for _, iss in kept:
         counts[iss.sev] = counts.get(iss.sev, 0) + 1
@@ -1268,6 +1336,8 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
         out["contrast"] = contrast_status
     if within:
         out["within"] = within
+    if covered:
+        out["covered"] = dict(_covered_out(ix, covered), listed=scope is not None)
     if unmapped:
         out["unmapped"] = len(unmapped)
     available = set(getattr(a11y_lint, "ALL_RULE_IDS", ())) | {
@@ -1318,6 +1388,11 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
     if not explicit and any(i.id.startswith("render.") for n in ix.nodes.values()
                             for i in n.issues):
         nxt.append('find(issue="render.")')
+    if covered and scope is None and out["covered"]["windows"]:
+        # ahead of find(issue="render."): what a dialog hides matters more (3 hints at most)
+        render = 'find(issue="render.")'
+        nxt.insert(nxt.index(render) if render in nxt else len(nxt),
+                   f'lint(within="{out["covered"]["windows"][0]}")')
     if explicit and not kept and any(r.startswith("tb.") for r in selected_set):
         # nothing static: traps, loops and focus after an action or a list update show
         # only on the device
@@ -1418,7 +1493,15 @@ def _rule_items(ix: Index, kept: list[tuple[str, Issue]], per_rule: int,
     for rid, members in by_rule.items():
         rule = R.get(rid, members[0][1].sev)
         sev = R.worst(i.sev for _, i in members) or rule.sev
-        lines = _collapsed(ix, members)
+        if rid == DUP_RULE:  # one collapse per shared name (a row's own label can be its state)
+            by_name: dict[Any, list[tuple[str, Issue]]] = {}
+            for nid, iss in members:
+                n = ix.nodes[nid]
+                name = iss.evidence.get("name") or n.label or n.text or n.desc
+                by_name.setdefault(name, []).append((nid, iss))
+            lines = [ln for grp in by_name.values() for ln in _collapsed(ix, grp)]
+        else:
+            lines = _collapsed(ix, members)
         shown = lines[:per_rule]
         rest = sum(n for _, n in lines[per_rule:])
         nodes = [s for s, _ in shown]

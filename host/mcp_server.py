@@ -986,15 +986,17 @@ def tool_a11y_overlay(
         a11y_data=a11y_data)
     lint_out = report.to_dict()
     findings = lint_out["findings"]
+    # The ones under an open dialog go in too: the overlay counts them and draws none.
+    covered = lint_out.get("covered_findings") or []
     with _png_scratch(serial, package, "a11y_base") as base, \
             _png_output(serial, package, "a11y_overlay") as out:
         try:
             base_scale = ov.write_screen_png(session, a11y_data, base, scale=scale)
         except RuntimeError as exc:
             raise ToolError(str(exc)) from None
-        summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
+        summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings + covered,
                                          scale=base_scale)
-    return {
+    result = {
         "serial": serial, "package": package,
         "path": out, "overlay_path": out,
         "boxes": summary["boxes"], "labels": summary["labels"],
@@ -1005,6 +1007,11 @@ def tool_a11y_overlay(
         "lint_diagnostics": lint_out["diagnostics"],
         "diagnostics": a11y_data.get("diagnostics"),
     }
+    if summary.get("covered_windows"):
+        # a window under an open dialog: not drawn, its findings only counted
+        result["covered_windows"] = summary["covered_windows"]
+        result["findings_covered"] = summary.get("findings_covered", 0)
+    return result
 
 
 def _h_dump_accessibility(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1234,7 +1241,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "rules R1..R18: labels, touch targets, contrast (per window), roles, state, empty "
             "stops, headings, grouping, text size, duplicates, forms, links, traversal. by_rule: "
             "each rule's count, message and first node_keys (for inspect_node); group_by=none "
-            "lists every finding (node_key, bounds px/dp, window, message, evidence)."
+            "lists every finding (node_key, bounds px/dp, window, message, evidence). Those "
+            "under an open dialog are apart: covered_by_rule, covered_findings."
         ),
         "schema": {
             "type": "object",

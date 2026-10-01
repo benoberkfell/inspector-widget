@@ -971,21 +971,11 @@ def _finding_node_id(f: Mapping) -> Any:
     return node if node is not None else f.get("node_id")
 
 
-def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
-    """Findings grouped by rule (count, message once, 3 node keys); the run's
-    ``stats`` and its info-level diagnostics are left out and counted."""
-    if (args.get("group_by") or "rule") == "none":
-        return dict(result)
-    out: dict[str, Any] = {k: v for k, v in result.items()
-                           if k not in ("findings", "summary", "stats", "diagnostics")}
-    extra: dict[str, int] = {}
-    if isinstance(result.get("stats"), Mapping):
-        extra["stats"] = len(result["stats"])
-    summary = result.get("summary")
-    if isinstance(summary, Mapping):
-        out["summary"] = {k: v for k, v in summary.items() if k != "by_rule"}
+def _by_rule(findings: Any) -> dict[str, dict[str, Any]]:
+    """Finding dicts grouped by rule: ``{rule: {sev, n, msg, nodes (3 node keys), more?}}``
+    (the severity and message of the rule's first finding, the worst: errors come first)."""
     by_rule: dict[str, dict[str, Any]] = {}
-    for f in result.get("findings") or []:
+    for f in findings or []:
         if not isinstance(f, Mapping):
             continue
         r = by_rule.setdefault(str(f.get("rule")), {"sev": f.get("severity"), "n": 0,
@@ -996,7 +986,28 @@ def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
     for r in by_rule.values():
         if r["n"] > len(r["nodes"]):
             r["more"] = r["n"] - len(r["nodes"])
-    out["by_rule"] = by_rule
+    return by_rule
+
+
+def _slim_a11y_lint(tool: str, result: Mapping, args: Mapping) -> dict:
+    """Findings grouped by rule (count, message once, 3 node keys), the ones under an open
+    dialog apart in ``covered_by_rule`` (same shape); the run's ``stats`` and its
+    info-level diagnostics are left out and counted. ``group_by=none`` keeps every finding
+    (``findings`` and ``covered_findings``)."""
+    if (args.get("group_by") or "rule") == "none":
+        return dict(result)
+    out: dict[str, Any] = {k: v for k, v in result.items()
+                           if k not in ("findings", "covered_findings", "summary", "stats",
+                                        "diagnostics")}
+    extra: dict[str, int] = {}
+    if isinstance(result.get("stats"), Mapping):
+        extra["stats"] = len(result["stats"])
+    summary = result.get("summary")
+    if isinstance(summary, Mapping):
+        out["summary"] = {k: v for k, v in summary.items() if k != "by_rule"}
+    out["by_rule"] = _by_rule(result.get("findings"))
+    if result.get("covered_findings"):
+        out["covered_by_rule"] = _by_rule(result["covered_findings"])
     diags = result.get("diagnostics")
     if isinstance(diags, list):
         kept = [d for d in diags if not (isinstance(d, Mapping) and d.get("level") == "info")]

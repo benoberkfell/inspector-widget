@@ -43,10 +43,18 @@ FIXES = {
     "tb.initial_focus": "Put the content first (or give the close button a label and place it "
                         "last), give the window/pane a title (Compose DialogProperties / "
                         "paneTitle), and drop stray FocusRequester.requestFocus() calls.",
-    "tb.restore_failed": "Give each destination a paneTitle (a distinct window identity lets "
-                         "TalkBack restore its per-window focus), keep list state "
-                         "(rememberSaveable / LazyListState), stable ids, "
-                         "AccessibilityNodeInfo.setUniqueId (API 33).",
+    "tb.restore_failed": "Put accessibility focus back yourself when the screen returns. On "
+                         "TalkBack 17 a paneTitle per destination does not restore it, and "
+                         "neither does input focus (View.requestFocus / Compose "
+                         "FocusRequester.requestFocus: TalkBack does not follow it), measured on "
+                         "A11yProbe C14 and Now in Android. Keep the list state "
+                         "(rememberSaveable / LazyListState, stable keys) so the row is still "
+                         "there, then, once it is laid out, send it "
+                         "ACTION_ACCESSIBILITY_FOCUS: "
+                         "View.performAccessibilityAction(AccessibilityNodeInfo"
+                         ".ACTION_ACCESSIBILITY_FOCUS, null), or for Compose the host view's "
+                         "accessibilityNodeProvider.performAction(semanticsNodeId, "
+                         "ACTION_ACCESSIBILITY_FOCUS, null) (A11yProbe C14 GOOD).",
     "tb.focus_reset": "Keep the focused item's identity stable: items(key = { it.id }), "
                       "setHasStableIds + DiffUtil with payloads, supportsChangeAnimations = false, "
                       "ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed for ComposeView cells.",
@@ -320,7 +328,8 @@ def _restore(drv: Driver, cur: Snapshot, wait_s: float, legacy: bool) -> Dict[st
     if verdict not in ("restored", "near"):
         same_window = _windows(cur) == _windows(back) and top0 == top2
         why = ("single-activity navigation: the window (root, title, pane titles) did not change, so "
-               "TalkBack had no per-window record to restore" if same_window and top1 == top0
+               "TalkBack had no per-window record to restore (a paneTitle per destination does "
+               "not change that on TalkBack 17)" if same_window and top1 == top0
                else "the screen came back as a new window/activity instance")
         res["finding"] = {"code": "tb.restore_failed", "sev": "warn", "basis": "walk",
                           "msg": f"after back, focus went {verdict} instead of {_ref(f0, legacy)}; {why}",

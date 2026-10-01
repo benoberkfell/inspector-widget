@@ -632,7 +632,8 @@
    ],
    "static_findings": [
     "tb.double_stop",
-    "tb.ghost_stop"
+    "tb.ghost_stop",
+    "tb.skipped"
    ],
    "walk_expect": {
     "ended": "wrap"
@@ -929,25 +930,16 @@
     "tb.out_of_order"
    ],
    "static_findings": [
-    "tb.edge_stuck"
+    "tb.edge_stuck",
+    "tb.ghost_stop",
+    "tb.out_of_order"
    ],
    "walk_expect": {
     "ended": "wrap"
    },
-   "model_mismatch": {
-    "differ": 5,
-    "note": "TalkBack 17 walks into the WebView's virtual nodes (the show notes); the model does not model web content beyond supportsWebActions (talkback/rules.py), so it predicts the Download button after the page and none of the web stops.",
-    "unpredicted": [
-     "virtual:17:4",
-     "virtual:17:8",
-     "virtual:17:7",
-     "virtual:17:2",
-     "virtual:17:12"
-    ],
-    "unvisited": []
-   },
+   "model_mismatch": null,
    "calibration": false,
-   "note": "AntennaPod: ViewPager2 keeps the offscreen WebView page in the tree; TalkBack walks into show notes nobody can see."
+   "note": "AntennaPod: ViewPager2 keeps the offscreen WebView page in the tree; TalkBack walks into show notes nobody can see. The model walks the offscreen page's web content too (talkback/order.py web navigation): it used to predict none of the 5 web stops (model.mismatch differ 5), now it matches press for press."
   },
   {
    "scenario": "tb_v13",

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from inspector_widget import a11y, a11y_lint
 from inspector_widget.proto import view_inspection_pb2 as pb
 from inspector_widget.talkback import diff, walk
 
@@ -86,11 +87,11 @@ def test_recorded_walk_still_classifies_the_same(entry):
 @pytest.mark.parametrize("entry", [e for e in WALK_ENTRIES if e.get("static_findings") is not None],
                          ids=_id)
 def test_the_model_alone_sees_the_defect(entry):
+    # Exactly the pinned codes, BAD variants included: a model change that adds or drops a
+    # finding shows here (tb_v13-bad's tb.out_of_order once went unnoticed under a subset check).
     _rec, resp = _load(entry)
     found = _codes(walk.static_walk(resp, expect=_expect(entry))["findings"])
-    assert set(entry["static_findings"]) <= found, (entry["static_findings"], found)
-    if entry["variant"] == "good" and not entry["static_findings"]:
-        assert found == set(), found
+    assert found == set(entry["static_findings"]), (entry["static_findings"], found)
 
 
 def _first_screen(steps):
@@ -116,3 +117,16 @@ def test_model_agrees_with_talkback_or_the_delta_is_pinned(entry):
     vs = diff.analyze(rec, expect=_expect(entry))["vs_model"]
     pinned = entry.get("model_mismatch") or {}
     assert vs.get("differ", 0) <= pinned.get("differ", 0), (vs, pinned)
+
+
+@pytest.mark.parametrize("entry", WALK_ENTRIES, ids=_id)
+def test_a_stop_talkback_called_unlabelled_is_an_r1_error(entry):
+    """Every stop of the start screen that TalkBack 17 announced as "Unlabelled" is an R1
+    error, not the clipped-maybe info (tb_c4's full-window scrim reaches the window's
+    bottom edge only because it spans the window)."""
+    rec, resp = _load(entry)
+    rep = a11y_lint.lint_unified(a11y.a11y_to_dict(resp), a11y_lint.LintContext(density=420))
+    r1 = {f.node_key: f.severity for f in rep.findings if f.rule == "a11y.label.missing"}
+    unlabelled = [s["key"] for s in _first_screen(rec["steps"])
+                  if s.get("key") and "Unlabelled" in (s.get("speak") or "")]
+    assert {k: r1.get(k) for k in unlabelled} == {k: "error" for k in unlabelled}

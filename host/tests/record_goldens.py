@@ -80,6 +80,11 @@ _NO_COMPOSE = ("a screen without a ComposeView (or with an obfuscated / unreadab
                "says why it has no slot table instead of recommending the destructive "
                "enable_inspection hot reload (results.compose_note)")
 
+_LINT_ACCURACY = ("lint accuracy round (improve/a11y-accuracy): an unnamed row clipped at a "
+                  "scroll edge is R1 info, not error (its label may be in the part scrolled "
+                  "away); R2 says a target is clipped only on evidence (wording and "
+                  "clipped_axes)")
+
 #: Legacy entries re-recorded after G1, and why: the only allowed deltas. Each
 #: carries its reason in the golden entry (``delta``).
 LEGACY_DELTAS: dict[tuple[str, str], str] = {
@@ -101,6 +106,9 @@ LEGACY_DELTAS: dict[tuple[str, str], str] = {
     ("cli", "component_image"): "component-image prints the MCP component_image document "
                                 "(serial, package and node_key added), as the other "
                                 "always-JSON subcommands do",
+    ("mcp", "a11y_lint"): _LINT_ACCURACY,
+    ("mcp", "a11y_overlay"): _LINT_ACCURACY,
+    ("cli", "a11y_lint"): _LINT_ACCURACY,
 }
 
 
