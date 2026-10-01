@@ -26,8 +26,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 DENSITY = 480  # emulator-5554 and emulator-5558 alike
 
 NEW = ("a11y.label.placeholder_token", "a11y.label.shared_prefix",
-       "a11y.label.decorative_merged", "a11y.state.label_contradicts",
-       "a11y.state.uniform_unselected")
+       "a11y.label.decorative_merged", "a11y.toggle.label_contradicts",
+       "a11y.selection.uniform_unselected")
 TITLE = ("a11y.heading.structure", "section_title")
 
 #: Every finding of R19..R23 and every R9 section title on the recorded real screens.
@@ -45,7 +45,7 @@ HUNT = {
     # TB-12: "Star" merged into every View row
     "thunderbird_list_views": [("a11y.label.decorative_merged", "view:352")],
     # NIA-9: "Not selected" on every Interests row
-    "nia_interests": [("a11y.state.uniform_unselected", "compose:8:168")],
+    "nia_interests": [("a11y.selection.uniform_unselected", "compose:8:168")],
     # L3: the settings dialog's section titles
     "nia_settings_dialog": [TITLE + ("compose:205:598",), TITLE + ("compose:205:610",),
                             TITLE + ("compose:205:620",)],
@@ -146,7 +146,7 @@ def test_nia9_interests_is_no_longer_silent():
     rep = lint(dump("nia_interests"))
     s = rep.summary
     assert (s["error"], s["warn"], s["info"]) == (0, 0, 1)  # was 0/0/0
-    f = of(rep, "a11y.state.uniform_unselected")[0]
+    f = of(rep, "a11y.selection.uniform_unselected")[0]
     assert (f.evidence["state"], f.evidence["rows"], f.evidence["row_count"],
             f.evidence["inner_label"]) == ("Not selected", 10, 20, "Follow interest")
 
@@ -170,13 +170,13 @@ def _bookmarked(data, *, checked=True, label="Unbookmark"):
 
 def test_nia10_a_checked_unbookmark_contradicts_its_state():
     plain = lint(dump("nia_feed"))
-    assert of(plain, "a11y.state.label_contradicts") == []  # "Bookmark", not checked
-    f = of(lint(_bookmarked(dump("nia_feed"))), "a11y.state.label_contradicts")
+    assert of(plain, "a11y.toggle.label_contradicts") == []  # "Bookmark", not checked
+    f = of(lint(_bookmarked(dump("nia_feed"))), "a11y.toggle.label_contradicts")
     assert [(x.node_key, x.severity, x.evidence["said"], x.evidence["undo"]) for x in f] == [
         ("compose:8:509", "warn", "checked", "Unbookmark")]
-    assert 'TalkBack says "Checked. Unbookmark"' in f[0].message
+    assert 'TalkBack says "checked. Unbookmark. Check box"' in f[0].message
     on = lint(_bookmarked(dump("nia_feed"), label="Bookmark"))  # a stable label: fine
-    assert of(on, "a11y.state.label_contradicts") == []
+    assert of(on, "a11y.toggle.label_contradicts") == []
 
 
 # ------------------------------------------------------------------------------------ G18

@@ -281,18 +281,25 @@ description on another; both are folded into the node.
 - **Severity:** `warn`.
 - **Fix:** at least 12sp (14–16sp for body text).
 
-### R22 `a11y.state.label_contradicts` — a toggle's label names the action
-- **Flags:** a checkable control (or a Checkbox/Switch) whose name is an undo action:
-  "Un…" on bookmark, follow, favorite, like, star, pin, mute, subscribe, save and the
-  like, or "Remove (from) bookmarks/favorites/star". Checked, TalkBack says "Checked.
-  Unbookmark", which reads as the opposite of what is on; not checked, the two contradict
-  outright; either way the label flips with the state (Now in Android's bookmark and
-  follow toggles, NIA-10).
+### R22 `a11y.toggle.label_contradicts` — a toggle's label names the action
+- **Flags:** a checkable control (or a Checkbox/Switch) whose whole name is an undo
+  action: "Un…" on bookmark, follow, favorite, like, star, pin, mute, subscribe, save
+  and the like, or "Remove (from) bookmarks/favorites/star", with at most two words of
+  object after it and no preposition ("Unfollow interest" is one; "Unlock with
+  fingerprint" and "Unmute on headset connect" name a feature and are not). Checked,
+  TalkBack says "checked. Unbookmark. Check box", which reads as the opposite of what is
+  on; not checked, it says only "Unbookmark" and a double-tap does the opposite; either
+  way the label flips with the state (Now in Android's bookmark and follow toggles,
+  NIA-10). The message quotes what TalkBack says, by its model: the stateDescription
+  ("On. Unmute. Switch"), else "checked", and no state for an unchecked node. A
+  stateDescription that names the state in words ("Bookmarked. Unbookmark") is no
+  contradiction and is not flagged.
 - **Severity:** `warn`.
 - **Fix:** one stable label that names the item ("Bookmark <title>") on the toggleable,
   so the checked state says on or off; or a plain button (not checkable) whose label
   names the action.
-- **Evidence:** `said` ("checked" / "not checked"), `undo` (the action word), `role`.
+- **Evidence:** `said` (the state TalkBack speaks: "checked", "On", or "" when it says
+  none), `checked`, `undo` (the action word), `role`.
 
 ---
 
@@ -358,26 +365,34 @@ description on another; both are folded into the node.
 - **Fix:** remove one constraint in the cycle; point links at nodes that exist.
 
 ### R19 `a11y.label.placeholder_token` — a placeholder read aloud
-- **Flags:** a visible node whose text or contentDescription holds a placeholder:
-  a bracketed identifier (`[attachment_icon]`, `[conversationCounter]`; Compose inline
-  content's `alternateText`, Thunderbird's message rows, TB-7), a resource reference
-  (`@string/x`, `R.string.x`), an unfilled format argument (`%s`, `%1$d`), a template
-  placeholder (`{{name}}`, `${name}`), or a whole contentDescription that is a
-  resource name (`ic_star_border`, `send_button`). A bracketed word (`[Draft]`), an
-  e-mail address or a user name is not one.
+- **Flags:** what a stop reads, as TalkBack reads it (its model's announcement: a
+  View's contentDescription silences its text and its children, while a Compose
+  merging row's description rides on a synthetic child and its children are still
+  read), holding a placeholder: a bracketed snake_case identifier
+  (`[attachment_icon]`; Compose inline content's `alternateText`, Thunderbird's
+  message rows, TB-7), a resource reference (`@string/x`, `R.string.x`), an unfilled
+  format argument (`%s`, `%1$d`), a template placeholder (`{{name}}`, `${name}`), or a
+  whole contentDescription that is a resource name (`ic_star_border`,
+  `send_button`). Brackets in what users write are not one: a word (`[Draft]`), a
+  dotted name or version (`[example.com]`, `[v1.2]`, `[README.md]`), a brand
+  (`[iPhone]`); nor is an e-mail address or a user name.
 - **Severity:** `warn`, one finding per token per window, on the first stop that reads
   it, with `rows` (how many rows or stops read it).
 - **Fix:** give inline content a localized `alternateText`
   (`appendInlineContent(id, alternateText = stringResource(...))`), clear decorative
-  inline content from semantics, or give the row a contentDescription; resolve string
-  resources and format arguments before they are set.
+  inline content from semantics, or replace the row's semantics
+  (`Modifier.clearAndSetSemantics { contentDescription = "..." }`; a View row:
+  `android:contentDescription`); resolve string resources and format arguments before
+  they are set.
 
 ### R20 `a11y.label.shared_prefix` — the same child description first in most rows
 - **Flags:** a list (three or more items) in which 60% or more of the rows start with
   the same contentDescription of a child that shows no text (an icon): TalkBack reads
   it first on every swipe, before what tells the rows apart (Thunderbird's settings:
   every row with the icon starts "Account settings", TB-11). A shared leading *text*
-  is visible content and is not flagged.
+  is visible content and is not flagged, nor is an icon that tells the rows apart:
+  when another row leads with a different description from the same kind of child
+  (same class and resource id), "Folder" on four rows and "PDF document" on two.
 - **Severity:** `warn`, one finding per list, on its first such row.
 - **Fix:** mark the icon decorative: View `android:importantForAccessibility="no"` or
   `contentDescription="@null"`; Compose `contentDescription = null`.
@@ -396,13 +411,15 @@ description on another; both are folded into the node.
 - **Evidence:** `merged`, `child`, `rows`, `of`, `twin_label` (what the row's own
   control says).
 
-### R23 `a11y.state.uniform_unselected` — every item says "Not selected"
-- **Flags:** a list of five or more items in which every item exposes a selection
-  state (Compose `selected`, read "Not selected") and none is selected, while each
-  item holds a control of its own named apart from the row, so the row's activation
-  is something else and its state never changes (Now in Android's Interests: every
-  row says "Not selected", NIA-9). An onboarding grid whose rows toggle the same
-  thing as their own checkbox is not flagged.
+### R23 `a11y.selection.uniform_unselected` — every item says "Not selected"
+- **Flags:** a list of five or more items in which every item says a selection
+  state (a stateDescription "Not selected" / "Selected": Compose `selected` on a
+  non-Tab) and none on screen is selected, while each item holds a control of its own
+  named apart from the row, so the row's activation is something else (Now in
+  Android's Interests: every row says "Not selected", NIA-9). An onboarding grid whose
+  rows toggle the same thing as their own checkbox is not flagged, nor is a list of
+  roleless checkable rows with no stateDescription (an unchecked to-do list): TalkBack
+  reads those "checked" or nothing, never "Not selected".
 - **Severity:** `info`, one finding per list.
 - **Fix:** set `selected` only where a selection is shown (`if (highlight) selected =
   isSelected`); View: `setSelected(true)` on the current item only.

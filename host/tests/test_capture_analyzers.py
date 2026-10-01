@@ -107,13 +107,16 @@ def test_one_short_code_never_names_two_rules():
     assert R.short("a11y.label.redundant") == "label_redundant"
     assert R.short("a11y.text.fixed_scaling") == "text_fixed_scaling"
     assert R.short("a11y.text.too_small") == "text_too_small"
-    assert R.short("a11y.state.not_exposed") == "state_not_exposed"  # R22, R23 joined it
+    # R22 and R23 have groups of their own, so R7 keeps its short, documented code "state"
+    # (they were in "state" once, which renamed R7's "!state" to "!state_not_exposed")
+    assert R.short("a11y.state.not_exposed") == "state"
+    assert R.short("a11y.toggle.label_contradicts") == "toggle"
+    assert R.short("a11y.selection.uniform_unselected") == "selection"
     # the bare group still selects the whole group
     assert R.resolve("label") == ["a11y.label.missing", "a11y.label.redundant",
                                   "a11y.label.placeholder_token", "a11y.label.shared_prefix",
                                   "a11y.label.decorative_merged"]
-    assert R.resolve("state") == ["a11y.state.not_exposed", "a11y.state.label_contradicts",
-                                  "a11y.state.uniform_unselected"]
+    assert R.resolve("state") == ["a11y.state.not_exposed"]
     assert R.resolve("label_redundant") == ["a11y.label.redundant"]
 
 
@@ -645,8 +648,7 @@ def test_lint_view_groups_by_node_and_flat():
     ix, loaded = _spec_launcher()
     by_node = an.lint_view(ix, loaded, group="node")["lines"]
     assert len(by_node) == 12
-    assert by_node[0] == ('n11 "▶ All scenarios (lint everythin…" !role warn; '
-                          '!state_not_exposed warn')
+    assert by_node[0] == 'n11 "▶ All scenarios (lint everythin…" !role warn; !state warn'
     flat = an.lint_view(ix, loaded, group="none")["lines"]
     assert len(flat) == 14 and flat[0].startswith("n11 ") and " R5 warn" in flat[0]
 
@@ -742,8 +744,8 @@ def test_lint_summary_for_capture():
         "lint": "no findings (contrast not run)",
         "issues": "1 clipped: n22"}
     ix, _ = _spec_launcher()
-    assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state_not_exposed, "
-                                           "1 touch_target (contrast not run)")
+    assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state, 1 touch_target "
+                                           "(contrast not run)")
 
 
 # --------------------------------------------------------------------------- #

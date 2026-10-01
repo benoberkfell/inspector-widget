@@ -165,12 +165,12 @@ _CATALOG: tuple[Rule, ...] = (
        "A decorative child's description is merged into every row (e.g. \"..., Star\").",
        "importantForAccessibility=no / contentDescription = null on the decorative child",
        "R21"),
-    _r("a11y.state.label_contradicts", "warn",
-       "A toggle's label names the action, so it contradicts its state (e.g. \"checked, "
+    _r("a11y.toggle.label_contradicts", "warn",
+       "A toggle's label names the action, so it contradicts its state (e.g. \"checked. "
        "Unbookmark\").",
        "One stable label that names the item; let the checked state say on or off", "R22"),
-    _r("a11y.state.uniform_unselected", "info",
-       "Every item of a list says \"Not selected\" and none ever is.",
+    _r("a11y.selection.uniform_unselected", "info",
+       "Every item of a list says \"Not selected\"; none on screen is selected.",
        "Set selected only where a selection is shown", "R23"),
     # Render signals (capture/analyzers.py).
     _r("render.clipped", "warn", "Only part of the node is visible.",

@@ -89,7 +89,8 @@ PER_RULE = 3
 #: 2: the unified a11y tree replaced Compose semantics as the lint input
 #: 3: evidence ``covered_by`` (a finding under an open dialog) and R12's ``name``
 #: 4: R19..R23, R9's section titles, R2 on clear Compose touch areas (lint-and-store)
-LINT_CACHE_VERSION = 4
+#: 5: R22/R23 ids in groups of their own, R19 reads what TalkBack says (its review)
+LINT_CACHE_VERSION = 5
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
 _EDGE_SLOP = 1
@@ -1243,9 +1244,11 @@ _NEW_DETAIL: dict[str, Callable[[Mapping[str, Any]], str]] = {
         f"{_quote(ev.get('merged') or '', 24)} merged into {_rows_of(ev)}, from "
         f"{ev.get('child_class') or 'a child'}"
         + (f"; {_quote(ev['twin_label'], 24)} says it" if ev.get("twin_label") else "")),
-    "a11y.state.label_contradicts": lambda ev: (
-        f"{ev.get('said')}, named for the action {_quote(ev.get('undo') or '', 24)}"),
-    "a11y.state.uniform_unselected": lambda ev: (
+    "a11y.toggle.label_contradicts": lambda ev: (
+        # "said": the state TalkBack speaks; none for an unchecked checkable node
+        f"{ev.get('said') or 'not checked'}, named for the action "
+        f"{_quote(ev.get('undo') or '', 24)}"),
+    "a11y.selection.uniform_unselected": lambda ev: (
         f"{ev.get('rows')} rows say {_quote(ev.get('state') or '', 20)}, none selected"
         + (f"; each has {_quote(ev['inner_label'], 24)}" if ev.get("inner_label") else "")),
 }

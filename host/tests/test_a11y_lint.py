@@ -329,6 +329,47 @@ def test_r19_placeholder_tokens_are_flagged_once_per_token_with_their_rows():
     assert f[0].alias == "R19" and "TalkBack reads" in f[0].message
 
 
+def test_r19_brackets_in_what_users_write_are_not_placeholders():
+    # An inbox's subjects: a site's mail prefix, a version, a brand, a file name. Only a
+    # snake_case identifier in brackets is Compose inline content's placeholder.
+    subjects = ["[example.com] Password reset", "Release [v1.2] notes", "[iPhone] trade-in offer",
+                "Fwd: [README.md] review", "[conversationCounter] 3", "Lunch?"]
+    rows = [_row(i, _text(300 + i, t)) for i, t in enumerate(subjects)]
+    assert of(ulint(screen(decor(1, _list(rows)))), "a11y.label.placeholder_token") == []
+    rows.append(_row(6, _text(306, "[conversation_counter] Re: Thread")))
+    f = of(ulint(screen(decor(1, _list(rows)))), "a11y.label.placeholder_token")
+    assert [(x.evidence["token"], x.node_key) for x in f] == [
+        ("[conversation_counter]", "view:106")]
+
+
+def test_r19_judges_what_talkback_reads_not_every_field():
+    # TB-7 after R19's View fix: the row's contentDescription replaces its text and its
+    # children's (getNodeTextDescription reads the description first; a description
+    # silences a View's children), so the token is no longer read.
+    token = "Inline image attachment, 2/14/2023, data@example.com, [attachment_icon]"
+    view_rows = [_row(i, _text(300 + i, token), cd=f"Inline image attachment {i}")
+                 for i in range(3)]
+    assert of(ulint(screen(decor(1, _list(view_rows)))), "a11y.label.placeholder_token") == []
+    merged = comp(9, 100, flags=CLICK, cd="Inline image attachment, has an attachment",
+                  text=token, b=(0, 300, 1080, 240))
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 0, 1080, 2400),
+                kids=[merged])
+    assert of(ulint(screen(decor(1, host))), "a11y.label.placeholder_token") == []
+    # Compose (ui 1.7+) carries a merging row's contentDescription on a synthetic child, and
+    # TalkBack still reads the row's children after it: Modifier.semantics { contentDescription }
+    # does not clear the token there; clearAndSetSemantics does.
+    fake = comp(9, 100 + 2_000_000_000, cd="Inline image attachment", b=(0, 300, 1080, 240))
+    kid = comp(9, 101, "android.widget.TextView", text="[attachment_icon] ",
+               b=(150, 330, 300, 60))
+    row17 = comp(9, 100, flags=CLICK, b=(0, 300, 1080, 240), kids=[fake, kid])
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 0, 1080, 2400),
+                kids=[row17])
+    f = of(ulint(screen(decor(1, host))), "a11y.label.placeholder_token")
+    assert [(x.node_key, x.evidence["carrier"], x.evidence["field"]) for x in f] == [
+        ("compose:9:100", "compose:9:101", "text")]
+    assert "clearAndSetSemantics" in f[0].message
+
+
 def test_r20_a_childs_description_read_first_in_most_rows():
     # Thunderbird's settings (TB-11): a decorative icon labelled "Account settings" starts
     # every row; the section titles in between are plain text rows.
@@ -350,6 +391,26 @@ def test_r20_a_childs_description_read_first_in_most_rows():
              for i in range(4)]
     for good in (plain, texts):
         assert of(ulint(screen(decor(1, _list(good)))), "a11y.label.shared_prefix") == []
+
+
+def test_r20_an_icon_that_tells_the_rows_apart_is_not_a_shared_prefix():
+    # A file list: the leading icon says what each entry is, "Folder" on 4 of 6 rows and
+    # "PDF document" on the other 2. It is content, not a decorative prefix.
+    kinds = ["Folder", "Folder", "Folder", "Folder", "PDF document", "PDF document"]
+    rows = [_row(i, _icon(200 + i, k, b=(24, 200 + 150 * i, 96, 96)),
+                 _text(300 + i, f"Entry {i}", b=(150, 200 + 150 * i, 800, 100)))
+            for i, k in enumerate(kinds)]
+    assert of(ulint(screen(decor(1, _list(rows)))), "a11y.label.shared_prefix") == []
+    # a different *kind* of child (another resource id) leading the other rows does not
+    # make the icon informative: a folder list with two "Shared" badges is still flagged
+    def badge(i):
+        return view(200 + i, "android.widget.ImageView", cd="Shared", b=(24, 200 + 150 * i, 96, 96),
+                    view_id_resource_name="app:id/badge")
+    mixed = rows[:4] + [_row(4 + j, badge(4 + j), _text(304 + j, f"Entry {4 + j}"))
+                        for j in range(2)]
+    f = of(ulint(screen(decor(1, _list(mixed)))), "a11y.label.shared_prefix")
+    assert [(x.evidence["prefix"], x.evidence["rows"], x.evidence["of"]) for x in f] == [
+        ("Folder", 4, 6)]
 
 
 def test_r21_a_decorative_description_merged_into_every_row():
@@ -388,10 +449,40 @@ def test_r22_a_toggle_label_naming_the_action_contradicts_its_state():
                       toggle(5, "Unfollow interest"), toggle(7, "Bookmark"),
                       comp(9, 9, "android.widget.Button", cd="Unfollow", flags=CLICK,
                            b=(100, 900, 144, 144))])
-    f = of(ulint(screen(decor(1, host))), "a11y.state.label_contradicts")
-    assert [(x.node_key, x.evidence["said"], x.severity) for x in f] == [
-        ("compose:9:1", "checked", "warn"), ("compose:9:5", "not checked", "warn")]
-    assert 'TalkBack says "Checked. Unbookmark"' in f[0].message
+    f = of(ulint(screen(decor(1, host))), "a11y.toggle.label_contradicts")
+    # what TalkBack says, by its model: "checked" when checked, no state at all when not
+    # (TreeNodesDescription adds "not checked" only in a selection-mode collection)
+    assert [(x.node_key, x.evidence["said"], x.evidence["checked"], x.severity) for x in f] == [
+        ("compose:9:1", "checked", True, "warn"), ("compose:9:5", "", False, "warn")]
+    assert 'TalkBack says "checked. Unbookmark"' in f[0].message
+    assert 'TalkBack says "Unfollow interest"' in f[1].message
+    assert "a double-tap does the opposite" in f[1].message
+
+
+def test_r22_a_feature_named_switch_or_a_worded_state_is_no_contradiction():
+    # Settings switches that name a feature (a preposition after the verb, or more than two
+    # words of object), and a toggle whose stateDescription says the state in words.
+    def switch(hv, text, on, state):
+        return view(hv, "android.widget.Switch", text=text, state=state,
+                    flags=CLICK + ("checkable",) + (("checked",) if on else ()),
+                    b=(0, 160 * hv, 1080, 150))
+
+    sws = [switch(1, "Unlock with fingerprint", True, "On"),
+           switch(2, "Unmute on headset connect", False, "Off"),
+           switch(3, "Unlock the screen automatically after a call", True, "On"),
+           switch(4, "Unlocked", True, "On")]
+    worded = comp(9, 7, "android.view.View", cd="Unbookmark", state="Bookmarked",
+                  flags=CLICK + ("checkable", "checked"), b=(100, 1200, 144, 144))
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 1100, 1080, 400),
+                kids=[worded])
+    root = view(2, "android.widget.LinearLayout", b=(0, 0, 1080, 2400), kids=sws + [host])
+    assert of(ulint(screen(decor(1, root))), "a11y.toggle.label_contradicts") == []
+    # the switch's own state words are quoted as TalkBack says them: "On", not "checked"
+    mute = switch(5, "Unmute", True, "On")
+    f = of(ulint(screen(decor(1, view(2, "android.widget.LinearLayout", b=(0, 0, 1080, 2400),
+                                      kids=[mute])))), "a11y.toggle.label_contradicts")
+    assert [(x.evidence["said"], x.evidence["undo"]) for x in f] == [("On", "Unmute")]
+    assert 'TalkBack says "On. Unmute. Switch"' in f[0].message
 
 
 def test_r23_every_row_says_not_selected_and_none_is():
@@ -411,15 +502,20 @@ def test_r23_every_row_says_not_selected_and_none_is():
                                collection_info={"row_count": 20, "column_count": 1})])
 
     f = of(ulint(screen(decor(1, lazy([row(i) for i in range(6)])))),
-           "a11y.state.uniform_unselected")
+           "a11y.selection.uniform_unselected")
     assert [(x.severity, x.node_key) for x in f] == [("info", "compose:8:100")]
     assert (f[0].evidence["rows"], f[0].evidence["row_count"],
             f[0].evidence["inner_label"]) == (6, 20, "Follow interest")
+    assert "never changes" not in f[0].message  # one capture cannot show that
+    assert 'say "Not selected" and none of them is selected' in f[0].message
     one_on = [row(i, *(("Selected", ("checked",)) if i == 2 else ())) for i in range(6)]
     same_name = [row(i, inner=f"Topic {i}") for i in range(6)]  # the row toggles: onboarding
     few = [row(i) for i in range(4)]
-    for good in (one_on, same_name, few):
-        assert of(ulint(screen(decor(1, lazy(good)))), "a11y.state.uniform_unselected") == []
+    # a to-do list: roleless toggleable rows, none done yet, each with its own Delete. With
+    # no stateDescription TalkBack says "checked" or nothing, never "Not selected".
+    todo = [row(i, state=None, inner="Delete") for i in range(6)]
+    for good in (one_on, same_name, few, todo):
+        assert of(ulint(screen(decor(1, lazy(good)))), "a11y.selection.uniform_unselected") == []
 
 
 def test_r9_section_titles_between_groups_of_rows_are_not_headings():

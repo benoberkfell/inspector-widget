@@ -113,9 +113,9 @@ RULE_SPECS: Tuple[RuleSpec, ...] = (
              "Most items of a list start with the same description of a child", ("warn",)),
     RuleSpec("a11y.label.decorative_merged", "R21",
              "A decorative child's description is read in every row", ("info",)),
-    RuleSpec("a11y.state.label_contradicts", "R22",
+    RuleSpec("a11y.toggle.label_contradicts", "R22",
              "A toggle's label names the action, so it contradicts its state", ("warn",)),
-    RuleSpec("a11y.state.uniform_unselected", "R23",
+    RuleSpec("a11y.selection.uniform_unselected", "R23",
              "Every item of a list says it is not selected", ("info",)),
 )
 
@@ -890,6 +890,8 @@ class _Run:
         self._ro_stops: Optional[Set[int]] = None
         self._ro_order: Optional[List["_Node"]] = None
         self._cand_desc: Dict[int, bool] = {}
+        self._spoken: Dict[int, Any] = {}
+        self._by_key: Optional[Dict[str, "_Node"]] = None
         self.stats: Dict[str, int] = {}
         self.identity_ok = True
         self._index()
@@ -982,6 +984,31 @@ class _Run:
         tb = self.talkback()
         tn = tb[0].by_raw.get(id(n.raw)) if tb is not None else None
         return tb[1].focus_decision(tn) if tn is not None else None
+
+    def spoken(self, n: _Node) -> Optional[Any]:
+        """What TalkBack says when ``n`` takes accessibility focus, by the TalkBack model
+        (``talkback.speech.announce``: its own description, no list or window transitions):
+        an Announcement (``text``, ``parts``), or None when the model has no node for it."""
+        k = id(n)
+        if k not in self._spoken:
+            tb = self.talkback()
+            tn = tb[0].by_raw.get(id(n.raw)) if tb is not None else None
+            res = None
+            if tn is not None:
+                try:
+                    from .talkback.speech import announce
+                    res = announce(tb[1], tn, transitions=False)
+                except Exception:  # never abort the lint; the rules fall back
+                    res = None
+            self._spoken[k] = res
+        return self._spoken[k]
+
+    def node_by_key(self, key: str) -> Optional[_Node]:
+        if self._by_key is None:
+            self._by_key = {}
+            for m in self.nodes:
+                self._by_key.setdefault(m.key, m)
+        return self._by_key.get(key)
 
     def selected_tabs(self, root: _Node) -> List[_Node]:
         """The selected nodes with the Tab role in ``root``'s subtree."""
@@ -2222,11 +2249,21 @@ def rule_link_purpose(n: _Node, run: _Run) -> List[Finding]:
 # R22 -- a toggle's label names the action that undoes its state.
 # --------------------------------------------------------------------------- #
 #: "Unbookmark", "Unfollow interest", "Remove from favorites": an action label that flips
-#: with the state it undoes (Now in Android's bookmark and follow toggles, NIA-10).
+#: with the state it undoes (Now in Android's bookmark and follow toggles, NIA-10). The
+#: whole label is the action, at most two words of object after it and none of them a
+#: preposition: "Unlock with fingerprint" or "Unmute on headset connect" names a feature.
+_UNDO_ACTION = (r"un(?:bookmark|follow|favou?rite|like|star|pin|mute|subscribe|save|block|"
+                r"archive|watch|select|check|hide|lock)|remove\s+(?:from\s+)?(?:bookmarks?|"
+                r"favou?rites?|stars?|saved)")
+_LINK_WORDS = (r"with|without|on|off|when|while|for|in|at|by|after|before|during|via|to|from|"
+               r"if|using|and|or|of|upon|until|into|onto")
 _UNDO_LABEL = re.compile(
-    r"^(?:un(?:bookmark|follow|favou?rite|like|star|pin|mute|subscribe|save|block|archive|"
-    r"watch|select|check|hide|lock)\b|remove\s+(?:from\s+)?(?:bookmarks?|favou?rites?|stars?|"
-    r"saved)\b)", re.I)
+    rf"^({_UNDO_ACTION})(?:\s+(?!(?:{_LINK_WORDS})\b)\S+){{0,2}}$", re.I)
+#: State descriptions that only say on or off: TalkBack reads them in place of "checked".
+#: Any other ("Bookmarked") names the state in words, so the action label does not
+#: contradict it.
+_BARE_STATES = {"checked", "not checked", "unchecked", "on", "off", "selected",
+                "not selected", "unselected"}
 
 
 def rule_label_contradicts(n: _Node, run: _Run) -> List[Finding]:
@@ -2236,11 +2273,25 @@ def rule_label_contradicts(n: _Node, run: _Run) -> List[Finding]:
     if "checkable" not in n.flags and role not in ("Checkbox", "Switch"):
         return []
     label, _src = run.effective_label(n, with_state=False)
-    m = _UNDO_LABEL.match((label or "").strip())
+    label = (label or "").strip()
+    m = _UNDO_LABEL.match(label)
     if not m:
         return []
+    if n.state and _norm(n.state) not in _BARE_STATES:
+        return []  # "Bookmarked. Unbookmark": the state is in words, no contradiction
     checked = "checked" in n.flags or n.raw.get("checked_state") == 1
-    said = "checked" if checked else "not checked"
+    # What TalkBack says, by its model: the stateDescription, else (a Switch) "on"/"off" or
+    # its text, else "checked", and nothing for an unchecked checkable node
+    # (TreeNodesDescription's status, SwitchDescription.stateDescription).
+    ann = run.spoken(n)
+    if ann is not None:
+        said = ", ".join(p["text"] for p in ann.parts
+                         if p.get("kind") == "state" and p.get("from") == n.key)
+        says = ann.text
+    else:
+        said = n.state or (("on" if checked else "off") if role == "Switch"
+                           else ("checked" if checked else ""))
+        says = f"{said}. {label}" if said else label
     what = (role or "toggle").lower().replace("checkbox", "check box")
     fix = _fix(
         n,
@@ -2251,12 +2302,18 @@ def rule_label_contradicts(n: _Node, run: _Run) -> List[Finding]:
                  "Modifier.toggleable(value = ...) so the checked state says on or off, or drop "
                  "the toggleable role and keep the action label on a plain button"),
         web="keep one aria-label and let aria-pressed / aria-checked carry the state")
+    if checked:
+        why = (f"is checked, yet its label names the action that undoes that state: TalkBack "
+               f"says \"{says}\", label and state contradicting each other, and the label "
+               f"flips whenever the state does")
+    else:
+        why = (f"is not checked, yet its label names the action that undoes the checked "
+               f"state: TalkBack says \"{says}\", and a double-tap does the opposite of what "
+               f"the label says")
     return [run.finding(
-        "a11y.state.label_contradicts", "warn", n,
-        f"A {what} labelled \"{label}\" is {said}: its label names the action that undoes its "
-        f"state, so TalkBack says \"{said.capitalize()}. {label}\", label and state "
-        f"contradicting each other, and the label flips whenever the state does. Fix: {fix}.",
-        {"label": label, "said": said, "undo": m.group(0), "role": role})]
+        "a11y.toggle.label_contradicts", "warn", n,
+        f"A {what} labelled \"{label}\" {why}. Fix: {fix}.",
+        {"label": label, "said": said, "checked": checked, "undo": m.group(1), "role": role})]
 
 
 # --------------------------------------------------------------------------- #
@@ -2276,7 +2333,7 @@ NODE_RULES: List[Tuple[str, Callable[[_Node, _Run], List[Finding]]]] = [
     ("a11y.link.purpose_unclear", rule_link_purpose),
     ("a11y.form.label_missing", rule_form_label),
     ("a11y.text.too_small", rule_text_too_small),
-    ("a11y.state.label_contradicts", rule_label_contradicts),
+    ("a11y.toggle.label_contradicts", rule_label_contradicts),
 ]
 
 
@@ -2630,11 +2687,12 @@ def rule_traversal(run: _Run) -> List[Finding]:
 # R19 -- a placeholder token or resource name read aloud.
 # --------------------------------------------------------------------------- #
 #: (pattern, what it is). Bracketed identifiers are Compose inline-content placeholders
-#: (Thunderbird's "[attachment_icon]" / "[conversation_counter]", TB-7); the others leak
-#: from an unresolved string resource or format call.
+#: (Thunderbird's "[attachment_icon]" / "[conversation_counter]", TB-7): snake_case only,
+#: since brackets in what users write hold dotted names and brands ("[example.com] Password
+#: reset", "Release [v1.2]", "[iPhone] trade-in", "[README.md]"). The others leak from an
+#: unresolved string resource or format call.
 _PLACEHOLDERS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
-    (re.compile(r"\[(?:[A-Za-z][A-Za-z0-9]*(?:[_.][A-Za-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+)\]"),
-     "a bracketed identifier"),
+    (re.compile(r"\[[a-z][a-z0-9]*(?:_[a-z0-9]+)+\]"), "a bracketed identifier"),
     (re.compile(r"(?<![\w.])@(?:string|plurals|drawable|mipmap|id|color|dimen|array)/"
                 r"[A-Za-z0-9_.]+"), "a resource reference"),
     (re.compile(r"(?<![\w.])R\.(?:string|plurals|drawable|mipmap|id|color|dimen|array)\."
@@ -2657,44 +2715,75 @@ def _placeholders(value: str, field: str) -> List[Tuple[str, str]]:
     return out
 
 
+#: What a spoken part is, by the TalkBack model's kind for it ("child" and the "(child)" /
+#: "(fake)" variants come from descendants): the parts that carry an app's own words.
+_SPOKEN_WORDS = {"name", "child", "state", "hint", "error", "tooltip", "label", "event"}
+
+
+def _spoken_parts(run: _Run, stop: _Node) -> List[Tuple[str, _Node, str]]:
+    """``[(text, the node it comes from, "cd" | "text")]`` for what TalkBack reads for a
+    focused ``stop``: the TalkBack model's announcement when it has one (a
+    contentDescription silences a View's children and its own text; Compose's merging node
+    carries its description on a synthetic child and its children are still read), else
+    ``label_parts`` (the legacy Compose-semantics input)."""
+    ann = run.spoken(stop)
+    if ann is None:
+        return [(t, src, "cd" if kind == "cd" else "text")
+                for t, src, kind in run.label_parts(stop) if kind in ("cd", "text")]
+    out: List[Tuple[str, _Node, str]] = []
+    for part in ann.parts:
+        kind = str(part.get("kind") or "")
+        base = kind.split("(", 1)[0]
+        if base not in _SPOKEN_WORDS or not part.get("text"):
+            continue
+        src = run.node_by_key(str(part.get("from") or "")) or stop
+        text = str(part["text"])
+        field = "cd" if (kind.endswith("(fake)") or (src.cd and text == src.cd)) else "text"
+        out.append((text, src, field))
+    return out
+
+
 def rule_placeholder_token(run: _Run) -> List[Finding]:
     """R19 -- one finding per placeholder token per window, on the first stop that reads
-    it, with how many rows (or stops) read it."""
-    found: Dict[Tuple[int, str], List[_Node]] = {}
+    it, with how many rows (or stops) read it. Only what TalkBack reads counts: a row's
+    contentDescription that replaces its text clears a token in that text."""
+    found: Dict[Tuple[int, str], List[Tuple[_Node, _Node, str]]] = {}
     why_of: Dict[str, str] = {}
-    for n in run.nodes:
-        if not _on_screen(n) or n.ignored:
+    for stop in run.stops_in_order():
+        if not _on_screen(stop) or stop.ignored:
             continue
-        for field, value in (("cd", n.cd), ("text", n.text)):
-            for tok, why in _placeholders(value, field) if value else ():
-                found.setdefault((n.win.index if n.win else 0, tok), []).append(n)
+        for value, src, field in _spoken_parts(run, stop):
+            for tok, why in _placeholders(value, field):
+                found.setdefault((stop.win.index if stop.win else 0, tok), []).append(
+                    (stop, src, field))
                 why_of.setdefault(tok, why)
     out: List[Finding] = []
-    for (_w, tok), carriers in found.items():
+    for (_w, tok), hits in found.items():
         owners: List[_Node] = []
-        for m in carriers:
-            o = run.owner(m)
-            if o not in owners:
-                owners.append(o)
-        rows = {id(m.collection_ctx[1]) for m in carriers if m.collection_ctx is not None}
+        for stop, _src, _field in hits:
+            if stop not in owners:
+                owners.append(stop)
+        rows = {id(src.collection_ctx[1]) for _stop, src, _f in hits
+                if src.collection_ctx is not None}
         where = (f"in {len(rows)} row(s) of a list" if rows
                  else f"by {len(owners)} stop(s)")
-        first = carriers[0]
+        _stop, first, field = hits[0]
         fix = _fix(
             first,
             view=("resolve the string resource or format argument before it is set "
                   "(getString(R.string.x, args)), or give the row a contentDescription"),
             compose=("give inline content a localized alternateText "
                      "(appendInlineContent(id, alternateText = stringResource(...))), clear "
-                     "decorative inline content from semantics, or give the row "
-                     "Modifier.semantics { contentDescription = \"...\" }"),
+                     "decorative inline content from semantics, or replace the row's "
+                     "semantics: Modifier.clearAndSetSemantics { contentDescription = \"...\" } "
+                     "(a contentDescription alone still reads the merged text)"),
             web="replace the placeholder in the page's HTML with real text or alt text")
         out.append(run.finding(
             "a11y.label.placeholder_token", "warn", owners[0],
             f"TalkBack reads \"{tok}\" aloud ({why_of[tok]}) {where}: a placeholder, not "
             f"words. Fix: {fix}.",
             {"token": tok, "kind": why_of[tok], "rows": len(rows) or len(owners),
-             "field": "content_description" if first.cd and tok in first.cd else "text",
+             "field": "content_description" if field == "cd" else "text",
              "carrier": first.key,
              "node_ids": [o.a11y_id for o in owners[1:]][:20]}))
     return out
@@ -2727,28 +2816,42 @@ def _a(word: str) -> str:
     return ("an " if word[:1].lower() in "aeiou" else "a ") + word
 
 
+def _child_kind(c: _Node) -> Tuple[str, str]:
+    """What kind of child ``c`` is in its row: its class (or Compose role) and resource id
+    (or testTag), so the same icon slot of every row compares alike."""
+    return (_cls(c), str(c.raw.get("view_id_resource_name") or c.test_tag or ""))
+
+
 def rule_shared_prefix(run: _Run) -> List[Finding]:
     """R20 -- most items of a collection start with the same child's contentDescription
     (Thunderbird's settings: every row starts "Account settings", the description of its
-    decorative icon, TB-11)."""
+    decorative icon, TB-11). Not when another row leads with a different description from
+    the same kind of child: then the icon tells the rows apart ("Folder" / "PDF document"
+    in a file list), as R21 treats a description that changes from row to row."""
     out: List[Finding] = []
     for c in _collections(run):
         rows = run.row_stops(c)
         if len(rows) < 3:
             continue
         lead: Dict[str, List[Tuple[_Node, _Node, str, str]]] = {}
+        said_by: Dict[Tuple[str, str], Set[str]] = {}  # child kind -> leading descriptions
         for _row, stop in rows:
             parts = run.label_parts(stop)
-            if len(parts) < 2:
+            if not parts:
                 continue
             text, src, kind = parts[0]
             if kind != "cd" or not _image_like(src, stop):
+                continue
+            said_by.setdefault(_child_kind(src), set()).add(_norm_label(text))
+            if len(parts) < 2:
                 continue
             lead.setdefault(_norm_label(text), []).append((stop, src, text, parts[1][0]))
         for _norm_text, hits in lead.items():
             if len(hits) < 3 or len(hits) < _SHARE * len(rows):
                 continue
             stop, src, text, after = hits[0]
+            if len(said_by.get(_child_kind(src), ())) > 1:
+                continue  # the same icon slot says different things: content
             share = (f"Every row starts \"{text}\"" if len(hits) == len(rows) else
                      f"Every row with {_a(_cls(src))} starts \"{text}\" ({len(hits)} of the "
                      f"{len(rows)} items)")
@@ -2861,9 +2964,12 @@ def _inner_control(run: _Run, row: _Node, stop: _Node) -> Optional[_Node]:
 
 
 def rule_uniform_unselected(run: _Run) -> List[Finding]:
-    """R23 -- every item of a list exposes a selection state and none is selected, while
+    """R23 -- every item of a list says a selection state and none is selected, while
     each row holds a control of its own that does something else (Now in Android's
-    Interests: "Not selected" on every row, NIA-9)."""
+    Interests: "Not selected" on every row, NIA-9). Only a stateDescription that says
+    selected or not counts (Compose's ``selected`` on a non-Tab): a roleless checkable row
+    with none (an unchecked to-do item) is read "checked" or nothing, never "Not selected"
+    (getCheckedStateText; getSelectedStateText speaks it only in Chrome)."""
     out: List[Finding] = []
     for c in _collections(run):
         rows = run.row_stops(c)
@@ -2873,8 +2979,7 @@ def rule_uniform_unselected(run: _Run) -> List[Finding]:
         stateful = True
         for _row, stop in rows:
             st = _norm_label(stop.state)
-            if not (st in _SELECTION_STATES
-                    or ("checkable" in stop.flags and run.role(stop) is None)):
+            if st not in _SELECTION_STATES:
                 stateful = False
                 break
             if ("checked" in stop.flags or "selected" in stop.flags or st == "selected"
@@ -2886,7 +2991,7 @@ def rule_uniform_unselected(run: _Run) -> List[Finding]:
         if not all(inner):
             continue
         stop = rows[0][1]
-        said = stop.state or "Not selected"
+        said = stop.state
         total = (c.collection_info or {}).get("row_count")
         of = f" (the list has {total} rows)" if isinstance(total, int) and total > 0 else ""
         first = inner[0]
@@ -2897,11 +3002,12 @@ def rule_uniform_unselected(run: _Run) -> List[Finding]:
                      "where a selection is shown, e.g. if (highlight) selected = isSelected"),
             web="set aria-selected only on the item shown as selected")
         out.append(run.finding(
-            "a11y.state.uniform_unselected", "info", stop,
-            f"All {len(rows)} items of {c.key} on screen say \"{said}\" and none is "
-            f"selected{of}: TalkBack reads a selection state on every row that never changes, "
-            f"while each row has its own control for the action ({first.key} "
-            f"\"{run.effective_label(first, with_state=False)[0]}\"). Fix: {fix}.",
+            "a11y.selection.uniform_unselected", "info", stop,
+            f"All {len(rows)} items of {c.key} on screen say \"{said}\" and none of them is "
+            f"selected{of}: TalkBack reads a selection state on every row, while each row has "
+            f"its own control for the action ({first.key} "
+            f"\"{run.effective_label(first, with_state=False)[0]}\"), so a row's state says "
+            f"nothing about it. Fix: {fix}.",
             {"state": said, "rows": len(rows), "container": c.key, "inner": first.key,
              "inner_label": run.effective_label(first, with_state=False)[0],
              **({"row_count": total} if isinstance(total, int) and total > 0 else {}),
@@ -2918,7 +3024,7 @@ SCREEN_RULES: List[Tuple[str, Callable[[_Run], List[Finding]]]] = [
     ("a11y.label.placeholder_token", rule_placeholder_token),
     ("a11y.label.shared_prefix", rule_shared_prefix),
     ("a11y.label.decorative_merged", rule_decorative_merged),
-    ("a11y.state.uniform_unselected", rule_uniform_unselected),
+    ("a11y.selection.uniform_unselected", rule_uniform_unselected),
 ]
 
 
