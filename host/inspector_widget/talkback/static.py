@@ -372,7 +372,9 @@ def _visual(cx: _Ctx, items: List[TbNode]) -> List[TbNode]:
     level by level down the groups that hold two or more of ``items``, so a card, a list
     row, a column of Views, a traversal group or a list reads as one block. A group is any
     node of the dump (View or semantics node, important or not) under the window root that
-    is not most of the window, or that is a collection item or traversal group."""
+    is not most of the window, or that is a collection item or traversal group. A group
+    that another box at its level overlaps opens up: what floats over it is read among
+    what it covers."""
     win = items[0].window
     area = max(1, _area(win.bounds))
     root = win.root.raw if win.root is not None else None
@@ -403,9 +405,17 @@ def _visual(cx: _Ctx, items: List[TbNode]) -> List[TbNode]:
         tree[parent].append(("n", n))
 
     def expand(key: Any) -> List[TbNode]:
-        boxes = []
-        for kind, x in tree[key]:
-            boxes.append((rects[x] if kind == "g" else x.rect, (kind, x)))
+        entries = list(tree[key])
+        # a group another box overlaps is no visual block: a View floating over a list
+        # or a ComposeView is read among what it covers, so the group opens up
+        while True:
+            boxes = [(rects[x] if kind == "g" else x.rect, (kind, x)) for kind, x in entries]
+            hit = next((i for i, (r, (kind, _x)) in enumerate(boxes) if kind == "g" and any(
+                j != i and not o.is_empty() and r.intersects(o)
+                for j, (o, _p) in enumerate(boxes))), None)
+            if hit is None:
+                break
+            entries[hit:hit + 1] = tree[entries[hit][1]]
         out: List[TbNode] = []
         for kind, x in cut_order(boxes):
             out.extend(expand(x) if kind == "g" else [x])
@@ -521,7 +531,8 @@ def _escapes(cx: _Ctx) -> Iterator[Finding]:
             if not under:
                 continue
             inside = _subtree_ids(scrim)
-            if not any(id(n.raw) in inside or cx.drawn_above(n.raw, scrim) is True
+            if not any(n.raw is not scrim and (id(n.raw) in inside
+                                               or cx.drawn_above(n.raw, scrim) is True)
                        for n in stops):
                 continue  # nothing over the scrim: no dialog or sheet to walk out of
             node = cx.tree.by_raw.get(id(scrim)) or cx.tree.excluded_by_raw.get(id(scrim))
