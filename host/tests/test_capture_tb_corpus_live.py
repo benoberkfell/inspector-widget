@@ -31,14 +31,16 @@ C15        double_stop                     yes     silent  (loop: walk only)
 C16        edge_stuck                      yes     silent
 V1, V2     out_of_order                    yes     silent
 V3         out_of_order                    NO      silent  needs tb_walk(expect=...)
-V4, V5     double+ghost / escape+ghost     yes     silent  V5: the real drawing order
+V4         double+ghost+skipped            yes     silent  the row's cd replaces "Wi-Fi"
+V5         escape, ghost_stop              yes     silent  the real drawing order
 V6         -                               -       silent  list updates
 V7, V8     edge_stuck                      yes     silent
 V9         ghost_stop                      yes     silent
 V10        window_order                    yes     silent
 V11        -                               -       silent  restore
 V12        wrong_announcement              yes     silent  RecyclerView item info (recycler.py)
-V13        edge_stuck (+ghost, ooo: web)   part    silent  web content: walk only
+V13        edge_stuck (+ghost, ooo: web)   part    silent  no web content with TalkBack
+                                                           off (the TalkBack-on dump: ghost)
 V14        -                               -       silent  dialog by action
 H1         ghost_stop, skipped             yes     silent
 H2-H4      -                               -       silent  calibrated / list updates
@@ -47,11 +49,13 @@ H6         -                               -       silent  calibrated
 =========  ==============================  ======  ======  =================================
 
 Precision and recall over (screen, rule) pairs, against the corpus's walk-confirmed findings
-(walk-only codes tb.trap and tb.loop left out) plus C11's swipe-only delete: 26 true, 3
-missed (V3 out_of_order, V13 ghost_stop and out_of_order on web content), 1 on a GOOD
-screen (C11). Recall 26/29; precision 26/27 by the corpus's labels, 27/27 if C11 GOOD is
-judged as TalkBack sees it: the real walk of C11 GOOD stops only on each row's Text, which
-has no action, so its "Delete" is as unreachable as BAD's.
+(walk-only codes tb.trap and tb.loop left out) plus C11's swipe-only delete and V4's unsaid
+"Wi-Fi" (the recorded walk's own analysis reports it: text on screen no stop read): 27
+true, 3 missed (V3 out_of_order, V13 ghost_stop and out_of_order on web content, which a
+TalkBack-off capture does not hold), 1 on a GOOD screen (C11). Recall 27/30; precision 27/28
+by the corpus's labels, 28/28 if C11 GOOD is judged as TalkBack sees it: the real walk of
+C11 GOOD stops only on each row's Text, which has no action, so its "Delete" is as
+unreachable as BAD's.
 """
 
 from __future__ import annotations
@@ -71,7 +75,9 @@ from inspector_widget.proto import view_inspection_pb2 as pb
 #: codes only a walk can raise: never expected of a capture
 WALK_ONLY = {"tb.trap", "tb.loop"}
 #: the static defects a corpus scenario has beyond its walk findings
-EXTRA_TRUTH = {"tb_c11_bad_slots": {"tb.custom_action_missing"}}
+EXTRA_TRUTH = {"tb_c11_bad_slots": {"tb.custom_action_missing"},
+               # the recorded walk's analysis: "1 text(s) on screen that no stop ... read"
+               "tb_v4_bad": {"tb.skipped"}}
 #: tb.* counts on each live capture: the derived corpus table, plus C11 with slots
 LIVE_TABLE = {f"{k.replace('-', '_')}": v for k, v in TABLE.items()}
 #: live captures of real apps beside the corpus
@@ -82,6 +88,9 @@ LIVE_TABLE.update({
     # finding on the NavigationRail (test_capture_walks.py has the walk)
     "nia_foryou_rail": {"tb.double_stop": 6},
     "tb_c11_bad_slots": {"tb.custom_action_missing": 3},
+    # TalkBack off: a WebView builds its accessibility tree only while a service runs, so
+    # the off-screen page's web stops (5 ghost stops in the TalkBack-on dump) are not here
+    "tb_v13_bad": {"tb.edge_stuck": 1},
     # GOOD's fix is unreachable for TalkBack (module docstring): the evidence says so
     "tb_c11_good_slots": {"tb.custom_action_missing": 3},
 })
@@ -122,6 +131,8 @@ def test_live_captures_agree_with_the_captures_derived_from_the_walks():
     View spines for V5 and H5) raises what the live captures raise, screen by screen."""
     for e in F.WALK_ENTRIES:
         name = f"{e['scenario']}_{e['variant']}"
+        if name == "tb_v13_bad":
+            continue  # web content exists only with a service on (LIVE_TABLE)
         derived, _ = F.corpus_capture(F.entry_id(e))
         live, _ = F.live_capture(name)
         assert _tb(live) == _tb(derived), name
@@ -142,8 +153,8 @@ def test_precision_and_recall_on_the_corpus():
         tp += len(truth & got)
         fn += len(truth - got)
         fp_bad += len(got - truth)
-    assert (tp, fn, fp_bad, fp_good) == (26, 3, 0, 1)
-    # recall 26/29; precision 26/27 by the corpus labels (C11 GOOD: see the docstring)
+    assert (tp, fn, fp_bad, fp_good) == (27, 3, 0, 1)
+    # recall 27/30; precision 27/28 by the corpus labels (C11 GOOD: see the docstring)
 
 
 def test_c11_good_names_the_container_talkback_never_focuses():

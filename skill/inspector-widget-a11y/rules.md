@@ -354,7 +354,9 @@ model and TalkBack disagreed.
   announcement; an ancestor hides it (`importantForAccessibility=
   noHideDescendants`, `hideFromAccessibility`, `clearAndSetSemantics`). The
   reading outline with `include_skipped=true` names the hider (`hidden_by=n40`),
-  or the stop whose contentDescription silences a child (`silenced_by=n12`).
+  or the stop whose contentDescription silences a child (`silenced_by=n12`; the
+  lint: `no stop says "Wi-Fi": n12 says something else`). An abbreviation of what
+  a stop says counts as said ("Aug 5" under "August 5, 2026").
   Not reported: what is hidden for a panel open over it (an open
   `DrawerLayout` drawer hides the content, a modal bottom or side sheet its
   siblings: that keeps focus in the panel), or under a scrim.
@@ -373,8 +375,9 @@ model and TalkBack disagreed.
 
 ### `tb.ghost_stop` — a stop with nothing useful to hear or see  (opt-in)
 - **Static:** an unlabelled stop (also `a11y.label.missing`), a focusable
-  container whose text children are invisible, a stop of no area or off its
-  window, a sliver at a scroll edge.
+  container whose text children are invisible, a stop of no area or wholly off
+  its window (`offscreen`: a pager's off-screen page TalkBack reads anyway, such
+  as a WebView's show notes), a sliver at a scroll edge TalkBack cannot scroll in.
 - **Walk:** TalkBack lands there.
 - **Fix:** label it, or hide it (`clearAndSetSemantics {}` /
   `hideFromAccessibility`; View `importantForAccessibility="no"`, `GONE` rather

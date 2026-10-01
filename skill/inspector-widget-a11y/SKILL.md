@@ -478,7 +478,8 @@ node is or is not a stop, and how focus gets there:
   a stop with nothing useful to hear or see.
 - **`why_not`** / `- ` lines (not a stop): `merged_into=<ref>` (that stop reads it),
   `silenced_by=<ref>` (that stop's contentDescription replaces its text: never
-  said), `hidden_by=<ref>` (`noHideDescendants` there), `covered_by=<ref>` (its
+  said), `inside_silent=<ref>` (under a focusable container that is no stop and
+  reads nothing), `hidden_by=<ref>` (`noHideDescendants` there), `covered_by=<ref>` (its
   window is under a modal one), `not_important`, `silent_container` (focusable,
   but its focusable children are the stops), `window_wrapper`, `offscreen` (outside
   its window or scrolled out of its scroller; `reachable: scroll` when TalkBack

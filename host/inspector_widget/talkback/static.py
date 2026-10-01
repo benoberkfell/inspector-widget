@@ -16,7 +16,8 @@ Codes, with what each looks at:
 ``tb.ghost_stop``
     A stop with nothing useful to say or show: it names nothing ("Button", "Unlabelled";
     not a clipped item TalkBack first scrolls into view), speaks only through invisible
-    children (UT/AccessibilityNodeInfoUtils.java:1109), or is under 4dp across.
+    children (UT/AccessibilityNodeInfoUtils.java:1109), is under 4dp across, or lies
+    wholly outside its window (an off-screen pager page's WebView).
 ``tb.out_of_order``
     Stops read against the visual reading order (:mod:`.visual`'s XY-cut, per window): the
     stops outside the longest run that follows it. A stop an app placed with an explicit,
@@ -44,7 +45,9 @@ Codes, with what each looks at:
 ``tb.skipped``
     Visible text TalkBack never gets because an ancestor hides it
     (importantForAccessibility=noHideDescendants), when no overlay covers it, no open panel
-    is why (an open drawer or modal sheet hides its siblings) and no stop says it.
+    is why (an open drawer or modal sheet hides its siblings) and no stop says it; and
+    visible text TalkBack gets that is no stop and that no stop says (a row's
+    contentDescription replaces it).
 
 ``tb.custom_action_missing`` needs the composables (the capture's slot table) and is
 computed on the capture side (``capture/tb.py``).
@@ -201,8 +204,9 @@ def show_on_screen(nav: Navigator, n: TbNode, forward: bool = True) -> Optional[
 
 def ghost(nav: Navigator, n: TbNode, density: int = 420) -> List[str]:
     """Ghost reasons of a stop: ``unlabelled``, ``invisible_children_only``, ``tiny`` (under
-    4dp across at ``density`` dpi), ``clipped:<scrollable key>`` (a sliver TalkBack cannot
-    scroll into view). A clipped item at the edge of a list TalkBack auto-scrolls is not a
+    4dp across at ``density`` dpi), ``offscreen`` (wholly outside its window: a pager's
+    off-screen page TalkBack reads anyway), ``clipped:<scrollable key>`` (a sliver TalkBack
+    cannot scroll into view). A clipped item at the edge of a list TalkBack auto-scrolls is not a
     ghost, not even a tiny one: TalkBack scrolls it fully into view first (ensureOnScreen)
     and speaks what it then shows."""
     shown_first = show_on_screen(nav, n) is not None
@@ -213,9 +217,12 @@ def ghost(nav: Navigator, n: TbNode, density: int = 420) -> List[str]:
             continue  # what it says once scrolled in is not in this dump
         out.append(g)
     r = n.rect
-    if not shown_first and not r.is_empty() \
-            and min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
-        out.append("tiny")  # a sliver TalkBack scrolls in first is not tiny once shown
+    if shown_first:
+        return out  # neither tiny nor off screen once TalkBack has scrolled it in
+    if not r.is_empty() and not r.intersects(n.window.bounds):
+        out.append("offscreen")  # read where nobody sees it (a pager's off-screen page)
+    elif not r.is_empty() and min(r.width, r.height) * 160.0 / max(1, density) < TINY_DP:
+        out.append("tiny")
     return out
 
 
@@ -688,6 +695,35 @@ def _skipped(cx: _Ctx) -> Iterator[Finding]:
                       {"texts": len(raws), "first": first[:40], "why": "noHideDescendants"})
 
 
+def _unspoken(cx: _Ctx) -> Iterator[Finding]:
+    """Visible text in the TalkBack view that is no stop and that no stop says (orphan
+    speech, design part 2): a View row's contentDescription replaces its children's text
+    (A11yProbe V4: "Settings row" over "Wi-Fi"). Words, not phrases: a text any of whose
+    words some stop says counts as read, as the walk's orphan check does
+    (talkback/walk.py orphan_text), and so does an abbreviation of a word said ("Aug 5"
+    under a row that says "August 5, 2026": AntennaPod). Only text under a stop that
+    speaks in its place; ``others``: that stop."""
+    spoken: Set[str] = set()
+    for st in cx.stops:
+        spoken |= _words(cx.own(st).text)
+    prefixes = {w[:k] for w in spoken for k in range(3, len(w))}
+    for n in cx.tree.nodes:
+        if not n.window.reported or not n.visible or id(n) in cx.stop_ids:
+            continue
+        text = n.text or n.content_description
+        r = n.rect
+        if not text or r.is_empty() or not r.intersects(n.window.bounds):
+            continue
+        words = _words(text)
+        if not words or words & spoken or words & prefixes:
+            continue
+        anc = cx.rules.focusable_ancestor(n)
+        if anc is None or id(anc) not in cx.stop_ids:
+            continue  # only where a stop speaks in its place: the model is sure of that
+        yield Finding("tb.skipped", "warn", n, [anc],
+                      {"texts": 1, "first": text[:40], "why": "not_spoken"})
+
+
 # ------------------------------------------------------------------------------------------
 # tb.window_order
 # ------------------------------------------------------------------------------------------
@@ -847,8 +883,8 @@ def _pagers(cx: _Ctx) -> Iterator[Finding]:
 # ------------------------------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------------------------------
-_CHECKS = (_double_stops, _ghosts, _orders, _escapes, _skipped, _window_orders, _speech_order,
-           _positions, _past_edge, _pagers)
+_CHECKS = (_double_stops, _ghosts, _orders, _escapes, _skipped, _unspoken, _window_orders,
+           _speech_order, _positions, _past_edge, _pagers)
 
 
 def findings(nav: Navigator, *, density: int = 420,

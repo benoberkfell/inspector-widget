@@ -175,7 +175,8 @@ def test_a_child_its_rows_description_silences_is_not_merged_into_it():
                   "why_not": "silenced_by:view:4: its contentDescription replaces its "
                              "children's text"}
     out = q.outline(ix, view="reading", loaded=raw, include_skipped=True)
-    assert '- view:5 TextView "Wi-Fi" [0,280 1959x107] silenced_by=view:4' in out["lines"]
+    assert '- view:5 TextView "Wi-Fi" [0,280 1959x107] !skipped silenced_by=view:4' \
+        in out["lines"]  # the static tb.skipped (no stop says it) sits on it
     # a merged child the stop does read keeps merged_into and its share of the speech
     merged, _ = tb_facet("tb_c9-bad-walk", "a11y:7:6")
     assert merged["why_not"] == "merged_into:a11y:7:5" and merged["reachable"] == "swipe"

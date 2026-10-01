@@ -21,7 +21,8 @@ What it serves:
 * **Explanations** (:meth:`TbCapture.explain`): why a node is a stop (``click``,
   ``focusable``, ``text_orphan``, ``leaf`` ...) or why not (``merged_into:<ref>`` (the
   stop reads it), ``silenced_by:<ref>`` (the stop above it does not: its contentDescription
-  replaces the text), ``hidden_by:<ref>``, ``silent_container``, ``covered_by:<ref>``,
+  replaces the text), ``inside_silent:<ref>`` (under a focusable container that is no
+  stop), ``hidden_by:<ref>``, ``silent_container``, ``covered_by:<ref>``,
   ``offscreen`` (outside its window or scrolled out of its scroller), ``zero_size``,
   ``invisible``, ``not_important`` ...), with ghost reasons for stops that say nothing
   useful.
@@ -313,6 +314,11 @@ class TbCapture:
             anc = self.rules.focusable_ancestor(n)
             if anc is None:
                 return "no_speech", None, None
+            if not self.rules.should_focus_node(anc):
+                # a focusable container TalkBack never stops on (silent_container)
+                return "inside_silent", self.nid(anc), (
+                    "under a focusable container TalkBack does not stop on, which reads "
+                    "nothing")
             if not self._read_by(anc, n):
                 return "silenced_by", self.nid(anc), (
                     "its contentDescription replaces its children's text"

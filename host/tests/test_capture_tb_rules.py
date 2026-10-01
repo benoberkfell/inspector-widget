@@ -24,15 +24,20 @@ C16        edge_stuck                                       the pager again (Com
                                                             offscreen WebView page out)
 V1         out_of_order                                     a traversal link to a duplicated id
 V2         out_of_order                                     a traversalAfter cycle
-V4         double_stop, ghost_stop                          a row with a cd + its own Switch
+V4         double_stop, ghost_stop, skipped                 a row with a cd + its own Switch;
+                                                            the cd replaces "Wi-Fi" (no stop
+                                                            says it)
 V5         escape, ghost_stop                               a same-window scrim and card
 V7         edge_stuck                                       rows past an edge nothing scrolls
 V8         edge_stuck                                       a scroller without scroll actions
 V9         ghost_stop x2                                    unlabelled ImageButton, silent row
 V10        window_order                                     a non-focusable popup read last
 V12        wrong_announcement                               an empty header counted: "2 of 21"
-V13        edge_stuck                                       ViewPager2 (the web stops are walk-
-                                                            only: web content is not modelled)
+V13        edge_stuck, ghost_stop x5                        ViewPager2: the off-screen page's
+                                                            WebView and its 4 web stops are
+                                                            read (the TalkBack-on dump holds
+                                                            them; a TalkBack-off capture does
+                                                            not)
 H1         ghost_stop, skipped x14                          noHideDescendants on every cell
 H5         escape, double_stop                              a Compose "dialog" over Views
 =========  ===============================================  =================================
@@ -71,21 +76,25 @@ TABLE = {
     "tb_c16-bad": {"tb.edge_stuck": 1},
     "tb_v1-bad": {"tb.out_of_order": 1},
     "tb_v2-bad": {"tb.out_of_order": 1},
-    "tb_v4-bad": {"tb.double_stop": 1, "tb.ghost_stop": 1},
+    "tb_v4-bad": {"tb.double_stop": 1, "tb.ghost_stop": 1, "tb.skipped": 1},
     "tb_v5-bad": {"tb.escape": 1, "tb.ghost_stop": 1},
     "tb_v7-bad": {"tb.edge_stuck": 1},
     "tb_v8-bad": {"tb.edge_stuck": 1},
     "tb_v9-bad": {"tb.ghost_stop": 2},
     "tb_v10-bad": {"tb.window_order": 1},
     "tb_v12-bad": {"tb.wrong_announcement": 1},
-    "tb_v13-bad": {"tb.edge_stuck": 1},
+    "tb_v13-bad": {"tb.edge_stuck": 1, "tb.ghost_stop": 5},
     "tb_h1-bad": {"tb.ghost_stop": 1, "tb.skipped": 14},
     "tb_h5-bad": {"tb.double_stop": 1, "tb.escape": 1},
 }
 #: corpus static expectations (tb_corpus_expected.json static_findings) the capture rules
-#: cannot meet, and why
+#: do not meet, by code, and why
 STATIC_EXCEPTIONS = {
-    "tb_v3-bad-walk": "the author's intended order (expect) is not in the capture",
+    "tb_v3-bad-walk": {"tb.out_of_order": "the author's intended order (expect) is not in "
+                                          "the capture"},
+    # the model's own walk reads the off-screen page's web stops against what is on screen;
+    # the capture reports those stops as what they are, tb.ghost_stop (offscreen)
+    "tb_v13-bad-walk": {"tb.out_of_order": "a visual order of content nobody can see"},
 }
 #: the tb.* issues on the recorded real captures: unlabelled controls (a11y.label.missing
 #: says so too), rows or cards with their own inline controls, and Thunderbird's counted
@@ -129,10 +138,7 @@ def test_the_capture_sees_what_the_corpus_says_the_model_sees(entry):
     eid = F.entry_id(entry)
     ix, _raw = F.corpus_capture(eid)
     missing = set(entry["static_findings"]) - set(_tb(ix))
-    if eid in STATIC_EXCEPTIONS:
-        assert missing, f"{eid} now passes: drop it from STATIC_EXCEPTIONS"
-        return
-    assert not missing, (eid, missing)
+    assert missing == set(STATIC_EXCEPTIONS.get(eid, {})), (eid, missing)
 
 
 @pytest.mark.parametrize("name", sorted(REAL))

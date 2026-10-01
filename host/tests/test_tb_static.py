@@ -189,3 +189,54 @@ def test_hidden_text_a_stop_already_says_is_not_skipped():
     assert findings(root(label, btn)) == []
     label["text"] = "Archive"
     assert codes(findings(root(label, btn))) == [("tb.skipped", "view:3")]
+
+
+def test_text_its_rows_description_replaces_is_skipped():
+    # A11yProbe V4: the row's contentDescription "Settings row" replaces "Wi-Fi"
+    row = n(4, cls="android.widget.LinearLayout", cd="Settings row", flags=FOCUS,
+            actions=[CLICK], b=(0, 256, 1080, 156), children=[
+                n(5, cls="android.widget.TextView", text="Wi-Fi", b=(0, 280, 900, 107))])
+    fs = findings(root(row))
+    assert codes(fs) == [("tb.skipped", "view:5")]
+    assert fs[0].evidence == {"texts": 1, "first": "Wi-Fi", "why": "not_spoken"}
+    assert [o.key for o in fs[0].others] == ["view:4"]
+    # a row that reads it (no description of its own) is fine
+    row.pop("content_description")
+    assert findings(root(row)) == []
+
+
+def test_a_stop_on_a_page_nobody_sees_is_a_ghost():
+    # A11yProbe V13 (TalkBack on): the off-screen pager page's WebView content is read
+    web = n(7, cls="android.widget.TextView", text="Show notes", flags=FOCUS,
+            actions=[CLICK], b=(1100, 300, 900, 100))
+    fs = findings(root(web, n(8, cls="android.widget.Button", text="Play", flags=FOCUS,
+                              actions=[CLICK], b=(0, 300, 1080, 100)), b=(0, 0, 1080, 2400)))
+    assert codes(fs) == [("tb.ghost_stop", "view:7")] and fs[0].evidence["why"] == "offscreen"
+
+
+def _realapp(name):
+    import gzip
+    import json
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), "data", "realapps", f"{name}.a11y.json.gz")
+    with gzip.open(path) as f:
+        return tb.build(json.load(f))
+
+
+def test_real_apps_open_drawer_and_abbreviated_dates_are_not_skipped():
+    # Thunderbird with its navigation drawer open (live, emulator-5554): the content is
+    # noHideDescendants while the drawer's ComposeView holds the stops
+    fs = static.findings(tb.Navigator(_realapp("thunderbird_drawer")))
+    assert "tb.skipped" not in [f.code for f in fs]
+    # AntennaPod rows say "August 5, 2026" in their description over the visible "Aug 5"
+    for name in ("antennapod_home", "antennapod_episodes"):
+        fs = static.findings(tb.Navigator(_realapp(name)))
+        assert "tb.skipped" not in [f.code for f in fs], name
+
+
+def test_the_real_off_screen_show_notes_are_ghost_stops():
+    # AntennaPod's player (live): ViewPager2 keeps the show notes' WebView page in the tree
+    fs = static.findings(tb.Navigator(_realapp("antennapod_player")))
+    off = [f.node.key for f in fs if f.code == "tb.ghost_stop" and f.evidence["why"] == "offscreen"]
+    assert off and all(k.startswith("virtual:") for k in off)

@@ -1198,6 +1198,9 @@ def _tb_detail(iss: Issue) -> str:
         return (f"{ev.get('past_edge')} past its edge ({_quote(ev.get('first') or '', 20)}), "
                 "nothing scrolls")
     if rid == "tb.skipped":
+        if ev.get("why") == "not_spoken":  # e.g. a row's contentDescription replaces it
+            over = f": {others[0]} says something else" if others else ""
+            return f"no stop says {_quote(ev.get('first') or '', 24)}{over}"
         return f"hides {ev.get('texts')} text(s): {_quote(ev.get('first') or '', 24)}"
     if rid == "tb.custom_action_missing":
         src = f" ({ev['src']})" if ev.get("src") else ""
