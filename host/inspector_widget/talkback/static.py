@@ -373,8 +373,11 @@ def _group_chain(cx: _Ctx, n: TbNode, root: Optional[Dict[str, Any]]
         if x is None or x is root:
             break
         fl = set(x.get("flags") or ())
+        xn = cx.tree.by_raw.get(id(x))  # its TalkBack node: item info a correction added
+        item = (xn.get("collection_item_info") if xn is not None
+                else x.get("collection_item_info"))
         add(("v", vx) if vx is not None else ("r", id(x)), _rect_of(x),
-            bool(x.get("collection_item_info")) or "is_traversal_group" in fl)
+            bool(item) or "is_traversal_group" in fl)
         below = x
     return out
 

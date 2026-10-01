@@ -162,3 +162,29 @@ def test_a_vertical_grid_with_margins_and_a_full_span_header_is_still_modelled()
     got = [(_info(tree, i)["row_index"], _info(tree, i)["column_index"],
             _info(tree, i)["column_span"]) for i in range(5)]
     assert got == [(0, 0, 2), (1, 0, 1), (1, 1, 1), (2, 0, 1), (2, 1, 1)]
+
+
+def test_a_service_off_list_inside_a_scrim_still_escapes_it():
+    # A hand-made dialog: a full-window clickable scrim holds the list, a button lies under
+    # it. The item info a service-off dump gets must not cost the items their place in the
+    # dump (the scrim's subtree is keyed on the dump's own dicts): tb.escape either way.
+    def screen():
+        behind = n(4, cls="android.widget.Button", text="Compose", flags=FOCUS, actions=[CLICK],
+                   b=(0, 2300, 1080, 100))
+        scrim = n(9, flags=("visible_to_user", "clickable", "focusable"), actions=[CLICK],
+                  b=(0, 0, 1080, 2400), children=[_list(21)])
+        return root(n(2, cls="android.widget.TextView", text="Inbox", b=(0, 0, 1080, 150)),
+                    behind, scrim), scrim
+
+    for services in ("on", "off"):
+        r, scrim = screen()
+
+        def above(a, b, scrim=scrim):
+            return True if a is scrim else (False if b is scrim else None)
+
+        tree = tb.build([r], services=services)
+        fs = static.findings(tb.Navigator(tree), drawn_above=above, codes=["tb.escape"])
+        assert [(f.code, f.node.key) for f in fs] == [("tb.escape", "view:9")], services
+        assert {o.key for o in fs[0].others} == {"view:2", "view:4"}
+    # and the corrected items keep the dump's own dicts
+    assert tree.node("view:11").raw is r["children"][2]["children"][0]["children"][1]

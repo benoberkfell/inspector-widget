@@ -162,8 +162,10 @@ def _all_attached(rv: Any, kids: List[Any]) -> bool:
 
 def apply_item_info(tree: Any) -> None:
     """Give RecyclerView items the item info TalkBack gets (``tree.services == "off"``), or
-    say why a service-on dump has none. The dump is not modified: a corrected item's
-    ``raw`` becomes a copy (``tree.by_raw`` knows it under both)."""
+    say why a service-on dump has none. The dump is not modified: a corrected item carries
+    the info in ``TbNode.extra`` (``TbNode.get`` reads it), and its ``raw`` stays the dump's
+    own dict, so what is keyed on the dump's identity (a scrim's subtree, the dump parents
+    talkback/static.py walks) still finds the item."""
     unknown: List[str] = []
     found = _lists(tree, unknown)
     if unknown and tree.services == "off":
@@ -196,9 +198,7 @@ def apply_item_info(tree: Any) -> None:
             scrolled.append(rv.key)
             continue
         for k, inf in zip(kids, infos):
-            orig = k.raw
-            k.raw = dict(orig, collection_item_info=inf)
-            tree.by_raw[id(k.raw)] = k
+            k.extra["collection_item_info"] = inf
             k.corrections.append(CORRECTION)
             added += 1
     if added:

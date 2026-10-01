@@ -210,7 +210,7 @@ class TbNode:
     """One node of the TalkBack view: the dump dict plus its TalkBack-view relations."""
 
     __slots__ = ("raw", "window", "parent", "children", "facet", "visible", "corrections",
-                 "rect", "flags", "actions", "__weakref__")
+                 "rect", "flags", "actions", "extra", "__weakref__")
 
     def __init__(self, raw: Dict[str, Any], window: TbWindow, parent: Optional["TbNode"],
                  facet: str):
@@ -222,6 +222,10 @@ class TbNode:
         self.flags = frozenset(raw.get("flags") or ())
         self.visible = "visible_to_user" in self.flags
         self.corrections: List[str] = []
+        # fields a correction adds (talkback/recycler.py: the item info a service-off dump
+        # lacks): :meth:`get` reads them first. ``raw`` stays the dump's own dict, so every
+        # identity map over the dump (by_raw, a scrim's subtree, the dump parents) holds it.
+        self.extra: Dict[str, Any] = {}
         self.rect = Rect.of(raw.get("bounds"))
         self.actions = _action_ids(raw)
 
@@ -306,6 +310,8 @@ class TbNode:
         return self.raw.get("state_description") or ""
 
     def get(self, field: str, default: Any = None) -> Any:
+        if field in self.extra:
+            return self.extra[field]
         return self.raw.get(field, default)
 
     def ancestors(self) -> Iterator["TbNode"]:
