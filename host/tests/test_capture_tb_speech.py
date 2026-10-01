@@ -209,3 +209,18 @@ def test_a_state_change_is_reported_once_not_again_as_speech():
     out = cdiff.diff(a, b, max_bytes=0)
     lines = [ln for ln in out["lines"] if "sem:80:191" in ln]
     assert lines and not any("speakable" in ln for ln in lines), lines
+
+
+def test_a_dialog_over_the_screen_does_not_change_what_its_nodes_are_called():
+    # Now in Android's settings dialog covers For you (TalkBack gets none of it while the
+    # dialog is open). Its nodes keep the labels and speech they had before it opened, so
+    # a capture diff across the dialog reports no change that did not happen
+    # ("n28: label "Headlines" -> "Not selected"").
+    def said(name):
+        ix, _raw = F.fixture_capture(name)
+        return {k: (ix.nodes[k].label, (ix.nodes[k].facets.get("a11y") or {}).get("speakable"))
+                for k in ("sem:8:57", "sem:8:94", "sem:8:100")}
+
+    before, under = said("nia_foryou"), said("nia_settings")
+    assert under == before
+    assert under["sem:8:94"] == ("Headlines", "Not selected. Headlines")

@@ -234,9 +234,17 @@ class TbCapture:
         return self._walk_speech.get(id(n)) or self.own(n)
 
     def stop_speech(self) -> dict[tuple[int, tuple[int, ...]], StopSpeech]:
-        """``{(root_view_id, path): StopSpeech}`` for every stop: the index builder's key."""
+        """``{(root_view_id, path): StopSpeech}`` for every stop: the index builder's key.
+        The stops of a window a modal window covers (TalkBack gets none of it while the
+        dialog is open) are spoken as they would be once it closes: a node's label and
+        speakable stay what they were before the dialog opened, so a capture diff does not
+        report changes that did not happen."""
         out: dict[tuple[int, tuple[int, ...]], StopSpeech] = {}
         stops = {id(n) for n in self.linear()}
+        for tw in self.tree.windows:
+            if tw.root is not None and str(tw.dropped or "").startswith("covered_by:") \
+                    and self.nav.accepts_window(tw):
+                stops |= {id(n) for n, stop in self.nav.window_order(tw) if stop}
         for w in self.dump.data.get("windows") or []:
             if not w.get("root"):
                 continue
