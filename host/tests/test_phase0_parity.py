@@ -203,3 +203,34 @@ def test_talkback_status_is_the_same_document(tmp_path):
     [(cli_text, rc)] = _run_cli("default", str(tmp_path / "c"),
                                 [(None, None, ["talkback", "status"])], extra=())
     assert not is_error and rc == 0 and cli_text == text
+
+
+def test_dump_tree_reports_what_the_agent_cut_on_both_surfaces(tmp_path, monkeypatch):
+    """DumpTreeResponse.diagnostics (depth-truncated=N, properties-failed=N) reach
+    the MCP dump_tree (brief and full) and the CLI's dump --json - alike, beside
+    the per-node CHILDREN_TRUNCATED flag: a cut tree never looks complete."""
+    import fakeagent
+    from inspector_widget.proto import view_inspection_pb2 as pb
+
+    real = fakeagent.FakeAgent._h_dump_tree
+    diag = "depth-truncated=3 (children below 80 levels not sent); properties-failed=2"
+
+    def cut(self, req_id, cmd):
+        resp = real(self, req_id, cmd)
+        resp.dump_tree.diagnostics = diag
+        resp.dump_tree.roots[0].flags |= pb.ViewNode.CHILDREN_TRUNCATED
+        return resp
+
+    monkeypatch.setattr(fakeagent.FakeAgent, "_h_dump_tree", cut)
+    cases = [("dump_tree", {}, ["dump"]),
+             ("dump_tree", {"detail": "full", "max_bytes": 0},
+              ["dump", "--detail", "full", "--max-bytes", "0"])]
+    mcp = _run_mcp("default", str(tmp_path / "mcp"), cases)
+    cli_out = _run_cli("default", str(tmp_path / "cli"), cases)
+    for (text, is_error), (cli_text, rc) in zip(mcp, cli_out):
+        assert not is_error and rc == 0
+        doc = json.loads(text)
+        assert doc["diagnostics"] == diag
+        assert "CHILDREN_TRUNCATED" in doc["roots"][0]["flags"]
+    _same_bytes(mcp[0][0], cli_out[0][0])  # brief: the same bytes
+    assert json.loads(cli_out[1][0])["diagnostics"] == diag  # full: the CLI's own document

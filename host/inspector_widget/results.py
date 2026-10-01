@@ -26,6 +26,10 @@ def dump_tree(data: Mapping[str, Any], serial: str, package: str,
                            "root_count": len(roots)}
     if include_properties:
         out["properties"] = dict(data.get("properties") or {})
+    if data.get("diagnostics"):
+        # What the agent cut or could not read (depth-truncated=N,
+        # properties-failed=N): without it a cut tree looks complete.
+        out["diagnostics"] = data["diagnostics"]
     return out
 
 
