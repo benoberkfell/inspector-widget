@@ -1340,10 +1340,12 @@ def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
         # Bounds that run past the window's (not just up to its edge) are not all shown, and
         # content reaching the window's bottom usually continues below it (a peeking sheet, a
         # half-shown footer). Its right edge is not such evidence: the overflow button of every
-        # toolbar sits there, a real 40dp target.
+        # toolbar sits there, a real 40dp target. Nor is the bottom edge of a node that starts
+        # at the window's top: it spans the window (a full-screen scrim), wholly shown.
         if n.x < win.x - _EDGE_TOL or n.x + n.w > win.x + win.w + _EDGE_TOL:
             axes.add("w")
-        if n.y < win.y - _EDGE_TOL or n.y + n.h >= win.y + win.h - _EDGE_TOL:
+        if n.y < win.y - _EDGE_TOL or (n.y + n.h >= win.y + win.h - _EDGE_TOL
+                                       and n.y > win.y + _EDGE_TOL):
             axes.add("h")
     if "bounds_clipped" in n.flags:
         axes |= {"w", "h"}
