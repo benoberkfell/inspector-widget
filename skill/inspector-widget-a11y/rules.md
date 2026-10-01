@@ -315,9 +315,13 @@ collapse like the a11y ones (`×6 in #message_list cells`). `lint()` reports
 `tb.skipped` with the a11y rules (no false positive on the corpus GOOD variants
 or the recorded real apps); `lint(rules=["tb"])` lists every `tb.*` rule,
 including the heuristic and opt-in ones (`tb.double_stop`, `tb.ghost_stop`,
-`tb.out_of_order`, `tb.boundary_jump`, `tb.custom_action_missing`). Outline
-lines carry the short code (`!escape`, `!double_stop`); `node(ref,
-facets="tb,issues")` explains one.
+`tb.out_of_order`, `tb.boundary_jump`, `tb.custom_action_missing`). Tree
+outlines and `lint()` carry the default codes only (`!escape`); the reading view
+(`outline(view="reading")`, whose `next` then points at `lint(rules=["tb"])`),
+`lint(rules=["tb"])` and `find(issue="tb.<rule>")` carry every code
+(`!double_stop`); `node(ref, facets="tb,issues")` explains one. When
+`lint(rules=["tb"])` finds nothing, its `next` points at a walk: a trap, a loop,
+or focus lost after an action or a list update shows only there.
 
 A real walk (`tb_walk`, device-wide) reports the same codes with basis `walk`
 (and `expect` when you passed the order you want), plus the ones only a walk
@@ -328,7 +332,11 @@ model and TalkBack disagreed.
 - **Static:** visible text that is neither a stop nor part of a stop's
   announcement; an ancestor hides it (`importantForAccessibility=
   noHideDescendants`, `hideFromAccessibility`, `clearAndSetSemantics`). The
-  reading outline with `include_skipped=true` names the hider (`hidden_by=n40`).
+  reading outline with `include_skipped=true` names the hider (`hidden_by=n40`),
+  or the stop whose contentDescription silences a child (`silenced_by=n12`).
+  Not reported: what is hidden for a panel open over it (an open
+  `DrawerLayout` drawer hides the content, a modal bottom or side sheet its
+  siblings: that keeps focus in the panel), or under a scrim.
 - **Walk:** predicted stops a full lap never reached (`diff.skip`,
   `diff.unvisited`), or text on screen no stop read.
 - **Fix:** drop the hiding flag (a ComposeView cell with `noHideDescendants`
@@ -369,7 +377,11 @@ model and TalkBack disagreed.
 
 ### `tb.escape` — focus walks out of a dialog or sheet  (default, error)
 - **Static:** stops drawn under a same-window overlay (a `Box` + scrim "dialog",
-  a `BottomSheetScaffold` sheet, a custom View overlay) stay reachable.
+  a `BottomSheetScaffold` sheet, a custom View overlay) stay reachable. What is
+  drawn above what follows the View tree's drawing order: elevation first (the
+  capture's View properties), then child order; without properties, an elevated
+  kind of View (a FAB, an AppBarLayout, a CardView) drawn earlier is not
+  counted under a later scrim.
 - **Walk:** focus leaves the overlay for nodes behind it, or reaches a window
   under a modal one (`diff.escape`): one finding per run of steps ("steps 3-11:
   ... read 9 stops behind it"). What is behind the overlay comes from the walk's
@@ -391,7 +403,9 @@ model and TalkBack disagreed.
   the ref it came from. A capture taken with TalkBack off has no RecyclerView
   item info (RecyclerView adds it only while a service runs): the model adds the
   positions a TalkBack user hears when the list is at its start or holds every
-  item, and says so in the capture's diagnostics when it cannot.
+  item (a grid only when it is clearly a vertical one), and says so in the
+  capture's diagnostics when it cannot. The lint line quotes the wrong "N of M"
+  itself (`says "2 of 21": counts 1 silent item(s), e.g. n12`).
 - **Walk:** the same at the stops TalkBack visited (`diff.speech`).
 - **Fix:** compose the texts in reading order, or
   `clearAndSetSemantics { contentDescription = "Socks, $5" }`; keep empty
@@ -399,7 +413,9 @@ model and TalkBack disagreed.
 
 ### `tb.edge_stuck` — content a swipe cannot reach  (default)
 - **Static:** content past a scroll edge with no scroll action in that
-  direction, a pager's other pages.
+  direction, a pager's other pages with nothing that turns them (no tabs or
+  selected page indicator, no "Next" / "Previous page" button, no labelled
+  custom action on the pager or above it).
 - **Walk:** an edge while the container can still scroll, two presses that move
   nothing (`ended: "stuck"`), hidden items after the last stop (`diff.stuck`).
 - **Fix:** scroll semantics and actions (`verticalScroll`, `LazyColumn`,

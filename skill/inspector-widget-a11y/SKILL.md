@@ -447,8 +447,8 @@ image(overlay="walk")                        the walk drawn: numbered arcs, mode
 tb_scenario(kind="survive", target="n47", mutate="tap:n49")   focus after a list update (or focus_after / restore)
 ```
 
-The first four calls never touch the device and cost about 1-2 KB each. Start
-there: the model (TalkBack 16.2's traversal rules, calibrated against TalkBack
+After `capture()`, the next three calls never touch the device and cost about
+1-2 KB each. Start there: the model (TalkBack 16.2's traversal rules, calibrated against TalkBack
 17) is right far more often than not, and it explains *why*. Then confirm with
 `tb_walk` (about 0.2-0.4 s a step on an emulator, at most 5 KB for 60 steps).
 
@@ -459,6 +459,30 @@ afterwards, at the server's exit, or by `talkback(action="restore")`; with
 keyboard, and need the app in the foreground. Do not run them while someone else
 uses the device, and do not run `uiautomator dump` meanwhile (it suppresses
 TalkBack).
+
+### Reading the model's codes
+
+`outline(view="reading", explain=true)` and `node(ref, facets="tb")` say why each
+node is or is not a stop, and how focus gets there:
+
+- **`why=`** (a stop): `click`, `longclick`, `focusable` (actionable), `srf`
+  (screen-reader-focusable: `Modifier.semantics { }` / `focusable`), `scroll_item`
+  (a speaking child of a list), `text_orphan` (text with no focusable ancestor: it
+  is its own stop), `leaf` (focusable, no children, nothing to say: "Unlabelled"),
+  `web` (inside a WebView). `ghost=unlabelled|tiny|clipped:<ref>|invisible_children_only`:
+  a stop with nothing useful to hear or see.
+- **`why_not`** / `- ` lines (not a stop): `merged_into=<ref>` (that stop reads it),
+  `silenced_by=<ref>` (that stop's contentDescription replaces its text: never
+  said), `hidden_by=<ref>` (`noHideDescendants` there), `covered_by=<ref>` (its
+  window is under a modal one), `not_important`, `silent_container` (focusable,
+  but its focusable children are the stops), `window_wrapper`, `offscreen` (outside
+  its window or scrolled out of its scroller; `reachable: scroll` when TalkBack
+  auto-scrolls to it), `zero_size`, `invisible`, `no_speech`.
+- **`edge_in`** (how a forward swipe arrives): `tree` (the tree order), `chain`
+  (Compose's traversal order), `bounds_swap` (re-sorted by position),
+  `before:<ref>` / `after:<ref>` (an app's traversalBefore/After link),
+  `window:<ref>` (the first stop of another window), `first`. `via=` on a reading
+  line shows it when a link or a reorder placed the stop.
 
 ### Reading a walk
 
@@ -499,7 +523,13 @@ TalkBack).
   `model.mismatch` is calibration data, not an app bug: the walk is ground truth.
 - The walk captured the screen with TalkBack on (`capture`), and again when
   TalkBack scrolled in nodes no capture held (`recaptured`); refs carry over, so
-  every ref in the walk works with `node`, `outline`, `find` and `image`.
+  every ref in the walk works with `node`, `outline`, `find` and `image`. Where
+  those tools are not listed (the default listing), `keys` maps each ref to its
+  node key for `inspect_node(node_key=...)`, and `next` names only listed tools.
+- A walk on a device or app you did not name says which it drove (`session`).
+- For the backward lap, `next` suggests `tb_walk(direction="prev", start=<the last
+  stop>)`; a backward walk from the first stop meets the edge at once and compares
+  the lap after the wrap.
 - The full record is stored: `captures(what="walks")` lists walks and
   scenarios, `captures(action="show", id="wbz8enj")` shows every step.
 
@@ -527,11 +557,12 @@ Each `tb.*` rule, with its fix, is in **[rules.md](rules.md#talkback-navigation-
 ```
 1. capture()                                   → c7h2kq, 1 window
 2. lint(rules=["tb"])                          → tb.escape ×23 under n60 @filter_sheet (58%)
-3. outline(view="reading", explain=true, root="@filter_sheet")
-                                               → the sheet's stops, then n14 ... behind it
+3. outline(view="reading", explain=true, from="@filter_sheet_title")
+                                               → the sheet's stops in swipe order, then
+                                                 n14 ... behind it
 4. node("n60", facets="tb,compose")            → a BottomSheetScaffold sheet, Filters.kt:77
 5. tb_walk(start="@filter_sheet_title", max_steps=12)
-                                               → step 6: n14 via=next !escape (behind the sheet)
+                                               → step 6: n14 !escape (behind the sheet)
 6. image(overlay="walk")                       → arcs leave the sheet at step 6 (red)
 7. FIX: ModalBottomSheet (its own window), or hideFromAccessibility on the content
    while the sheet is expanded, plus a paneTitle on the sheet
@@ -650,6 +681,14 @@ Or register manually, **from the repo root** so `$PWD` expands to your checkout
 
 ```
 claude mcp add inspector-widget -- env PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
+```
+
+The default listing is the legacy inspection tools plus the TalkBack tools. For
+the capture tools and the TalkBack loop of §5, register it with a toolset:
+
+```
+INSPECTOR_WIDGET_TOOLSET=capture,talkback ./scripts/register-mcp.sh
+# or: claude mcp add inspector-widget -- env INSPECTOR_WIDGET_TOOLSET=capture,talkback PYTHONPATH="$PWD/host" "$PWD/host/.venv/bin/python" "$PWD/host/mcp_server.py"
 ```
 
 Verify the server and its tool surface without a device:

@@ -139,9 +139,16 @@ TalkBack tools budget themselves instead (`max_bytes` per tool, an explicit
 ### TalkBack (device-wide: TalkBack runs for every app; settings are restored)
 Listed in the default toolset (in their pre-capture shape) and with
 `INSPECTOR_WIDGET_TOOLSET=talkback`, `capture,talkback` or `all`; one
-implementation either way, so results name capture refs. Failures are error
-envelopes with a code (`talkback_unavailable`, `busy`, `injector_failed`,
-`start_not_found`, `app_left_foreground` ...). Never retried.
+implementation either way, so results name capture refs; where the capture
+tools are not listed (the default listing) `keys` maps them to node keys
+(`inspect_node(node_key=...)`), and `next` names only listed tools. Failures are
+error envelopes with a code (`talkback_unavailable`, `busy`, `injector_failed`,
+`start_not_found`, `app_left_foreground`, `talkback_on`, `log_level_failed` ...).
+Never retried. Being device-wide, they act only on a device and app the caller
+named or its own default session (its last attach or capture), else
+`$ANDROID_SERIAL` or the only device: never on the store's shared default alone
+(another agent's). A walk or scenario on an app you did not name says which
+(`session`).
 - **`talkback(action=status|on|off|restore, serial?, package?, verbose_log=false)`**
   → TalkBack state, or what changed (`on` snapshots the settings first).
 - **`tb_walk(serial?, package?, start="current", direction="next", max_steps=60,
@@ -153,8 +160,10 @@ envelopes with a code (`talkback_unavailable`, `busy`, `injector_failed`,
   !double_stop`), `diff` = actual vs model by class and ref (`model`, `skip`,
   `double`, `out_of_order`, `loop`, `trap`, `escape`, `stuck`, `left_app` ...).
   `start` and `expect` take refs, selectors (`@tag`, `#rid`, `Type"label"`) or
-  labels. Focus on a node no capture holds (scrolled in) recaptures, at most
-  once per 3 steps. Stored as `<store>/walks/<id>.json`.
+  labels (a label that only looks like a selector, `@alice`, is matched as
+  spoken); a ref no capture holds fails before TalkBack is touched. Focus on a
+  node no capture holds (scrolled in) recaptures, at most once per 3 steps.
+  Stored as `<store>/walks/<id>.json`.
 - **`tb_scenario(kind=focus_after|restore|survive, serial?, package?, target?,
   action="activate", mutate?, wait_ms=2000, ...)`** → where real TalkBack focus
   goes after an action (`activate`, `back`, `tap:<ref>`, `key:<combo>`), after
@@ -164,7 +173,8 @@ envelopes with a code (`talkback_unavailable`, `busy`, `injector_failed`,
 - **`image(overlay="walk", walk=<id>)`** draws a walk on its capture (numbered
   arcs in TalkBack's order, the model's next stop dashed, mismatches red);
   **`captures(what="walks")`** lists the stored walks, `captures(action="show",
-  id=<walk id>)` shows every step.
+  id=<walk id>)` shows every step; with `what="walks"`, `show`, `export` and
+  `drop` take a walk id or `latest` (never a capture).
 - The loop: `capture -> lint(rules=["tb"]) -> outline(view="reading",
   explain=true) -> node(ref, facets="tb") -> tb_walk(start=ref) ->
   image(overlay="walk")` (SKILL.md §5).
