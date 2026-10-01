@@ -43,8 +43,14 @@ from typing import Any
 from . import rules as R
 from .model import Index, OpError, UNode
 
-#: bump when image rendering changes, so cached files are not reused
+#: bump when image rendering changes, so cached files are not reused (the code
+#: fingerprint below also changes every cached name when the rendering code does)
 IMG_VERSION = 1
+#: The modules whose code renders the images (relative to the package): a change to any
+#: of them changes :func:`code_fingerprint`, so no cached image outlives the code that drew
+#: it, base composites included.
+RENDER_MODULES = ("capture/images.py", "overlay.py", "png.py")
+_FINGERPRINT: str | None = None
 MAX_MARKS = 60
 DEFAULT_PAD = 16
 DEFAULT_MAX_SIDE = 1024
@@ -214,8 +220,30 @@ def crop_rgba(w: int, rgba: bytes, x0: int, y0: int, x1: int, y1: int) -> bytes:
 # --------------------------------------------------------------------------- #
 # The capture's image artifacts
 # --------------------------------------------------------------------------- #
+def code_fingerprint() -> str:
+    """A hash of the rendering code (:data:`RENDER_MODULES`' sources), computed once per
+    process; the package version when a source cannot be read (a zipped install)."""
+    global _FINGERPRINT
+    if _FINGERPRINT is None:
+        pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        h = hashlib.blake2s(digest_size=6)
+        try:
+            for rel in RENDER_MODULES:
+                with open(os.path.join(pkg, *rel.split("/")), "rb") as f:
+                    h.update(rel.encode() + b"\0" + f.read())
+            _FINGERPRINT = h.hexdigest()
+        except OSError:
+            from .. import __version__
+
+            _FINGERPRINT = f"v{__version__}"
+    return _FINGERPRINT
+
+
 def _hash(params: Any) -> str:
-    blob = json.dumps({"v": IMG_VERSION, **params}, sort_keys=True, default=str).encode()
+    """The cache key of a derived image: its parameters, :data:`IMG_VERSION` and the code
+    fingerprint, so a rendering change never reuses a stale PNG."""
+    blob = json.dumps({"v": IMG_VERSION, "code": code_fingerprint(), **params},
+                      sort_keys=True, default=str).encode()
     return hashlib.blake2s(blob, digest_size=4).hexdigest()
 
 
