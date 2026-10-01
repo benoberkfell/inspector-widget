@@ -1079,7 +1079,8 @@ def _item_instance(s: Dict[str, Any], c: str) -> Tuple[str, str]:
     rebinds the same item View to as it scrolls (the model's "#n" stop says which)."""
     it = _item_of(s, c)
     pk = str(_pk(s) or "")
-    return it, (pk.split("#", 1)[1] if it.startswith("view:") and "#" in pk else "")
+    # only a rebound item View (or ComposeView cell) gets a "#n" stop (talkback/walk.py)
+    return it, (pk.split("#", 1)[1] if "#" in pk else "")
 
 
 def _check_list_count(walk: Dict[str, Any], skip: Sequence[str] = ()) -> List[Dict[str, Any]]:
@@ -1215,6 +1216,7 @@ def _check_row_skip(walk: Dict[str, Any], lap: List[Dict[str, Any]]
         start = next((P.index(_pk(x)) for x in _moves(steps) if _pk(x) in P), 0)
         names: List[str] = []
         keys: List[str] = []
+        refs: List[str] = []
         for i, p in enumerate(pred):
             r = p.get("bounds")
             lab = (p.get("label") or "").strip()
@@ -1224,6 +1226,7 @@ def _check_row_skip(walk: Dict[str, Any], lap: List[Dict[str, Any]]
             if abs((r[1] + r[3] / 2) - bottom) <= 60:
                 continue  # the row TalkBack scrolls along
             keys.append(p["key"])
+            refs.append(p.get("ref") or p["key"])
             if lab and lab not in labels_read and lab not in names:
                 names.append(lab)
         if not names:
@@ -1236,7 +1239,7 @@ def _check_row_skip(walk: Dict[str, Any], lap: List[Dict[str, Any]]
                      f"TalkBack auto-scrolls {c} along its bottom row (steps {at}): the "
                      f"{len(bands) - 1} row(s) above in every column it scrolls in are passed "
                      f"over; {len(names)} item(s) never reached: {listed}", auto,
-                     refs=[c] + [pref for pref in keys][:MAX_REFS - 1], keys=keys)
+                     refs=[c] + refs[:MAX_REFS - 1], keys=keys)
         f["missed"] = names
         out.append(f)
     return out, gone

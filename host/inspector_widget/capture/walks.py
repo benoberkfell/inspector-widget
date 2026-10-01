@@ -58,8 +58,8 @@ CLASSES = {
     "tb.loop": "loop", "tb.trap": "trap", "tb.escape": "escape", "tb.edge_stuck": "stuck",
     "tb.focus_lost": "lost", "tb.ghost_stop": "ghost", "tb.revisit": "revisit",
     "tb.window_order": "window_order", "tb.wrong_announcement": "speech",
-    "tb.covered_stop": "covered", "tb.webview_block": "stuck", "tb.interleaved": "out_of_order",
-    "tb.autoscroll_row_skip": "skip",
+    "tb.covered_stop": "covered", "tb.webview_block": "stuck", "tb.interleaved": "interleaved",
+    "tb.autoscroll_row_skip": "row_skip",
 }
 
 Rect = tuple[int, int, int, int]

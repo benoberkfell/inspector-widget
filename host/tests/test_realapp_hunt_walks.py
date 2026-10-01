@@ -411,3 +411,12 @@ def test_live_nia13_a_lap_through_the_whole_list_counts_the_spacer():
     assert len(f) == 1 and '"In list. 20 items"' in f[0]["msg"] and "reached 19" in f[0]["msg"]
     # the same list scrolled to its middle: the lap starts there and cannot tell
     assert _codes(H.record("wdz81d8"), "tb.wrong_announcement") == []
+
+
+def test_live_l1_recycled_rows_are_neither_a_wrap_nor_interleaved():
+    # A11yProbe V6 BAD_B: 50 mails in a RecyclerView, row Views rebound as TalkBack
+    # auto-scrolls; 10 runs on emulator-5554 gave this same walk
+    rec = H.record("wfx9awc")
+    assert rec["ended"] == "wrap" and len(rec["steps"]) == 53
+    assert rec["findings"] == []
+    assert (rec["vs_model"]["agree"], rec["vs_model"]["differ"]) == (50, 0)
