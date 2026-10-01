@@ -54,6 +54,7 @@ so tb-walk's model passes ``keyboard=True``.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import rules as R
@@ -151,27 +152,97 @@ def _trim(s: Optional[str]) -> str:
 
 
 #: What TalkBack says for a text that is one symbol and nothing else (SpeechCleanupUtils
-#: .cleanUp: a single character is replaced by its spoken name, res/values/strings.xml
-#: "symbol_*"). Measured on TalkBack 17.0: AntennaPod's show notes, whose list bullets are
-#: their own web elements ("•" -> "Bullet. 1 of 19. In list. 19 items"), and a paragraph
-#: that is only "." ("Period"). The rest are TalkBack's English names for the same table.
+#: .cleanUp: a single character is replaced by its spoken name). Generated from TalkBack's
+#: own table, TALKBACK_PUNCTUATION_AND_SYMBOL in utils/output/SpeechCleanupUtils.java with
+#: the English names of utils/res/values/strings_symbols.xml: every key it has, nothing it
+#: lacks ("+" is read as it is). Measured on TalkBack 17.0: AntennaPod's show notes, whose
+#: list bullets are their own web elements ("•" -> "Bullet. 1 of 19. In list. 19 items"),
+#: and a paragraph that is only "." ("Period").
 SYMBOL_NAMES = {
-    "•": "Bullet", ".": "Period", ",": "Comma", ":": "Colon", ";": "Semicolon",
-    "!": "Exclamation mark", "?": "Question mark", "&": "Ampersand", "*": "Asterisk",
-    "@": "At", "#": "Pound", "%": "Percent", "+": "Plus", "=": "Equals", "/": "Slash",
-    "\\": "Backslash", "|": "Vertical bar", "-": "Dash", "_": "Underscore",
-    "~": "Tilde", "^": "Caret", "$": "Dollar", "€": "Euro", "£": "Pound sterling",
-    "¥": "Yen", "©": "Copyright", "®": "Registered trademark", "™": "Trademark",
-    "°": "Degree", "…": "Ellipsis", "—": "Em dash", "–": "En dash", "·": "Middle dot",
-    "§": "Section", "¶": "Paragraph", "×": "Multiplication", "÷": "Division",
+    "&": "Ampersand", "<": "Less than sign", ">": "Greater than sign", "'": "Apostrophe",
+    "*": "Asterisk", "@": "At", "\\": "Backslash", "•": "Bullet", "^": "Caret",
+    "¢": "Cent sign", ":": "Colon", ",": "Comma", "©": "Copyright", "{": "Left curly bracket",
+    "}": "Right curly bracket", "°": "Degree sign", "÷": "Division sign", "…": "Ellipsis",
+    "—": "Em dash", "–": "En dash", "!": "Exclamation mark", "`": "Grave accent", "-": "Dash",
+    "„": "Low double quote", "×": "Multiplication sign", "\n": "New line",
+    "¶": "Paragraph mark", "(": "Left paren", ")": "Right paren", "%": "Percent",
+    ".": "Period", "π": "Pi", "#": "Pound", "$": "Dollar sign", "€": "Euro",
+    "£": "Pound currency sign", "¥": "Yen", "₱": "Peso sign", "₹": "Rupee", "₫": "Dong sign",
+    "¤": "Currency sign", "?": "Question mark", "\"": "Quote", "®": "Registered trademark",
+    ";": "Semicolon", "/": "Slash", " ": "Space", "\u00a0": "Space",
+    "[": "Left square bracket", "]": "Right square bracket", "√": "Square root",
+    "™": "Trademark", "✓": "Check mark", "_": "Underscore", "|": "Vertical line",
+    "¬": "Not sign", "¦": "Broken bar", "µ": "Micro sign", "≈": "Almost equal to",
+    "≠": "Not equal to", "§": "Section sign", "↑": "Upwards arrow", "←": "Leftwards arrow",
+    "→": "Rightwards Arrow", "↓": "Downwards Arrow", "♥": "Black Heart", "~": "Tilde",
+    "=": "Equal sign", "￦": "Won currency sign", "₩": "Won currency sign",
+    "※": "Reference Mark", "☆": "White star", "★": "Black star", "♡": "White Heart",
+    "○": "White circle", "●": "Black circle", "⊙": "Solar symbol", "◎": "Bullseye",
+    "♧": "White club suit", "♤": "White spade suit", "☜": "White left pointing index",
+    "☞": "White right pointing index", "◐": "Circle with left half black",
+    "◑": "Circle with right half black", "□": "White square", "■": "Black square",
+    "△": "White up pointing triangle", "▽": "White down pointing triangle",
+    "◁": "White left pointing triangle", "▷": "White right pointing triangle",
+    "◇": "White diamond", "♩": "Quarter Note", "♪": "Eighth Note",
+    "♬": "Beamed sixteenth notes", "♀": "Female symbol", "♂": "Male symbol",
+    "【": "Left Black Lenticular Bracket", "】": "Right Black Lenticular Bracket",
+    "「": "Left Corner Bracket", "」": "Right Corner Bracket", "±": "Plus minus sign",
+    "ℓ": "Liter", "℃": "Celsius degree", "℉": "Fahrenheit degree", "≒": "Approximately equals",
+    "∫": "Integral", "⟨": "Mathematical left angle bracket",
+    "⟩": "Mathematical right angle bracket", "〒": "Postal mark",
+    "▲": "Black triangle pointing up", "▼": "Black triangle pointing down",
+    "♦": "Black suit of diamonds", "◆": "Black suit of diamonds",
+    "･": "Halfwidth Katakana middle dot", "▪": "Small black square",
+    "《": "Left double angle bracket", "》": "Right double angle bracket",
+    "¡": "Inverted exclamation mark", "¿": "Inverted question mark", "，": "Full-width comma",
+    "！": "Full-width exclamation mark", "。": "Ideographic full stop",
+    "？": "Full-width question mark", "·": "Middle dot", "”": "Right double quotation mark",
+    "、": "Ideographic comma", "：": "Full-width colon", "；": "Full-width semicolon",
+    "＆": "Full-width ampersand", "＾": "Full-width circumflex", "～": "Full-width tilde",
+    "“": "Left double quotation mark", "（": "Full-width left parenthesis",
+    "）": "Full-width right parenthesis", "＊": "Full-width asterisk",
+    "＿": "Full-width underscore", "’": "Right single quotation mark",
+    "｛": "Full-width left curly bracket", "｝": "Full-width right curly bracket",
+    "＜": "Full-width less than sign", "＞": "Full-width greater than sign",
+    "‘": "Left single quotation mark", "\u064e": "\u0641\u064e\u062a\u0652\u062d\u064e\u0629",
+    "\u0650": "\u0643\u064e\u0633\u0652\u0631\u064e\u0629",
+    "\u064f": "\u0636\u064e\u0645\u064e\u0651\u0629",
+    "\u064b": "\u0641\u062a\u062d\u064e\u0629 \u062a\u0646\u0648\u064a\u0646",
+    "\u064d": ("\u0643\u064e\u0633\u0652\u0631\u064e\u0629 "
+                "\u062a\u064e\u0646\u0652\u0648\u0650\u064a\u0646"),
+    "\u064c": ("\u0636\u064e\u0645\u064e\u0651\u0629 "
+                "\u062a\u064e\u0646\u0652\u0648\u0650\u064a\u0646"),
+    "\u0651": "\u0634\u064e\u062f\u0651\u0629\u200e",
+    "\u0652": "\u0633\u064f\u0643\u064f\u0648\u0646\u0652",
 }
+
+#: Character.isWhitespace: what SpannableUtils.trimText trims (a no-break space is not
+#: whitespace to Java, so a lone one is a symbol: "Space").
+_JAVA_SPACE = frozenset("\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f")
+_NO_BREAK = frozenset("\u00a0\u2007\u202f")
+
+
+def _java_ws(c: str) -> bool:
+    return c in _JAVA_SPACE or (c not in _NO_BREAK and unicodedata.category(c) in
+                                ("Zs", "Zl", "Zp"))
 
 
 def spoken_text(s: str) -> str:
-    """A node's text as TalkBack speaks it: a lone symbol (whitespace, non-breaking spaces
-    included, around it) by its name; anything else as it is."""
-    t = (s or "").strip()
-    return SYMBOL_NAMES.get(t, s) if len(t) == 1 else s
+    """A node's text as TalkBack speaks it (SpeechCleanupUtils.cleanUp): trimmed of Java
+    whitespace, a lone symbol is read by its name; a text of whitespace only by the name of
+    its first character ("Space", "New line"); anything else as it is."""
+    if not s:
+        return s
+    i, j = 0, len(s)
+    while i < j and _java_ws(s[i]):
+        i += 1
+    while j > i and _java_ws(s[j - 1]):
+        j -= 1
+    if j - i == 1:
+        return SYMBOL_NAMES.get(s[i], s[i:j])
+    if j == i:
+        return SYMBOL_NAMES.get(s[0], s[0])
+    return s
 
 
 def node_text(n: TbNode) -> str:
