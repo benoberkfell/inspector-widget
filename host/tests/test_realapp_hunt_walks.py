@@ -420,3 +420,33 @@ def test_live_l1_recycled_rows_are_neither_a_wrap_nor_interleaved():
     assert rec["ended"] == "wrap" and len(rec["steps"]) == 53
     assert rec["findings"] == []
     assert (rec["vs_model"]["agree"], rec["vs_model"]["differ"]) == (50, 0)
+
+
+def test_a_remodel_puts_a_new_top_stop_at_the_top():
+    # AntennaPod's feed: the collapsing toolbar's title appears once the list scrolls; it
+    # comes first in the new order, so it goes before the stops the model knows, not after
+    # the bottom navigation (where a lap would call everything between "skipped")
+    from inspector_widget.talkback import walk
+    from test_tb_rules import CLICK, FOCUS, n, root
+
+    def screen(*top):
+        rows = [n(2, cls="android.widget.Button", text="Play", flags=FOCUS, actions=[CLICK],
+                  b=(0, 400, 1080, 120)),
+                n(3, cls="android.widget.Button", text="Next", flags=FOCUS, actions=[CLICK],
+                  b=(0, 600, 1080, 120))]
+        return {"windows": [{"root_view_id": 1, "root": root(*top, *rows)}]}
+
+    model = walk.Model()
+    model.build(H.to_proto(screen()), False)
+    title = n(9, cls="android.widget.TextView", text="Planet Money", b=(0, 160, 1080, 100))
+    model.remodel(H.to_proto(screen(title)), False)
+    assert [(p.key, p.added) for p in model.stops] == [
+        ("view:9", 1), ("view:2", None), ("view:3", None)]
+
+
+def test_live_l4_a_collapsing_title_the_model_learned_of_late_is_no_skip():
+    rec = H.record("w9h3ogw")
+    sk = _codes(rec, "tb.skipped")
+    assert [(f["sev"], f["basis"]) for f in sk] == [("info", "model")]
+    assert "Back | Planet Money" in sk[0]["msg"]
+    assert _codes(rec, "tb.revisit") == []  # rows rebound to other episodes are not re-reads

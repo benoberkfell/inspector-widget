@@ -180,8 +180,17 @@ def _unlabelled(sig: str) -> bool:
 CTX_LEN = 80
 
 
+#: Scrollers that hold one page of mixed content, not a list of items (a View's
+#: ScrollView / NestedScrollView, which a CoordinatorLayout page also reports): its children
+#: are no items, so they give no item context (AntennaPod's feed: the toolbar in the
+#: scrolling page header would change "item" as the header collapses).
+_PAGE_SCROLLERS = ("android.widget.ScrollView", "android.widget.HorizontalScrollView",
+                   "androidx.core.widget.NestedScrollView")
+
+
 def _node_scrolls(n: "Node") -> bool:
-    return n.cls != _WEBVIEW and ("scrollable" in n.flags or bool(n.actions & set(_SCROLL_ACTIONS)))
+    return n.cls != _WEBVIEW and n.cls not in _PAGE_SCROLLERS and (
+        "scrollable" in n.flags or bool(n.actions & set(_SCROLL_ACTIONS)))
 
 
 def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any], Any],
@@ -190,8 +199,9 @@ def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any],
     """``(ctx, item_root)`` of a node inside a scrolling list: ``ctx`` the first text of
     the innermost list item around it that has one outside the node itself (a card's title,
     a row's sender: what stays put while the item scrolls and its other texts come and go;
-    "" when none has; None when it is in no list), ``item_root`` whether the node is itself
-    a list item (a child of the scrolling container). Two nodes alike in class, label and
+    for an unlabelled list item itself, its own first text; "" when none has; None when it
+    is in no list), ``item_root`` whether the node is itself a list item (a child of the scrolling
+    container). Two nodes alike in class, label and
     screen slot are told apart by it: the HEADLINES chips of two news cards (NiA, after a
     scroll put the second where the first was), a RecyclerView row View rebound to another
     item."""
@@ -209,6 +219,17 @@ def item_context(n: Any, parent: Callable[[Any], Any], children: Callable[[Any],
             if first:
                 item_root = child is n
                 first = False
+                if item_root and not words(n) and not any(words(c) for c in children(n) or ()):
+                    # an unlabelled item (its label comes from its direct children only:
+                    # AntennaPod's feed rows): its own first text says which item it shows
+                    # now, a row View rebound to another episode
+                    stack = [n]
+                    while stack:
+                        x = stack.pop()
+                        w = words(x)
+                        if w:
+                            return w[:CTX_LEN], True
+                        stack.extend(reversed(list(children(x) or ())))
             stack = [child]
             while stack:
                 x = stack.pop()
@@ -827,7 +848,7 @@ def predict_initial(resp: Any, window: Optional[int] = None) -> Optional[Dict[st
 
 
 def _dict_scrolls(n: Dict[str, Any]) -> bool:
-    if (n.get("class_name") or "") == _WEBVIEW:
+    if (n.get("class_name") or "") == _WEBVIEW or (n.get("class_name") or "") in _PAGE_SCROLLERS:
         return False
     return "scrollable" in (n.get("flags") or ()) or any(
         isinstance(a, dict) and a.get("id") in _SCROLL_ACTIONS for a in n.get("actions") or ())
@@ -889,7 +910,7 @@ class Model:
         present = {k.key for k in known_of if k is not None}
         keys = [s.key for s in self.stops]
         prev: Optional[str] = None
-        for s, known in zip(new, known_of, strict=True):
+        for j, (s, known) in enumerate(zip(new, known_of, strict=True)):
             if known is not None:
                 if known.key != s.key and "#" not in known.key:
                     self.aliases[s.key] = known.key
@@ -898,7 +919,13 @@ class Model:
             if s.key in keys:  # a View (or ComposeView cell) rebound to another item
                 s = replace(s, key=f"{s.key}#{sum(k.split('#')[0] == s.key for k in keys)}")
             s = replace(s, added=self.remodels)
-            at = keys.index(prev) + 1 if prev in keys else len(keys)
+            if prev is None:
+                # nothing known before it in the new order: it goes before the first known
+                # stop after it (the top of a page), not after everything the model knows
+                nxt = next((k for k in known_of[j + 1:] if k is not None), None)
+                at = keys.index(nxt.key) if nxt is not None and nxt.key in keys else len(keys)
+            else:
+                at = keys.index(prev) + 1 if prev in keys else len(keys)
             while prev in keys and at < len(keys) and keys[at] not in present:
                 at += 1
             keys.insert(at, s.key)
