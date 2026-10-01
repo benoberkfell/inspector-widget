@@ -1237,6 +1237,8 @@ def _reading_items(ix: Index, loaded: Any, *, granularity: str, direction: str,
         meta["ended"] = facts.get("ended")
         if facts.get("start"):
             meta["ended"] = f"{facts['ended']}: {facts['start']}"
+        if facts.get("moved_to"):  # a container TalkBack never gets: its first stop
+            meta["from"] = f"{start} -> {facts['moved_to']}"
     return items, meta
 
 
@@ -1274,9 +1276,10 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
     ``granularity`` (default|heading|control: TalkBack's navigation settings), ``from``
     (a selector: the walk from that node), ``direction`` (next|prev) and
     ``include_skipped`` (``- `` lines for the nodes with content the walk passes over:
-    ``merged_into=``, ``hidden_by=``, ``covered_by=`` or ``why=`` silent_container,
-    offscreen, zero_size, invisible, not_important ...). The prefix is the stop's
-    number in the default forward order."""
+    ``merged_into=``, ``silenced_by=``, ``hidden_by=``, ``covered_by=`` or ``why=``
+    silent_container, offscreen, zero_size, invisible, not_important ...). ``from`` a
+    container TalkBack never gets starts at its first stop (``from: n20 -> n21``). The
+    prefix is the stop's number in the default forward order."""
     _check_unknown("outline", params, _OUTLINE_ARGS)
     view = _enum("view", params.get("view"), OUTLINE_VIEWS, "ui")
     explain = _bool("explain", params.get("explain"), False)

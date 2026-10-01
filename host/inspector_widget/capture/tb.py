@@ -19,10 +19,12 @@ What it serves:
   came from the model ("tb"); the index falls back to its own RO1 text ("ro1") when the
   model cannot run.
 * **Explanations** (:meth:`TbCapture.explain`): why a node is a stop (``click``,
-  ``focusable``, ``text_orphan``, ``leaf`` ...) or why not (``merged_into:<ref>``,
-  ``hidden_by:<ref>``, ``silent_container``, ``covered_by:<ref>``, ``offscreen``,
-  ``zero_size``, ``invisible``, ``not_important`` ...), with ghost reasons for stops that
-  say nothing useful.
+  ``focusable``, ``text_orphan``, ``leaf`` ...) or why not (``merged_into:<ref>`` (the
+  stop reads it), ``silenced_by:<ref>`` (the stop above it does not: its contentDescription
+  replaces the text), ``hidden_by:<ref>``, ``silent_container``, ``covered_by:<ref>``,
+  ``offscreen`` (outside its window or scrolled out of its scroller), ``zero_size``,
+  ``invisible``, ``not_important`` ...), with ghost reasons for stops that say nothing
+  useful.
 * **Reading walks** (:meth:`TbCapture.reading`): the stops in swipe order with what TalkBack
   says on arrival (collection and window transitions included), per granularity (default,
   heading, control), from any node, forward or backward, optionally with the nodes the walk
@@ -133,6 +135,9 @@ class TbCapture:
         self._by_key: dict[str, TbNode] = {}
         for n in self.tree.nodes:
             self._by_key.setdefault(n.key, n)
+        dpi = ((getattr(getattr(ix, "meta", None), "device", None) or {}).get("dpi")
+               if ix is not None else None)
+        self.density = int(dpi) if dpi else 420  # the dpi the lint sizes ghosts with
         self._own: dict[int, Announcement] = {}
         self._linear: list[TbNode] | None = None
         self._stop_no: dict[int, int] | None = None
@@ -298,16 +303,21 @@ class TbCapture:
                                               "screen reader runs"
             if "obscured_by_system_bar" in n.corrections:
                 return "under_system_bar", None, None
+            if self._offscreen(n):
+                return "offscreen", None, None
             if n.rect.is_empty():
                 return "zero_size", None, None
-            if not n.rect.intersects(n.window.bounds):
-                return "offscreen", None, None
             return "invisible", None, "not visible to the user (alpha 0, hidden, or clipped)"
         if branch == "focusable_ancestor":
             anc = self.rules.focusable_ancestor(n)
-            if anc is not None:
-                return "merged_into", self.nid(anc), None
-            return "no_speech", None, None
+            if anc is None:
+                return "no_speech", None, None
+            if not self._read_by(anc, n):
+                return "silenced_by", self.nid(anc), (
+                    "its contentDescription replaces its children's text"
+                    if anc.content_description else
+                    "TalkBack reads that stop without this node's text")
+            return "merged_into", self.nid(anc), None
         if branch == "silent_container":
             kids = [self.nid(c) for c in n.children if self.rules.should_focus_node(c)]
             kids = [k for k in kids if k]
@@ -317,6 +327,33 @@ class TbCapture:
         if branch == "window_wrapper":
             return "window_wrapper", None, "the size of its window, has children, not focusable"
         return branch or "no_speech", None, None
+
+    def _offscreen(self, n: TbNode) -> bool:
+        """Laid out outside its window or outside the nearest scrollable above it: a View
+        scrolled out of its ScrollView has its bounds clipped to an empty rect at the
+        scroller's edge (not a zero-size View)."""
+        r = n.rect
+        if not r.is_empty() and r.intersects(n.window.bounds):
+            return False
+        if _outside(r, n.window.bounds):
+            return True
+        sc = next((a for a in n.ancestors() if self.rules.is_scrollable(a)), None)
+        return sc is not None and _outside(r, sc.rect)
+
+    def _read_by(self, anc: TbNode, n: TbNode) -> bool:
+        """Whether the stop ``anc`` says something of ``n`` (or of a node inside it), or
+        ``n`` has nothing to say: a View container's contentDescription silences its
+        children (design 1(c)), so a child under it is not merged into it."""
+        keys = {x.key for x in n.iter()}
+        ann = self.own(anc)
+        if any(p.get("from") in keys for p in ann.parts if p.get("from") != anc.key):
+            return True
+        texts = [t for x in n.iter() for t in (x.text, x.content_description,
+                                                x.state_description) if t]
+        if not texts:
+            return True  # nothing of its own to say: merged, silently
+        said = ann.text.lower()
+        return any(t.strip().lower() in said for t in texts)
 
     def reachable(self, n: TbNode, code: str) -> str:
         if code in ("merged_into", "stop"):
@@ -333,7 +370,7 @@ class TbCapture:
         from ..talkback.static import ghost
 
         out = []
-        for g in ghost(self.nav, n):
+        for g in ghost(self.nav, n, self.density):
             if g.startswith("clipped:"):
                 sc = self.by_key(g.split(":", 1)[1])
                 g = f"clipped:{self.nid(sc) or g.split(':', 1)[1]}"
@@ -364,7 +401,8 @@ class TbCapture:
         Without ``start`` every stop of the screen in reading order (``direction="prev"``:
         backwards from the last); with ``start`` (a node id) the stops a swipe reaches from
         that node until the edge, the start itself first when it is a stop the granularity
-        keeps. ``include_skipped`` adds the nodes the walk passes over that carry content
+        keeps (a container TalkBack never gets starts at its first stop, ``moved_to`` in the
+        facts). ``include_skipped`` adds the nodes the walk passes over that carry content
         or actions, each with its reason."""
         forward = direction != "prev"
         accept = self.rules.node_filter(granularity)
@@ -399,9 +437,16 @@ class TbCapture:
             return items, meta
         x = self.node(start)
         if x is None or isinstance(x, Excluded):
-            meta["start"] = "not a TalkBack node: " + self.explain(start).get("why_not", "?")
-            meta["ended"] = "empty"
-            return items, meta
+            inner = self.first_stop_within(start)
+            if inner is None:
+                meta["start"] = "not a TalkBack node: " + \
+                    self.explain(start).get("why_not", "?")
+                meta["ended"] = "empty"
+                return items, meta
+            # a container TalkBack never gets (not important, a ComposeView host): the walk
+            # starts at the first stop inside it
+            meta["moved_to"] = self.nid(inner)
+            x = inner
         pivot: TbNode = x
         st = SpeechState()
         seen = {id(pivot)}
@@ -436,6 +481,32 @@ class TbCapture:
             reach_edge = res["reach_edge"]
         meta["ended"] = ended
         return items, meta
+
+    def first_stop_within(self, nid: str) -> TbNode | None:
+        """The first stop (in swipe order) inside the index node ``nid``: its dump subtree
+        when TalkBack never gets it, else its subtree in the capture's trees."""
+        order = {id(n): i for i, n in enumerate(self.linear())}
+        cands: list[TbNode] = []
+        x = self.node(nid)
+        if isinstance(x, Excluded):
+            if x.reason == "hidden":
+                return None
+            stack = [x.raw]
+            while stack:
+                raw = stack.pop()
+                n = self.tree.by_raw.get(id(raw))
+                if n is not None and id(n) in order:
+                    cands.append(n)
+                stack.extend(raw.get("children") or ())
+        elif x is None and self.ix is not None:
+            for tree in ("ui", "views"):
+                for u, _d in self.ix.walk(tree, nid):
+                    n = self.node(u.id)
+                    if isinstance(n, TbNode) and id(n) in order:
+                        cands.append(n)
+                if cands:
+                    break
+        return min(cands, key=lambda n: order[id(n)]) if cands else None
 
     def _stop_item(self, n: TbNode, ann: Announcement, prev: TbNode | None,
                    via: str | None = None, forward: bool = True) -> ReadItem | None:
@@ -563,6 +634,12 @@ class TbCapture:
     def _part(self, p: Mapping[str, Any]) -> dict[str, Any]:
         src = self.by_key(p.get("from") or "")
         return {"t": p.get("text"), "from": self.nid(src) or p.get("from"), "k": p.get("kind")}
+
+
+def _outside(r: Any, o: Any) -> bool:
+    """Whether rect ``r`` (possibly empty) lies wholly past an edge of ``o``."""
+    return (r.top >= o.bottom or r.bottom <= o.top or r.left >= o.right
+            or r.right <= o.left)
 
 
 def _has_content(rules: Any, x: TbNode | Excluded) -> bool:

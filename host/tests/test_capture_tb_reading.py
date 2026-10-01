@@ -166,6 +166,51 @@ def test_tb_facet_of_nodes_talkback_does_not_stop_on():
     assert reorder["edge_in"] == "before:view:4"
 
 
+def test_a_child_its_rows_description_silences_is_not_merged_into_it():
+    # V4 BAD (live): the row's contentDescription "Settings row" replaces "Wi-Fi", so
+    # TalkBack never says it (the walk's tb.skipped); not "read inside the row"
+    ix, raw = F.live_capture("tb_v4_bad")
+    tb = q.node(ix, raw, "view:5", facets="tb")["tb"]
+    assert tb == {"stop": None, "reachable": "not",
+                  "why_not": "silenced_by:view:4: its contentDescription replaces its "
+                             "children's text"}
+    out = q.outline(ix, view="reading", loaded=raw, include_skipped=True)
+    assert '- view:5 TextView "Wi-Fi" [0,280 1959x107] silenced_by=view:4' in out["lines"]
+    # a merged child the stop does read keeps merged_into and its share of the speech
+    merged, _ = tb_facet("tb_c9-bad-walk", "a11y:7:6")
+    assert merged["why_not"] == "merged_into:a11y:7:5" and merged["reachable"] == "swipe"
+
+
+def test_a_view_scrolled_out_of_its_scrollview_is_offscreen_not_zero_size():
+    # its bounds are clipped to an empty rect at the window's bottom edge: TalkBack
+    # auto-scrolls the ScrollView to it
+    tb, _ = tb_facet("a11yprobe_viewscreen", "view:37")
+    assert tb == {"stop": None, "why_not": "offscreen", "reachable": "scroll"}
+    lines = reading("a11yprobe_viewscreen", include_skipped=True)["lines"]
+    assert '- view:37 MaterialTextView #pinLabel "PIN" hidden [48,2856 0x0] why=offscreen' \
+        in lines
+    assert not any("zero_size" in x for x in lines)
+
+
+def test_from_a_container_talkback_never_gets_starts_at_its_first_stop():
+    # V5 BAD: the dialog card is a LinearLayout that is not important for accessibility
+    ix, raw = F.live_capture("tb_v5_bad")
+    out = q.outline(ix, view="reading", loaded=raw, **{"from": "view:13"})
+    assert out["from"] == "view:13 -> view:14" and out["ended"] == "edge"
+    assert [x.split()[1] for x in out["lines"]] == ["view:14", "view:15", "view:16"]
+    # a node with no stop inside still says why
+    out = q.outline(ix, view="reading", loaded=raw, **{"from": "view:19"})
+    assert out["total"] == 0 and out["ended"].startswith("empty: not a TalkBack node")
+
+
+def test_the_ghost_facet_sizes_tiny_at_the_captures_dpi():
+    from inspector_widget.capture import tb as T
+
+    ix, raw = F.live_capture("tb_v12_good")
+    tbc = T.TbCapture(raw.a11y, ix)
+    assert tbc.density == ix.meta.device["dpi"] != 420
+
+
 def test_facets_all_has_tb_only_with_a_model():
     _tb, out = tb_facet("nia_settings", "sem:80:191")
     ix, raw = F.fixture_capture("nia_settings")
