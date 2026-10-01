@@ -324,5 +324,5 @@ the device-only regressions the offline suite and code review miss.
 - `README.md` — product overview + quickstart.
 - `host/README.md` — host driver internals and the full tool surface.
 - `host/PACKAGING.md` — wheel/console-script packaging.
-- `skill/inspector-widget-a11y/` — the accessibility debugging Skill (rules R1..R18).
+- `skill/inspector-widget-a11y/` — the accessibility debugging Skill (rules R1..R23).
 - `../docs/` — the original reverse-engineering spec this tool was built from.

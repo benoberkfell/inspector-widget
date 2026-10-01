@@ -88,7 +88,9 @@ PER_RULE = 3
 #: bump when the cached lint shape or its input changes (derived/lint.<hash>.json);
 #: 2: the unified a11y tree replaced Compose semantics as the lint input
 #: 3: evidence ``covered_by`` (a finding under an open dialog) and R12's ``name``
-LINT_CACHE_VERSION = 3
+#: 4: R19..R23, R9's section titles, R2 on clear Compose touch areas (lint-and-store)
+#: 5: R22/R23 ids in groups of their own, R19 reads what TalkBack says (its review)
+LINT_CACHE_VERSION = 5
 
 _ACTION_FLAGS = frozenset({"click", "longclick", "edit", "checkable"})
 _EDGE_SLOP = 1
@@ -96,11 +98,14 @@ _LABEL_CUT = 32
 #: evidence the capture does not keep: what the node itself says (label, class),
 #: how the lint worked it out (sampling, label sources searched, the bounds used,
 #: the standard behind min_dp, clipped axes: render.clipped reports clipping), and
-#: the lint's typed keys of other nodes (``node_ids`` names them as refs instead)
+#: the lint's typed keys of other nodes (``node_ids`` names them as refs instead; R19..R23
+#: keep the texts those nodes say: ``twin_label``, ``inner_label``)
 _EVIDENCE_DROP = frozenset({"label", "class_name", "announceable_keys", "structural_keys",
                             "fg_lum", "bg_lum", "px_sampled", "fg_fraction", "sample",
                             "text_size_class", "checked", "bounds_source", "standard",
-                            "floor_dp", "clipped_axes", "duplicates", "duplicate_of"})
+                            "floor_dp", "clipped_axes", "duplicates", "duplicate_of",
+                            "carrier", "child", "container", "twin", "inner",
+                            "touch_rivals"})
 SLIVER_NOTE = "low confidence: only a sliver is visible at the scroll edge"
 
 
@@ -800,22 +805,58 @@ def _cached_lint(src: _Src, ix: Index, kind: str, *, density: int, font_scale: f
     return res
 
 
+def _clip_axes(clipped: Iterable[Issue]) -> set[str]:
+    """The axes ``render.clipped`` cuts: its ``edge`` top/bottom is the height, left/right
+    the width; an issue that names no edge may cut either."""
+    axes: set[str] = set()
+    for r in clipped:
+        edge = r.evidence.get("edge")
+        if edge in ("top", "bottom"):
+            axes.add("h")
+        elif edge in ("left", "right"):
+            axes.add("w")
+        else:
+            axes |= {"w", "h"}
+    return axes
+
+
+def _small_axes(ev: Mapping[str, Any]) -> set[str]:
+    """The axes R2 found below its minimum (``w_dp``/``h_dp`` against ``min_dp``, with
+    R2's 1px slack at any density down to 160dpi)."""
+    try:
+        min_dp = float(ev.get("min_dp") or 48)
+    except (TypeError, ValueError):
+        min_dp = 48.0
+    out: set[str] = set()
+    for ax in ("w", "h"):
+        v = ev.get(f"{ax}_dp")
+        if isinstance(v, (int, float)) and v < min_dp - 0.3:
+            out.add(ax)
+    return out
+
+
 def _annotate_touch_fp(pairs: Iterable[tuple[str, Issue]],
-                       render: Mapping[str, Iterable[Issue]]) -> None:
-    """Findings on a node clipped at a scroll edge measure the visible sliver, not
-    the node: a touch target there is a likely false positive (L2), and a contrast
-    sample is low confidence."""
+                       render: Mapping[str, Iterable[Issue]]) -> list[tuple[str, Issue]]:
+    """``pairs`` without the touch-target findings that a ``render.clipped`` node only
+    has because of the clip: its visible part is not its size (a 9dp sliver of a 72dp row
+    at a scroll edge, Now in Android's Unbookmark half under the bottom bar), so R2 is not
+    judged there (G18; it used to be kept as a likely false positive). That is R2's own
+    ``info`` (every small axis clipped), or a small axis set that the clip covers; a
+    warn/error on an axis the clip leaves whole is kept, as the live lint keeps it. A
+    contrast sample on a node clipped at a scroll edge is kept, low confidence: the sliver
+    may not show the text."""
+    out: list[tuple[str, Issue]] = []
     for nid, iss in pairs:
-        if iss.id not in (TOUCH_RULE, CONTRAST_RULE):
-            continue
-        for r in render.get(nid, ()):
-            if r.id == CLIPPED and r.evidence.get("scroll"):
-                if iss.id == TOUCH_RULE:
-                    iss.evidence["note"] = LIKELY_FP
-                else:
-                    iss.evidence["note"] = SLIVER_NOTE
-                    iss.conf = "inferred"
-                break
+        clipped = [r for r in render.get(nid, ()) if r.id == CLIPPED]
+        if iss.id == TOUCH_RULE and clipped:
+            small = _small_axes(iss.evidence)
+            if iss.sev == "info" or not small or small <= _clip_axes(clipped):
+                continue
+        if iss.id == CONTRAST_RULE and any(r.evidence.get("scroll") for r in clipped):
+            iss.evidence["note"] = SLIVER_NOTE
+            iss.conf = "inferred"
+        out.append((nid, iss))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -943,7 +984,7 @@ def analyze(ix: Index, loaded: Any, *, lint: str = "tree", density: int | None =
         if unmapped:
             diags.append(f"lint: {len(unmapped)} findings not mapped to nodes: "
                          + ", ".join(unmapped[:3]) + (" …" if len(unmapped) > 3 else ""))
-        _annotate_touch_fp(lint_pairs, render)
+        lint_pairs = _annotate_touch_fp(lint_pairs, render)
         tb_pairs, tb_diags = _tb_issues(ix, src, density)
         lint_pairs.extend(tb_pairs)
         diags.extend(tb_diags)
@@ -1213,11 +1254,48 @@ def _tb_detail(iss: Issue) -> str:
     return ""
 
 
+def _rows_of(ev: Mapping[str, Any]) -> str:
+    n, of = ev.get("rows"), ev.get("of")
+    return f"{n} of {of} rows" if of else f"{n} row(s)"
+
+
+def _heading_detail(ev: Mapping[str, Any]) -> str:
+    if ev.get("reason") != "section_title":
+        return ""
+    at = f", list item {ev['position']}" if ev.get("position") else (
+        ", a list item" if ev.get("list_item") else "")
+    return f"section title, not a heading ({ev.get('rows')} rows below{at})"
+
+
+#: A few words of evidence on the lint lines of R9's section titles and R19..R23.
+_NEW_DETAIL: dict[str, Callable[[Mapping[str, Any]], str]] = {
+    "a11y.heading.structure": _heading_detail,
+    "a11y.label.placeholder_token": lambda ev: (
+        f"reads {_quote(ev.get('token') or '', 40)} in {ev.get('rows')} row(s)"),
+    "a11y.label.shared_prefix": lambda ev: (
+        f"{_rows_of(ev)} start {_quote(ev.get('prefix') or '', 32)}, the description of "
+        f"{ev.get('child_class') or 'a child'} in each"),
+    "a11y.label.decorative_merged": lambda ev: (
+        f"{_quote(ev.get('merged') or '', 24)} merged into {_rows_of(ev)}, from "
+        f"{ev.get('child_class') or 'a child'}"
+        + (f"; {_quote(ev['twin_label'], 24)} says it" if ev.get("twin_label") else "")),
+    "a11y.toggle.label_contradicts": lambda ev: (
+        # "said": the state TalkBack speaks; none for an unchecked checkable node
+        f"{ev.get('said') or 'not checked'}, named for the action "
+        f"{_quote(ev.get('undo') or '', 24)}"),
+    "a11y.selection.uniform_unselected": lambda ev: (
+        f"{ev.get('rows')} rows say {_quote(ev.get('state') or '', 20)}, none selected"
+        + (f"; each has {_quote(ev['inner_label'], 24)}" if ev.get("inner_label") else "")),
+}
+
+
 def _detail(iss: Issue) -> str:
     ev = iss.evidence or {}
     bits = []
     if iss.id.startswith("tb."):
         bits.append(_tb_detail(iss))
+    elif iss.id in _NEW_DETAIL:
+        bits.append(_NEW_DETAIL[iss.id](ev))
     elif iss.id == TOUCH_RULE and "w_dp" in ev:
         bits.append(f"{_num(ev['w_dp'])}x{_num(ev.get('h_dp'))}dp")
     elif iss.id == CONTRAST_RULE and "ratio" in ev:
@@ -1256,7 +1334,7 @@ def _effective(ix: Index, src: _Src, *, contrast: bool, wcag: bool, density: int
     if wcag:
         res = _cached_lint(src, ix, "tree", density=density, font_scale=font_scale, wcag=True)
         pairs = [(nid, Issue(i.id, i.sev, dict(i.evidence), i.conf)) for nid, i in res.issues]
-        _annotate_touch_fp(pairs, render)
+        pairs = _annotate_touch_fp(pairs, render)
         out = [(nid, i) for nid, i in out
                if not i.id.startswith("a11y.") or i.id == CONTRAST_RULE] + pairs
         unmapped.extend(res.unmapped)
@@ -1264,7 +1342,7 @@ def _effective(ix: Index, src: _Src, *, contrast: bool, wcag: bool, density: int
         res = _cached_lint(src, ix, "contrast", density=density, font_scale=font_scale,
                            wcag=False)
         pairs = [(nid, Issue(i.id, i.sev, dict(i.evidence), i.conf)) for nid, i in res.issues]
-        _annotate_touch_fp(pairs, render)
+        pairs = _annotate_touch_fp(pairs, render)
         out = [(nid, i) for nid, i in out if i.id != CONTRAST_RULE] + pairs
         unmapped.extend(res.unmapped)
         status = "sampled" if res.status.startswith("sampled") else res.status

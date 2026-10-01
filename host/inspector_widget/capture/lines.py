@@ -208,9 +208,22 @@ def display_label(n: UNode) -> str | None:
     return None
 
 
+#: The accessibility actions that scroll: a node with an a11y facet shows ``scroll`` only
+#: when it offers one of them (G18: Now in Android's feed cards report scrollable with only
+#: CLICK; a list that fits its viewport reports scrollable with no scroll action).
+SCROLL_ACTIONS = frozenset({
+    "SCROLL_FORWARD", "SCROLL_BACKWARD", "SCROLL_UP", "SCROLL_DOWN", "SCROLL_LEFT",
+    "SCROLL_RIGHT", "PAGE_UP", "PAGE_DOWN", "PAGE_LEFT", "PAGE_RIGHT"})
+
+
 def display_flags(n: UNode) -> list[str]:
-    """``UNode.flags`` in vocabulary order (unknown words are dropped)."""
+    """``UNode.flags`` in vocabulary order (unknown words are dropped); ``scroll`` only for a
+    node that can scroll now (a scroll action, when the capture has its a11y node)."""
     have = set(n.flags)
+    if "scroll" in have:
+        a11y = n.facets.get("a11y")
+        if a11y is not None and not SCROLL_ACTIONS & set(a11y.get("actions") or ()):
+            have.discard("scroll")
     return [f for f in FLAGS if f in have]
 
 

@@ -959,7 +959,7 @@ def tool_a11y_lint(
     wcag_mode: bool = False, rules: Optional[List[str]] = None,
     include_rendering_info: bool = True,
 ) -> Dict[str, Any]:
-    """Run the host-side accessibility lint (R1..R18) over the unified a11y tree
+    """Run the host-side accessibility lint (R1..R23) over the unified a11y tree
     (Views + Compose, joined with Compose semantics detail). Returns findings with
     typed node keys plus a summary and diagnostics. Contrast samples each window."""
     _require(package, "package")
@@ -1251,7 +1251,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "handler": _h_a11y_lint,
         "description": (
             "Lint the a11y tree (Views, Compose, RecyclerView cells, AndroidView-in-Compose), "
-            "rules R1..R18: labels, touch targets, contrast (per window), roles, state, empty "
+            "rules R1..R23: labels, touch targets, contrast (per window), roles, state, empty "
             "stops, headings, grouping, text size, duplicates, forms, links, traversal. by_rule: "
             "each rule's count, message and first node_keys (for inspect_node); group_by=none "
             "lists every finding (node_key, bounds px/dp, window, message, evidence). Those "
@@ -1268,7 +1268,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
                 "wcag_mode": {"type": "boolean", "default": False,
                     "description": "WCAG 44dp targets instead of Material 48dp."},
                 "rules": {"type": "array", "items": _A11Y_RULE_ITEMS,
-                    "description": "Rule ids (a11y.label.missing, ...), R1..R18 or ATF check "
+                    "description": "Rule ids (a11y.label.missing, ...), R1..R23 or ATF check "
                                    "names; omit for all."},
                 "include_rendering_info": {"type": "boolean", "default": True,
                     "description": "Read View text sizes (R11, R18, size-aware contrast)."},

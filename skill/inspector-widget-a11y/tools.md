@@ -79,7 +79,7 @@ TalkBack tools budget themselves instead (`max_bytes` per tool, an explicit
   (`window.covered_by`) are kept apart: counted in `summary.covered {error, warn,
   info, total, windows}`, grouped in `covered_by_rule` (the shape of `by_rule`)
   when brief, listed in full in `covered_findings`.
-  `rules` runs a subset (ids, `R1`..`R18` aliases or ATF names; unknown ids are a
+  `rules` runs a subset (ids, `R1`..`R23` aliases or ATF names; unknown ids are a
   tool error); `wcag_mode` uses 44dp targets; `include_contrast=false` skips the
   pixel rule. See **rules.md**.
 - **`a11y_overlay(serial, package, scale=1.0, include_contrast=true,

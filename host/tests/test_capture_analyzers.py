@@ -107,8 +107,16 @@ def test_one_short_code_never_names_two_rules():
     assert R.short("a11y.label.redundant") == "label_redundant"
     assert R.short("a11y.text.fixed_scaling") == "text_fixed_scaling"
     assert R.short("a11y.text.too_small") == "text_too_small"
+    # R22 and R23 have groups of their own, so R7 keeps its short, documented code "state"
+    # (they were in "state" once, which renamed R7's "!state" to "!state_not_exposed")
+    assert R.short("a11y.state.not_exposed") == "state"
+    assert R.short("a11y.toggle.label_contradicts") == "toggle"
+    assert R.short("a11y.selection.uniform_unselected") == "selection"
     # the bare group still selects the whole group
-    assert R.resolve("label") == ["a11y.label.missing", "a11y.label.redundant"]
+    assert R.resolve("label") == ["a11y.label.missing", "a11y.label.redundant",
+                                  "a11y.label.placeholder_token", "a11y.label.shared_prefix",
+                                  "a11y.label.decorative_merged"]
+    assert R.resolve("state") == ["a11y.state.not_exposed"]
     assert R.resolve("label_redundant") == ["a11y.label.redundant"]
 
 
@@ -118,7 +126,9 @@ def test_resolve_accepts_ids_aliases_shorts_families_and_atf_names():
     assert R.resolve([ROLE]) == [ROLE]
     assert R.resolve("TouchTargetSize") == [TOUCH]
     assert R.resolve("clipped") == ["render.clipped"]
-    assert set(R.resolve("label")) == {"a11y.label.missing", "a11y.label.redundant"}
+    assert set(R.resolve("label")) == {"a11y.label.missing", "a11y.label.redundant",
+                                       "a11y.label.placeholder_token", "a11y.label.shared_prefix",
+                                       "a11y.label.decorative_merged"}
     assert set(R.resolve("render.")) == {r for r in R.RULES if r.startswith("render.")}
     assert R.resolve("R5,R7") == [ROLE, STATE]
     assert R.resolve(None) is None and R.resolve([]) is None
@@ -330,22 +340,24 @@ def test_launcher_lint_maps_every_finding_to_its_node():
     """The capture's lint is ``a11y_lint.run_lint`` over the stored unified a11y tree,
     so it finds what the live a11y_lint tool finds on the same dump, and every
     finding lands on its node. The launcher's rows sit in a collection, so the
-    lint no longer asks them for a role (R5); the screen has no heading (R9), and
-    the last row, clipped at the list's edge, is a small touch target."""
+    lint no longer asks them for a role (R5), and a list counts once toward a long
+    screen, so R9 does not ask the menu for headings. The last row is clipped at the
+    list's edge: the live lint measures its 9dp sliver as a small touch target, which the
+    capture does not judge on a render.clipped node (G18)."""
     from inspector_widget import a11y
 
     ix, loaded = _launcher_loaded()
     _clear(ix)
     an.analyze(ix, loaded, lint="tree", density=480, font_scale=1.0)
     assert not any(d.startswith("lint:") for d in ix.diagnostics), ix.diagnostics
-    assert _issues(ix) == {"n1": [("a11y.heading.structure", "info")],
-                           "n22": [(TOUCH, "info"), ("render.clipped", "info")]}
+    assert _issues(ix) == {"n22": [("render.clipped", "info")]}
     live = a11y_lint.run_lint(
         None, density=480, include_contrast=False,
         a11y_data=a11y.a11y_to_dict(pb.DumpA11yResponse.FromString(loaded.raw("a11y"))),
         compose_data=an._Src(loaded).compose_dict())
     assert sorted((f.rule, f.severity) for f in live.findings) == sorted(
-        (i.id, i.sev) for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y."))
+        [(i.id, i.sev) for n in ix.nodes.values() for i in n.issues
+         if i.id.startswith("a11y.")] + [(TOUCH, "info")])
 
 
 def test_view_screens_are_linted_too():
@@ -368,13 +380,14 @@ def test_view_screens_are_linted_too():
                and all(x in ix.nodes for x in i.evidence["node_ids"]) for n, i in groups)
 
 
-def test_touch_target_on_scroll_clipped_node_is_a_likely_false_positive():
+def test_touch_target_on_a_clipped_node_is_not_judged():
+    # G18: R2 measured the 9dp sliver of a 72dp row clipped at the list's edge; it was kept
+    # as a "likely false positive". A render.clipped node's visible part is not its size,
+    # so R2 is not judged there; render.clipped says what is going on.
     ix, loaded = _launcher_loaded()
     _clear(ix)
     an.analyze(ix, loaded)
-    touch = [i for i in ix.get("n22").issues if i.id == TOUCH]
-    assert touch[0].evidence["note"] == "likely false positive: clipped at scroll edge"
-    assert touch[0].evidence["w_dp"] == 426.7 and touch[0].evidence["h_dp"] == 9.0
+    assert [i.id for i in ix.get("n22").issues] == ["render.clipped"]
 
 
 def test_analyze_is_idempotent_and_keeps_foreign_issues():
@@ -402,7 +415,9 @@ def test_analyze_accepts_a_raw_capture_before_publish():
     raw = RawCapture(meta=ix.meta, compose_sem=_real_compose(),
                      a11y=a11y_pb_from_index(cb.launcher_index()).SerializeToString())
     an.analyze(ix, raw, lint="tree")
-    assert sorted(_issues(ix, "a11y.")) == ["n1", "n22"]
+    # n22: clipped, R2 not judged; n1: a list counts once toward a long screen (R9)
+    assert sorted(_issues(ix, "a11y.")) == []
+    assert "n22" in _issues(ix)
 
 
 def test_no_a11y_tree_means_no_lint_and_says_so():
@@ -726,7 +741,7 @@ def test_cursors_page_through_every_finding_once():
 def test_lint_summary_for_capture():
     ix, _ = _analyzed_launcher()
     assert an.lint_summary(ix) == {
-        "lint": "2 info: 1 heading, 1 touch_target (contrast not run)",
+        "lint": "no findings (contrast not run)",
         "issues": "1 clipped: n22"}
     ix, _ = _spec_launcher()
     assert an.lint_summary(ix)["lint"] == ("14 warn: 12 role, 1 state, 1 touch_target "
@@ -866,10 +881,32 @@ def test_contrast_on_a_scroll_clipped_sliver_is_low_confidence():
     pairs = [("n22", Issue(an.CONTRAST_RULE, "error", {"ratio": 1.25})),
              ("n22", Issue(TOUCH, "warn", {"w_dp": 426.7, "h_dp": 9.0})),
              ("n11", Issue(an.CONTRAST_RULE, "error", {"ratio": 2.0}))]
-    an._annotate_touch_fp(pairs, {"n22": [clipped]})
+    kept = an._annotate_touch_fp(pairs, {"n22": [clipped]})
+    assert [(nid, i.id) for nid, i in kept] == [("n22", an.CONTRAST_RULE),
+                                                ("n11", an.CONTRAST_RULE)]  # R2: not judged
     assert pairs[0][1].conf == "inferred" and "sliver" in pairs[0][1].evidence["note"]
-    assert pairs[1][1].evidence["note"] == an.LIKELY_FP and pairs[1][1].conf == "exact"
     assert "note" not in pairs[2][1].evidence and pairs[2][1].conf == "exact"
+
+
+def test_r2_on_an_axis_the_clip_leaves_whole_is_kept():
+    # A 30x20dp control whose width is clipped at its parent's right edge: its 20dp height
+    # is real and below the 24dp floor, so the live lint's error stands in the capture too.
+    # Only a small size the clip explains (every small axis clipped, or R2's own info) is
+    # not judged.
+    def keep(touch, edge):
+        clip = Issue(an.CLIPPED, "warn", {"clipped_by": "n2", "edge": edge, "visible_px": 60,
+                                          "declared_px": 90})
+        return [i.sev for _n, i in an._annotate_touch_fp([("n9", touch)], {"n9": [clip]})]
+
+    def r2(sev, w, h):
+        return Issue(TOUCH, sev, {"w_dp": w, "h_dp": h, "min_dp": 48})
+
+    assert keep(r2("error", 30.0, 20.0), "right") == ["error"]  # the height is not clipped
+    assert keep(r2("warn", 120.0, 40.0), "right") == ["warn"]  # nor here
+    assert keep(r2("warn", 120.0, 40.0), "bottom") == []  # the small height is the clip's
+    assert keep(r2("error", 30.0, 20.0), "bottom") == ["error"]  # the width is still small
+    assert keep(r2("info", 426.7, 9.0), "bottom") == []  # R2 already found it clipped
+    assert keep(r2("warn", 30.0, 20.0), None) == []  # no edge: either axis may be cut
 
 
 def test_rules_the_installed_lint_cannot_produce_are_flagged(monkeypatch):

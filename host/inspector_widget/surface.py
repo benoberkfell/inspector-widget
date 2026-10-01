@@ -238,7 +238,7 @@ D_NODE = ("Everything about one node (refs: up to 10): ids, bounds, tap_xy, layo
           "#rid, @tag, Type\"label\" joined by ' > ' (direct child).")
 D_IMAGE = ("PNG: a node's crop of its window's screenshot, or an overlay (marks: boxes by "
            "ref; walk: a tb_walk's steps). Returns the path.")
-D_LINT = ("Accessibility lint (R1..R18) of a capture grouped by rule, with fixes; "
+D_LINT = ("Accessibility lint (R1..R23) of a capture grouped by rule, with fixes; "
           "rules=[\"tb\"]: TalkBack navigation; [\"render.\"]: clipped, hidden, offscreen. "
           "contrast=true samples the screenshot (~4s, cached).")
 D_DIFF = ("Compare two captures of one app by ref: changed, moved, added, removed, "
@@ -440,7 +440,7 @@ def _specs() -> list[ToolSpec]:
         ToolSpec("lint", "lint", "accessibility lint of a capture, grouped", [
             _capture(),
             Param("rules", "array", items="string", cli=("--rule",), check=_rules_check,
-                  help="ids, R1..R18, codes, a11y., render. or tb"),
+                  help="ids, R1..R23, codes, a11y., render. or tb"),
             Param("severity", "string", "info", enum=("error", "warn", "info")),
             Param("within", "string"),
             Param("contrast", "boolean", False), Param("wcag", "boolean", False),

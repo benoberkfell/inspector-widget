@@ -861,3 +861,98 @@ def test_unlabelled_controls_in_list_cells_get_a_durable_sel():
     for n in ix.nodes.values():
         if n.sel != n.id:
             assert anchors.match_sel(ix, n.sel) == [n.id], n.sel
+
+
+# --------------------------------------------------------------------------- G6: names
+def _realapp_capture(name, mutate=None, package="com.google.samples.apps.nowinandroid.demo.debug"):
+    """A capture of a tests/data/realapps dump (480dpi), built offline; ``mutate(node)``
+    edits each dump node first."""
+    import gzip
+    import json
+    from pathlib import Path
+
+    import tb_capture_fixtures as F
+
+    path = Path(__file__).parent / "data" / "realapps" / f"{name}.a11y.json.gz"
+    data = json.loads(gzip.decompress(path.read_bytes()))
+
+    def walk(n):
+        yield n
+        for c in n.get("children") or []:
+            yield from walk(c)
+
+    if mutate is not None:
+        for w in data["windows"]:
+            for n in walk(w["root"]) if w.get("root") else ():
+                mutate(n)
+    raw = F.raw_from_a11y(fs.a11y_to_pb(data), cid="crealap1", package=package, dpi=480)
+    return F.build(raw), data
+
+
+def test_a_node_talkback_does_not_stop_on_is_named_not_by_its_state():
+    # G6: the capture labelled a node TalkBack does not stop on by contentDescription >
+    # text > stateDescription, so a merged row's state became its name: an agent read
+    # "Not selected" and concluded the control was unlabelled. The name is cd > text (a
+    # focusable node: its descendants' names); the state stays in ``state``.
+    def hide_row(n):  # Headlines' row, made a node the model does not stop on
+        if n.get("node_key") == "compose:8:94":
+            n["flags"] = [f for f in n["flags"] if f != "visible_to_user"]
+
+    ix, _data = _realapp_capture("nia_onboarding_grid", hide_row)
+    row = ix.get("a11y:8:94")
+    assert row.id not in ix.reading
+    assert (row.label, row.state) == ("Headlines", "Not selected")
+    assert row.facets["a11y"]["speakable"] == "Not selected"  # what it would say is kept
+    # a stop keeps the model's name: "Not selected. UI. Check box" is named "UI"
+    stop = ix.get("a11y:8:104")
+    assert stop.id in ix.reading and (stop.label, stop.state) == ("UI", "Not selected")
+
+
+def test_a_stateful_control_inside_its_row_has_no_name_of_its_own():
+    # A11yProbe V4 GOOD: the row is the stop; its Switch (a non-stop) used to be labelled
+    # "ON", its state. It has no name of its own: the row's text names it.
+    import tb_capture_fixtures as F
+
+    ix, _raw = F.live_capture("tb_v4_good")
+    sw = ix.get("view:3")
+    assert sw.id not in ix.reading and sw.type == "Switch"
+    assert sw.label is None and sw.state == "ON"
+
+
+def test_outline_reading_on_the_nia_onboarding_grid_is_column_major_like_talkback():
+    # G6 / NIA-1 regression: the topic grid (LazyHorizontalGrid, 3 rows) reads column by
+    # column before it scrolls, in TalkBack (w7y77g9, wox59ex) and in talkback.order; the
+    # capture's reading view once read it row by row.
+    from inspector_widget import talkback as tb
+    from inspector_widget.capture import query
+
+    ix, data = _realapp_capture("nia_onboarding_grid")
+    out = query.outline(ix, view="reading", max_bytes=0)
+    keys = [re.match(r"\d+\. a11y:(\d+:\d+) ", ln).group(1) for ln in out["lines"]]
+    model = list(dict.fromkeys(k.split(":", 1)[1] for k in tb.simulate(tb.build(data)).keys()))
+    assert keys == model
+    grid = [k for k in keys if k in ("8:94", "8:100", "8:104", "8:110", "8:114", "8:120",
+                                     "8:124", "8:134", "8:144")]
+    assert grid == ["8:94", "8:100", "8:104", "8:110", "8:114", "8:120",  # column 0
+                    "8:124", "8:134", "8:144"]                            # column 1
+
+
+def test_the_outline_says_scroll_only_for_a_node_that_can_scroll():
+    # G18: the outline's ``scroll`` came from AccessibilityNodeInfo.scrollable, which a
+    # Compose card reports with only CLICK (Now in Android's feed, n2839), and a list that
+    # fits reports with no scroll action. It now follows the scroll actions.
+    import tb_capture_fixtures as F
+
+    from inspector_widget.capture import lines
+
+    ix, _raw = F.fixture_capture("nia_settings")
+    fits = ix.get("sem:80:166")  # the dialog's ScrollView: everything fits, no action
+    grid = ix.get("sem:8:85")  # the topic grid: SCROLL_FORWARD, SCROLL_RIGHT
+    assert "scroll" in fits.flags and "scroll" not in lines.display_flags(fits)
+    assert "scroll" in lines.display_flags(grid)
+    # no a11y node to ask: the flag stands
+    bare = type(grid)(key="sem:1:2", kind="compose", flags=["scroll"], facets={})
+    assert lines.display_flags(bare) == ["scroll"]
+    card = type(grid)(key="sem:1:3", kind="compose", flags=["click", "scroll"],
+                      facets={"a11y": {"actions": ["CLICK"]}})
+    assert lines.display_flags(card) == ["click"]

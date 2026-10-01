@@ -288,6 +288,36 @@ def test_every_overlay_kind_renders_and_is_cached():
     assert len(names) == len(set(names)) == len(im.OVERLAY_KINDS) - 1  # "none" draws nothing
 
 
+def test_a_rendering_code_change_misses_the_cache(monkeypatch):
+    # L6: base composites were keyed by max_side and window ids only, so a rendering fix
+    # reused the stale PNGs until someone bumped IMG_VERSION by hand. Every derived name
+    # now folds in a fingerprint of the rendering code.
+    ix, loaded = _loaded()
+    first = im.overlay(loaded, ix, "marks", max_side=320)
+    crop = im.crop(loaded, "n4", pad=8)
+    n_puts = len(loaded.puts)
+    assert im.overlay(loaded, ix, "marks", max_side=320) == first  # same code: a hit
+    assert im.crop(loaded, "n4", pad=8) == crop and len(loaded.puts) == n_puts
+    monkeypatch.setattr(im, "_FINGERPRINT", "changed-code")
+    again = im.overlay(loaded, ix, "marks", max_side=320)
+    assert again["path"] != first["path"] and os.path.exists(again["path"])
+    assert im.crop(loaded, "n4", pad=8)["path"] != crop["path"]
+    new = loaded.puts[n_puts:]
+    assert any(p.startswith("img/base-") for p in new), new  # the base is redrawn too
+    assert any(p.startswith("img/ov-marks") for p in new) and any(
+        p.startswith("img/n4-p8-") for p in new)
+
+
+def test_the_code_fingerprint_hashes_the_rendering_sources(monkeypatch):
+    monkeypatch.setattr(im, "_FINGERPRINT", None)
+    fp = im.code_fingerprint()
+    assert len(fp) == 12 and im.code_fingerprint() == fp
+    monkeypatch.setattr(im, "_FINGERPRINT", None)
+    monkeypatch.setattr(im, "RENDER_MODULES", ("capture/no_such_module.py",))
+    from inspector_widget import __version__
+    assert im.code_fingerprint() == f"v{__version__}"  # no source to read: the version
+
+
 def test_overlay_cache_key_follows_the_issues():
     ix, loaded = _loaded()
     first = im.overlay(loaded, ix, "lint")

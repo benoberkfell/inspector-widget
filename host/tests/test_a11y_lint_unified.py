@@ -791,8 +791,8 @@ def test_rule_aliases_and_atf_names_resolve():
     assert L.resolve_rule_ids("R13,R14") == {"a11y.clickable.duplicate_bounds",
                                              "a11y.editable.content_description"}
     assert L.resolve_rule_ids(None) is None and L.resolve_rule_ids([]) is None
-    assert len(L.ALL_RULE_IDS) == 18
-    assert set(L.RULE_CHOICES) >= set(L.ALL_RULE_IDS) | {f"R{i}" for i in range(1, 19)}
+    assert len(L.ALL_RULE_IDS) == 23  # R19..R23: the real-app hunt's (lint-and-store)
+    assert set(L.RULE_CHOICES) >= set(L.ALL_RULE_IDS) | {f"R{i}" for i in range(1, 24)}
 
 
 def test_unknown_rule_id_raises_a_clear_error():
@@ -1045,11 +1045,21 @@ def test_r2_compose_small_layout_behind_widened_touch_bounds_warns():
     # Material IconButton / Checkbox: minimumInteractiveComponentSize reserves 48dp.
     material = comp(20, 25, flags=CLICK, cd="Add", b=(20, 900, 117, 117),
                     layout_size={"w": 117, "h": 117})
-    host = view(20, ACV, b=(0, 0, 2076, 2152), kids=[bare, material], provider_class=ACV)
+    # another target right beside it, inside its widened touch area (G18: without one the
+    # widened area is all its own, and it is info)
+    beside = comp(20, 31, flags=CLICK, cd="Beside", b=(120, 666, 117, 117),
+                  layout_size={"w": 117, "h": 117})
+    host = view(20, ACV, b=(0, 0, 2076, 2152), kids=[bare, material, beside],
+                provider_class=ACV)
     f = of(lint(screen(decor(1, host)), density=390), "a11y.touch_target.small")
     assert [(x.node_key, x.severity) for x in f] == [("compose:20:29", "warn")]
     assert f[0].evidence["w_dp"] == 32.0 and f[0].evidence["touch_w_dp"] == 48.0
+    assert f[0].evidence["touch_rivals"] == ["compose:20:31"]
     assert "minimumInteractiveComponentSize" in f[0].message
+    alone = view(20, ACV, b=(0, 0, 2076, 2152), kids=[bare, material], provider_class=ACV)
+    f = of(lint(screen(decor(1, alone)), density=390), "a11y.touch_target.small")
+    assert [(x.node_key, x.severity) for x in f] == [("compose:20:29", "info")]
+    assert f[0].evidence["touch_area_clear"] is True
     # a View's layout_size (LayoutParams) never overrides its real touch bounds
     v = view(30, "android.widget.ImageButton", flags=CLICK, cd="Info", b=(20, 1200, 117, 117),
              layout_size={"w": 59, "h": 59})

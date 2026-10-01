@@ -200,3 +200,26 @@ def _argv(args: dict) -> list[str]:
         else:
             out += [f"--{k.replace('_', '-')}", ",".join(v) if isinstance(v, list) else str(v)]
     return out
+
+
+def test_a_label_with_upper_case_is_stored_lowercase_and_says_so(tmp_path):
+    # G27: labels are lowercase; "afterCompose" used to be rejected (bad_args). Both surfaces
+    # store it lowercased, say so in a note, and resolve either spelling.
+    with ch.harness("viewscreen", str(tmp_path), toolset="capture"):
+        cap = mcp("capture", serial=ch.SERIAL, package=ch.PACKAGE, label="afterCompose")
+        assert cap["label"] == "aftercompose"
+        assert "label 'afterCompose' stored as 'aftercompose' (labels are lowercase)" \
+            in cap["note"]
+        for spec in ("aftercompose", "afterCompose", "@AfterCompose"):
+            assert mcp("captures", action="show", id=spec)["capture"] == cap["capture"]
+        rc, printed, err = run_cli("capture", "--label", "BeforeTap", "--json")
+        assert rc == 0, err
+        doc = json.loads(printed)
+        assert doc["label"] == "beforetap" and "stored as 'beforetap'" in doc["note"]
+        moved = mcp("captures", action="label", id=cap["capture"], label="Final")
+        assert moved["label"] == "final" and moved["note"] == \
+            "label 'Final' stored as 'final' (labels are lowercase)"
+        same = mcp("captures", action="label", id=cap["capture"], label="final")
+        assert "note" not in same
+        text, is_error = mcp_server._call_tool_text("capture", {"label": "Bad Label"})
+        assert is_error and "upper case is lowercased" in text

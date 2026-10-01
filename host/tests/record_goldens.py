@@ -113,6 +113,17 @@ LEGACY_DELTAS: dict[tuple[str, str], str] = {
     ("cli", "a11y_lint"): _LINT_ACCURACY,
 }
 
+# --- lint-and-store (the real-app hunt round): its own block. --------------------------- #
+_HUNT_LINT = (_LINT_ACCURACY + "; then the real-app hunt's lint rules (lint-and-store): "
+              "R19..R23 (placeholder tokens, shared prefixes, merged decorative descriptions, "
+              "contradicting toggle labels, uniform unselected rows) join the catalog, R22 "
+              "and R23 in groups of their own (a11y.toggle.*, a11y.selection.*), so "
+              "stats.rules lists 23 rules; no finding changes on these scenes")
+LEGACY_DELTAS.update({
+    ("mcp", "a11y_lint"): _HUNT_LINT,
+    ("cli", "a11y_lint"): _HUNT_LINT,
+})
+
 
 # --------------------------------------------------------------------------- #
 # What runs

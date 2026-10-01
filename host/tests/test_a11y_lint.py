@@ -284,3 +284,263 @@ def test_asking_the_a11y_lint_for_tb_rules_says_where_they_are():
     with _pytest.raises(L.UnknownRuleError) as err:
         L.resolve_rule_ids(["R99"])
     assert "tb_walk" not in str(err.value)
+
+
+# --------------------------------------------------------------------------- #
+# R19..R23 and R9's section titles -- the real-app hunt's static defects, on the unified
+# a11y tree (tests/test_realapp_hunt_lint.py runs them on the recorded real screens).
+# --------------------------------------------------------------------------- #
+from test_a11y_lint_unified import CLICK, comp, decor, of, screen, view  # noqa: E402
+from test_a11y_lint_unified import lint as ulint  # noqa: E402
+
+RV = "androidx.recyclerview.widget.RecyclerView"
+
+
+def _list(rows, *, hv=20, row_count=None, b=(0, 200, 1080, 2000)):
+    info = {"row_count": row_count if row_count is not None else len(rows), "column_count": 1}
+    return view(hv, RV, flags=("scrollable",), b=b, kids=rows, collection_info=info)
+
+
+def _row(i, *kids, h=150, y0=200, **kw):
+    return view(100 + i, "android.widget.FrameLayout", flags=CLICK + ("long_clickable",),
+                b=(0, y0 + h * i, 1080, h), kids=kids,
+                collection_item_info={"row_index": i, "column_index": 0}, **kw)
+
+
+def _icon(hv, cd=None, *, b=(24, 0, 120, 120)):
+    return view(hv, "android.widget.ImageView", cd=cd, b=b)
+
+
+def _text(hv, text, *, b=(150, 0, 800, 100)):
+    return view(hv, "android.widget.TextView", text=text, b=b)
+
+
+def test_r19_placeholder_tokens_are_flagged_once_per_token_with_their_rows():
+    rows = [_row(0, _text(300, "Photo. [attachment_icon] sent")),
+            _row(1, _text(301, "[attachment_icon] Report.pdf")),
+            _row(2, _text(302, "%s unread"), _icon(400, "ic_star_border", b=(900, 500, 72, 72))),
+            # not placeholders: a bracketed word, an e-mail, a user name, a percentage
+            _row(3, _text(303, "[Draft] Re: first_last@example.com, john_doe, 50% sold"))]
+    f = of(ulint(screen(decor(1, _list(rows)))), "a11y.label.placeholder_token")
+    got = {x.evidence["token"]: (x.severity, x.evidence["rows"], x.node_key) for x in f}
+    assert got == {"[attachment_icon]": ("warn", 2, "view:100"),
+                   "%s": ("warn", 1, "view:102"),
+                   "ic_star_border": ("warn", 1, "view:102")}
+    assert f[0].alias == "R19" and "TalkBack reads" in f[0].message
+
+
+def test_r19_brackets_in_what_users_write_are_not_placeholders():
+    # An inbox's subjects: a site's mail prefix, a version, a brand, a file name. Only a
+    # snake_case identifier in brackets is Compose inline content's placeholder.
+    subjects = ["[example.com] Password reset", "Release [v1.2] notes", "[iPhone] trade-in offer",
+                "Fwd: [README.md] review", "[conversationCounter] 3", "Lunch?"]
+    rows = [_row(i, _text(300 + i, t)) for i, t in enumerate(subjects)]
+    assert of(ulint(screen(decor(1, _list(rows)))), "a11y.label.placeholder_token") == []
+    rows.append(_row(6, _text(306, "[conversation_counter] Re: Thread")))
+    f = of(ulint(screen(decor(1, _list(rows)))), "a11y.label.placeholder_token")
+    assert [(x.evidence["token"], x.node_key) for x in f] == [
+        ("[conversation_counter]", "view:106")]
+
+
+def test_r19_judges_what_talkback_reads_not_every_field():
+    # TB-7 after R19's View fix: the row's contentDescription replaces its text and its
+    # children's (getNodeTextDescription reads the description first; a description
+    # silences a View's children), so the token is no longer read.
+    token = "Inline image attachment, 2/14/2023, data@example.com, [attachment_icon]"
+    view_rows = [_row(i, _text(300 + i, token), cd=f"Inline image attachment {i}")
+                 for i in range(3)]
+    assert of(ulint(screen(decor(1, _list(view_rows)))), "a11y.label.placeholder_token") == []
+    merged = comp(9, 100, flags=CLICK, cd="Inline image attachment, has an attachment",
+                  text=token, b=(0, 300, 1080, 240))
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 0, 1080, 2400),
+                kids=[merged])
+    assert of(ulint(screen(decor(1, host))), "a11y.label.placeholder_token") == []
+    # Compose (ui 1.7+) carries a merging row's contentDescription on a synthetic child, and
+    # TalkBack still reads the row's children after it: Modifier.semantics { contentDescription }
+    # does not clear the token there; clearAndSetSemantics does.
+    fake = comp(9, 100 + 2_000_000_000, cd="Inline image attachment", b=(0, 300, 1080, 240))
+    kid = comp(9, 101, "android.widget.TextView", text="[attachment_icon] ",
+               b=(150, 330, 300, 60))
+    row17 = comp(9, 100, flags=CLICK, b=(0, 300, 1080, 240), kids=[fake, kid])
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 0, 1080, 2400),
+                kids=[row17])
+    f = of(ulint(screen(decor(1, host))), "a11y.label.placeholder_token")
+    assert [(x.node_key, x.evidence["carrier"], x.evidence["field"]) for x in f] == [
+        ("compose:9:100", "compose:9:101", "text")]
+    assert "clearAndSetSemantics" in f[0].message
+
+
+def test_r20_a_childs_description_read_first_in_most_rows():
+    # Thunderbird's settings (TB-11): a decorative icon labelled "Account settings" starts
+    # every row; the section titles in between are plain text rows.
+    rows = [_row(0, _icon(200 + i, "Account settings"), _text(300 + i, f"Item {i}"))
+            for i in range(4)]
+    title = view(150, "android.widget.TextView", text="Backup", flags=CLICK, b=(0, 900, 1080, 80),
+                 collection_item_info={"row_index": 4, "column_index": 0})
+    rep = ulint(screen(decor(1, _list(rows + [title]))))
+    f = of(rep, "a11y.label.shared_prefix")
+    assert [(x.severity, x.node_key) for x in f] == [("warn", "view:100")]
+    ev = f[0].evidence
+    assert (ev["prefix"], ev["child"], ev["child_class"], ev["rows"], ev["of"]) == (
+        "Account settings", "view:200", "ImageView", 4, 5)
+    assert f[0].message.startswith('Every row with an ImageView starts "Account settings"')
+    assert of(rep, "a11y.label.decorative_merged") == []  # read first: R20's, not R21's
+    # an icon without a description, or the same visible text first, is no finding
+    plain = [_row(i, _icon(200 + i), _text(300 + i, f"Item {i}")) for i in range(4)]
+    texts = [_row(i, _text(200 + i, "Inbox", b=(24, 0, 100, 60)), _text(300 + i, f"Item {i}"))
+             for i in range(4)]
+    for good in (plain, texts):
+        assert of(ulint(screen(decor(1, _list(good)))), "a11y.label.shared_prefix") == []
+
+
+def test_r20_an_icon_that_tells_the_rows_apart_is_not_a_shared_prefix():
+    # A file list: the leading icon says what each entry is, "Folder" on 4 of 6 rows and
+    # "PDF document" on the other 2. It is content, not a decorative prefix.
+    kinds = ["Folder", "Folder", "Folder", "Folder", "PDF document", "PDF document"]
+    rows = [_row(i, _icon(200 + i, k, b=(24, 200 + 150 * i, 96, 96)),
+                 _text(300 + i, f"Entry {i}", b=(150, 200 + 150 * i, 800, 100)))
+            for i, k in enumerate(kinds)]
+    assert of(ulint(screen(decor(1, _list(rows)))), "a11y.label.shared_prefix") == []
+    # a different *kind* of child (another resource id) leading the other rows does not
+    # make the icon informative: a folder list with two "Shared" badges is still flagged
+    def badge(i):
+        return view(200 + i, "android.widget.ImageView", cd="Shared", b=(24, 200 + 150 * i, 96, 96),
+                    view_id_resource_name="app:id/badge")
+    mixed = rows[:4] + [_row(4 + j, badge(4 + j), _text(304 + j, f"Entry {4 + j}"))
+                        for j in range(2)]
+    f = of(ulint(screen(decor(1, _list(mixed)))), "a11y.label.shared_prefix")
+    assert [(x.evidence["prefix"], x.evidence["rows"], x.evidence["of"]) for x in f] == [
+        ("Folder", 4, 6)]
+
+
+def test_r21_a_decorative_description_merged_into_every_row():
+    # Thunderbird's View rows (TB-12): each ends "Star", while the row's own star button says
+    # "Add star".
+    def row(i, cd="Star", twin=True):
+        kids = [_text(300 + i, f"Message {i}"), _icon(400 + i, cd, b=(900, 200 + 150 * i, 72, 72))]
+        if twin:
+            kids.append(view(500 + i, "android.view.View", cd="Add star", flags=CLICK,
+                             b=(960, 200 + 150 * i, 120, 150)))
+        return _row(i, *kids)
+
+    f = of(ulint(screen(decor(1, _list([row(i) for i in range(4)])))),
+           "a11y.label.decorative_merged")
+    assert [(x.severity, x.node_key) for x in f] == [("info", "view:100")]
+    assert (f[0].evidence["merged"], f[0].evidence["rows"], f[0].evidence["twin"]) == (
+        "Star", 4, "view:500")
+    # a description that changes with the row is content; one with no control repeating it
+    # and no picture word may be content too ("Verified")
+    varied = [row(i, cd="Starred" if i % 2 else "Not starred") for i in range(4)]
+    alone = [row(i, cd="Verified", twin=False) for i in range(4)]
+    picture = [row(i, cd="Chevron icon", twin=False) for i in range(4)]
+    assert of(ulint(screen(decor(1, _list(varied)))), "a11y.label.decorative_merged") == []
+    assert of(ulint(screen(decor(1, _list(alone)))), "a11y.label.decorative_merged") == []
+    assert len(of(ulint(screen(decor(1, _list(picture)))), "a11y.label.decorative_merged")) == 1
+
+
+def test_r22_a_toggle_label_naming_the_action_contradicts_its_state():
+    def toggle(hv, label, *flags):
+        return comp(9, hv, "android.view.View", flags=CLICK + ("checkable",) + flags,
+                    b=(100, 100 * hv, 144, 144),
+                    kids=[comp(9, hv + 1000, cd=label, b=(130, 100 * hv + 30, 72, 72))])
+
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 0, 1080, 2400),
+                kids=[toggle(1, "Unbookmark", "checked"), toggle(3, "Bookmark", "checked"),
+                      toggle(5, "Unfollow interest"), toggle(7, "Bookmark"),
+                      comp(9, 9, "android.widget.Button", cd="Unfollow", flags=CLICK,
+                           b=(100, 900, 144, 144))])
+    f = of(ulint(screen(decor(1, host))), "a11y.toggle.label_contradicts")
+    # what TalkBack says, by its model: "checked" when checked, no state at all when not
+    # (TreeNodesDescription adds "not checked" only in a selection-mode collection)
+    assert [(x.node_key, x.evidence["said"], x.evidence["checked"], x.severity) for x in f] == [
+        ("compose:9:1", "checked", True, "warn"), ("compose:9:5", "", False, "warn")]
+    assert 'TalkBack says "checked. Unbookmark"' in f[0].message
+    assert 'TalkBack says "Unfollow interest"' in f[1].message
+    assert "a double-tap does the opposite" in f[1].message
+
+
+def test_r22_a_feature_named_switch_or_a_worded_state_is_no_contradiction():
+    # Settings switches that name a feature (a preposition after the verb, or more than two
+    # words of object), and a toggle whose stateDescription says the state in words.
+    def switch(hv, text, on, state):
+        return view(hv, "android.widget.Switch", text=text, state=state,
+                    flags=CLICK + ("checkable",) + (("checked",) if on else ()),
+                    b=(0, 160 * hv, 1080, 150))
+
+    sws = [switch(1, "Unlock with fingerprint", True, "On"),
+           switch(2, "Unmute on headset connect", False, "Off"),
+           switch(3, "Unlock the screen automatically after a call", True, "On"),
+           switch(4, "Unlocked", True, "On")]
+    worded = comp(9, 7, "android.view.View", cd="Unbookmark", state="Bookmarked",
+                  flags=CLICK + ("checkable", "checked"), b=(100, 1200, 144, 144))
+    host = view(9, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 1100, 1080, 400),
+                kids=[worded])
+    root = view(2, "android.widget.LinearLayout", b=(0, 0, 1080, 2400), kids=sws + [host])
+    assert of(ulint(screen(decor(1, root))), "a11y.toggle.label_contradicts") == []
+    # the switch's own state words are quoted as TalkBack says them: "On", not "checked"
+    mute = switch(5, "Unmute", True, "On")
+    f = of(ulint(screen(decor(1, view(2, "android.widget.LinearLayout", b=(0, 0, 1080, 2400),
+                                      kids=[mute])))), "a11y.toggle.label_contradicts")
+    assert [(x.evidence["said"], x.evidence["undo"]) for x in f] == [("On", "Unmute")]
+    assert 'TalkBack says "On. Unmute. Switch"' in f[0].message
+
+
+def test_r23_every_row_says_not_selected_and_none_is():
+    # Now in Android's Interests (NIA-9): each row opens its topic and holds its own follow
+    # toggle, yet every row says "Not selected".
+    def row(i, state="Not selected", flags=(), inner="Follow interest"):
+        toggle = comp(8, 500 + i, flags=CLICK + ("checkable",), b=(900, 300 + 200 * i, 144, 144),
+                      kids=[comp(8, 600 + i, cd=inner, b=(930, 330 + 200 * i, 72, 72))])
+        return comp(8, 100 + i, flags=CLICK + ("checkable",) + tuple(flags), state=state,
+                    b=(0, 300 + 200 * i, 1080, 200),
+                    kids=[comp(8, 200 + i, "android.widget.TextView", text=f"Topic {i}",
+                               b=(150, 330 + 200 * i, 500, 60)), toggle])
+
+    def lazy(rows):
+        return view(8, "androidx.compose.ui.platform.AndroidComposeView", b=(0, 0, 1080, 2400),
+                    kids=[comp(8, 1, flags=("scrollable",), b=(0, 300, 1080, 2000), kids=rows,
+                               collection_info={"row_count": 20, "column_count": 1})])
+
+    f = of(ulint(screen(decor(1, lazy([row(i) for i in range(6)])))),
+           "a11y.selection.uniform_unselected")
+    assert [(x.severity, x.node_key) for x in f] == [("info", "compose:8:100")]
+    assert (f[0].evidence["rows"], f[0].evidence["row_count"],
+            f[0].evidence["inner_label"]) == (6, 20, "Follow interest")
+    assert "never changes" not in f[0].message  # one capture cannot show that
+    assert 'say "Not selected" and none of them is selected' in f[0].message
+    one_on = [row(i, *(("Selected", ("checked",)) if i == 2 else ())) for i in range(6)]
+    same_name = [row(i, inner=f"Topic {i}") for i in range(6)]  # the row toggles: onboarding
+    few = [row(i) for i in range(4)]
+    # a to-do list: roleless toggleable rows, none done yet, each with its own Delete. With
+    # no stateDescription TalkBack says "checked" or nothing, never "Not selected".
+    todo = [row(i, state=None, inner="Delete") for i in range(6)]
+    for good in (one_on, same_name, few, todo):
+        assert of(ulint(screen(decor(1, lazy(good)))), "a11y.selection.uniform_unselected") == []
+
+
+def test_r9_section_titles_between_groups_of_rows_are_not_headings():
+    def title(hv, text, y, heading=False):
+        return view(hv, "android.widget.TextView", text=text, b=(0, y, 1080, 80),
+                    flags=("heading",) if heading else ())
+
+    def rows(base, y):
+        return [view(base + i, "android.widget.LinearLayout", flags=CLICK,
+                     b=(0, y + 150 * i, 1080, 150),
+                     kids=[_text(base + 50 + i, f"Setting {base + i}",
+                                 b=(48, y + 150 * i + 30, 600, 60))]) for i in range(2)]
+
+    def page(*, heading=False, sections=2):
+        kids, y = [], 200
+        for k in range(sections):
+            kids.append(title(10 + k, f"Section {k}", y, heading))
+            kids.extend(rows(100 + 10 * k, y + 80))
+            y += 80 + 300
+        return screen(decor(1, view(2, "android.widget.LinearLayout", b=(0, 0, 1080, 2400),
+                                    kids=kids)))
+
+    f = [x for x in of(ulint(page()), "a11y.heading.structure")
+         if x.evidence.get("reason") == "section_title"]
+    assert [(x.node_key, x.severity, x.evidence["rows"]) for x in f] == [
+        ("view:10", "info", 2), ("view:11", "info", 2)]
+    assert of(ulint(page(heading=True)), "a11y.heading.structure") == []
+    assert of(ulint(page(sections=1)), "a11y.heading.structure") == []  # one caption: no

@@ -115,7 +115,7 @@ Run two tools:
   windows. Every node has a `node_key` you can pass to `inspect_node`, and the
   dump has a `generation` that changes when Compose re-mints its ids. Read this
   to understand what gets announced and in what order.
-- **`a11y_lint(serial, package)`** — the rule engine (R1..R18). It lints the
+- **`a11y_lint(serial, package)`** — the rule engine (R1..R23). It lints the
   same unified tree as `dump_accessibility`, so classic View screens, Compose,
   RecyclerView cells, AndroidView-in-Compose and dialogs are all covered in one
   call. **By default it answers grouped by rule** (brief):

@@ -1,6 +1,6 @@
 # Inspector Widget — a11y lint rule reference
 
-The `a11y_lint` MCP tool (and the `a11y-lint` CLI subcommand) run rules R1..R18
+The `a11y_lint` MCP tool (and the `a11y-lint` CLI subcommand) run rules R1..R23
 over the app's **unified accessibility tree**: every node TalkBack sees, classic
 Views and Compose alike, in one pass. RecyclerView cells that are ComposeViews,
 AndroidViews inside Compose, Fragments, dialogs and popups (each window is
@@ -106,10 +106,14 @@ description on another; both are folded into the node.
   alone cannot tell a stock M3 control from a `Modifier.size(24.dp).clickable`. The
   agent also reports each Compose node's layout size (its LayoutNode, `layout_size`
   in the a11y dump). Stock M3 Checkbox/IconButton/Switch reserve 48dp there
-  (`minimumInteractiveComponentSize`) and pass; a clickable laid out smaller is a
-  `warn` with `bounds_source` "Compose layout size" and `touch_w_dp`/`touch_h_dp`
-  in the evidence: the extra touch area is not reserved, so a neighbour or a clip
-  can take it and the visible control stays small.
+  (`minimumInteractiveComponentSize`) and pass. A clickable laid out smaller is
+  reported with `bounds_source` "Compose layout size" and `touch_w_dp`/`touch_h_dp`
+  in the evidence. It is a `warn` when another clickable (not its own row or
+  child) lies inside its widened touch area (`touch_rivals`): the extra area is not
+  reserved, so the neighbour can take a touch meant for it. With nothing there
+  (`touch_area_clear`) every touch in the area reaches it, so it works as a 48dp
+  target and the finding is `info` (Thunderbird's message-row stars, laid out
+  48x24dp).
 - **Clipping (on evidence only):** a dimension is clipped where the node touches
   an edge of a scroll container that can still scroll past that edge (its scroll
   actions say so; a container with none counts for every edge; a pager's page at
@@ -128,8 +132,15 @@ description on another; both are folded into the node.
   reflected in accessibility bounds, so this rule still reports it. Web content
   (a WebView's page): CSS `min-width`/`min-height` or padding on the link/button.
   Every rule gives web content HTML/CSS advice, never Compose's.
+- **Capture lint:** `lint()` over a capture does not judge R2 where `render.clipped`
+  explains the small size (its visible part is not its size: a 9dp sliver of a row at
+  a scroll edge, a toggle half under a bar): R2's own `info` (every small axis
+  clipped), or a small axis that the clip's edge cuts; the `render.clipped` issue says
+  so. A `warn`/`error` on an axis the clip leaves whole (a 20dp-tall control whose
+  width is clipped) stays, as in the live `a11y_lint`.
 - **Evidence:** `w_dp`, `h_dp`, `min_dp`, `floor_dp`, `standard`, `clipped_axes`,
-  `bounds_source` (and `touch_w_dp`/`touch_h_dp` for the Compose layout case).
+  `bounds_source` (and `touch_w_dp`/`touch_h_dp` plus `touch_rivals` or
+  `touch_area_clear` for the Compose layout case).
 
 ### R3 `a11y.contrast.low` — text contrast below WCAG 1.4.3  (ATF TextContrast; the one pixel rule)
 - **Flags:** a visible, enabled, non-password node with its own text whose
@@ -273,20 +284,53 @@ description on another; both are folded into the node.
 - **Severity:** `warn`.
 - **Fix:** at least 12sp (14–16sp for body text).
 
+### R22 `a11y.toggle.label_contradicts` — a toggle's label names the action
+- **Flags:** a checkable control (or a Checkbox/Switch) whose whole name is an undo
+  action: "Un…" on bookmark, follow, favorite, like, star, pin, mute, subscribe, save
+  and the like, or "Remove (from) bookmarks/favorites/star", with at most two words of
+  object after it and no preposition ("Unfollow interest" is one; "Unlock with
+  fingerprint" and "Unmute on headset connect" name a feature and are not). Checked,
+  TalkBack says "checked. Unbookmark. Check box", which reads as the opposite of what is
+  on; not checked, it says only "Unbookmark" and a double-tap does the opposite; either
+  way the label flips with the state (Now in Android's bookmark and follow toggles,
+  NIA-10). The message quotes what TalkBack says, by its model: the stateDescription
+  ("On. Unmute. Switch"), else "checked", and no state for an unchecked node. A
+  stateDescription that names the state in words ("Bookmarked. Unbookmark") is no
+  contradiction and is not flagged.
+- **Severity:** `warn`.
+- **Fix:** one stable label that names the item ("Bookmark <title>") on the toggleable,
+  so the checked state says on or off; or a plain button (not checkable) whose label
+  names the action.
+- **Evidence:** `said` (the state TalkBack speaks: "checked", "On", or "" when it says
+  none), `checked`, `undo` (the action word), `role`.
+
 ---
 
 ## Cross-node / structural rules
 
-### R9 `a11y.heading.structure` — headings missing / empty / duplicated
+### R9 `a11y.heading.structure` — section titles, headings missing / empty / duplicated
 - **Flags (per window):**
+  - A section title that is not a heading (`reason: section_title`): a short,
+    text-only stop (1-5 words, no sentence ending, no icon) not marked heading,
+    followed in the reading order by two or more stacked, wide controls (actionable
+    or checkable rows) taller than it, in a window with two or more such titles
+    (sections, not one caption over a list). → `warn` when the title is itself a list
+    item (it is counted in the positions TalkBack reads: Thunderbird's settings,
+    "Accounts. 2 of 11", TB-11), else `info` (Now in Android's Settings dialog:
+    "Theme", "Use Dynamic Color", "Dark mode preference"). Evidence: `rows` (below
+    it), `list_item`, `position`.
   - A long screen with no heading. → `info`. "Long" means more than 12 text
     stops, or at least 8 with a scrollable container that can scroll. Text stops
-    are the reading order's, so the texts inside a (focusable) ScrollView or
-    RecyclerView count.
+    are the reading order's, counted by what they read: a merged Compose row or a
+    View row whose text is in its children counts. A list of three or more items
+    counts once (a long inbox or feed is a long list, not a long page); a small
+    group (a RadioGroup) counts item by item. Not reported when the window has
+    section titles: those findings say where the headings go.
   - A heading with no label. → `warn`.
   - Duplicate adjacent headings. → `info`.
 - **Fix:** Compose `Modifier.semantics { heading() }`; View
-  `android:accessibilityHeading="true"`.
+  `android:accessibilityHeading="true"` (`ViewCompat.setAccessibilityHeading`); a
+  header item in a RecyclerView should not be clickable.
 
 ### R10 `a11y.grouping.missing` — related text read as separate stops
 - **Flags:** a non-focusable container with short, one- or two-line text leaves
@@ -322,6 +366,67 @@ description on another; both are folded into the node.
     reading order becomes undefined.
   - A link to a node that is not in the tree. → `info`.
 - **Fix:** remove one constraint in the cycle; point links at nodes that exist.
+
+### R19 `a11y.label.placeholder_token` — a placeholder read aloud
+- **Flags:** what a stop reads, as TalkBack reads it (its model's announcement: a
+  View's contentDescription silences its text and its children, while a Compose
+  merging row's description rides on a synthetic child and its children are still
+  read), holding a placeholder: a bracketed snake_case identifier
+  (`[attachment_icon]`; Compose inline content's `alternateText`, Thunderbird's
+  message rows, TB-7), a resource reference (`@string/x`, `R.string.x`), an unfilled
+  format argument (`%s`, `%1$d`), a template placeholder (`{{name}}`, `${name}`), or a
+  whole contentDescription that is a resource name (`ic_star_border`,
+  `send_button`). Brackets in what users write are not one: a word (`[Draft]`), a
+  dotted name or version (`[example.com]`, `[v1.2]`, `[README.md]`), a brand
+  (`[iPhone]`); nor is an e-mail address or a user name.
+- **Severity:** `warn`, one finding per token per window, on the first stop that reads
+  it, with `rows` (how many rows or stops read it).
+- **Fix:** give inline content a localized `alternateText`
+  (`appendInlineContent(id, alternateText = stringResource(...))`), clear decorative
+  inline content from semantics, or replace the row's semantics
+  (`Modifier.clearAndSetSemantics { contentDescription = "..." }`; a View row:
+  `android:contentDescription`); resolve string resources and format arguments before
+  they are set.
+
+### R20 `a11y.label.shared_prefix` — the same child description first in most rows
+- **Flags:** a list (three or more items) in which 60% or more of the rows start with
+  the same contentDescription of a child that shows no text (an icon): TalkBack reads
+  it first on every swipe, before what tells the rows apart (Thunderbird's settings:
+  every row with the icon starts "Account settings", TB-11). A shared leading *text*
+  is visible content and is not flagged, nor is an icon that tells the rows apart:
+  when another row leads with a different description from the same kind of child
+  (same class and resource id), "Folder" on four rows and "PDF document" on two.
+- **Severity:** `warn`, one finding per list, on its first such row.
+- **Fix:** mark the icon decorative: View `android:importantForAccessibility="no"` or
+  `contentDescription="@null"`; Compose `contentDescription = null`.
+- **Evidence:** `prefix`, `child` and `child_class` (the icon), `rows`, `of`.
+
+### R21 `a11y.label.decorative_merged` — a decorative description in every row
+- **Flags:** the same contentDescription of a text-less child merged into 60% or more
+  of a list's rows (three or more), not first (that is R20), and decorative: another
+  control of the row already says it (Thunderbird's View rows end "Star" while each
+  row's own star button says "Add star", TB-12), or it only names a picture (it ends
+  in icon, image, arrow, chevron, ...). A description that changes from row to row is
+  content.
+- **Severity:** `info`.
+- **Fix:** `importantForAccessibility="no"` (Compose `contentDescription = null`) on the
+  decorative child; the state belongs on the control that changes it.
+- **Evidence:** `merged`, `child`, `rows`, `of`, `twin_label` (what the row's own
+  control says).
+
+### R23 `a11y.selection.uniform_unselected` — every item says "Not selected"
+- **Flags:** a list of five or more items in which every item says a selection
+  state (a stateDescription "Not selected" / "Selected": Compose `selected` on a
+  non-Tab) and none on screen is selected, while each item holds a control of its own
+  named apart from the row, so the row's activation is something else (Now in
+  Android's Interests: every row says "Not selected", NIA-9). An onboarding grid whose
+  rows toggle the same thing as their own checkbox is not flagged, nor is a list of
+  roleless checkable rows with no stateDescription (an unchecked to-do list): TalkBack
+  reads those "checked" or nothing, never "Not selected".
+- **Severity:** `info`, one finding per list.
+- **Fix:** set `selected` only where a selection is shown (`if (highlight) selected =
+  isSelected`); View: `setSelected(true)` on the current item only.
+- **Evidence:** `state`, `rows` (on screen), `row_count`, `inner_label`.
 
 ---
 

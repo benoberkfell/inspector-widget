@@ -397,6 +397,7 @@ def test_labels_are_unique_per_lineage(tmp_path):
     assert store.load(a).meta.label == "base" and store.load(o).meta.label == "base"
     assert store.resolve("base", (SERIAL, APP)) == a
     assert store.resolve("@base", (SERIAL, OTHER)) == o
+    assert store.resolve("@Base", (SERIAL, OTHER)) == o  # labels are lowercase (G27)
     with pytest.raises(OpError) as e:
         store.resolve("base")
     assert e.value.code == "ambiguous"
@@ -840,6 +841,28 @@ def test_publish_merges_tombstones(tmp_path, monkeypatch):
     assert list(store.lineage_state(SERIAL, APP).tomb) == ["n93", "n94", "n95"]
     with pytest.raises(ValueError):
         store.save_lineage_state(S.LineageState())
+
+
+def test_only_the_latest_captures_tombstones_keep_their_identity(tmp_path, monkeypatch):
+    # L8: a recall reads the fifth item of the tombstones retired in the last
+    # refs.TOMB_RECENT captures; older tombstones keep only [type, label, sel, last].
+    monkeypatch.setattr(S, "TOMB_RECENT", 2)
+    clock = Clock()
+    store = make_store(tmp_path, clock)
+    ids = []
+    for i in range(4):
+        clock.advance(1)
+        with store.refs_lock():
+            raw, ix, refmap = payload(tag=f"t{i}", first_ref=store.next_refs(3))
+            last = ids[-1] if ids else "c00000"
+            ids.append(store.publish(raw, ix, refmap, tomb={
+                f"n{90 + i}": ["A", "a", "#a", last, {"key": f"view:{90 + i}"}]}))
+    st = store.lineage_state(SERIAL, APP)
+    assert st.history[:2] == ids[::-1][:2]
+    kept = {ref: len(e) for ref, e in st.tomb.items()}
+    # n<90+i> was last seen in the capture before ids[i]: only n93 (last seen in ids[2],
+    # one of the 2 latest) keeps its identity
+    assert kept == {"n90": 4, "n91": 4, "n92": 4, "n93": 5}
 
 
 # --------------------------------------------------------------------------- memory

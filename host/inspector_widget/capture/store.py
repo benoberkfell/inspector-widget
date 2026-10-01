@@ -94,6 +94,8 @@ from .model import (
     skp_file,
 )
 
+from .refs import TOMB_RECENT, slim_tomb
+
 try:  # POSIX
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -976,7 +978,9 @@ class CaptureStore:
         ``prev`` is the next older capture, and its tombstones are dropped because
         they name refs the newer latest holds), applies ``meta.label`` (moving the
         label from another capture of the lineage), merges ``tomb`` updates (refs
-        present in ``refmap`` leave the tomb) and sets the default session.
+        present in ``refmap`` leave the tomb; only the tombstones retired in the latest
+        ``refs.TOMB_RECENT`` captures keep the identity a recall reads) and sets the
+        default session.
         ``meta.pinned`` pins it (bad_args when 20 are pinned already).
         """
         meta = raw.meta
@@ -1026,6 +1030,8 @@ class CaptureStore:
                     st.tomb[ref] = list(info)
             for ref in refmap.values():
                 st.tomb.pop(ref, None)
+            # only the tombstones of the latest captures keep what a recall matches on
+            st.tomb = slim_tomb(st.tomb, st.history[:TOMB_RECENT])
             self._write_lineage((serial, package), st)
             self.set_default_session(serial, package)
             if self.gc_on_publish:
@@ -1169,7 +1175,7 @@ class CaptureStore:
                 lineage: tuple[str, str] | None = None) -> str:
         """The single resolver for the ``capture`` argument on both surfaces.
 
-        Accepts an id (case-insensitive), ``label`` or ``@label``, ``latest``,
+        Accepts an id (case-insensitive), ``label`` or ``@label`` (case-insensitive), ``latest``,
         ``prev`` and ``latest~N``. ``latest``/``prev``/``latest~N`` count within
         ``lineage`` (the resolved session) when given, else across the whole store
         by ``created_at``. A label resolves in ``lineage`` first, else it must be
@@ -1188,7 +1194,7 @@ class CaptureStore:
             if self.exists(cid):
                 return cid
             raise _not_found(cid, self.ttl_s)
-        name = s.removeprefix("@")
+        name = s.removeprefix("@").lower()  # labels are stored lowercase (ops._check_label)
         if LABEL_RE.match(name):
             return self._resolve_label(name, lineage)
         raise OpError("bad_args", f"bad capture reference {spec!r}", hint=SPEC_HINT)

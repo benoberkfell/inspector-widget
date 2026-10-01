@@ -533,16 +533,26 @@ def _enum(name: str, v: Any, allowed: tuple[str, ...], default: str) -> str:
 
 
 def _check_label(label: Any) -> str | None:
+    """The label a capture is stored under: lowercased (labels are lowercase, so
+    ``afterCompose`` is stored as ``aftercompose``; :func:`_label_note` says so)."""
     if label is None or label == "":
         return None
     if not isinstance(label, str):
         raise _bad(f"label must be a string; got {label!r}")
-    name = label.removeprefix("@")
+    name = label.removeprefix("@").lower()
     if not is_valid_label(name) or name in RESERVED_LABELS or is_capture_id(name):
         raise _bad(f"invalid label {label!r}",
-                   hint="Labels match ^[a-z][a-z0-9_-]{0,31}$ and must not look like a "
-                        "capture id, latest or prev.")
+                   hint="Labels match ^[a-z][a-z0-9_-]{0,31}$ (upper case is lowercased) "
+                        "and must not look like a capture id, latest or prev.")
     return name
+
+
+def _label_note(label: Any, name: str | None) -> str | None:
+    """The note when :func:`_check_label` lowercased ``label`` (None when it did not)."""
+    given = label.removeprefix("@") if isinstance(label, str) else None
+    if name and given and given != name:
+        return f"label {given!r} stored as {name!r} (labels are lowercase)"
+    return None
 
 
 def _latest(ctx: OpContext, lineage: tuple[str, str]) -> LoadedCapture | None:
@@ -623,7 +633,8 @@ def capture(ctx: OpContext, serial: Any = None, package: Any = None, label: Any 
         except OpError as e:  # the capture is published: report the diff's failure in it
             diff_doc = {"a": base_id, "error": e.message}
     note = getattr(session, "note", None)
-    notes = [n for n in (fell_through, note) if isinstance(n, str) and n]
+    notes = [n for n in (fell_through, note, _label_note(label, name))
+             if isinstance(n, str) and n]
     return _summary(ctx, lc, ix, budget=budget, n_lines=n_lines, on_screen=want_on_screen,
                     diff_doc=diff_doc, diff_next=diff_next,
                     moved_from=moved_from if moved_from and moved_from != lc.id else None,
@@ -670,7 +681,7 @@ def publish_capture(ctx: OpContext, lineage: tuple[str, str], session: Any,
             moved_from = st.labels.get(label)
         same_pid, same_gen = refs.identity_flags(raw.meta, pix.meta if pix else None)
         refmap, tomb = refs.assign(ix, pix, same_pid=same_pid, same_generation=same_gen,
-                                   alloc=store.next_refs)
+                                   alloc=store.next_refs, tomb=refs.recent_tomb(st))
         ix = index.apply_refs(ix, refmap)
         raw.meta.label = label
         raw.meta.pinned = pin
@@ -1161,6 +1172,8 @@ def captures(ctx: OpContext, action: Any = None, id: Any = None, label: Any = No
         out: dict[str, Any] = {"capture": cid, "label": name}
         if moved:
             out["moved_from"] = moved
+        if _label_note(label, name):
+            out["note"] = _label_note(label, name)
         return out
     if act == "drop":
         store.drop(cid)
