@@ -2465,9 +2465,28 @@ class LintReport:
             s["covered"] = c
         return s
 
+    def covered_by_rule(self) -> Dict[str, Dict[str, Any]]:
+        """The covered findings grouped by rule: the worst severity and its message, how many,
+        and the first node keys. They are not actionable until the dialog closes, so they are
+        kept this short (``findings`` objects hold them all; inspect-node shows a node's)."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for f in self.covered:
+            r = out.setdefault(f.rule, {"severity": f.severity, "message": f.message, "n": 0,
+                                        "nodes": []})
+            r["n"] += 1
+            if _SEV_RANK.get(f.severity, 3) < _SEV_RANK.get(r["severity"], 3):
+                r["severity"], r["message"] = f.severity, f.message
+            if len(r["nodes"]) < 5:
+                r["nodes"].append(f.node_key)
+        for r in out.values():
+            if r["n"] > len(r["nodes"]):
+                r["more"] = r["n"] - len(r["nodes"])
+        return out
+
     def to_dict(self) -> Dict[str, Any]:
-        """``findings`` are the reachable ones; ``covered_findings`` (only when there are any)
-        the ones on windows under an open dialog, kept apart so they don't drown it."""
+        """``findings`` are the reachable ones; the ones on windows under an open dialog are
+        counted in ``summary.covered`` and grouped by rule in ``covered_by_rule`` (only when
+        there are any), so they don't drown the screen the user is on."""
         out = {
             "density": self.density,
             "font_scale": self.font_scale,
@@ -2477,9 +2496,8 @@ class LintReport:
             "diagnostics": self.diagnostics,
             "stats": self.stats,
         }
-        covered = self.covered
-        if covered:
-            out["covered_findings"] = [f.to_dict() for f in covered]
+        if self.covered:
+            out["covered_by_rule"] = self.covered_by_rule()
         if (self.a11y_data or {}).get("generation"):
             # The generation of the dump the finding keys belong to (see a11y.generation).
             out["generation"] = self.a11y_data["generation"]
@@ -2523,9 +2541,8 @@ def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
         ctx.diag("window.covered",
                  f"{len(covered)} finding(s) are on window(s) under an open modal window (a "
                  f"dialog or sheet); TalkBack cannot reach them until it closes. They are "
-                 f"listed apart (covered_findings; summary.covered) and left out of the "
-                 f"summary counts (finding.window.covered_by names the dialog's "
-                 f"root_view_id).", level="info")
+                 f"counted apart (summary.covered, covered_by_rule) and left out of the "
+                 f"summary counts and findings; inspect_node shows a node's.", level="info")
     if rstats.get("r1_silent_containers"):
         ctx.diag("label.silent_containers",
                  f"{rstats['r1_silent_containers']} actionable container(s) without a name "

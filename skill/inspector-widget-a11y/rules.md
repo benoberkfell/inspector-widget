@@ -14,9 +14,10 @@ is never seen by TalkBack, so no rule reports it; its children still count. Focu
 stops (R9, R10) are the reading order's stops. A finding on a window under an
 open modal dialog carries `window.covered_by` (the dialog's `root_view_id`):
 still a defect, but TalkBack cannot reach it until the dialog closes. Those are
-kept apart: `covered_findings` (not `findings`), `summary.covered` (not the
-summary counts), a section of their own in the text report, and the overlay does
-not draw that window over the dialog.
+kept apart: counted in `summary.covered` (not the summary counts), grouped by
+rule in `covered_by_rule` (not in `findings`; `inspect_node` still shows a node's
+findings), a section of their own in the text report, and the overlay does not
+draw that window over the dialog.
 
 Every finding looks like:
 

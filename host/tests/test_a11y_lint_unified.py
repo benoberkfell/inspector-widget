@@ -1289,11 +1289,13 @@ def test_findings_under_a_modal_dialog_are_counted_apart():
     assert s["covered"] == {"error": 2, "warn": 0, "info": 0, "total": 2, "windows": [9]}
     out = rep.to_dict()
     assert [f["node_key"] for f in out["findings"]] == ["view:10"]
-    assert sorted(f["node_key"] for f in out["covered_findings"]) == ["view:3", "view:4"]
+    assert out["covered_by_rule"] == {"a11y.label.missing": {
+        "severity": "error", "message": rep.covered[0].message, "n": 2,
+        "nodes": [f.node_key for f in rep.covered]}}
     text = L.format_text(rep).splitlines()
     assert text[0].endswith("1 error, 0 warn, 0 info (+2 under an open dialog)")
     assert text[2].startswith("-- 2 finding(s) on window(s) under an open dialog")
-    assert "covered_findings" not in lint(screen(activity), enabled=["R1"]).to_dict()
+    assert "covered_by_rule" not in lint(screen(activity), enabled=["R1"]).to_dict()
 
 
 # --------------------------------------------------------------------------- #

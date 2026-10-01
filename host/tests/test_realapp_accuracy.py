@@ -97,8 +97,9 @@ def test_findings_under_an_open_sheet_are_counted_apart():
     rep = lint("antennapod_filter_sheet")
     out = rep.to_dict()
     assert out["summary"]["total"] == len(out["findings"]) == 1
-    assert out["summary"]["covered"]["total"] == len(out["covered_findings"]) == 9
-    assert all(f["window"]["covered_by"] is not None for f in out["covered_findings"])
+    assert out["summary"]["covered"]["total"] == 9 == len(rep.covered)
+    assert sum(r["n"] for r in out["covered_by_rule"].values()) == 9
+    assert all(f.window["covered_by"] is not None for f in rep.covered)
     text = L.format_text(rep)
     assert "(+9 under an open dialog)" in text.splitlines()[0]
     assert "-- 9 finding(s) on window(s) under an open dialog" in text
