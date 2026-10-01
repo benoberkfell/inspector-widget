@@ -262,3 +262,18 @@ def test_mcp_and_cli_give_the_same_talkback_answers(tmp_path):
         nxt = json.loads(_mcp("outline", capture=cid, view="reading", granularity="control",
                               max_lines=3))["next"][0]
         assert nxt.startswith('outline(view="reading",granularity="control",max_lines=3,')
+
+
+def test_explain_keeps_the_web_stops_talkback_reads():
+    # V13 BAD: the off-screen pager page's WebView and its elements are stops TalkBack reads
+    # (its walk did); the explained reading walk dropped them (their WebView is not
+    # visible, which should_focus_node alone rejects) and numbered past the gap
+    plain = reading("tb_v13-bad-walk", max_lines=200)
+    for args in ({"explain": True}, {"include_skipped": True}):
+        out = reading("tb_v13-bad-walk", max_lines=200, max_bytes=20000, **args)
+        assert plain["total"] == 9 and out["total"] >= 9, args  # (+ the nodes passed over)
+        assert [ln.split(" ", 2)[:2] for ln in out["lines"] if ln[:1].isdigit()] == \
+            [ln.split(" ", 2)[:2] for ln in plain["lines"]], args
+    explained = reading("tb_v13-bad-walk", explain=True, max_lines=200, max_bytes=20000)
+    assert explained["lines"][3].startswith('4. a11y:17:4 WebView "Webview"')
+    assert "why=web" in explained["lines"][4]

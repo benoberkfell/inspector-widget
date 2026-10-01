@@ -424,7 +424,12 @@ class TbCapture:
         meta: dict[str, Any] = {}
         items: list[ReadItem] = []
         if start is None:
-            seq = [n for n in self.linear() if accept(n)]
+            # the default walk is the Navigator's own: it already applies TalkBack's filter,
+            # web content included (nodeFilterOrWebView reaches a WebView whose container is
+            # not visible, and TalkBack reads its elements: V13, AntennaPod's show notes),
+            # which should_focus_node alone would drop
+            seq = list(self.linear()) if granularity in ("default", None) else \
+                [n for n in self.linear() if accept(n)]
             if not forward:
                 seq.reverse()
             st = SpeechState()
@@ -596,7 +601,8 @@ class TbCapture:
         for w in self.nav.windows:
             if not self.nav.accepts_window(w):
                 continue
-            for n in self.nav.traversal(w).order:
+            # the traversal, with a WebView's elements after its root (window_order)
+            for n, _stop in self.nav.window_order(w):
                 out.append(n)
                 out.extend(hoisted.get(id(n), ()))
         if not forward:
