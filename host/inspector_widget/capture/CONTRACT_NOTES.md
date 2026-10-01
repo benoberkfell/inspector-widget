@@ -1415,7 +1415,19 @@ what now holds:
   first; a re-minted Compose id by class + label + IoU >= 0.8);
   `walks.bind_walk` re-runs `talkback.diff.analyze` on the refs. Records are
   `<store>/walks/<id>.json` (`w` + 6: a walk, `t` + 6: a scenario; the newest
-  100 kept, `gc(all=true)` wipes them), each with its `captures`.
+  100 kept, `gc(all=true)` wipes them), each with its `captures`. The store
+  holds a walk's captures (`CaptureStore.held`) until its record is stored, so a
+  lineage full of labeled captures cannot evict them mid-walk.
+- **What a bound walk takes from its captures** (live stage, emulator-5556): a
+  step's `covered_by` (what a same-window overlay covers: `static.covered`, the
+  View tree's drawing order) replaces the engine's guess; a step whose node sits
+  where its capture has it gets `vrank` (its place in tb.out_of_order's visual
+  order, `static.visual_ranks`), and a segment whose stops all have one in one
+  capture, window and layer is ordered by them; a step that reached a new window
+  while its capture no longer holds the previous step's window becomes
+  `via="screen"` (the screen was replaced under the walk: the model is compared
+  with the steps before it); the engine's notes name nodes by ref. Consecutive
+  escaped steps out of one overlay are one tb.escape finding.
 - **Instructions** (`instructions(listed)`, at most 900 B): the spec 5.13 text when
   `capture` is listed, else a legacy text naming the toolset variable; plus a
   TalkBack sentence when `tb_walk` is listed (with the capture tools: the loop
