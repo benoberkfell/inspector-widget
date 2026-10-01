@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -689,7 +690,7 @@ def execute(name: str, args: Any, ctx: ops.OpContext, *, surface: str = "mcp",
     except passthrough:
         raise
     except Exception as exc:  # noqa: BLE001 - the agent-facing envelope
-        return Result(ops.error_envelope(exc))
+        return Result(listed_hint(ops.error_envelope(exc), ctx.listed))
     images: list[tuple[str, str]] = []
     if inline and isinstance(doc.get("path"), str):
         from .capture import images as cimages
@@ -701,6 +702,43 @@ def execute(name: str, args: Any, ctx: ops.OpContext, *, surface: str = "mcp",
             images.append((mime, data))
             doc = dict(doc, inline_tokens=tokens)
     return Result(doc, images)
+
+
+_CALL = re.compile(r"\b([a-z_]+)\(")
+#: An error's way on for a caller that lists the TalkBack tools but not the capture ones
+#: (the default and talkback listings), by error code: a tb_walk captures the screen itself.
+_TB_ROUTES = {
+    "ref_not_in_capture": "Take refs from a tb_walk's lines (each walk captures the screen), "
+                          "or pass the label as spoken.",
+    "capture_not_found": "Run tb_walk once (it captures the screen) to get refs, or pass the "
+                         "label as spoken.",
+    "not_found": "Pass a ref from a tb_walk's lines, or the label as spoken.",
+    "ambiguous": "Pass a ref from a tb_walk's lines, or more of the label as spoken.",
+    "bad_selector": "Pass a ref from a tb_walk's lines, or the label as spoken.",
+    "walk_not_found": "tb_walk() records one.",
+}
+
+
+def listed_hint(env: dict[str, Any], listed: Iterable[str] | None) -> dict[str, Any]:
+    """An error envelope whose hint names only tools the caller lists (``listed``; None:
+    every tool, unchanged): sentences that call an unlisted tool are dropped, and when none
+    is left, a TalkBack-only caller gets the way on it has (:data:`_TB_ROUTES`)."""
+    err = env.get("error") if isinstance(env, dict) else None
+    hint = err.get("hint") if isinstance(err, dict) else None
+    if listed is None or not isinstance(hint, str) or not hint:
+        return env
+    have = set(listed)
+    tools = set(LEGACY_TOOLS) | set(TALKBACK_TOOLS) | set(CAPTURE_TOOLS)
+
+    def unlisted(text: str) -> set[str]:
+        return {m for m in _CALL.findall(text) if m in tools} - have
+
+    if not unlisted(hint):
+        return env
+    keep = [x for x in re.split(r"(?<=[.!?])\s+", hint) if not unlisted(x)]
+    new = " ".join(keep).strip() or (_TB_ROUTES.get(str(err.get("code")))
+                                     if "tb_walk" in have else None)
+    return dict(env, error=dict(err, hint=new or None))
 
 
 def error_result(exc: BaseException) -> Result:

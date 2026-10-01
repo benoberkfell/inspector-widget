@@ -624,3 +624,27 @@ def test_the_cli_says_talkback_stays_on_only_when_it_does(tb_env, run_cli):
     assert r.rc == 0 and json.loads(r.out)["restore_pending"] is True and "stays on" not in r.err
     r = run_cli("talkback", "restore", "--serial", SERIAL)
     assert r.rc == 0 and "note:" not in r.err and tb_env.talkback.running
+
+
+def test_error_hints_name_only_listed_tools(tb, monkeypatch):
+    # The talkback listing has no capture(), outline() or find(): an error's hint must not
+    # send the agent there, but to what it has (a tb_walk captures the screen itself).
+    monkeypatch.setenv(surface.ENV_TOOLSET, "talkback")
+    listed = set(mcp_server._listed_tools())
+    doc, is_error = call("tb_walk", serial=SERIAL, package=PKG, start="n40", **FAST)
+    assert is_error and doc["error"]["code"] == "capture_not_found"
+    assert doc["error"]["hint"].startswith("Run tb_walk once")
+    ok("tb_walk", serial=SERIAL, package=PKG, **FAST)  # captures the screen
+    doc, is_error = call("tb_walk", start="n99999", **FAST)
+    assert is_error and doc["error"]["code"] == "ref_not_in_capture"
+    hint = doc["error"]["hint"]
+    assert set(re.findall(r"\b([a-z_]+)\(", hint)) <= listed and "tb_walk" in hint, hint
+    # with the capture tools listed the hint is left as it is
+    monkeypatch.setenv(surface.ENV_TOOLSET, "all")
+    doc, _ = call("tb_walk", start="n99999", **FAST)
+    assert "outline()" in doc["error"]["hint"]
+    # the filter itself: a sentence naming an unlisted tool goes, the rest stays
+    env = {"error": {"code": "not_found", "message": "m",
+                     "hint": "Retry later. Or find(text=\"x\") in a capture."}}
+    assert surface.listed_hint(env, {"tb_walk"})["error"]["hint"] == "Retry later."
+    assert surface.listed_hint(env, None) is env
