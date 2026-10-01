@@ -199,9 +199,10 @@ _CATALOG: tuple[Rule, ...] = (
        "pager's other pages.",
        "Scroll semantics and actions (verticalScroll, RecyclerView, NestedScrollView); page "
        "buttons or custom actions for a pager"),
-    _r("tb.skipped", "warn", "Visible text TalkBack never reads: an ancestor hides it.",
+    _r("tb.skipped", "warn", "Visible text TalkBack never reads: an ancestor hides it, or "
+       "the stop over it says something else (its contentDescription).",
        "Drop importantForAccessibility=noHideDescendants (or hideFromAccessibility), or fold "
-       "the text into a stop's label"),
+       "the text into the stop's label"),
     _r("tb.custom_action_missing", "warn",
        "A gesture-only action (swipe to dismiss, drag) has no accessibility action.",
        "Modifier.semantics { customActions = listOf(CustomAccessibilityAction(\"Delete\") "
