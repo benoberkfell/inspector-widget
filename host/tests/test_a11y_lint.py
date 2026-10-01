@@ -252,3 +252,35 @@ def test_zero_area_parent_still_lints_measured_child():
     # Child fires missing-label (error) + small touch target.
     assert "a11y.label.missing" in rules(findings)
     assert "a11y.touch_target.small" in rules(findings)
+
+
+def test_an_unnamed_scrim_is_not_asked_for_a_content_description():
+    # A11yProbe V5 BAD: a clickable #99000000 View over 90% of the window behind a hand-made
+    # dialog. R1 told the agent to set android:contentDescription on it, which keeps the
+    # scrim a stop and the escape; it now says what a scrim needs.
+    import tb_capture_fixtures as F
+
+    from inspector_widget import a11y
+
+    _rec, resp = F.load_walk("tb_v5-bad-walk")
+    rep = L.lint_unified(a11y.a11y_to_dict(resp), L.LintContext(density=390))
+    f = next(x for x in rep.findings if x.rule == "a11y.label.missing" and x.node_key == "view:12")
+    assert f.severity == "error" and f.evidence["covers_window_pct"] == 90
+    assert "scrim" in f.message and "importantForAccessibility=no" in f.message
+    assert "android:contentDescription" not in f.message
+    # a plain unlabelled button keeps the label fix
+    _rec, resp = F.load_walk("tb_v9-bad-walk")
+    rep = L.lint_unified(a11y.a11y_to_dict(resp), L.LintContext(density=390))
+    f = next(x for x in rep.findings if x.rule == "a11y.label.missing")
+    assert "covers_window_pct" not in f.evidence and "contentDescription" in f.message
+
+
+def test_asking_the_a11y_lint_for_tb_rules_says_where_they_are():
+    import pytest as _pytest
+
+    with _pytest.raises(L.UnknownRuleError) as err:
+        L.resolve_rule_ids(["tb"])
+    assert "tb_walk" in str(err.value) and 'lint(rules=["tb"])' in str(err.value)
+    with _pytest.raises(L.UnknownRuleError) as err:
+        L.resolve_rule_ids(["R99"])
+    assert "tb_walk" not in str(err.value)

@@ -128,10 +128,15 @@ class UnknownRuleError(ValueError):
     def __init__(self, unknown: Sequence[str]):
         self.unknown = list(unknown)
         valid = ", ".join(f"{s.alias}={s.id}" for s in RULE_SPECS)
+        tb = any(str(u).strip().lower().startswith("tb") for u in self.unknown)
         super().__init__(
             "unknown a11y lint rule id(s): " + ", ".join(repr(u) for u in self.unknown)
             + ". Valid rules (alias=id): " + valid
             + ". ATF check names (e.g. 'TouchTargetSize') are accepted too."
+            + (" TalkBack navigation (tb.*: escape, double_stop, ghost_stop, out_of_order ...) "
+               "is not an a11y lint rule: tb_walk drives the real TalkBack and reports them, "
+               "and lint(rules=[\"tb\"]) over a capture (INSPECTOR_WIDGET_TOOLSET=capture) "
+               "checks them from the model." if tb else "")
         )
 
 
@@ -1229,6 +1234,17 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
                 "are the stops), so its click or long-press cannot be reached with TalkBack")
     else:
         said = f"TalkBack announces it only as \"{(role or 'unlabelled').lower()}\""
+    scrim = None if silent or toggle else _covers_window(n)
+    if scrim is not None:
+        # A clickable, unnamed node over most of its window is a scrim (behind a hand-made
+        # dialog or sheet: A11yProbe V5): a name would keep it a stop, and focus would still
+        # walk out of the dialog behind it.
+        said += (f"; it covers {scrim}% of its window, so it is most likely the scrim behind "
+                 "a dialog or sheet")
+        fix = ("do not label a scrim: hide it from TalkBack (View: "
+               "importantForAccessibility=no; Compose: clearAndSetSemantics {}), and keep focus "
+               "in the dialog: a real Dialog / ModalBottomSheet, or hide what it covers while "
+               "it is open (tb_walk shows focus walking out of it: tb.escape)")
     return [run.finding(
         "a11y.label.missing", "error", n,
         f"Actionable {what} has no accessible name (no text, contentDescription, "
@@ -1236,8 +1252,24 @@ def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
         f"\"On\" says its state, not what it is); {said}. Fix: {fix}.",
         {"role": role, "class_name": n.class_name, "actionable_reason": reason,
          "checked": ["own", "descendants", "labeled_by", "compose_merged"],
-         **({"talkback": "silent_container"} if silent else {})},
+         **({"talkback": "silent_container"} if silent else {}),
+         **({"covers_window_pct": scrim} if scrim is not None else {})},
     )]
+
+
+SCRIM_COVER = 0.8  # an unnamed clickable node over this much of its window is a scrim
+
+
+def _covers_window(n: _Node) -> Optional[int]:
+    """The percent of its window ``n`` covers when that is most of it (a scrim), else None.
+    Not the window root (a clickable root is the window itself)."""
+    w = n.win
+    if w is None or n.parent is None or w.w <= 0 or w.h <= 0:
+        return None
+    ix = max(0, min(n.x + n.w, w.x + w.w) - max(n.x, w.x))
+    iy = max(0, min(n.y + n.h, w.y + w.h) - max(n.y, w.y))
+    share = ix * iy / float(w.w * w.h)
+    return round(100 * share) if share >= SCRIM_COVER else None
 
 
 # --------------------------------------------------------------------------- #
