@@ -1250,3 +1250,22 @@ def test_a_wrap_needs_the_node_read_before_not_an_alike_one_still_on_screen():
     del idx.nodes[old.key]
     assert tbwalk._seen_again(s, snap)  # gone: a re-minted id of the same chip
     assert tbwalk._seen_again(tbwalk.Step(6, new.key, node=new), snap)
+
+
+def test_cli_tb_walk_json_to_a_file_as_the_legacy_cli_did(probe, run_cli, tmp_path):
+    # The legacy `tb-walk / tb-scenario --json DEST` wrote the JSON to DEST; the generated
+    # subcommands made --json a flag, and `--json walk.json` was an argparse error (exit 2)
+    import cli
+    from inspector_widget import surface
+
+    parser = cli.build_parser()
+    for argv, dest in ((["tb-walk", "--json", "walk.json"], "walk.json"),
+                       (["tb-scenario", "focus-after", "--json", "out.json"], "out.json"),
+                       (["tb-walk", "--json", "-"], None)):
+        ns = parser.parse_args(surface.cli_argv(argv))
+        assert ns.json_out == dest and (ns.json or dest), argv
+    out = tmp_path / "walk.json"
+    r = run_cli("tb-walk", "--serial", SERIAL, "--step-timeout-ms", 250, "--settle-ms", 20,
+                "--json", str(out))
+    assert r.rc == 0, r
+    assert json.loads(out.read_text())["ended"] == "wrap" and r.out == ""

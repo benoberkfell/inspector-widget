@@ -802,7 +802,10 @@ def mcp_entries(toolset: str = "all", *, context: Callable[[], ops.OpContext] | 
 # CLI
 # --------------------------------------------------------------------------- #
 #: CLI flags that shape the output, not the call (every generated subcommand).
-CLI_OUTPUT_FLAGS = ("json", "pretty", "quiet")
+CLI_OUTPUT_FLAGS = ("json", "pretty", "quiet", "json_out")
+#: Subcommands whose legacy form took ``--json DEST`` (write the JSON to DEST): cli_argv
+#: maps ``--json DEST`` to ``--json-out DEST`` for them.
+JSON_DEST_SUBCOMMANDS = frozenset({"tb-walk", "tb-scenario"})
 
 
 def _cli_value(p: Param) -> Callable[[str], Any]:
@@ -860,6 +863,9 @@ def add_cli(subparsers: Any, *, context: Callable[[argparse.Namespace], ops.OpCo
                                 default=argparse.SUPPRESS, help=f"same as {p.flag} {value}")
         sp.add_argument("--json", action="store_true",
                         help="print the JSON the MCP tool returns")
+        if ts.cli_name in JSON_DEST_SUBCOMMANDS:  # the legacy "--json DEST" (cli_argv)
+            sp.add_argument("--json-out", dest="json_out", default=None, metavar="DEST",
+                            help=argparse.SUPPRESS)
         sp.add_argument("--pretty", action="store_true", help="indent the JSON")
         if ts.name == "capture":
             sp.add_argument("-q", "--quiet", action="store_true",
@@ -956,7 +962,11 @@ def cli_main(ts: ToolSpec, ns: argparse.Namespace,
     note = _talkback_note(ts, args, res) if ts.device_wide else None
     if note:
         print(note, file=sys.stderr)
-    if ns.json or ns.pretty:
+    json_out = getattr(ns, "json_out", None)
+    if json_out and json_out != "-":
+        with open(json_out, "w", encoding="utf-8") as f:
+            f.write(res.text(pretty=ns.pretty) + "\n")
+    elif ns.json or ns.pretty or json_out == "-":
         print(res.text(pretty=ns.pretty))
     elif getattr(ns, "quiet", False):
         print(res.get("capture", ""))
@@ -1193,7 +1203,8 @@ def cli_argv(argv: Iterable[str]) -> list[str]:
 
     * ``--json -`` is ``--json``: the legacy subcommands take ``--json
       OUT.json|-``, these always print to stdout, and the habit should not be
-      an argparse error;
+      an argparse error; ``tb-walk`` / ``tb-scenario --json DEST`` (their legacy
+      form) writes the JSON to DEST (``--json-out DEST``);
     * a flag's value that starts with ``-`` but is no flag of the subcommand
       is joined to it (``--fields -bounds`` -> ``--fields=-bounds``, ``--at
       -5,10``): spec 6.4's field removal must work as written, and argparse
@@ -1213,6 +1224,10 @@ def cli_argv(argv: Iterable[str]) -> list[str]:
         nxt = argv[i + 1] if i + 1 < len(argv) else None
         if a == "--json" and nxt == "-":
             out.append(a)
+            skip = True
+        elif a == "--json" and argv[0] in JSON_DEST_SUBCOMMANDS and nxt is not None \
+                and not nxt.startswith("-"):
+            out += ["--json-out", nxt]
             skip = True
         elif (a in takes and nxt is not None and nxt.startswith("-") and nxt != "-"
               and nxt.split("=", 1)[0] not in every):
