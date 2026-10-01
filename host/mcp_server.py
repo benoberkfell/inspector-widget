@@ -1559,8 +1559,9 @@ _TB_LEGACY_ENTRIES: Dict[str, Dict[str, Any]] = {
         "description": (
             _DEVICE_WIDE + "Presses REAL TalkBack's next/previous (uinput keyboard, touch "
             "fallback), records where focus lands and diffs that order with the model's and a "
-            "visual order. Returns one line per step, how it ended (wrap, edge, loop, stuck, "
-            "left_app, max_steps), vs_model and tb.* findings with fixes; the full walk is saved. "
+            "visual order. Returns one line per step (a ref; keys maps refs to node keys for "
+            "inspect_node), how it ended (wrap, edge, loop, stuck, left_app, max_steps), the "
+            "diff with the model and tb.* findings with fixes; the full walk is saved. "
             "~0.1-0.4s per step."
         ),
         "schema": {
@@ -1886,6 +1887,9 @@ def _ops_context() -> Any:
     with _OPS_LOCK:
         if _OPS is None or _OPS.store.configured_root != root or _OPS.store.persist != persist:
             _OPS = ops.OpContext(CaptureStore(), _McpSessions(), "mcp")
+        # what an agent of this server can call: TalkBack results hint only listed tools
+        # (and name node keys where the capture tools are not listed)
+        _OPS.listed = frozenset(_listed_tools())
         return _OPS
 
 
@@ -1933,6 +1937,9 @@ def _listed_tools() -> Dict[str, Dict[str, Any]]:
         for name, shape in _TB_LEGACY_LISTING.items():
             if name in listed:
                 listed[name] = dict(listed[name], **shape)
+    elif "tb_walk" in listed and "outline" not in names:
+        # the TalkBack tools alone: no capture loop to point at
+        listed["tb_walk"] = dict(listed["tb_walk"], description=surface.D_TB_WALK_ALONE)
     return listed
 
 

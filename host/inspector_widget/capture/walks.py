@@ -420,6 +420,16 @@ class Binding:
     def has(self, key: str | None) -> bool:
         return bool(key) and any(key in c.keys for _a, c in self._caps)
 
+    def key_of(self, ref: str | None) -> str | None:
+        """The accessibility node key a ref names (the legacy tools take keys)."""
+        if not ref:
+            return None
+        for _a, c in reversed(self._caps):
+            for k, nid in c.keys.items():
+                if nid == ref and _KEY_IN_TEXT.fullmatch(k):
+                    return k
+        return None
+
     def vrank(self, cid: str | None, ref: str | None, bounds: Any = None) -> list[Any] | None:
         for _a, c in self._caps:
             if c.id == cid:
@@ -580,7 +590,25 @@ def bind_walk(record: dict[str, Any], binding: Binding,
     if analysis.get("expect") is not None:
         record["expect"] = analysis["expect"]
     record["captures"] = binding.ids
+    record["ref_keys"] = _ref_keys(record, binding)
     return record
+
+
+def _ref_keys(record: Mapping[str, Any], binding: Binding) -> dict[str, str]:
+    """``{ref: node key}`` for the refs a walk's steps and findings name: what a listing
+    without the capture tools (the default one: inspect_node takes keys) follows up with."""
+    out: dict[str, str] = {}
+    for s in record.get("steps") or []:
+        ref, key = s.get("ref"), s.get("key")
+        if ref and key and ref != key and not s.get("unbound"):
+            out.setdefault(str(ref), str(key))
+    for f in record.get("findings") or []:
+        for r in f.get("refs") or []:
+            if r and r not in out:
+                k = binding.key_of(r)
+                if k:
+                    out[str(r)] = k
+    return out
 
 
 def classify(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -591,6 +619,8 @@ def classify(record: Mapping[str, Any]) -> dict[str, Any]:
     agree, differ = vs.get("agree"), vs.get("differ")
     if agree is not None:
         text = f"{agree} agree, {differ or 0} differ"
+        if not agree and not differ:
+            text = "no moves compared"  # the lap held no move to check against the model
         if vs.get("first"):
             text += f": {vs['first']}"
         out["model"] = text
@@ -669,9 +699,32 @@ def _compact_findings(record: Mapping[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def walk_hints(record: Mapping[str, Any]) -> list[str]:
+def listed_hints(hints: Sequence[str], listed: Any = None,
+                 keys: Mapping[str, str] | None = None) -> list[str]:
+    """The hints a caller can follow: those naming a tool it lists (``listed``: the tool
+    names; None: every tool). A node(ref) hint becomes inspect_node(node_key=...) where only
+    the legacy tools are listed."""
+    if listed is None:
+        return list(hints)
+    from .query import call
+
+    out: list[str] = []
+    for h in hints:
+        name = h.split("(", 1)[0]
+        if name in listed:
+            out.append(h)
+            continue
+        m = re.match(r'^node\("([^"]+)"', h)
+        key = (keys or {}).get(m.group(1)) if m else None
+        if key and "inspect_node" in listed:
+            out.append(call("inspect_node", node_key=key))
+    return out
+
+
+def walk_hints(record: Mapping[str, Any], listed: Any = None) -> list[str]:
     """At most 3 next calls (<= 200 B): the first finding's node, the overlay, the
-    reverse walk or a restore."""
+    reverse walk (from the last stop before the edge, so its lap is a whole one) or a
+    restore; only tools the caller lists (``listed``)."""
     from .query import call
 
     hints: list[str] = []
@@ -687,25 +740,49 @@ def walk_hints(record: Mapping[str, Any]) -> list[str]:
     if str(record.get("restore") or "").startswith("left on"):
         hints.append(call("talkback", action="restore"))
     elif record.get("ended") in ("wrap", "edge") and record.get("direction") == "next":
-        hints.append(call("tb_walk", direction="prev"))
+        last = _last_before_edge(record)
+        hints.append(call("tb_walk", direction="prev", **({"start": last} if last else {})))
     vs = record.get("vs_model") or {}
     if vs.get("differ") and len(hints) < 3:
         first = next((s for s in record.get("steps") or [] if s.get("i") == 0), None)
         frm = (first or {}).get("ref")
+        back = {"direction": "prev"} if record.get("direction") == "prev" else {}
         hints.append(call("outline", view="reading", explain=True,
-                          **({"from": frm} if frm and not (first or {}).get("unbound") else {})))
+                          **({"from": frm} if frm and not (first or {}).get("unbound") else {}),
+                          **back))
     out: list[str] = []
-    for h in hints:
+    for h in listed_hints(hints, listed, record.get("ref_keys")):
         if len(out) < 3 and utf8_len(dumps(out + [h])) <= NEXT_MAX_BYTES:
             out.append(h)
     return out
 
 
+def _last_before_edge(record: Mapping[str, Any]) -> str | None:
+    """The ref of the last stop a forward walk read before its first edge or wrap: a
+    backward walk from there reads the whole lap (from the first stop it meets the edge
+    at once)."""
+    last = None
+    for s in record.get("steps") or []:
+        if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost", "screen"):
+            break
+        if s.get("key") and s.get("ref") and not s.get("unbound"):
+            last = s["ref"]
+    return str(last) if last and re.match(r"^n\d+$", str(last)) else None
+
+
+def _keys_shown(out: Mapping[str, Any], keys: Mapping[str, str]) -> dict[str, str]:
+    """The ``keys`` entries for the refs a response names."""
+    text = dumps({k: v for k, v in out.items() if k != "next"})
+    return {r: k for r, k in keys.items() if re.search(r"\b" + re.escape(r) + r"\b", text)}
+
+
 def walk_result(record: Mapping[str, Any], *, max_lines: int = WALK_MAX_LINES,
-                max_bytes: int = WALK_MAX_BYTES) -> dict[str, Any]:
+                max_bytes: int = WALK_MAX_BYTES, listed: Any = None) -> dict[str, Any]:
     """The tb_walk response for a bound record, within ``max_bytes`` of compact JSON:
     one line per step (``i. ref "speak" via=... !finding``), the classified ``diff``,
-    the findings (fix once per code) and ``next``."""
+    the findings (fix once per code) and ``next``. ``listed``: the tool names the caller
+    sees (None: all); without ``node`` among them, ``keys`` maps each ref shown to its
+    node key (what inspect_node takes) and the hints name only listed tools."""
     tags = _tags(record)
     steps = [dict(s, tags=sorted(tags.get(s.get("i"), []))) for s in record.get("steps") or []]
     caps = list(record.get("captures") or [])
@@ -729,7 +806,8 @@ def walk_result(record: Mapping[str, Any], *, max_lines: int = WALK_MAX_LINES,
     if record.get("notes"):
         tail["notes"] = list(record["notes"])
     tail["restore"] = record.get("restore")
-    hints = walk_hints(record)
+    hints = walk_hints(record, listed)
+    keys = record.get("ref_keys") or {} if listed is not None and "node" not in listed else {}
     # max_lines counts the steps; the start line (step 0) comes on top
     speak_len, n_findings, n_lines = SPEAK_LEN, 8, max(5, int(max_lines)) + 1
     while True:
@@ -744,6 +822,8 @@ def walk_result(record: Mapping[str, Any], *, max_lines: int = WALK_MAX_LINES,
         if len(findings) > n_findings:
             out["findings_omitted"] = len(findings) - n_findings
         out.update(tail)
+        if keys:
+            out["keys"] = _keys_shown(out, keys) or None
         if hints:
             out["next"] = hints
         out = {k: v for k, v in out.items() if v is not None}
@@ -842,7 +922,7 @@ def _quote(s: Any, n: int = 24) -> str:
     return '"' + (s if len(s) <= n else s[: n - 1] + "…") + '"'
 
 
-def scenario_hints(rec: Mapping[str, Any]) -> list[str]:
+def scenario_hints(rec: Mapping[str, Any], listed: Any = None) -> list[str]:
     from .query import call
 
     hints: list[str] = []
@@ -858,9 +938,19 @@ def scenario_hints(rec: Mapping[str, Any]) -> list[str]:
     if str(rec.get("restore") or "").startswith("left on"):
         hints.append(call("talkback", action="restore"))
     out: list[str] = []
-    for h in hints:
+    for h in listed_hints(hints, listed, _scenario_keys(rec)):
         if len(out) < 3 and utf8_len(dumps(out + [h])) <= NEXT_MAX_BYTES:
             out.append(h)
+    return out
+
+
+def _scenario_keys(rec: Mapping[str, Any]) -> dict[str, str]:
+    """``{ref: node key}`` of a scenario's target and landing focus."""
+    out: dict[str, str] = {}
+    for k in ("target", "focus"):
+        d = rec.get(k)
+        if isinstance(d, dict) and d.get("ref") and d.get("key") and d["ref"] != d["key"]:
+            out.setdefault(str(d["ref"]), str(d["key"]))
     return out
 
 
@@ -869,9 +959,10 @@ def _cut(s: Any, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYTES
-                    ) -> dict[str, Any]:
-    """The tb_scenario response (at most ``max_bytes``, 1 KB by default)."""
+def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYTES,
+                    listed: Any = None) -> dict[str, Any]:
+    """The tb_scenario response (at most ``max_bytes``, 1 KB by default). ``listed``:
+    as :func:`walk_result` (``keys`` for the refs, hints to listed tools)."""
     caps = list(rec.get("captures") or [])
     tgt = rec.get("target") if isinstance(rec.get("target"), dict) else None
     foc = rec.get("focus") if isinstance(rec.get("focus"), dict) else None
@@ -909,7 +1000,9 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
     if rec.get("notes"):
         out["notes"] = list(rec["notes"])
     out["restore"] = rec.get("restore")
-    hints = scenario_hints(rec)
+    if listed is not None and "node" not in listed:
+        out["keys"] = _keys_shown(out, _scenario_keys(rec)) or None
+    hints = scenario_hints(rec, listed)
     if hints:
         out["next"] = hints
     out = {k: v for k, v in out.items() if v not in (None, [], "")}
@@ -975,6 +1068,7 @@ __all__ = [
     "drop",
     "is_walk_id",
     "keys_of",
+    "listed_hints",
     "listing",
     "load",
     "resolve",

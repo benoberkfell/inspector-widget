@@ -83,6 +83,12 @@ ERROR_CODES: dict[str, str] = {
     "keymap_unknown": "TalkBack did not react to its keyboard shortcuts.",
     "focus_unreadable": "The agent could not read accessibility focus.",
     "start_not_found": "No focus stop matches start / target; pass a ref or the label as spoken.",
+    "talkback_on": "TalkBack is on and this needs it off: talkback(action=\"off\") first, or "
+                   "walk with utterance=\"auto\".",
+    "log_level_failed": "TalkBack's developer settings could not be driven to set its log "
+                        "level; retry with utterance=\"auto\" (the model's speech).",
+    "talkback_error": "TalkBack could not be driven; talkback(action=\"status\") says its state, "
+                      "talkback(action=\"restore\") puts the settings back.",
 }
 
 

@@ -168,10 +168,15 @@ def _moves(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def first_lap(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Moves up to the first edge or wrap (the lap the order checks look at)."""
+    """Moves up to the first edge or wrap (the lap the order checks look at). A walk that
+    meets the edge before any move (backwards from the first stop) compares the lap after
+    it: from the stop the wrap lands on."""
     out: List[Dict[str, Any]] = []
     for s in steps:
         if s.get("edge") or s.get("via") in ("wrap", "left_app", "lost", "screen"):
+            if len(out) <= 1 and s.get("via") not in ("left_app", "lost", "screen"):
+                out = [s] if s.get("via") == "wrap" and s.get("moved") and s.get("key") else []
+                continue
             break
         if s.get("moved") and s.get("key") and (not out or out[-1]["key"] != s["key"]):
             out.append(s)

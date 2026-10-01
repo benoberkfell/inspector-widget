@@ -31,6 +31,13 @@ from inspector_widget.output import dumps, utf8_len
 FAST = {"step_timeout_ms": 250, "settle_ms": 20}
 
 
+@pytest.fixture(autouse=True)
+def _capture_listing(monkeypatch):
+    """The capture loop's listing: its hints name capture tools. The default listing
+    (legacy + TalkBack) has its own tests below."""
+    monkeypatch.setenv(surface.ENV_TOOLSET, "capture,talkback")
+
+
 @pytest.fixture
 def tb(tb_env):
     """The title + 6 items scene, TalkBack's order over it, and the settings check."""
@@ -78,7 +85,9 @@ def test_a_walk_names_its_steps_by_capture_ref_and_is_stored(tb, run_cli):
                                 '2. n6 "Item 0. Button"']
     assert res["lines"][-1] == '9. n3 "Title" via=wrap'
     assert res["diff"] == {"ended": "wrap", "model": "6 agree, 0 differ"}
-    assert res["next"] == [f'image(overlay="walk",walk="{res["walk"]}")', 'tb_walk(direction="prev")']
+    # the backward walk starts at the last stop: from the first it meets the edge at once
+    assert res["next"] == [f'image(overlay="walk",walk="{res["walk"]}")',
+                           'tb_walk(direction="prev",start="n11")']
     rec = record(tb, res["walk"])
     assert rec["captures"] == [res["capture"]] and rec["id"] == res["walk"]
     moved = [s for s in rec["steps"] if s.get("key")]
@@ -145,8 +154,35 @@ def test_start_by_ref_focuses_that_node(tb):
 
 
 def test_a_start_that_matches_nothing_is_an_error_and_restores(tb):
+    # a selector that matches nothing is taken as the label as spoken, which no stop says
     doc, is_error = call("tb_walk", start='Button"Nope"', **FAST)
-    assert is_error and doc["error"]["code"] == "not_found" and "Nope" in doc["error"]["message"]
+    assert is_error and doc["error"]["code"] == "start_not_found"
+    assert "Nope" in doc["error"]["message"]
+
+
+def test_a_ref_no_capture_holds_fails_before_talkback_is_touched(tb):
+    presses = len(tb.talkback.presses)
+    doc, is_error = call("tb_walk", serial=SERIAL, package=PKG, start="n40", **FAST)
+    assert is_error and doc["error"]["code"] == "capture_not_found"
+    assert tb.secure == tb.original  # TalkBack never turned on
+    ok("capture", serial=SERIAL, package=PKG)
+    doc, is_error = call("tb_walk", start="n999", **FAST)
+    assert is_error and doc["error"]["code"] == "ref_not_in_capture"
+    doc, is_error = call("tb_walk", expect=["n3", "n999"], **FAST)
+    assert is_error and doc["error"]["code"] == "ref_not_in_capture"
+    assert len(tb.talkback.presses) == presses  # no key ever pressed
+
+
+def test_labels_that_look_like_selectors_are_matched_as_spoken(tb):
+    # "@alice", "#general", 'Say "Hi"', "Settings > Display" are common labels: they no
+    # longer fail as selectors, and never after the walk ran (its record was lost)
+    ok("capture", serial=SERIAL, package=PKG)
+    res = ok("tb_walk", expect=["Title", 'Item 0 "Button"', "@alice", "Settings > Display"],
+             **FAST)
+    assert res["walk"] and res["expect"]["ok"] is False
+    assert os.path.isfile(os.path.join(walks_dir(tb), f"{res['walk']}.json"))
+    doc, is_error = call("tb_walk", start="#1 Item", **FAST)
+    assert is_error and doc["error"]["code"] == "start_not_found"
 
 
 def test_expect_takes_refs_selectors_and_labels(tb):
@@ -432,7 +468,9 @@ def test_the_default_listing_keeps_the_pre_capture_shape_and_runs_the_surface(tb
     for toolset in ("capture,talkback", "talkback", "all"):
         shaped = _listing(monkeypatch, toolset)["tb_walk"]
         assert shaped["inputSchema"] == surface.json_schema(surface.spec("tb_walk"))
-        assert shaped["description"] == surface.D_TB_WALK
+        # the capture loop only where its tools are listed
+        assert shaped["description"] == (surface.D_TB_WALK_ALONE if toolset == "talkback"
+                                         else surface.D_TB_WALK)
 
 
 def test_the_loop_is_in_the_instructions_and_tb_walk():
@@ -464,3 +502,123 @@ def test_a_busy_device_says_what_to_do(tb):
         doc, is_error = call("tb_walk", serial=SERIAL, **FAST)
     assert is_error and doc["error"]["code"] == "busy"
     assert doc["error"]["hint"] == ERROR_CODES["busy"]
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5 review: what each listing can follow up, sessions, storage, errors
+# --------------------------------------------------------------------------- #
+def _out_of_order(env):
+    env.talkback.order = [TB_TITLE, tb_item(0), tb_item(3), tb_item(1), tb_item(4), tb_item(5)]
+
+
+def test_the_default_listing_names_node_keys_and_hints_only_listed_tools(tb, monkeypatch):
+    # Clients such as Claude Code expose only listed tools: the default listing has
+    # inspect_node (node keys), not node/image/outline (refs)
+    monkeypatch.delenv(surface.ENV_TOOLSET, raising=False)
+    _out_of_order(tb)
+    res = ok("tb_walk", serial=SERIAL, package=PKG, **FAST)
+    listed = set(mcp_server._listed_tools())
+    assert all(h.split("(", 1)[0] in listed for h in res["next"]), res["next"]
+    refs = set(re.findall(r"\bn\d+\b", json.dumps(res["lines"])))
+    assert refs and refs <= set(res["keys"])
+    key = res["keys"]["n9"]
+    assert res["next"][0] == f'inspect_node(node_key="{key}")'
+    node = ok("inspect_node", serial=SERIAL, package=PKG, node_key=key)
+    assert "Item 3" in json.dumps(node)
+    legacy = mcp_server._listed_tools()["tb_walk"]["description"]
+    assert "vs_model" not in legacy and "keys maps refs to node keys" in legacy
+
+
+def test_the_talkback_toolset_hints_only_its_own_tools(tb, monkeypatch):
+    monkeypatch.setenv(surface.ENV_TOOLSET, "talkback")
+    _out_of_order(tb)
+    res = ok("tb_walk", serial=SERIAL, package=PKG, **FAST)
+    assert res["next"] == ['tb_walk(direction="prev",start="n11")'] and res["keys"]
+    assert "Loop:" not in mcp_server._listed_tools()["tb_walk"]["description"]
+
+
+def test_a_backward_walk_from_the_first_stop_compares_the_lap_after_the_wrap(tb):
+    _out_of_order(tb)
+    res = ok("tb_walk", serial=SERIAL, package=PKG, **FAST)
+    assert res["diff"]["out_of_order"] == ["n9"]
+    # from the first stop the edge comes at once: the lap after the wrap is compared
+    back = ok("tb_walk", direction="prev", **FAST)
+    assert back["lines"][:3] == ['0. n3 "Title"', "1. — edge",
+                                 '2. n11 "Item 5. Button" via=wrap']
+    assert back["diff"]["model"].startswith("2 agree, 3 differ")
+    assert back["diff"]["out_of_order"] == ["n7"]
+
+
+def test_device_wide_tools_never_follow_another_callers_default(tb, monkeypatch, run_cli):
+    from inspector_widget.capture.store import CaptureStore
+
+    # another agent's server (same store) last captured on its own emulator
+    CaptureStore().set_default_session("emulator-9999", "com.other.app")
+    monkeypatch.setenv("ANDROID_SERIAL", SERIAL)
+    ctx = ops.OpContext(CaptureStore(), ops.AttachProvider(), "cli")
+    assert ops._tb_device(ctx, None, None) == (SERIAL, None)
+    r = run_cli("talkback", "status", "--json")
+    assert r.rc == 0 and json.loads(r.out)["serial"] == SERIAL, r.err
+    res = ok("tb_walk", until="edge", **FAST)
+    assert res["session"] == f"{SERIAL}/{PKG}" and res["walk"]
+    # naming the package lets the shared default complete the serial
+    assert ops._tb_device(ctx, None, "com.other.app") == (SERIAL, "com.other.app")
+
+
+def test_a_walk_says_when_its_default_app_is_gone(tb):
+    ok("capture", serial=SERIAL, package=PKG)
+    mcp_server._ops_context().session = (SERIAL, "com.example.gone")
+    res = ok("tb_walk", until="edge", **FAST)
+    assert res["session"] == f"{SERIAL}/{PKG}"
+    assert any("com.example.gone (the default session) is not running; drove "
+               f"{PKG}" in n for n in res["notes"])
+
+
+def test_talkback_on_keeps_only_a_named_app_in_front(tb):
+    ok("capture", serial=SERIAL, package=PKG)  # the default session: a11yprobe
+    tb.activity_stack.append("com.android.settings/.Settings")
+    on = ok("talkback", action="on")
+    assert on["changed"] is True and on["serial"] == SERIAL
+    assert ok("talkback", action="restore")["restored"] is True
+    doc, is_error = call("talkback", action="on", package=PKG)
+    assert is_error and doc["error"]["code"] == "app_left_foreground"
+
+
+def test_dropping_the_latest_walk_drops_the_walk_not_its_capture(tb):
+    res = ok("tb_walk", serial=SERIAL, package=PKG, until="edge", **FAST)
+    assert ok("captures", action="show", what="walks", id="latest")["walk"] == res["walk"]
+    assert ok("captures", action="drop", what="walks", id="latest") == {"dropped": res["walk"]}
+    assert ok("captures", action="show", id=res["capture"])["capture"] == res["capture"]
+    doc, is_error = call("captures", action="drop", what="walks", id="latest")
+    assert is_error and doc["error"]["code"] == "walk_not_found"
+    doc, is_error = call("captures", action="pin", what="walks", id=res["capture"])
+    assert is_error and doc["error"]["code"] == "bad_args"
+
+
+def test_talkback_failures_keep_their_codes_and_point_at_talkback():
+    from inspector_widget.talkback import device as tbdevice
+
+    for code in ("log_level_failed", "talkback_on", "something_new"):
+        err = ops._tb_error(tbdevice.TalkBackError(code, "could not find Log output level"))
+        d = err.to_dict()["error"]
+        assert d["code"] == (code if code != "something_new" else "talkback_error")
+        assert "ViewSpector" not in d["hint"] and "talkback" in d["hint"].lower()
+
+
+def test_the_cli_says_talkback_stays_on_only_when_it_does(tb_env, run_cli):
+    from inspector_widget.talkback import device as tbdevice
+
+    tb_env.scene_factory = fakeagent.talkback_scene
+    r = run_cli("talkback", "on", "--serial", SERIAL)
+    assert r.rc == 0 and "stays on" in r.err
+    assert run_cli("talkback", "restore", "--serial", SERIAL).rc == 0
+    # the user had TalkBack on: off saves a snapshot that restore turns back on
+    tb_env.secure.update({"enabled_accessibility_services": tbdevice.TALKBACK_COMPONENT,
+                          "accessibility_enabled": "1"})
+    tb_env.talkback.sync()
+    r = run_cli("talkback", "off", "--serial", SERIAL)
+    assert r.rc == 0 and "stays on" not in r.err and "talkback restore` puts back" in r.err
+    r = run_cli("talkback", "status", "--serial", SERIAL, "--json")
+    assert r.rc == 0 and json.loads(r.out)["restore_pending"] is True and "stays on" not in r.err
+    r = run_cli("talkback", "restore", "--serial", SERIAL)
+    assert r.rc == 0 and "note:" not in r.err and tb_env.talkback.running

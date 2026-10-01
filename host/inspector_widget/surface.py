@@ -249,11 +249,13 @@ TB_LOOP = ('capture -> lint(rules=["tb"]) -> outline(view="reading",explain=true
 _DEVICE_WIDE = "DEVICE-WIDE: "
 D_TALKBACK = (_DEVICE_WIDE + "TalkBack status (read-only) | on | off | restore. on snapshots "
               "the accessibility settings first; restore (also at exit) writes them back.")
-D_TB_WALK = (_DEVICE_WIDE + "drives the REAL TalkBack (on, then restored) with next/prev from "
-             "start (current, first, a ref or selector). Each step is a capture ref + what it "
-             "says; diff: actual vs model (skip, double, out_of_order, loop, trap, escape, "
-             "stuck, left_app) by ref; findings with fixes. Stored as a walk (w3f9ak1). "
-             "Loop: " + TB_LOOP + ".")
+D_TB_WALK_ALONE = (_DEVICE_WIDE + "drives the REAL TalkBack (on, then restored) with "
+                   "next/prev from start (current, first, a ref or selector). Each step is a "
+                   "capture ref + what it says; diff: actual vs model (skip, double, "
+                   "out_of_order, loop, trap, escape, stuck, left_app) by ref; findings with "
+                   "fixes. Stored as a walk (w3f9ak1).")
+#: ... with the capture tools listed: the loop that leads to (and from) a walk
+D_TB_WALK = D_TB_WALK_ALONE + " Loop: " + TB_LOOP + "."
 D_TB_SCENARIO = (_DEVICE_WIDE + "where real TalkBack focus goes, by ref. focus_after: do "
                  "action (activate|back|tap:<ref>|key:<combo>); restore: activate target, go "
                  "back; survive: focus target, apply mutate (tap:<ref>|activate|key:|broadcast:"
@@ -859,6 +861,25 @@ def cli_args(ts: ToolSpec, ns: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+def _talkback_note(ts: ToolSpec, args: Mapping[str, Any], res: Result) -> str | None:
+    """The CLI's stderr note after a device-wide call: TalkBack left on (talkback on, a
+    walk with leave_on), or a pending snapshot that restore will put back while TalkBack
+    is off now (after off it may turn TalkBack back on)."""
+    stays = f"note: TalkBack stays on (device-wide) until `{CLI_PROG} talkback restore`"
+    if ts.name != "talkback":
+        return stays if str(res.get("restore") or "").startswith("left on") else None
+    act = args.get("action") or "status"
+    if act == "on":
+        return stays if res.get("changed") else None
+    if res.get("restore_pending") is not True:
+        return None
+    tbs = res.get("talkback")
+    if act == "status" and isinstance(tbs, dict) and tbs.get("enabled"):
+        return stays
+    return (f"note: `{CLI_PROG} talkback restore` puts back the saved settings (TalkBack too, "
+            "if it was on before)")
+
+
 def cli_main(ts: ToolSpec, ns: argparse.Namespace,
              context: Callable[[argparse.Namespace], ops.OpContext] | None) -> int:
     """Run a generated subcommand: print the MCP text (``--json``) or the human
@@ -887,10 +908,9 @@ def cli_main(ts: ToolSpec, ns: argparse.Namespace,
     out_path = getattr(ns, "out", None)
     if ts.name == "image" and out_path and isinstance(res.get("path"), str):
         shutil.copyfile(res["path"], out_path)
-    if ts.device_wide and (res.get("restore_pending") is True
-                           or str(res.get("restore") or "").startswith("left on")):
-        print(f"note: TalkBack stays on (device-wide) until `{CLI_PROG} talkback restore`",
-              file=sys.stderr)
+    note = _talkback_note(ts, args, res) if ts.device_wide else None
+    if note:
+        print(note, file=sys.stderr)
     if ns.json or ns.pretty:
         print(res.text(pretty=ns.pretty))
     elif getattr(ns, "quiet", False):
