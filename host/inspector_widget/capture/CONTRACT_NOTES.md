@@ -1392,7 +1392,7 @@ what now holds:
   18,337 B tools/list) of before, until the deliberate flip (S4). An unknown name
   logs a warning and lists the default. Every tool stays callable by name.
   Measured tools/list (compact): default 18,337 B, capture 11,994 (12,000),
-  legacy 13,247, talkback 5,113, capture,talkback 15,521, all 27,182 (the capture
+  legacy 13,247, talkback 5,114, capture,talkback 15,522, all 27,183 (the capture
   tools spend each parameter description once; the instructions carry the rest;
   no listing averages over 1,300 B a tool). Instructions: 739 B (capture), 892 B
   (capture,talkback and all), 718 B (the default).

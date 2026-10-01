@@ -18,7 +18,7 @@ most one per three steps). This module does everything after the device part:
   :func:`scenario_result` (at most 1 KB), with their ``next`` hints.
 * **Storage**: ``<store>/walks/<id>.json`` (``w`` + 6 for walks, ``t`` + 6 for
   scenarios), each with the capture ids it ran against; listed, read and dropped
-  through ``captures(what="walks")`` / ``captures(action="show", id="w3f9ak")``, and
+  through ``captures(what="walks")`` / ``captures(action="show", id="w3f9ak1")``, and
   drawn by ``image(overlay="walk")`` (:mod:`.images`).
 
 Pure, apart from the files under ``<store>/walks``.
@@ -38,7 +38,7 @@ from ..output import dumps, utf8_len
 from .model import OpError
 
 WALKS_DIR = "walks"
-#: ``w3f9ak`` (a walk) or ``t3f9ak`` (a scenario).
+#: ``w3f9ak1`` (a walk) or ``t3f9ak1`` (a scenario): a letter and 6 more.
 ID_RE = re.compile(r"^[wt][0-9a-z]{6}$")
 #: Newest records kept; older ones are deleted when a new one is saved.
 KEEP = 100

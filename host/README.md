@@ -267,7 +267,7 @@ inspection tools), `talkback` (the 4 session tools and the 3 TalkBack tools),
 default is `legacy,talkback` (18) until the deliberate flip; every tool stays
 callable by name. The MCP `instructions` name only listed tools. Compact
 `tools/list` sizes: default 18,337 B, `capture` 11,994 (at most 12,000),
-`talkback` 5,113, `capture,talkback` 15,521, `all` 27,182 (no listing averages
+`talkback` 5,114, `capture,talkback` 15,522, `all` 27,183 (no listing averages
 more than 1,300 B a tool). The same 8 tools (and the 3 TalkBack tools) are CLI
 subcommands generated from one registry
 (`inspector_widget/surface.py`: same names, kebab-case flags, same defaults;

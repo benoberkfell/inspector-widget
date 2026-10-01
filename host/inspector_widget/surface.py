@@ -252,7 +252,7 @@ D_TALKBACK = (_DEVICE_WIDE + "TalkBack status (read-only) | on | off | restore. 
 D_TB_WALK = (_DEVICE_WIDE + "drives the REAL TalkBack (on, then restored) with next/prev from "
              "start (current, first, a ref or selector). Each step is a capture ref + what it "
              "says; diff: actual vs model (skip, double, out_of_order, loop, trap, escape, "
-             "stuck, left_app) by ref; findings with fixes. Stored as a walk (w3f9ak). "
+             "stuck, left_app) by ref; findings with fixes. Stored as a walk (w3f9ak1). "
              "Loop: " + TB_LOOP + ".")
 D_TB_SCENARIO = (_DEVICE_WIDE + "where real TalkBack focus goes, by ref. focus_after: do "
                  "action (activate|back|tap:<ref>|key:<combo>); restore: activate target, go "
