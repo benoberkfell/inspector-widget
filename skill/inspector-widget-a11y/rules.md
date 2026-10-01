@@ -13,7 +13,10 @@ focusable, labelled or otherwise important: layout containers, decorative icons)
 is never seen by TalkBack, so no rule reports it; its children still count. Focus
 stops (R9, R10) are the reading order's stops. A finding on a window under an
 open modal dialog carries `window.covered_by` (the dialog's `root_view_id`):
-still a defect, but TalkBack cannot reach it until the dialog closes.
+still a defect, but TalkBack cannot reach it until the dialog closes. Those are
+kept apart: `covered_findings` (not `findings`), `summary.covered` (not the
+summary counts), a section of their own in the text report, and the overlay does
+not draw that window over the dialog.
 
 Every finding looks like:
 
@@ -76,8 +79,15 @@ description on another; both are folded into the node.
 - **Flags:** a visible clickable / long-clickable node (not a text field, see R16)
   whose computed name is empty. This includes an unlabeled `ImageButton`, an icon-only
   Compose button whose `Icon` has `contentDescription = null`, a Checkbox with no
-  label, and a clickable card whose only labelled child is a *separate* button.
-- **Severity:** `error`. TalkBack announces only the role ("button").
+  label, and a clickable card whose only labelled child is a *separate* button
+  (TalkBack never stops on such a card, so its click cannot be reached).
+- **Not flagged:** a list, or a long-click-only container, that TalkBack never
+  stops on (TalkBack's shouldFocusNode: nothing of its own to say, its children
+  are the stops; e.g. a long-clickable RecyclerView), and a WebView (TalkBack
+  calls it "Webview"; its page is its content).
+- **Severity:** `error`. TalkBack announces only the role ("button"). `info` when
+  the node is clipped (see R2): its label may be in the part scrolled out of view
+  (Compose drops the children a list scrolled away); scroll it in and re-lint.
 - **Fix:** View: `android:contentDescription` (icon-only) or visible `android:text`;
   for a CheckBox/Switch give it text or point its label at it with `android:labelFor`.
   Compose: pass `contentDescription` to the `Icon`/`Image`, or
@@ -88,7 +98,8 @@ description on another; both are folded into the node.
 - **Flags:** a visible, enabled, actionable node whose **accessibility (touch)
   bounds** are `< 48dp` (Material) or `< 44dp` (`wcag_mode`) in width or height,
   with 1px of slack for rounding (a 48dp target measures 116-118px at 2.4375x).
-  The WCAG inline-link exception (an unroled link inside a run of text) is skipped.
+  The WCAG inline-link exception (an unroled link inside a run of text, or a web
+  link sharing its line with text) is skipped.
 - **Compose:** Compose widens the touch bounds of *every* clickable to 48dp, so they
   alone cannot tell a stock M3 control from a `Modifier.size(24.dp).clickable`. The
   agent also reports each Compose node's layout size (its LayoutNode, `layout_size`
@@ -97,17 +108,24 @@ description on another; both are folded into the node.
   `warn` with `bounds_source` "Compose layout size" and `touch_w_dp`/`touch_h_dp`
   in the evidence: the extra touch area is not reserved, so a neighbour or a clip
   can take it and the visible control stays small.
-- **Clipping:** a dimension where the node touches the edge of a scroll container
-  (or runs into the window's right/bottom edge) is probably clipped. If only clipped
-  dimensions are small the finding is `info` ("scroll it into view and re-lint").
-  Otherwise the clipped dimensions are not used to decide severity.
+- **Clipping (on evidence only):** a dimension is clipped where the node touches
+  an edge of a scroll container that can still scroll past that edge (its scroll
+  actions say so; a container with none counts for every edge; a pager's page at
+  rest fills it and is whole), where its bounds are reported clipped, or where
+  Compose laid it out larger than it shows. The window's edge alone is no
+  evidence: a 40dp overflow button flush with the screen edge is a real 40dp
+  target. If only clipped dimensions are small the finding is `info` ("scroll it
+  into view and re-lint"). Otherwise the clipped dimensions are not used to
+  decide severity.
 - **Severity:** `error` if an unclipped dimension is `< 24dp` (the WCAG 2.5.8
   floor); otherwise `warn`.
 - **Fix:** Compose: `Modifier.minimumInteractiveComponentSize()` or
   `sizeIn(minWidth = 48.dp, minHeight = 48.dp)`. Padding grows the target only when
   it is applied *after* (inside) `clickable`. View: `android:minWidth/minHeight` or
   padding on the clickable view itself. A `TouchDelegate` helps users but is not
-  reflected in accessibility bounds, so this rule still reports it.
+  reflected in accessibility bounds, so this rule still reports it. Web content
+  (a WebView's page): CSS `min-width`/`min-height` or padding on the link/button.
+  Every rule gives web content HTML/CSS advice, never Compose's.
 - **Evidence:** `w_dp`, `h_dp`, `min_dp`, `floor_dp`, `standard`, `clipped_axes`,
   `bounds_source` (and `touch_w_dp`/`touch_h_dp` for the Compose layout case).
 
@@ -189,8 +207,9 @@ description on another; both are folded into the node.
   stateDescription or range info that:
   - has a stateful role (Switch, Checkbox, RadioButton, Tab). → `warn`. A Tab's
     state is its selection: an unselected tab is fine when it carries
-    CollectionItemInfo or a sibling tab is selected (Material TabLayout,
-    BottomNavigationView, NavigationRailView, Compose `Tab`).
+    CollectionItemInfo or another tab in its window is selected (Material
+    TabLayout, BottomNavigationView, NavigationRailView, Compose `Tab` and
+    `NavigationDrawerItem`, whose items each sit in their own lazy-list item).
   - has a label ending in a state word ("Wi-Fi off", "Sync enabled"), excluding
     phrasal verbs such as "Sign off" and "Log on". → `warn`.
   - has a label containing "toggle". → `warn`.
