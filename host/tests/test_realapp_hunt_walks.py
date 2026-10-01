@@ -144,8 +144,28 @@ def test_ap2_the_capture_marks_what_the_expanded_player_covers():
     assert len(covered) >= 10
     assert all(i.evidence["kind"] == "sheet" for n in covered for i in n.issues
                if i.id == "render.covered")
-    # their lint findings are counted apart, as under a dialog
-    assert "under an open dialog" in analyzers.lint_summary(ix)["lint"]
+    # their lint findings are counted apart, as under a dialog, under the sheet's name
+    assert analyzers.lint_summary(ix)["lint"].endswith(
+        "; +14 under view:22 (sheet) (contrast not run)")
+
+
+def test_tb4_findings_under_the_action_mode_bar_are_not_said_to_be_under_a_dialog():
+    # The action-mode bar is no dialog, and the window it is in is the whole screen: the
+    # summary named "an open dialog" and lint() sent the agent to lint(within=<that window>)
+    ix, raw = _capture("thunderbird_selection_mode")
+    summary = analyzers.lint_summary(ix)["lint"]
+    assert "; +2 under view:236 (bar) " in summary and "dialog" not in summary
+    out = analyzers.lint_view(ix, raw)
+    assert out["covered"] == {"n": 2, "windows": [], "by": ["view:236 (bar)"], "listed": False}
+    assert 'find(issue="render.covered")' in out["next"]
+    assert not any(h.startswith("lint(within=") for h in out["next"])
+    # with a finding on a window under a dialog as well, each is counted under its own
+    win = next(n.window for n in ix.nodes.values() if n.window)
+    iss = next(i for n in ix.nodes.values() for i in n.issues if i.id.startswith("a11y.")
+               and not i.evidence.get("covered_by"))
+    iss.evidence["covered_by"] = win
+    assert "; +1 under an open dialog, +2 under view:236 (bar) " in \
+        analyzers.lint_summary(ix)["lint"]
 
 
 # ------------------------------------------------------------- the drawer's texts
