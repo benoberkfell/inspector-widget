@@ -26,7 +26,7 @@ Non-stops (:func:`why_not`)
     ``silent_container`` (focusable, but only its focusable children speak: they are the stops),
     ``merged_into:<key>`` (read as part of that focusable ancestor), ``no_speech``,
     ``web_part`` (web content the WebView reads as part of an element, or a container with
-    nothing to say), ``web_empty`` (a web element of zero size: never a stop).
+    nothing to say).
 
 Edges (the ``via`` of a :func:`~.order.simulate` step)
     ``tree``, ``bounds_swap``, ``chain``, ``before:<key>``, ``before_of:<key>``,
@@ -53,7 +53,7 @@ STOP_CODES = ("click", "longclick", "focusable", "srf", "scroll_item", "leaf", "
               "web", "pip")
 NON_STOP_CODES = ("not_important", "hidden_by", "covered_by", "not_touchable", "skipped",
                   "hidden", "offscreen", "window_wrapper", "silent_container", "merged_into",
-                  "no_speech", "web_part", "web_empty")
+                  "no_speech", "web_part")
 EDGE_CODES = ("tree", "bounds_swap", "chain", "before", "before_of", "after", "window", "wrap",
               "autoscroll", "edge")
 

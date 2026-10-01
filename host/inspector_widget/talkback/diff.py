@@ -5,7 +5,8 @@ Pure: it works on the walk record :mod:`.walk` saves (steps, predicted stops,
 how the walk ended), so a stored walk can be re-analysed offline.
 
 Codes: ``tb.out_of_order``, ``tb.loop``, ``tb.trap`` (the app took focus
-between presses, or a WebView swallows "next"), ``tb.revisit`` (a stop read twice in one lap),
+between presses, or a WebView on an off-screen page keeps it), ``tb.revisit`` (a stop read
+twice in one lap),
 ``tb.edge_stuck``, ``tb.skipped`` (predicted stops never reached, or text on
 screen nobody read), ``tb.ghost_stop``, ``tb.double_stop``, ``tb.escape``,
 ``tb.focus_lost``, ``tb.wrong_announcement`` ("N of M" that counts an item
@@ -71,7 +72,7 @@ FIXES = {
                  "it is open (Compose hideFromAccessibility, View noHideDescendants) and give the "
                  "overlay a paneTitle.",
 }
-# tb.trap for a WebView that swallows "next" (FIXES has the focus-stealing one).
+# tb.trap for a WebView on an off-screen page (FIXES has the focus-stealing one).
 FIX_WEB_TRAP = ("Keep pages that are not on screen out of the accessibility tree: "
                 "importantForAccessibility=noHideDescendants on the pager pages that are not "
                 "current (AUTO on the current one), or keep the WebView GONE/INVISIBLE until its "
@@ -95,11 +96,18 @@ def _finding(code: str, sev: str, msg: str, steps: Sequence[Dict[str, Any]] = ()
     return f
 
 
-def web_trap_finding(trap: Dict[str, Any], steps: Sequence[Dict[str, Any]] = (),
+def web_trap_finding(hidden: Dict[str, Any], steps: Sequence[Dict[str, Any]] = (),
                      basis: str = "walk") -> Dict[str, Any]:
-    """tb.trap for talkback.order's ``web_trap`` diagnostic: a WebView swallows "next"."""
-    keys = _uniq([trap.get("at"), trap.get("web_root")])
-    f = _finding("tb.trap", "error", trap["message"], steps, basis=basis,
+    """The finding for talkback.order's ``web_hidden_page`` diagnostic: tb.trap (error) when
+    TalkBack cannot focus that WebView (``trap``: a walk stuck there, or the model's
+    prediction), else tb.ghost_stop (warn): TalkBack reads a page nobody can see."""
+    keys = _uniq([hidden.get("before"), hidden.get("web_root")])
+    msg = hidden["message"]
+    if steps:
+        msg = (f"TalkBack stopped at {_name(steps[-1])}: the next stop is the WebView "
+               f"{hidden.get('web_root')}, whose page is off screen. " + msg)
+    code, sev = ("tb.trap", "error") if hidden.get("trap") or steps else ("tb.ghost_stop", "warn")
+    f = _finding(code, sev, msg, steps, basis=basis,
                  refs=[s.get("ref") for s in steps] or keys, keys=keys)
     f["fix"] = FIX_WEB_TRAP
     return f
@@ -464,9 +472,9 @@ def _check_end(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
                             [s for s in steps if s.get("ref") in cyc][:MAX_REFS], refs=cyc))
     last = next((s for s in reversed(steps) if s.get("moved") and s.get("key")), None)
     if walk.get("ended") == "stuck" and last is not None:
-        # Stuck right before (or on) a WebView the model says swallows "next": that is why.
+        # Stuck right before (or on) a WebView whose page is off screen: that is why.
         trap = next((t for t in walk.get("web_traps") or ()
-                     if last.get("key") in (t.get("before"), t.get("at"), t.get("web_root"))), None)
+                     if last.get("key") in (t.get("before"), t.get("web_root"))), None)
         if trap is not None:
             out.append(web_trap_finding(trap, [last]))
         else:

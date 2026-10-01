@@ -44,9 +44,9 @@ from .rules import (ACTION_SCROLL_BACKWARD, ACTION_SCROLL_DOWN, ACTION_SCROLL_FO
                     ROLE_GRID as R_GRID, ROLE_LIST as R_LIST, ROLE_NAMES, ROLE_PAGER,
                     ROLE_WEB_VIEW, TB_RULES_REV, Rules)
 from .speech import DEFAULT_VERSION
-from .tree import (WINDOW_APPLICATION, WINDOW_INPUT_METHOD, WINDOW_MAGNIFICATION_OVERLAY,
-                   WINDOW_SPLIT_SCREEN_DIVIDER, WINDOW_SYSTEM, Rect, TbNode, TbTree, TbWindow,
-                   build)
+from .tree import (WEBVIEW_CLASS, WINDOW_APPLICATION, WINDOW_INPUT_METHOD,
+                   WINDOW_MAGNIFICATION_OVERLAY, WINDOW_SPLIT_SCREEN_DIVIDER, WINDOW_SYSTEM, Rect,
+                   TbNode, TbTree, TbWindow, build)
 
 _EMPTY = Rect()
 
@@ -562,15 +562,14 @@ class Navigator:
     def step(self, pivot: TbNode, forward: bool, granularity: str,
              reach_edge: bool) -> Dict[str, Any]:
         """navigateToDefaultOrMacroGranularityTarget (:1105) with scroll=wrap=true. Returns
-        {"target", "via", "reach_edge", "autoscroll", "show_on_screen", "duplicate",
-        "swallowed", "web_unseen"}; ``swallowed`` is the web root whose WebView took the press
-        without moving focus (:meth:`swallows`), ``web_unseen`` the number of zero-size web
-        elements TalkBack reads first (the WebView scrolls them in; the dump cannot show them)."""
+        {"target", "via", "reach_edge", "autoscroll", "show_on_screen", "duplicate", "stuck"};
+        ``stuck`` is the WebView root TalkBack targets but cannot focus (:meth:`traps`): focus
+        stays on the pivot."""
         win = pivot.window
         trav = self.traversal(win)
         out: Dict[str, Any] = {"target": None, "via": None, "reach_edge": reach_edge,
                                "autoscroll": None, "show_on_screen": None, "duplicate": False,
-                               "swallowed": None, "web_unseen": 0}
+                               "stuck": None}
         if not self.rules.supports_web_actions(pivot):
             # "autoScrollAtEdge returns due to pivot is web node" (:2273).
             out["autoscroll"] = self.autoscroll_container(pivot, forward, trav)
@@ -586,52 +585,51 @@ class Navigator:
     # Forward: native elements -> the WebView's root ("Webview") -> web elements -> native
     # elements. Backward: native elements -> web elements -> native elements (the root is
     # skipped). Inside, the WebView moves focus itself (ACTION_NEXT/PREVIOUS_HTML_ELEMENT).
-    def _html_target(self, pivot: TbNode, forward: bool) -> Tuple[Optional[TbNode], List[TbNode]]:
-        """navigateToHtmlTarget: the element the WebView moves to from ``pivot`` (None when it
-        reports none), and the elements of zero size it would pass on the way: clipped out of
-        view, so the dump cannot say what TalkBack reads there (the WebView scrolls them in)."""
+    def _html_target(self, pivot: TbNode, forward: bool) -> Optional[TbNode]:
+        """navigateToHtmlTarget: the element the WebView moves to from ``pivot``, or None when
+        it reports none (the end of the page that way)."""
         root = self.rules.web_root_of(pivot)
         if root is None:
-            return None, []
-        elems = self.rules.web_elements(root, include_empty=True)
+            return None
+        elems = self.rules.web_elements(root)
         if pivot is root and not forward:
-            ahead = list(reversed(elems))  # PREVIOUS_HTML_ELEMENT on the root: its last element
-        else:
-            doc = {id(n): i for i, n in enumerate(root.iter())}
-            here = doc.get(id(pivot), 0)
-            ahead = ([n for n in elems if doc[id(n)] > here] if forward
-                     else [n for n in reversed(elems) if doc[id(n)] < here])
-        for i, n in enumerate(ahead):
-            if not n.rect.is_empty():
-                return n, ahead[:i]
-        return None, ahead
+            return elems[-1] if elems else None  # PREVIOUS_HTML_ELEMENT on the root: the last
+        doc = {id(n): i for i, n in enumerate(root.iter())}
+        here = doc.get(id(pivot), 0)
+        ahead = ([n for n in elems if doc[id(n)] > here] if forward
+                 else [n for n in reversed(elems) if doc[id(n)] < here])
+        return ahead[0] if ahead else None
 
-    def swallows(self, root: TbNode) -> bool:
-        """Whether the WebView of ``root`` swallows "next": it has elements, all of zero size,
-        on a pager page (nothing can scroll a pager page into view for it; TalkBack never
-        auto-scrolls a pager) or with a root of zero size. Chromium still finds an element and
-        reports ACTION_NEXT_HTML_ELEMENT done, so TalkBack keeps its focus ("Return and reset
-        reachEdge, web element focus will be handled by the framework", :1172): the AntennaPod
-        player trap, 19 presses on TalkBack 17.0 that never left the show notes."""
-        if self.rules.web_elements(root) or not self.rules.web_elements(root, include_empty=True):
-            return False
-        return root.rect.is_empty() or any(self.rules.role(a) == ROLE_PAGER
-                                           for a in root.ancestors())
+    def hidden_page(self, root: TbNode) -> bool:
+        """The WebView of the web root ``root`` is off screen: its View is not visible to the
+        user (the pager page or scroller holding it is clipped away), yet its page stays in the
+        accessibility tree, and TalkBack still hands focus to it (nodeFilterOrWebView checks
+        no visibility)."""
+        host = root.parent
+        if host is None or host.class_name != WEBVIEW_CLASS:
+            return root.rect.is_empty()
+        return not host.visible or host.rect.is_empty()
+
+    def traps(self, root: TbNode) -> bool:
+        """TalkBack cannot focus the root of a WebView on an off-screen page while that root
+        reports itself on screen. Measured on TalkBack 17.0, AntennaPod's expanded player:
+        ACTION_ACCESSIBILITY_FOCUS on the show notes' root (on screen, 2164..2856, its WebView
+        View clipped to nothing by the vertical ViewPager2) "returns true", no focus event
+        follows, focus stays on "Shownotes", and every press targets the root again: 19 presses,
+        and again live this round. With the root off screen too (A11yProbe V13's next page,
+        AntennaPod's collapsed player on its home screen) TalkBack lands and reads the whole
+        page instead, content nobody can see."""
+        return self.hidden_page(root) and root.rect.intersects(root.window.bounds)
 
     def _html_or_fallback(self, pivot: TbNode, forward: bool, accept: Callable[[TbNode], bool],
                           trav: Traversal, out: Dict[str, Any]) -> Optional[TbNode]:
         """navigateToHtmlTargetWithFallBack (:1541): the next web element, else out of the
         WebView with normal navigation from its root."""
-        target, passed = self._html_target(pivot, forward)
-        if passed:
-            out["web_unseen"] = len(passed)
+        target = self._html_target(pivot, forward)
         if target is not None:
             out["via"] = "web"
             return target
         root = self.rules.web_root_of(pivot) or pivot
-        if passed and forward and self.swallows(root):
-            out["swallowed"] = root
-            return None
         target, out["duplicate"] = search_focus(trav, root, forward, accept)
         return target
 
@@ -648,8 +646,14 @@ class Navigator:
                      accept: Callable[[TbNode], bool], trav: Traversal,
                      out: Dict[str, Any]) -> Optional[TbNode]:
         """findTargetFromMiddlePivot (:1459): a native node is the target; a WebView's root is
-        the target going forward, and going back its last element."""
-        if middle is None or forward or not self.rules.is_web_root(middle):
+        the target going forward (unless it :meth:`traps`: focus stays put), and going back its
+        last element."""
+        if middle is None or not self.rules.is_web_root(middle):
+            return middle
+        if forward:
+            if self.traps(middle):
+                out["stuck"] = middle
+                return None
             return middle
         return self._html_or_fallback(middle, forward, accept, trav, out)
 
@@ -667,8 +671,8 @@ class Navigator:
             # findTargetFromNativeElement (:1351): "returns WebView if find it first".
             middle, out["duplicate"] = search_focus(trav, pivot, forward, accept_or_web)
             target = self._from_middle(middle, forward, accept, trav, out) if web else middle
-        if out["swallowed"] is not None:
-            out.update(via="swallowed", reach_edge=False)
+        if out["stuck"] is not None:
+            out["via"] = "stuck"
             return
         if target is not None:
             if out["via"] != "web":
@@ -693,8 +697,8 @@ class Navigator:
         if out["reach_edge"]:
             middle = find_first_focus_in_tree(trav, win.root, forward, accept_or_web)
             target = self._from_middle(middle, forward, accept, trav, out) if web else middle
-            if out["swallowed"] is not None:
-                out.update(via="swallowed", reach_edge=False)
+            if out["stuck"] is not None:
+                out["via"] = "stuck"
                 return
             if target is not None:
                 out.update(target=target, via="wrap", reach_edge=False)
@@ -805,24 +809,21 @@ class Navigator:
                 continue
             yield n, accept(n)
 
-    def web_traps(self) -> List[Dict[str, Any]]:
-        """Every WebView that traps a forward walk: TalkBack reaches its root, but each of its
-        elements has zero size, so the WebView swallows the next press (:meth:`_html_target`).
-        ``before`` is the stop TalkBack reads just before the root."""
+    def hidden_web_pages(self) -> List[Dict[str, Any]]:
+        """A ``web_hidden_page`` diagnostic for every WebView a forward walk reaches whose page
+        is off screen (:meth:`hidden_page`); ``before`` is the stop TalkBack reads just before
+        its root, where it stays when the WebView :meth:`traps` it (``trap``)."""
         out: List[Dict[str, Any]] = []
         for w in self.windows:
             if not self.accepts_window(w):
                 continue
             prev: Optional[TbNode] = None
             for n, stop in self.window_order(w):
-                if self.rules.is_web_root(n) and self.swallows(n):
-                    d = web_trap(self.rules, n, n)
-                    d["before"] = prev.key if prev is not None else None
-                    out.append(d)
+                if self.rules.is_web_root(n) and self.hidden_page(n):
+                    out.append(web_hidden_page(self.rules, n, prev, self.traps(n)))
                 if stop:
                     prev = n
         return out
-
 
 def _supported_scroll_action(n: TbNode, forward: bool) -> Optional[int]:
     """ScrollableNodeInfo.getSupportedScrollDirection (UT/ScrollableNodeInfo.java:104) as the
@@ -895,24 +896,31 @@ def _simple_description(rules: Rules, n: TbNode) -> Optional[str]:
     return hit.content_description or hit.text
 
 
-def web_trap(rules: Rules, root: TbNode, at: TbNode) -> Dict[str, Any]:
-    """The ``web_trap`` diagnostic for a WebView whose elements all have zero size: TalkBack
-    stays on ``at`` while the WebView swallows every "next"."""
-    empty = rules.web_elements(root, include_empty=True)
+def web_hidden_page(rules: Rules, root: TbNode, before: Optional[TbNode],
+                    trap: bool) -> Dict[str, Any]:
+    """The ``web_hidden_page`` diagnostic (:meth:`Navigator.hidden_page`, :meth:`Navigator.traps`)."""
     holder = next((a for a in root.ancestors() if rules.role(a) == ROLE_PAGER), None)
     if holder is not None:
-        where = f" on a page of the pager {holder.key}"
+        where = f"on an off-screen page of the pager {holder.key}"
     else:
         holder = next((a for a in root.ancestors() if rules.is_scrollable(a)), None)
-        where = f" inside {holder.key}" if holder is not None else ""
+        where = f"scrolled out of view in {holder.key}" if holder is not None else "off screen"
+    after = f" after {before.key}" if before is not None else ""
+    head = (f"TalkBack hands focus{after} to the WebView {root.key}, which is {where} but "
+            "still in the accessibility tree")
+    if trap:
+        tail = (": its root reports itself on screen, so (as on AntennaPod's player, TalkBack "
+                "17.0) the focus action \"returns true\", no focus event follows, and every next "
+                "press targets the WebView again. Focus never moves on: a trap.")
+    else:
+        n = len(rules.web_elements(root))
+        tail = (f": TalkBack reads it and its {n} web element(s), content nobody can see "
+                "(A11yProbe V13; AntennaPod's home reads the collapsed player's show notes).")
     return {
-        "kind": "web_trap", "web_root": root.key, "at": at.key, "elements": len(empty),
+        "kind": "web_hidden_page", "web_root": root.key, "trap": trap,
+        "before": before.key if before is not None else None,
         "container": holder.key if holder is not None else None,
-        "message": (f"TalkBack hands \"next\" to the WebView {root.key}{where}, but all "
-                    f"{len(empty)} of its web elements have zero size on screen (the page is "
-                    "off screen or collapsed). The WebView still reports ACTION_NEXT_HTML_ELEMENT "
-                    "as done, so focus never moves on: every swipe stays put (AntennaPod's "
-                    "player, measured on TalkBack 17.0: 19 presses never left the show notes)."),
+        "message": head + tail,
     }
 
 
@@ -992,13 +1000,14 @@ class Order:
 
     @property
     def stops(self) -> List[Dict[str, Any]]:
-        return [s for s in self.steps if not s.get("edge") and not s.get("swallowed")]
+        return [s for s in self.steps if not s.get("edge") and not s.get("stuck")]
 
     @property
     def hints(self) -> List[Dict[str, Any]]:
-        """The ``autoscroll_ahead`` and ``web_trap`` diagnostics: what the walk hits that the
-        dump alone does not show."""
-        return [d for d in self.diagnostics if d.get("kind") in ("autoscroll_ahead", "web_trap")]
+        """The ``autoscroll_ahead`` and ``web_hidden_page`` diagnostics: what the walk runs
+        into that the dump alone does not show."""
+        return [d for d in self.diagnostics
+                if d.get("kind") in ("autoscroll_ahead", "web_hidden_page")]
 
     def keys(self) -> List[str]:
         return [s["key"] for s in self.stops]
@@ -1043,18 +1052,18 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
     scrollable TalkBack asks to bring this target fully into view; with ``"speak_conf":
     "pre_scroll"`` when the target is a clipped sliver, whose full text TalkBack speaks only
     after the scroll). An edge step with ``"autoscroll"`` is a press TalkBack spends scrolling,
-    not pausing. ``"web_unseen"`` counts the web elements TalkBack reads before this stop that
-    the dump has at zero size (the WebView scrolls them in). ``version`` picks the wording
+    not pausing. ``version`` picks the wording
     (:data:`.speech.VERSIONS`); ``keyboard`` speaks as for a walk driven by a hardware keyboard
     (tb-walk's), see :func:`.speech.announce`. ``via`` is how focus got there: ``tree``,
     ``bounds_swap``, ``chain``, ``before:<key>``, ``before_of:<key>``, ``after:<key>``,
     ``window:<index>``, ``web`` (the WebView moved it) or ``wrap``. An edge step is ``{"i",
     "edge": True, "key", "window"}``: the press only sets TalkBack's reachEdge; the next one
-    wraps. A ``{"i", "swallowed": True, "key", "web_root"}`` step ends the walk (``ended``
-    "trap"): the WebView takes the press and focus stays (:meth:`Navigator.swallows`).
+    wraps. A WebView root on an off-screen page is marked ``"hidden_page"``; one TalkBack cannot
+    focus (:meth:`Navigator.traps`) ends the walk with a ``{"i", "stuck": True, "key",
+    "web_root"}`` step (``ended`` "trap"): focus stays where it is.
 
-    ``diagnostics`` add ``web_trap`` for that, and an ``autoscroll_ahead`` hint per container
-    TalkBack auto-scrolls on the way (:func:`autoscroll_hint`).
+    ``diagnostics`` add a ``web_hidden_page`` for each such WebView and an ``autoscroll_ahead``
+    hint per container TalkBack auto-scrolls on the way (:func:`autoscroll_hint`).
     """
     from .explain import ghost_reasons, why_stop
     from .speech import SpeechState, announce
@@ -1090,7 +1099,6 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
 
     steps: List[Dict[str, Any]] = []
     nodes: List[Optional[TbNode]] = []
-    web_traps: List[Dict[str, Any]] = []
     hints: List[Dict[str, Any]] = []
     state = SpeechState()
     reach_edge = False
@@ -1124,13 +1132,12 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
         if scroller is not None and id(scroller) not in hinted:
             hinted.add(id(scroller))
             hints.append(autoscroll_hint(nav, scroller, pivot, target, forward, version))
-        if res["swallowed"] is not None:
-            # The WebView takes every press from here and moves nothing: a trap.
-            root = res["swallowed"]
-            steps.append({"i": i, "swallowed": True, "key": pivot.key,
-                          "window": pivot.window.index, "web_root": root.key})
+        if res["stuck"] is not None:
+            root = res["stuck"]
+            steps.append({"i": i, "stuck": True, "key": pivot.key, "window": pivot.window.index,
+                          "web_root": root.key})
             nodes.append(None)
-            web_traps.append(web_trap(nav.rules, root, pivot))
+            hints.append(web_hidden_page(nav.rules, root, pivot, True))
             ended = "trap"
             break
         if target is None:
@@ -1163,10 +1170,11 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
             step["unlabelled"] = True
         if res["autoscroll"] is not None:
             step["autoscroll"] = res["autoscroll"].key
-        if res["web_unseen"]:
-            # The WebView scrolls these in and TalkBack reads them first; the dump has them at
-            # zero size (clipped), so what they say is not known here.
-            step["web_unseen"] = res["web_unseen"]
+        if nav.rules.is_web_root(target) and nav.hidden_page(target):
+            step["hidden_page"] = True
+            if id(target) not in hinted:
+                hinted.add(id(target))
+                hints.append(web_hidden_page(nav.rules, target, pivot, False))
         if res["show_on_screen"] is not None:
             step["show_on_screen"] = res["show_on_screen"].key
             if any(g.startswith("clipped:") for g in ghost_reasons(nav.rules, target)):
@@ -1185,7 +1193,6 @@ def simulate(tree: Any, start: Any = None, direction: str = "next",
     diags = list(tb.diagnostics)
     for t in nav._trav.values():
         diags.extend(t.diagnostics)
-    diags.extend(web_traps)
     diags.extend(hints)
     order = Order(steps, ended, direction=direction, granularity=granularity, start=start_key,
                   diagnostics=diags, nodes=nodes)

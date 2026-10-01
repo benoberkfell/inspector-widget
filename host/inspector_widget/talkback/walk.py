@@ -71,9 +71,11 @@ Rect = Tuple[int, int, int, int]
 _FLAG_FIELDS = ("clickable", "long_clickable", "focusable", "focused", "accessibility_focused",
                 "scrollable", "visible_to_user", "enabled", "checkable", "checked", "heading",
                 "screen_reader_focusable", "editable", "is_traversal_group")
-_SCROLL_ACTIONS = {0x1000: "forward", 0x2000: "backward", 0x0102003F: "up", 0x01020041: "down",
-                   0x01020040: "left", 0x01020042: "right", 0x01020049: "page_down",
-                   0x01020048: "page_up", 0x0102004A: "page_left", 0x0102004B: "page_right"}
+# The scroll and page actions by id (android.R.id.accessibilityAction*, a11y.ACTION_NAMES).
+_SCROLL_ACTIONS = {0x1000: "forward", 0x2000: "backward", 0x01020038: "up", 0x0102003A: "down",
+                   0x01020039: "left", 0x0102003B: "right", 0x01020047: "page_down",
+                   0x01020046: "page_up", 0x01020048: "page_left", 0x01020049: "page_right"}
+_WEBVIEW = "android.webkit.WebView"
 _ROLE_WORDS = {
     "Button": "Button", "ImageButton": "Button", "CheckBox": "Checkbox", "Switch": "Switch",
     "ToggleButton": "Toggle button", "RadioButton": "Radio button", "EditText": "Edit box",
@@ -264,7 +266,12 @@ class DumpIndex:
                 for r in (self.window_meta.get(window) or {}).get("obscured") or []]
 
     def scroll_container(self, n: Node) -> Optional[Node]:
+        """The nearest scrollable around ``n`` that TalkBack scrolls: not a WebView, which
+        scrolls its own page as it moves focus through it (TalkBack never auto-scrolls web
+        content, FocusProcessorForLogicalNavigation :2273)."""
         for a in n.ancestors():
+            if a.cls == _WEBVIEW:
+                continue
             if "scrollable" in a.flags or a.actions & set(_SCROLL_ACTIONS):
                 return a
         return None
@@ -1532,8 +1539,8 @@ def _finish(drv: Driver, steps: List[Step], model: Model, *, ended: str, cycle: 
         last_idx = next((s.index for s in reversed(steps) if s.index is not None), start_idx)
         walk["orphans"] = orphan_text(last_idx, records, legacy)
     if start_resp is not None:
-        # What the model knows lies ahead (auto-scrolled content, a WebView that swallows
-        # "next"): diff names a stuck walk at such a WebView a tb.trap.
+        # What the model knows lies ahead (auto-scrolled content, a WebView on an off-screen
+        # page): diff names a walk stuck at such a WebView a tb.trap.
         known = model_hints(start_resp)
         walk["hints"] = known["hints"]
         walk["web_traps"] = known["web_traps"]
@@ -1708,8 +1715,10 @@ def static_walk(resp: Any, *, direction: str = "next", until: str = "wrap",
     The model does not scroll: the walk ends (``ended`` "autoscroll") where
     TalkBack would auto-scroll a list, so what it would scroll in is not judged;
     ``hints`` says what lies there (talkback.order's ``autoscroll_ahead``). A
-    pager is not auto-scrolled, so leaving one is still reported. A WebView that
-    swallows "next" ends it as ``ended`` "trap" with a tb.trap finding."""
+    pager is not auto-scrolled, so leaving one is still reported. A WebView on
+    an off-screen page that the walk reaches is a tb.ghost_stop (TalkBack reads
+    what nobody sees), or a tb.trap when TalkBack cannot focus it (``ended``
+    "trap", see talkback.order.Navigator.traps)."""
     from .. import a11y
     from .order import simulate
     from .tree import build
@@ -1723,7 +1732,7 @@ def static_walk(resp: Any, *, direction: str = "next", until: str = "wrap",
     for st in order.steps:
         key = st.get("key")
         node = idx.nodes.get(key) if key else None
-        if st.get("swallowed"):
+        if st.get("stuck"):
             break
         if st.get("autoscroll"):
             ended = "autoscroll"
@@ -1754,17 +1763,18 @@ def static_walk(resp: Any, *, direction: str = "next", until: str = "wrap",
     analysis = diff.analyze(walk, expect=expect)
     findings = [dict(f, basis="model" if f.get("basis") == "walk" else f.get("basis"))
                 for f in analysis["findings"] if f["code"] != "model.mismatch"]
-    traps = [d for d in order.diagnostics if d.get("kind") == "web_trap"]
-    walk["findings"] = [diff.web_trap_finding(t, basis="model") for t in traps] + findings
+    hidden = [d for d in order.diagnostics if d.get("kind") == "web_hidden_page"]
+    walk["findings"] = [diff.web_trap_finding(d, basis="model") for d in hidden] + findings
     walk["hints"] = [h["message"] for h in order.hints]
     return walk
 
 
 def model_hints(resp: Any) -> Dict[str, Any]:
     """What the model knows about a screen that a walk over it runs into: ``hints`` (the
-    autoscroll_ahead and web_trap messages of a forward lap) and ``web_traps`` (every WebView
-    that swallows "next", :meth:`.order.Navigator.web_traps`). Empty when the model cannot
-    read the dump."""
+    autoscroll_ahead and web_hidden_page messages of a forward lap) and ``web_traps`` (the
+    WebViews on an off-screen page that TalkBack cannot focus,
+    :meth:`.order.Navigator.hidden_web_pages` with ``trap``). Empty when the model cannot read
+    the dump."""
     try:
         from .. import a11y
         from .order import Navigator, simulate
@@ -1772,7 +1782,7 @@ def model_hints(resp: Any) -> Dict[str, Any]:
         tb = build(a11y.a11y_to_dict(resp))
         order = simulate(tb, start=None, until="wrap", keyboard=True)
         return {"hints": [h["message"] for h in order.hints],
-                "web_traps": Navigator(tb).web_traps()}
+                "web_traps": [d for d in Navigator(tb).hidden_web_pages() if d["trap"]]}
     except Exception:  # noqa: BLE001 - the walk reports without them
         return {"hints": [], "web_traps": []}
 

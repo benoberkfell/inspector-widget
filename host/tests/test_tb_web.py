@@ -1,7 +1,8 @@
 """Web content in the TalkBack model (talkback.rules web_elements / order's web navigation),
 calibrated on TalkBack 17.0 walks: Thunderbird's message body, A11yProbe V13 (a WebView on
-an offscreen ViewPager2 page) and AntennaPod's player, where a WebView whose page is off
-screen swallows every "next" (REALAPP_RESULTS B7).
+an offscreen ViewPager2 page, read in full), AntennaPod's home (the collapsed player's show
+notes, read though every element is 0px tall off screen) and AntennaPod's expanded player,
+where TalkBack cannot focus that WebView and never gets past it (REALAPP_RESULTS B7).
 
 TB = talkback/src/main/java/com/google/android/accessibility/talkback/ @229212f."""
 
@@ -108,10 +109,10 @@ def test_containers_and_the_texts_inside_a_link_are_not_stops():
     assert rules.focus_decision(tree.node("virtual:31:102")) == (False, "web_part")
 
 
-def test_zero_size_elements_are_never_stops_and_are_counted_when_passed():
-    # AntennaPod's show notes below the WebView's visible part: Chromium reports them at zero
-    # height. Never a stop; the step after them says how many TalkBack reads there first (the
-    # WebView scrolls them in; the dump cannot say what they are).
+def test_zero_size_elements_are_stops_too():
+    # Chromium moves through the page in document order whether an element is on screen or
+    # not. Live on TalkBack 17.0, AntennaPod's home: TalkBack read the collapsed player's show
+    # notes element by element, every one reported 0px tall below the screen.
     page = webview(32,
                    web(32, 5, cls="android.widget.TextView", text="Visible paragraph",
                        b=(0, 610, 1080, 100)),
@@ -121,12 +122,10 @@ def test_zero_size_elements_are_never_stops_and_are_counted_when_passed():
                        b=(0, 1400, 300, 0)),
                    web(32, 8, cls="android.widget.TextView", text="\n", b=(0, 700, 0, 57)))
     tree = tb.build([root(button(10, "Play", 300), page, button(11, "Next", 1500))])
-    rules = R.Rules(tree)
-    assert rules.focus_decision(tree.node("virtual:32:6")) == (False, "web_empty")
     walk = tb.simulate(tree)
-    assert walk.keys()[:-1] == ["view:10", "virtual:32:4", "virtual:32:5", "view:11"]
-    assert walk.stops[3]["web_unseen"] == 2
-    assert walk.ended == "wrap"
+    assert walk.keys()[:-1] == ["view:10", "virtual:32:4", "virtual:32:5", "virtual:32:6",
+                                "virtual:32:7", "view:11"]
+    assert R.Rules(tree).focus_decision(tree.node("virtual:32:8")) == (False, "web_part")
 
 
 def test_an_offscreen_webview_page_is_still_walked():
@@ -142,68 +141,87 @@ def test_an_offscreen_webview_page_is_still_walked():
 
 
 # ------------------------------------------------------------------------- the AntennaPod trap
-def pager_with_hidden_notes(in_pager=True):
-    """AntennaPod's expanded player at walk time (walk_player.json): a vertical ViewPager2
-    whose second page, the show notes WebView, peeks in at the bottom (its root 2164..2856)
-    while every web element is clipped to zero height at the screen's bottom edge."""
-    links = [web(40, vid, flags=FOCUS, role_description="link", text=t, b=(96, 2856, 600, 0))
-             for vid, t in ((160, "Planet Money newsletter"), (161, "Instagram"))]
-    notes = webview(40, web(40, 12, b=(24, 2856, 1233, 0), children=links),
-                    b=(0, 2164, 1280, 692))
+def player_with_notes_page(hidden=True, root_on_screen=True):
+    """AntennaPod's player (live on emulator-5554, TalkBack 17.0): a vertical ViewPager2 whose
+    second page, the show notes WebView, is clipped to nothing below the first (the WebView
+    View is not visible to the user). Expanded, Chromium's root still reports itself on screen
+    (2164..2856); collapsed, on the home screen, it reports 0px tall below the screen."""
+    root_b = (0, 2164, 1280, 692) if root_on_screen else (0, 4564, 1280, 0)
+    notes = webview(40,
+                    web(40, 10, cls="android.widget.TextView", text="Very soon, Social Security",
+                        b=(96, root_b[1] + 96, 1017, 228 if root_on_screen else 0)),
+                    web(40, 160, flags=FOCUS, role_description="link", text="Instagram",
+                        b=(120, 2856 if root_on_screen else 4564, 219, 0)),
+                    b=(0, root_b[1], 1280, 0) if hidden else (0, 2164, 1280, 692),
+                    root_b=root_b, host_flags=("enabled",) if hidden else VIS)
     handle = n(37, cls="android.widget.LinearLayout", cd="swipe up to read shownotes",
                flags=FOCUS, b=(415, 2032, 450, 108))
-    page1 = n(36, cls="android.widget.FrameLayout", b=(0, 348, 1280, 2508), children=[
+    page1 = n(36, cls="android.widget.FrameLayout", b=(0, 348, 1280, 1816), children=[
         n(35, cls="android.widget.TextView", text="Who's gonna pay for Social Security?",
-          b=(24, 1867, 1232, 69)), handle, notes])
-    if not in_pager:
-        return [root(page1, b=(0, 0, 1280, 2856))]
-    pager = n(34, cls="androidx.viewpager.widget.ViewPager", b=(0, 348, 1280, 2508),
+          b=(24, 1867, 1232, 69)), handle])
+    page2 = n(39, cls="android.widget.FrameLayout", b=(0, 2164, 1280, 0), flags=("enabled",),
+              children=[notes])
+    pager = n(34, cls="androidx.viewpager.widget.ViewPager", b=(0, 348, 1280, 1816),
               collection_info={"row_count": 2, "column_count": 1},
               actions=({"id": R.ACTION_SCROLL_FORWARD}, {"id": R.ACTION_PAGE_DOWN}),
-              children=[page1])
-    return [root(pager, b=(0, 0, 1280, 2856))]
+              children=[page1, page2])
+    seek = n(41, cls="android.widget.SeekBar", flags=FOCUS, b=(0, 2200, 1280, 60),
+             range_info={"min": 0, "max": 100, "current": 6, "type": "PERCENT"})
+    return [root(pager, seek, b=(0, 0, 1280, 2856))]
 
 
-def test_a_webview_whose_page_shows_nothing_swallows_next_a_trap():
-    # navigateToHtmlTargetWithFallBack: Chromium finds an element (of zero size) and reports
-    # ACTION_NEXT_HTML_ELEMENT done, so TalkBack keeps focus ("Return and reset reachEdge, web
-    # element focus will be handled by the framework", :1172). AntennaPod, TalkBack 17.0: 19
-    # presses never left the show notes.
-    tree = tb.build(pager_with_hidden_notes())
+def test_an_offscreen_webview_whose_root_claims_the_screen_traps_talkback():
+    # nodeFilterOrWebView (:1357) checks no visibility, so TalkBack targets the root of a WebView
+    # whose page is clipped away. On AntennaPod's expanded player TalkBack 17.0 logged "perform
+    # action=64=ACTION_ACCESSIBILITY_FOCUS returns true" on it, no focus event followed, and the
+    # next press targeted it again: focus never left "Shownotes" (19 presses; again live).
+    tree = tb.build(player_with_notes_page())
     walk = tb.simulate(tree)
     assert walk.ended == "trap"
-    assert walk.keys()[-2:] == ["view:37", "virtual:40:4"]
     last = walk.steps[-1]
-    assert last["swallowed"] and last["web_root"] == "virtual:40:4"
-    trap = next(d for d in walk.diagnostics if d["kind"] == "web_trap")
-    assert trap["container"] == "view:34" and trap["elements"] == 2
-    assert "vertical" not in trap["message"] and "pager" in trap["message"]
-    assert walk.hints == [trap]
-    assert tb.Navigator(tree).web_traps() == [dict(trap, at="virtual:40:4", before="view:37")]
+    assert last["stuck"] and last["key"] == "view:37" and last["web_root"] == "virtual:40:4"
+    assert walk.keys()[-1] == "view:37"
+    hint = next(d for d in walk.hints if d["kind"] == "web_hidden_page")
+    assert hint["trap"] is True and hint["before"] == "view:37" and hint["container"] == "view:34"
+    assert "returns true" in hint["message"]
+    assert tb.Navigator(tree).hidden_web_pages() == [hint]
 
 
-def test_outside_a_pager_zero_size_web_content_is_scrolled_in_not_a_trap():
-    # Without a pager, Chromium's focus request scrolls the page into view: not a trap.
-    tree = tb.build(pager_with_hidden_notes(in_pager=False))
-    assert tb.simulate(tree).ended == "wrap"
-    assert tb.Navigator(tree).web_traps() == []
+def test_an_offscreen_webview_off_screen_too_is_read_nobody_sees_it():
+    # The same page with the player collapsed (AntennaPod's home, live): the root is 0px tall
+    # below the screen, and TalkBack 17.0 read "Webview" and every element of it.
+    tree = tb.build(player_with_notes_page(root_on_screen=False))
+    walk = tb.simulate(tree)
+    keys = walk.keys()
+    at = keys.index("view:37")
+    assert keys[at:at + 4] == ["view:37", "virtual:40:4", "virtual:40:10", "virtual:40:160"]
+    assert walk.stops[at + 1]["hidden_page"] is True and walk.ended == "wrap"
+    hint = next(d for d in walk.hints if d["kind"] == "web_hidden_page")
+    assert hint["trap"] is False and "nobody can see" in hint["message"]
+    ghost = diff.web_trap_finding(hint, basis="model")
+    assert (ghost["code"], ghost["sev"]) == ("tb.ghost_stop", "warn")
 
 
-def test_a_stuck_walk_at_a_trapping_webview_is_a_trap_not_an_edge():
-    tree = tb.build(pager_with_hidden_notes())
-    traps = tb.Navigator(tree).web_traps()
+def test_a_webview_on_screen_is_not_flagged():
+    tree = tb.build(player_with_notes_page(hidden=False))
+    walk = tb.simulate(tree)
+    assert not any(s.get("hidden_page") for s in walk.stops) and walk.ended == "wrap"
+    assert tb.Navigator(tree).hidden_web_pages() == []
+
+
+def test_a_walk_stuck_before_a_trapping_webview_is_a_trap_not_an_edge():
+    traps = tb.Navigator(tb.build(player_with_notes_page())).hidden_web_pages()
     steps = [{"i": 0, "key": "view:35", "ref": "view:35", "moved": True, "via": "start"},
              {"i": 1, "key": "view:37", "ref": "view:37", "moved": True, "via": "next"},
              {"i": 2, "key": "view:37", "ref": "view:37", "moved": False, "via": "next"},
              {"i": 3, "key": "view:37", "ref": "view:37", "moved": False, "via": "next"}]
     walk = {"steps": steps, "ended": "stuck", "predicted": [], "direction": "next"}
-    codes = {f["code"] for f in diff.analyze(dict(walk, web_traps=traps))["findings"]}
-    assert "tb.trap" in codes and "tb.edge_stuck" not in codes
-    trap = next(f for f in diff.analyze(dict(walk, web_traps=traps))["findings"]
-                if f["code"] == "tb.trap")
+    found = diff.analyze(dict(walk, web_traps=traps))["findings"]
+    assert "tb.edge_stuck" not in {f["code"] for f in found}
+    trap = next(f for f in found if f["code"] == "tb.trap")
     assert trap["sev"] == "error" and "noHideDescendants" in trap["fix"]
-    plain = {f["code"] for f in diff.analyze(walk)["findings"]}
-    assert "tb.edge_stuck" in plain
+    assert trap["msg"].startswith("TalkBack stopped at view:37")
+    assert "tb.edge_stuck" in {f["code"] for f in diff.analyze(walk)["findings"]}
 
 
 # ------------------------------------------------------------------- no web content in the dump
@@ -244,3 +262,20 @@ def test_v13_model_walks_the_offscreen_webview_page_press_for_press():
     assert model == actual
     said = [s["speak"] for s in rec["steps"][1:] if s["moved"] and s.get("utt") == "logcat"]
     assert [s["speak"] for s in walk.stops][:len(said)] == said
+    # Its WebView sits on the pager's off-screen page: the model flags the risk.
+    assert next(s for s in walk.stops if s["key"] == "virtual:17:4")["hidden_page"] is True
+
+
+def test_v13_static_walk_reports_the_hidden_page():
+    resp = pb.DumpA11yResponse()
+    resp.ParseFromString(gzip.decompress((WALKS / "tb_v13-bad-walk.a11y.pb.gz").read_bytes()))
+    from inspector_widget.talkback import walk as tbwalk
+    static = tbwalk.static_walk(resp)
+    ghost = next(f for f in static["findings"]
+                 if f["code"] == "tb.ghost_stop" and "virtual:17:4" in f["keys"])
+    assert ghost["basis"] == "model" and "noHideDescendants" in ghost["fix"]
+    assert any("off-screen page" in h for h in static["hints"])
+    assert "tb.trap" not in {f["code"] for f in static["findings"]}
+    good = pb.DumpA11yResponse()
+    good.ParseFromString(gzip.decompress((WALKS / "tb_v13-good-walk.a11y.pb.gz").read_bytes()))
+    assert "tb.ghost_stop" not in {f["code"] for f in tbwalk.static_walk(good)["findings"]}

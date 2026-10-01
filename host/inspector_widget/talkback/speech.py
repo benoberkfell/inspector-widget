@@ -120,7 +120,10 @@ class Announcement:
         text = ""
         for s in segs:
             text = s.text if not text else text + (sep if s.glue is None else s.glue) + s.text
-        self.text = text
+        # The utterance is spoken trimmed, non-breaking spaces too, but not inside: "Follow:\xa0"
+        # says "Follow:" (AntennaPod's show notes) while a row's "[attachment_icon] " child keeps
+        # its space before the next part (Thunderbird), on TalkBack 17.0.
+        self.text = text.strip()
         self.parts: List[Dict[str, Any]] = [
             {"text": s.text, "from": s.node.key, "kind": s.kind} for s in segs]
         self.unlabelled = unlabelled

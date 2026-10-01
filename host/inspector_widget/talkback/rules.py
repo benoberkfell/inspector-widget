@@ -13,8 +13,8 @@ Where the port deliberately differs from the Java it says so:
 * Web content (``WebInterfaceUtils``): TalkBack hands navigation inside a WebView to the
   WebView (ACTION_NEXT/PREVIOUS_HTML_ELEMENT), and Chromium picks the next element. The
   elements it moves through are approximated by :meth:`Rules.web_elements`, calibrated on
-  TalkBack 17.0 walks (Thunderbird's message body, A11yProbe V13): document order, elements
-  with words or an action, never one of zero size.
+  TalkBack 17.0 walks (Thunderbird's message body, A11yProbe V13, AntennaPod): document order,
+  elements with words or an action, whether on screen or not.
 * ``ClassLoadingCache.checkInstanceOf`` loads classes in TalkBack's own process: framework
   classes and the androidx/material classes TalkBack bundles. :data:`_SUPERCLASS` stands in for
   that class loader; any other class name matches only itself.
@@ -476,9 +476,9 @@ class Rules:
         """shouldFocusNode with the branch that decided it:
 
         ``web`` (a WebView's root or an element its WebView moves focus to), ``web_part`` (web
-        content read as part of an element, or a container with nothing to say), ``web_empty``
-        (a web element of zero size), ``not_visible``, ``window_wrapper`` (bounds equal to the
-        window's, has children, neither focusable nor clickable), ``leaf`` (accessibility-focusable with no
+        content read as part of an element, or a container with nothing to say),
+        ``not_visible``, ``window_wrapper`` (bounds equal to the window's, has children, neither
+        focusable nor clickable), ``leaf`` (accessibility-focusable with no
         children: always focused, the unlabeled-button path), ``speaking`` (focusable with
         something to speak), ``silent_container`` (focusable, has children, nothing to speak),
         ``text_orphan`` (not focusable, has text or a state, no focusable ancestor),
@@ -507,8 +507,6 @@ class Rules:
                     self.is_web_element(a) for a in n.ancestors() if a is not root
                     and root in a.ancestors()):
                 return False, "web_part"
-            if n.rect.is_empty():
-                return False, "web_empty"
             return True, "web"
         if not self.is_visible(n):
             return False, "not_visible"
@@ -563,21 +561,20 @@ class Rules:
         return bool(words) or self.is_heading(n) or n.has("checkable") or n.has("focusable") \
             or self.is_clickable(n) or self.is_long_clickable(n)
 
-    def web_elements(self, root: TbNode, include_empty: bool = False) -> List[TbNode]:
+    def web_elements(self, root: TbNode) -> List[TbNode]:
         """The elements TalkBack reaches inside the web root ``root``, in document (pre-)order.
 
         Measured on TalkBack 17.0: Thunderbird's message body (the root "Webview", a paragraph,
         an image) and A11yProbe V13 (a heading, a paragraph, two links: not the containers
-        around the links, nor the texts inside them). An element of zero size is never a stop
-        (AntennaPod's show notes, clipped to nothing below the screen, were never read);
-        ``include_empty`` lists those too. An element's descendants are read as part of it."""
+        around the links, nor the texts inside them). On screen or not, and of zero size or
+        not: on AntennaPod's home TalkBack read the collapsed player's show notes, every one
+        reported 0px tall below the screen. An element's descendants are read as part of it."""
         out: List[TbNode] = []
         stack = list(reversed(root.children))
         while stack:
             n = stack.pop()
             if self.is_web_element(n):
-                if include_empty or not n.rect.is_empty():
-                    out.append(n)
+                out.append(n)
                 continue
             stack.extend(reversed(n.children))
         return out
