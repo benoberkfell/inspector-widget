@@ -132,9 +132,12 @@ description on another; both are folded into the node.
   reflected in accessibility bounds, so this rule still reports it. Web content
   (a WebView's page): CSS `min-width`/`min-height` or padding on the link/button.
   Every rule gives web content HTML/CSS advice, never Compose's.
-- **Capture lint:** `lint()` over a capture does not judge R2 on a node that
-  `render.clipped` flags (its visible part is not its size: a 9dp sliver of a row at
-  a scroll edge, a toggle half under a bar); the `render.clipped` issue says so.
+- **Capture lint:** `lint()` over a capture does not judge R2 where `render.clipped`
+  explains the small size (its visible part is not its size: a 9dp sliver of a row at
+  a scroll edge, a toggle half under a bar): R2's own `info` (every small axis
+  clipped), or a small axis that the clip's edge cuts; the `render.clipped` issue says
+  so. A `warn`/`error` on an axis the clip leaves whole (a 20dp-tall control whose
+  width is clipped) stays, as in the live `a11y_lint`.
 - **Evidence:** `w_dp`, `h_dp`, `min_dp`, `floor_dp`, `standard`, `clipped_axes`,
   `bounds_source` (and `touch_w_dp`/`touch_h_dp` plus `touch_rivals` or
   `touch_area_clear` for the Compose layout case).

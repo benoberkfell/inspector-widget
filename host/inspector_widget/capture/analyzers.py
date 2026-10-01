@@ -805,18 +805,53 @@ def _cached_lint(src: _Src, ix: Index, kind: str, *, density: int, font_scale: f
     return res
 
 
+def _clip_axes(clipped: Iterable[Issue]) -> set[str]:
+    """The axes ``render.clipped`` cuts: its ``edge`` top/bottom is the height, left/right
+    the width; an issue that names no edge may cut either."""
+    axes: set[str] = set()
+    for r in clipped:
+        edge = r.evidence.get("edge")
+        if edge in ("top", "bottom"):
+            axes.add("h")
+        elif edge in ("left", "right"):
+            axes.add("w")
+        else:
+            axes |= {"w", "h"}
+    return axes
+
+
+def _small_axes(ev: Mapping[str, Any]) -> set[str]:
+    """The axes R2 found below its minimum (``w_dp``/``h_dp`` against ``min_dp``, with
+    R2's 1px slack at any density down to 160dpi)."""
+    try:
+        min_dp = float(ev.get("min_dp") or 48)
+    except (TypeError, ValueError):
+        min_dp = 48.0
+    out: set[str] = set()
+    for ax in ("w", "h"):
+        v = ev.get(f"{ax}_dp")
+        if isinstance(v, (int, float)) and v < min_dp - 0.3:
+            out.add(ax)
+    return out
+
+
 def _annotate_touch_fp(pairs: Iterable[tuple[str, Issue]],
                        render: Mapping[str, Iterable[Issue]]) -> list[tuple[str, Issue]]:
-    """``pairs`` without the touch-target findings on a node ``render.clipped`` flags: its
-    visible part is not its size (a 9dp sliver of a 72dp row at a scroll edge, Now in
-    Android's Unbookmark half under the bottom bar), so R2 is not judged there (G18; it
-    used to be kept as a likely false positive). A contrast sample on a node clipped at a
-    scroll edge is kept, low confidence: the sliver may not show the text."""
+    """``pairs`` without the touch-target findings that a ``render.clipped`` node only
+    has because of the clip: its visible part is not its size (a 9dp sliver of a 72dp row
+    at a scroll edge, Now in Android's Unbookmark half under the bottom bar), so R2 is not
+    judged there (G18; it used to be kept as a likely false positive). That is R2's own
+    ``info`` (every small axis clipped), or a small axis set that the clip covers; a
+    warn/error on an axis the clip leaves whole is kept, as the live lint keeps it. A
+    contrast sample on a node clipped at a scroll edge is kept, low confidence: the sliver
+    may not show the text."""
     out: list[tuple[str, Issue]] = []
     for nid, iss in pairs:
         clipped = [r for r in render.get(nid, ()) if r.id == CLIPPED]
         if iss.id == TOUCH_RULE and clipped:
-            continue
+            small = _small_axes(iss.evidence)
+            if iss.sev == "info" or not small or small <= _clip_axes(clipped):
+                continue
         if iss.id == CONTRAST_RULE and any(r.evidence.get("scroll") for r in clipped):
             iss.evidence["note"] = SLIVER_NOTE
             iss.conf = "inferred"

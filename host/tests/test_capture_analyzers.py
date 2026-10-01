@@ -888,6 +888,27 @@ def test_contrast_on_a_scroll_clipped_sliver_is_low_confidence():
     assert "note" not in pairs[2][1].evidence and pairs[2][1].conf == "exact"
 
 
+def test_r2_on_an_axis_the_clip_leaves_whole_is_kept():
+    # A 30x20dp control whose width is clipped at its parent's right edge: its 20dp height
+    # is real and below the 24dp floor, so the live lint's error stands in the capture too.
+    # Only a small size the clip explains (every small axis clipped, or R2's own info) is
+    # not judged.
+    def keep(touch, edge):
+        clip = Issue(an.CLIPPED, "warn", {"clipped_by": "n2", "edge": edge, "visible_px": 60,
+                                          "declared_px": 90})
+        return [i.sev for _n, i in an._annotate_touch_fp([("n9", touch)], {"n9": [clip]})]
+
+    def r2(sev, w, h):
+        return Issue(TOUCH, sev, {"w_dp": w, "h_dp": h, "min_dp": 48})
+
+    assert keep(r2("error", 30.0, 20.0), "right") == ["error"]  # the height is not clipped
+    assert keep(r2("warn", 120.0, 40.0), "right") == ["warn"]  # nor here
+    assert keep(r2("warn", 120.0, 40.0), "bottom") == []  # the small height is the clip's
+    assert keep(r2("error", 30.0, 20.0), "bottom") == ["error"]  # the width is still small
+    assert keep(r2("info", 426.7, 9.0), "bottom") == []  # R2 already found it clipped
+    assert keep(r2("warn", 30.0, 20.0), None) == []  # no edge: either axis may be cut
+
+
 def test_rules_the_installed_lint_cannot_produce_are_flagged(monkeypatch):
     ix, loaded = _spec_launcher()
     monkeypatch.setattr(a11y_lint, "ALL_RULE_IDS",
