@@ -679,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_a11y)
 
     sp = sub.add_parser("a11y-lint",
-                        help="run the accessibility lint (R1..R18) over the unified a11y tree "
+                        help="run the accessibility lint (R1..R23) over the unified a11y tree "
                              "(Views + Compose)")
     _add_serial_arg(sp)
     sp.add_argument("--package", default=DEFAULT_PACKAGE)
@@ -689,7 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scale", type=_scale, default=1.0, help="screenshot scale for the contrast sample")
     sp.add_argument("--rule", action="append", dest="rules", metavar="RULE_ID",
                     help="only run this rule (repeatable): an id like a11y.label.missing, an "
-                         "alias R1..R18, or an ATF name like TouchTargetSize; omit to run all")
+                         "alias R1..R23, or an ATF name like TouchTargetSize; omit to run all")
     sp.add_argument("--no-rendering-info", action="store_false", dest="include_rendering_info",
                     help="skip per-node ExtraRenderingInfo (disables the text-size rules R11/R18 "
                          "and text-size-aware contrast)")

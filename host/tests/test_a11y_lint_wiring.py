@@ -64,12 +64,37 @@ def test_mcp_a11y_lint_unknown_rule_is_a_tool_error(monkeypatch):
         mcp_server.tool_a11y_lint("emulator-5556", "com.example", rules=5)
 
 
+def test_every_surface_names_the_whole_rule_range():
+    # What an agent reads before it lints: the MCP descriptions, the capture lint's
+    # description and --rule help, and the CLI help name the catalog's last rule. They said
+    # R1..R18 while the catalog ran to R23, so no listing mentioned R19..R23.
+    import argparse
+
+    from inspector_widget import surface
+
+    span = f"R1..{L.RULE_SPECS[-1].alias}"
+    tool = mcp_server.TOOLS["a11y_lint"]
+    assert span in tool["description"] and span in tool["schema"]["properties"]["rules"][
+        "description"]
+    assert span in (mcp_server.tool_a11y_lint.__doc__ or "")
+    assert span in surface.D_LINT
+    lint = surface.spec("lint")
+    assert span in next(p for p in lint.params if p.name == "rules").help
+    sub = next(a for a in cli.build_parser()._actions
+               if isinstance(a, argparse._SubParsersAction))
+    sp = sub.choices["a11y-lint"]
+    assert span in next(a for a in sub._choices_actions if a.dest == "a11y-lint").help
+    assert span in next(a for a in sp._actions if a.dest == "rules").help
+    for text in (tool["description"], surface.D_LINT, mcp_server.tool_a11y_lint.__doc__ or ""):
+        assert "R1..R18" not in text
+
+
 def test_mcp_rule_ids_are_checked_before_the_device(monkeypatch):
     """The schema takes strings (an enum of all 47 ids and aliases would cost ~900 B
     of tools/list); the handler checks them first and names the valid ones."""
     props = mcp_server.TOOLS["a11y_lint"]["schema"]["properties"]
     assert props["rules"]["items"] == {"type": "string"}
-    assert "R1..R18" in props["rules"]["description"]
+    assert "R1..R23" in props["rules"]["description"]
     assert props["include_rendering_info"]["default"] is True
     monkeypatch.setattr(mcp_server.SESSIONS, "get_or_attach", _explode)
     res = mcp_server._run_tool("a11y_lint", {"package": "com.example", "serial": "s",
