@@ -33,6 +33,10 @@ RANKS = ("exact", "word", "substring")
 FIELDS = ("label", "cd", "text", "speech", "child text")
 #: Candidates an ambiguity error lists.
 MAX_CANDIDATES = 5
+#: A partial match (whole word or substring) that is less than this share of the words it
+#: matched is too loose to activate: "Wear OS" in a card titled "The new Google Pixel Watch
+#: is here: start building for Wear OS!" (t5c05ht opened Chrome that way).
+WEAK = 0.5
 HEAD = 40
 #: What makes an activation leave the app: a web link, a URL, a ClickableSpan.
 _URL = re.compile(r"\b(?:https?://|www\.)\S", re.I)
@@ -96,9 +100,12 @@ class Stop:
         return f'{self.key} "{self.head(n)}"'
 
     def fields(self) -> Iterator[Tuple[str, str]]:
+        """What a selector is matched against: what TalkBack speaks for the stop (a
+        contentDescription replaces the text, so a text under one is not matched)."""
         yield "label", self.label
         yield "cd", self.cd
-        yield "text", self.text
+        if not self.cd:
+            yield "text", self.text
         yield "speech", self.speech
         for seg in re.split(r"\.\s+|,\s+", self.speech or ""):
             yield "speech", seg
@@ -119,6 +126,7 @@ class Match:
     selector: str
     via: Optional[str] = None
     notes: List[str] = field(default_factory=list)
+    cover: float = 1.0  # the share of the matched words the selector is (weak below WEAK)
 
     @property
     def key(self) -> str:
@@ -216,7 +224,9 @@ def custom_actions(n: Dict[str, Any]) -> Dict[str, int]:
 
 
 def _words(n: Dict[str, Any]) -> List[str]:
-    return [str(x) for x in (n.get("content_description"), n.get("text")) if x]
+    """What TalkBack speaks of a node: its contentDescription, else its text."""
+    w = n.get("content_description") or n.get("text")
+    return [str(w)] if w else []
 
 
 def _link(n: Dict[str, Any]) -> Optional[str]:
@@ -224,7 +234,7 @@ def _link(n: Dict[str, Any]) -> Optional[str]:
     extras = n.get("extras") or {}
     if role == "link" or str(extras.get("AccessibilityNodeInfo.chromeRole") or "") == "link":
         return "a web link"
-    if any(_URL.search(w) for w in _words(n)):
+    if any(_URL.search(str(w)) for w in (n.get("content_description"), n.get("text")) if w):
         return "a URL"
     spans = next((v for k, v in extras.items() if "SPANS" in k and "START" in k), None)
     if spans not in (None, "", "[]"):
@@ -232,10 +242,31 @@ def _link(n: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _shown(n: Dict[str, Any]) -> bool:
+    """Whether a window root shows anything: visible itself, or a visible node under it."""
+    stack = [n]
+    while stack:
+        x = stack.pop()
+        if "visible_to_user" in (x.get("flags") or ()):
+            return True
+        stack.extend(x.get("children") or [])
+    return False
+
+
 def stops_from_dump(d: Dict[str, Any], *, legacy: bool = False) -> List[Stop]:
-    """The model's stops of one :func:`~inspector_widget.a11y.a11y_to_dict` dump."""
+    """The model's stops of one :func:`~inspector_widget.a11y.a11y_to_dict` dump.
+
+    A window that shows nothing (its whole tree invisible: a dismissed dialog's leftover
+    window, seen on Now in Android after the 16 KB dialog) is not let to hide the windows
+    under it: their stops are what TalkBack reads (the walk reaches them)."""
     windows = d.get("windows") or []
     key_of = _key_fn(windows, legacy)
+    blank = {int(w.get("root_view_id") or 0) for w in windows
+             if w.get("root") and not _shown(w["root"])}
+    if blank and any(w.get("covered_by") in blank for w in windows):
+        d = dict(d, windows=[{k: v for k, v in w.items() if k != "covered_by"}
+                             if w.get("covered_by") in blank else w for w in windows])
+        windows = d["windows"]
     nodes, speaks = _ordered(d)
     parent: Dict[int, Dict[str, Any]] = {}
     win_of: Dict[int, int] = {}
@@ -250,8 +281,8 @@ def stops_from_dump(d: Dict[str, Any], *, legacy: bool = False) -> List[Stop]:
         win = win_of.get(id(n), 0)
         b = (n.get("bounds") or {}).get("layout") or {}
         text, cd = str(n.get("text") or ""), str(n.get("content_description") or "")
-        kids = [str(c.get("text") or c.get("content_description") or "") for c in n.get("children") or []]
-        s = Stop(key=key_of(n, win), order=i + 1, speech=sp, label=text or cd or " | ".join(k for k in kids if k),
+        kids = [str(c.get("content_description") or c.get("text") or "") for c in n.get("children") or []]
+        s = Stop(key=key_of(n, win), order=i + 1, speech=sp, label=cd or text or " | ".join(k for k in kids if k),
                  cd=cd, text=text, cls=str(n.get("class_name") or "").rsplit(".", 1)[-1],
                  bounds=(int(b.get("x", 0)), int(b.get("y", 0)), int(b.get("w", 0)), int(b.get("h", 0))),
                  window=win, node=n, rid=str(n.get("view_id_resource_name") or ""), link=_link(n),
@@ -300,25 +331,32 @@ def _by_key(stops: Sequence[Stop], key: str) -> Tuple[Optional[Stop], Optional[s
     return None, None
 
 
-def _label_match(stops: Sequence[Stop], sel: str) -> Tuple[Optional[int], List[Tuple[Stop, str]]]:
-    """(best rank, [(stop, field)] at that rank, in reading order)."""
+def _label_match(stops: Sequence[Stop], sel: str
+                 ) -> Tuple[Optional[int], List[Tuple[Stop, str, float]]]:
+    """(best rank, [(stop, field, cover)] at that rank, in reading order); ``cover``: the
+    share of the matched words the selector is (1 for an exact match)."""
     want = norm(sel)
+    n_want = len(want.split())
     best: Optional[int] = None
-    hits: List[Tuple[Stop, str]] = []
+    hits: List[Tuple[Stop, str, float]] = []
     for s in stops:
-        r_best, f_best = None, ""
+        r_best, f_best, c_best = None, "", 0.0
         for f, v in s.fields():
-            r = _rank(want, norm(v))
-            if r is not None and (r_best is None or r < r_best):
-                r_best, f_best = r, f
+            nv = norm(v)
+            r = _rank(want, nv)
+            if r is None:
+                continue
+            cov = 1.0 if r == 0 else n_want / max(1, len(nv.split()))
+            if r_best is None or r < r_best or (r == r_best and cov > c_best):
+                r_best, f_best, c_best = r, f, cov
                 if r == 0:
                     break
         if r_best is None:
             continue
         if best is None or r_best < best:
-            best, hits = r_best, [(s, f_best)]
+            best, hits = r_best, [(s, f_best, c_best)]
         elif r_best == best:
-            hits.append((s, f_best))
+            hits.append((s, f_best, c_best))
     return best, hits
 
 
@@ -386,8 +424,9 @@ def resolve(stops: Sequence[Stop], selector: str, *,
     rank, hits = _label_match(stops, sel)
     if rank is None:
         return None
-    first, fld = hits[0]
-    return Match(first, fld, RANKS[rank], [s for s, _f in hits], sel)
+    first, fld, cover = hits[0]
+    return Match(first, fld, RANKS[rank], [s for s, _f, _c in hits], sel,
+                 cover=max(c for _s, _f, c in hits))
 
 
 def _inner_nodes(s: Stop) -> Iterator[Dict[str, Any]]:
@@ -433,9 +472,18 @@ def vet(m: Match, *, activate: bool, where: str = "",
     (``ambiguous``, listing the candidates) and a stop ``covered`` says lies under an open
     drawer, sheet or dialog (``start_not_found``), and notes a stop that may leave the app
     (a link). A walk start keeps the first of a tie, with a note."""
+    if activate and m.ambiguous:
+        raise ambiguity_error(m, f" on {where}" if where else "")
+    if activate and m.how in ("word", "substring") and m.cover < WEAK:
+        raise SelectError(
+            "ambiguous",
+            f"{m.selector!r} is only part of what {len(m.candidates)} stop(s) say ({m.how} match "
+            f"in their {m.field}, at most {round(m.cover * 100)}% of its words): too loose to "
+            f"activate" + (f" on {where}" if where else ""),
+            hint="Pass the words the stop speaks (more of them), its key or ref, or "
+                 "'<label> within <card label>'.",
+            candidates=candidates(m))
     if m.ambiguous:
-        if activate:
-            raise ambiguity_error(m, f" on {where}" if where else "")
         m.notes.append(f"{m.selector!r}: {len(m.candidates)} stops match ({m.how} {m.field}); "
                        f"took the first, {m.node.key}")
     by = covered(m.node) if covered is not None else None
@@ -494,6 +542,6 @@ def scrollables(d: Dict[str, Any]) -> List[Tuple[str, Set[int]]]:
     return [(k, ids) for _a, k, ids in out]
 
 
-__all__ = ["FIELDS", "Match", "RANKS", "SelectError", "Stop", "ambiguity_error", "can_bring_more",
+__all__ = ["FIELDS", "Match", "RANKS", "SelectError", "WEAK", "Stop", "ambiguity_error", "can_bring_more",
            "candidates", "is_key", "norm", "not_found_error", "require", "resolve", "scrollables",
            "stops_from_dump", "vet"]

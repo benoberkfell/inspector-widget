@@ -88,7 +88,7 @@ def test_nia_feed_bookmark_and_the_topic_chip_by_its_spoken_label():
                                              "compose:8:191"]
     # NIA-7: the description is on a child Text; the stop is the chip
     m = S.resolve(st, "Wear OS is not followed")
-    assert (m.key, m.field, m.how) == ("compose:8:110", "speech", "exact")
+    assert (m.key, m.field, m.how) == ("compose:8:110", "label", "exact")
     assert m.node.speech == "Wear OS is not followed. Button"
     # scoped: the card's own Bookmark, and its n-th stop
     m = S.resolve(st, "Bookmark within Deep Links")
@@ -99,7 +99,8 @@ def test_nia_feed_bookmark_and_the_topic_chip_by_its_spoken_label():
 
 def test_a_tie_is_refused_for_an_activation_and_listed_in_under_a_kilobyte():
     """t5c05ht: "Wear OS" activated a news card whose text holds the words, and left the
-    app for Chrome. Several chips and a card match alike: an activation refuses."""
+    app for Chrome. The chips show "WEAR OS" but TalkBack speaks their description ("Wear
+    OS is followed"), so the card and every chip match alike: an activation refuses."""
     card = _node("compose:8:100", flags=("clickable", "focusable"), bounds=(0, 0, 400, 300),
                  kids=[_node("compose:8:101", "android.widget.TextView",
                              text="The new Pixel Watch: start building for Wear OS!")])
@@ -112,15 +113,35 @@ def test_a_tie_is_refused_for_an_activation_and_listed_in_under_a_kilobyte():
         S.require(st, "Wear OS", activate=True, where="MainActivity")
     e = err.value
     assert e.code == "ambiguous" and len(e.tried) == 5
-    assert "'Wear OS' matches 7 stops" in str(e) and "2 more not listed" in str(e)
-    assert all(t.startswith("compose:8:2") for t in e.tried)
+    assert str(e) == "'Wear OS' matches 8 stops (word label) on MainActivity; 3 more not listed"
+    assert e.tried[0].startswith('compose:8:100 "The new Pixel Watch')
+    assert all(t.startswith("compose:8:2") for t in e.tried[1:])
     doc = {"error": {"code": e.code, "message": str(e), "hint": e.hint, "candidates": e.tried}}
     assert utf8_len(dumps(doc)) <= 1000
     # a walk start takes the first, and says so
     m = S.require(st, "Wear OS", activate=False)
-    assert m.key == "compose:8:200" and "7 stops match" in m.notes[0]
+    assert m.key == "compose:8:100" and "8 stops match" in m.notes[0]
     # the full description names one
     assert S.require(st, "Wear OS is followed", activate=True).key == "compose:8:200"
+
+
+def test_a_few_words_inside_a_long_text_are_too_loose_to_activate():
+    """t5c05ht, again with only the card on screen: "Wear OS" is 2 of the 12 words of the
+    card's title. A walk may start there; an activation is refused, naming the card."""
+    card = _node("compose:8:100", flags=("clickable", "focusable"), bounds=(0, 0, 400, 300),
+                 kids=[_node("compose:8:101", "android.widget.TextView",
+                             text="The new Google Pixel Watch is here: start building for Wear OS!")])
+    st = S.stops_from_dump(_screen(card, _button("view:10", "Settings", 400)))
+    m = S.resolve(st, "Wear OS")
+    assert (m.key, m.how) == ("compose:8:100", "word") and m.cover < S.WEAK
+    assert S.require(st, "Wear OS", activate=False).key == "compose:8:100"
+    with pytest.raises(S.SelectError) as err:
+        S.require(st, "Wear OS", activate=True)
+    assert err.value.code == "ambiguous" and "too loose to activate" in str(err.value)
+    assert err.value.tried == ['compose:8:100 "The new Google Pixel Watch is here: sta…"']
+    m = S.require(S.stops_from_dump(_screen(_button("view:11", "Theme settings", 0))), "Theme",
+                  activate=True)
+    assert m.key == "view:11" and m.cover == 0.5
 
 
 def test_keys_climb_to_the_stop_talkback_focuses():
@@ -164,6 +185,24 @@ def test_nia_onboarding_double_stops_are_a_tie_but_done_is_one():
     m = S.resolve(st, "Headlines")  # NIA-2: the row and its own toggle
     assert m.ambiguous and [c.key for c in m.candidates] == ["compose:8:94", "compose:8:100"]
     assert S.can_bring_more(dump("nia_for_you"))  # the feed scrolls
+
+
+def test_a_blank_window_left_on_top_does_not_hide_the_stops_under_it():
+    """Now in Android after the 16 KB dialog: a dialog window of the app with nothing
+    visible sits on top, and the model marked the activity covered by it (no stops at all,
+    so every label failed). TalkBack reads the activity: so do the selectors."""
+    d = _screen(_button("view:10", "Bookmark", 0))
+    d["windows"][0]["covered_by"] = 251
+    blank = _node("view:251", "android.widget.FrameLayout", bounds=(0, 234, 400, 500))
+    blank["flags"] = ["enabled"]
+    d["windows"].append({"root_view_id": 251, "window_type": 2, "modal": True, "root": blank})
+    assert S.resolve(S.stops_from_dump(d), "Bookmark").key == "view:10"
+    # a covering window that shows something still covers
+    shown = _node("view:300", "android.widget.FrameLayout", bounds=(0, 234, 400, 500),
+                  kids=[_button("view:301", "OK", 300)])
+    d["windows"][0]["covered_by"] = 300
+    d["windows"][1] = {"root_view_id": 300, "window_type": 2, "modal": True, "root": shown}
+    assert [s.key for s in S.stops_from_dump(d)] == ["view:301"]
 
 
 def test_covered_targets_and_links():

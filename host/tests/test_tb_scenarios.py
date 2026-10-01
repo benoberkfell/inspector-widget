@@ -18,7 +18,7 @@ import pytest
 import fakeagent
 from fakeagent import DEFAULT_PACKAGE as PKG
 from fakeagent import DEFAULT_SERIAL as SERIAL
-from fakeagent import TB_TITLE, Scene, ViewSpec, tb_item
+from fakeagent import TB_TITLE, ViewSpec, tb_item
 
 import inspector_widget as iw
 from inspector_widget.capture import walks
@@ -141,6 +141,9 @@ def test_verdicts_on_the_hunts_shapes():
     assert S.classify(F(f1_label="", f1_unlabelled=True))[0] == "on_close_or_unlabeled"
     assert S.classify(F(f1_key=None))[0] == "none"
     assert S.classify(F(left_app=True))[0] == "left_app"
+    # a navigation rail's first tab is the screen's first stop: a reset, not a move to nav
+    assert S.classify(F(f1_label="For you", f1_nav=True, target_gone=True, tree_changed=True,
+                        first_key="compose:8:19"))[0] == "reset_to_top"
 
 
 def test_moved_to_nav_on_the_device_quotes_the_spoken_label(probe):
@@ -151,10 +154,10 @@ def test_moved_to_nav_on_the_device_quotes_the_spoken_label(probe):
     probe.talkback.on_click = unbookmark
     res = scenario("focus_after", target="Item 2", action="activate")
     assert res["verdict"] == "moved_to_nav", res
-    assert res["why"].endswith('view:1062 "Saved. Tab"')
+    assert res["why"] == "same screen; focus thrown to the navigation bar (the target was removed)"
     assert res["finding"]["code"] == "tb.focus_reset"
-    assert "neighbour" not in res["finding"]["fix"] and "previous one" in res["finding"]["fix"]
-    assert "announce" in res["finding"]["fix"]
+    assert res["finding"]["msg"].endswith('to the navigation bar (view:1062 "Saved. Tab")')
+    assert "previous one" in res["finding"]["fix"] and "announce" in res["finding"]["fix"]
     assert res["speak_after"] == "Saved. Tab" and res["speak_before"] == "Item 2. Button"
 
 
@@ -268,12 +271,19 @@ def test_the_log_parser_reads_talkback_17_lines():
         "TYPE_WINDOW_STATE_CHANGED:  ttsOutput= Thunderbird Debug    queueMode=1",
         "         1790846357.000 23067 23067 V talkback: TalkBackFeedbackProvider:  "
         "TYPE_VIEW_CLICKED:  ttsOutput=     queueMode=0",
+        # a window state with nothing to say logs no queueMode: its flags end it
+        "         1790848978.692 23067 23067 V talkback: TalkBackFeedbackProvider:  "
+        "TYPE_WINDOW_STATE_CHANGED:  ttsOutput=     ttsAddToHistory  "
+        "forceFeedbackEvenIfAudioPlaybackActive  forceFeedbackEvenIfPhoneCallActive",
+        "         1790848978.694 23067 23067 V talkback: TalkBackFeedbackProvider:  "
+        "TYPE_WINDOW_STATE_CHANGED:  ttsOutput= 1 selected  ttsAddToHistory",
     ]
     got = [S.parse_line(x) for x in lines]
     assert got == [("reason", "restore"), ("tts", "Webview. In horizontal pager"),
                    ("hint", "Press select to activate"), None,
                    ("announce", "TYPE_WINDOW_STATE_CHANGED\tThunderbird Debug"),
-                   ("announce", "TYPE_VIEW_CLICKED\t")]
+                   ("announce", "TYPE_VIEW_CLICKED\t"), None,
+                   ("announce", "TYPE_WINDOW_STATE_CHANGED\t1 selected")]
     # a long utterance logcat split over two lines (G24's shape) is joined
     log = S.SpeechLog(SERIAL)
     log.feed("         1.0 1 1 V talkback: TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:"
@@ -282,6 +292,14 @@ def test_the_log_parser_reads_talkback_17_lines():
     log.feed("         2.0 1 1 V talkback: unrelated", now=2.0)
     assert log.since(0, "tts") == [(1.0, "tts", "Message details demo. Alice – multiple addresses "
                                                 "in the To: header. 5 of 6. In list")]
+    # logcat prints each line of a multi-line message with its own header (wtvdjj3 step 10)
+    log = S.SpeechLog(SERIAL)
+    log.feed("         1.0 1 1 V talkback: TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:"
+             "  ttsOutput= Release notes", now=1.0)
+    log.feed("         1.0 1 1 V talkback: Fixed a crash. 3 of 9    queueMode=0  ttsAddToHistory",
+             now=1.0)
+    log.feed("         1.1 1 1 V talkback: Compositor: eventInterpretation= x", now=1.1)
+    assert log.since(0, "tts") == [(1.0, "tts", "Release notes Fixed a crash. 3 of 9")]
 
 
 # --------------------------------------------------------------------------- selectors (G4)
@@ -442,7 +460,7 @@ def test_a_scenario_result_with_everything_fits_its_budget():
            "timeline": [{"t": 0, "focus": "n12"}, {"t": 82, "focus": None},
                         {"t": 164, "focus": "n19"}, {"t": 170, "said": "Saved. Tab", "why": "restore"},
                         {"t": 300, "announced": "Bookmark removed", "event": "window_state_changed"}],
-           "focus": {"ref": "n19", "speak": "Saved. Tab"}, "speak_after": "Saved. Tab",
+           "focus": {"ref": "n19", "speak": "Saved, Tab"}, "speak_after": "Saved. Tab",
            "announced": ["Bookmark removed"], "verdict": "moved_to_nav",
            "why": 'same screen; focus thrown to the navigation bar (the target was removed): n19 "Saved. Tab"',
            "walk": [{"i": i, "ref": f"n{20 + i}", "speak": f"Stop {i}. Button"} for i in range(1, 9)],
@@ -452,8 +470,9 @@ def test_a_scenario_result_with_everything_fits_its_budget():
            "notes": ["a note " * 10], "restore": "restored"}
     out = walks.scenario_result(rec)
     assert utf8_len(dumps(out)) <= walks.SCENARIO_MAX_BYTES
-    for key in ("verdict", "why", "focus", "speak_after", "expect", "finding", "lines"):
+    for key in ("verdict", "why", "focus", "expect", "finding", "lines"):
         assert key in out, key
+    assert "speak_after" not in out  # what the focus line already quotes
     assert out["expect"] == '"Undo" reached (walk press 6)'
     assert any(t.startswith('170 said "Saved. Tab" (restore)') for t in out["timeline"])
     full = walks.scenario_result(rec, max_bytes=4000)

@@ -54,7 +54,7 @@ from .. import adb
 from . import device
 from . import select as tbselect
 from .walk import (Driver, Node, Snapshot, STEP_TIMEOUT_MS, SETTLE_MS, WalkError, _seek_start,
-                   _walk_id, predict, predict_initial, walks_dir)
+                   _walk_id, predict_initial, walks_dir)
 
 KINDS = ("focus_after", "restore", "survive")
 ACTIONS = ("activate", "back", "tap")
@@ -100,13 +100,12 @@ FIXES = {
     "tb.focus_drift": "The focused View was rebound to other content (notifyDataSetChanged): use "
                       "DiffUtil / stable ids so the View keeps its item.",
     # an action that removed the focused node on a screen that stays (a list mutation)
-    "tb.focus_reset:mutation": "When an action removes the focused item, move accessibility "
-                               "focus yourself once the list is laid out: to the item that took "
-                               "its place, else the previous one, else the empty-state text "
-                               "(View.performAccessibilityAction(ACTION_ACCESSIBILITY_FOCUS, null) "
-                               "/ the Compose host's accessibilityNodeProvider.performAction(id, "
-                               "ACTION_ACCESSIBILITY_FOCUS, null)), and announce the result (an "
-                               "accessible Snackbar with Undo, or announceForAccessibility).",
+    "tb.focus_reset:mutation": "Once the list is laid out again, send "
+                               "ACTION_ACCESSIBILITY_FOCUS to the item that took the removed "
+                               "one's place, else the previous one, else the empty-state text "
+                               "(View.performAccessibilityAction / the Compose host's "
+                               "accessibilityNodeProvider.performAction), and announce the result "
+                               "(a Snackbar with Undo, or announceForAccessibility).",
 }
 
 
@@ -172,8 +171,14 @@ def _activates(kind: str, steps: List[Step]) -> bool:
 # --------------------------------------------------------------------------- #
 # What TalkBack said: its verbose log
 # --------------------------------------------------------------------------- #
-_HEADER = re.compile(r"^\s*\d+\.\d+\s+\d+\s+\d+\s+[VDIWEFA]\s")
-_FEEDBACK = re.compile(r"TalkBackFeedbackProvider:\s+(\w+):\s+ttsOutput=\s?(.*?)(?:\s{2,}queueMode|$)")
+_HEADER = re.compile(r"^\s*\d+\.\d+\s+\d+\s+\d+\s+[VDIWEFA]\s+[\w.-]+\s*:\s?")
+#: Where an utterance ends: the flags TalkBack logs after it (queueMode=0, ttsAddToHistory,
+#: forceFeedbackEvenIf..., haptic=, earcon= ...), two spaces in.
+_FLAG_WORDS = (r"(?:queueMode|tts[A-Z]\w*|force\w+|advance\w+|prevent\w+|haptic=|earcon="
+               r"|refresh\w+|inline\w*|interrupt\w*|skip\w*|speech\w*|flush\w*)")
+_FEEDBACK = re.compile(r"TalkBackFeedbackProvider:\s+(\w+):\s+ttsOutput=\s?(.*?)"
+                       r"(?=\s{2,}" + _FLAG_WORDS + r"|\s*$)")
+_ENDED = re.compile(r"\s{2,}" + _FLAG_WORDS)
 _REASON = re.compile(r"viewAccessibilityFocused:.*?isInitialFocus=(\w+),\s*"
                      r"isRestoreFocusOrEnsureOnScreen=(\w+),\s*isEventNavigateByUser=(\w+)")
 _EDGE = re.compile(r"FocusProcessor-LogicalNav: Reach edge")
@@ -228,24 +233,33 @@ class SpeechLog:
         return True
 
     def feed(self, raw: Any, now: Optional[float] = None) -> None:
-        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        """One line of the log. An utterance with a line break goes on over the next lines
+        (with or without logcat's header) until TalkBack's flags end it: those lines are
+        joined to it."""
+        line = raw.decode("utf-8", "replace").rstrip("\n") if isinstance(raw, bytes) \
+            else str(raw).rstrip("\n")
         now = time.monotonic() if now is None else now
         with self._lock:
             self.lines += 1
-            if not _HEADER.match(line) and self._open is not None:
-                t, k, v = self.events[self._open]
-                cut = re.split(r"\s{2,}queueMode", line.strip(), maxsplit=1)
-                self.events[self._open] = (t, k, f"{v} {cut[0]}".strip())
-                if len(cut) > 1:
-                    self._open = None
-                return
             ev = parse_line(line)
+            if ev is None and self._open is not None:
+                head = _HEADER.match(line)
+                more = line[head.end():] if head else line
+                if not (head and ":" in more.split(" ", 1)[0]):  # not another tag's line
+                    t, k, v = self.events[self._open]
+                    m = _ENDED.search(more)
+                    piece = (more[:m.start()] if m else more).strip()
+                    self.events[self._open] = (t, k, f"{v} {piece}".strip())
+                    if m:
+                        self._open = None
+                    return
             self._open = None
             if ev is None:
                 return
             self.events.append((now, ev[0], ev[1]))
-            if ev[0] in ("tts", "announce") and "queueMode" not in line:
-                self._open = len(self.events) - 1
+            m = _FEEDBACK.search(line)
+            if ev[0] in ("tts", "announce") and m is not None and not _ENDED.search(line, m.end(2)):
+                self._open = len(self.events) - 1  # cut at a line break: more lines follow
 
     def _read(self) -> None:
         out = self.proc.stdout
@@ -687,8 +701,10 @@ def _observe(drv: Driver, cur: Snapshot, steps: List[Step], log: Optional[Speech
 # The scenario
 # --------------------------------------------------------------------------- #
 def _first_stop(snap: Snapshot, legacy: bool, window: Optional[int] = None) -> Optional[str]:
+    """The model's first stop (of ``window``): :mod:`.select`'s stops, which a blank window
+    left over on top does not hide."""
     try:
-        stops, _src, _meta = predict(snap.resp, legacy)
+        stops = _dump(snap)[1]
     except Exception:  # noqa: BLE001 - classification degrades to "elsewhere"
         return None
     for s in stops:
@@ -738,8 +754,8 @@ def _precheck(session: Any, target: Optional[str], steps: List[Step], activate: 
                 raise tbselect.not_found_error(sel, len(stops),
                                                top.rsplit("/", 1)[-1].rsplit(".", 1)[-1])
             continue
-        if act and m.ambiguous:
-            raise tbselect.ambiguity_error(m)
+        if act:
+            tbselect.vet(m, activate=True)  # a tie, or a match too loose to activate
 
 
 def run_scenario(session: Any, kind: str, *, target: Optional[str] = None,
@@ -844,7 +860,8 @@ def _act_all(drv: Driver, cur: Snapshot, acting: List[Step], wait_s: float, lega
         t0 = getattr(drv, "acted_at", None) or time.monotonic()
         events, cur = timeline(drv, t0, wait_s, quiet, legacy)
         if i < len(acting) - 1 and (len(_windows(cur)) > len(_windows(start))
-                                    or set(_panes(cur)) - set(_panes(start))
+                                    or any(_screen_pane(cur, p) for p in
+                                           set(_panes(cur)) - set(_panes(start)))
                                     or (start.key is not None and start.key not in cur.index.nodes)):
             opened = True
     assert start is not None
@@ -902,10 +919,10 @@ def classify(f: Facts) -> Tuple[str, str]:
         if f.f1_key in (f.model_initial, f.first_key):
             return "initial_ok", "a new screen; focus on its first stop"
         return "elsewhere", "a new screen; focus not on its first stop"
+    if f.f1_key == f.first_key:  # (a navigation rail's first tab is the first stop too)
+        return "reset_to_top", "same screen; focus thrown to its first stop" + gone
     if f.f1_nav and not f.f0_nav:
         return "moved_to_nav", "same screen; focus thrown to the navigation bar" + gone
-    if f.f1_key == f.first_key:
-        return "reset_to_top", "same screen; focus thrown to its first stop" + gone
     return "elsewhere", "same screen; focus somewhere else" + gone
 
 
@@ -916,6 +933,20 @@ def _is_nav(n: Optional[Node], stop: Optional[tbselect.Stop]) -> bool:
                              or str(stop.node.get("role_description") or "").lower() == "tab"):
         return True
     return any(_NAV_CLS.search(a.cls or "") for a in [n, *list(n.ancestors())[:4]])
+
+
+def _screen_pane(s: Snapshot, title: str) -> bool:
+    """Whether the pane ``title`` is a screen (a destination, a sheet), not a snackbar or a
+    banner ("Alert"): it covers at least 40% of its window."""
+    for n in s.index.order:
+        if n.pane_title != title:
+            continue
+        win = s.index.window_rect(n.window)
+        if win is None or win[2] * win[3] <= 0:
+            return True
+        if n.bounds[2] * n.bounds[3] >= 0.4 * win[2] * win[3]:
+            return True
+    return False
 
 
 def _sig(s: Snapshot) -> set:
@@ -936,7 +967,7 @@ def facts(drv: Driver, before: Snapshot, after: Snapshot, top0: Optional[str],
     new_windows = [w for w in _windows(after) if w not in _windows(before)]
     closed = any(w not in _windows(after) for w in _windows(before))
     left = bool(top1) and not str(top1).startswith(drv.package + "/")
-    new_panes = set(_panes(after)) - set(_panes(before))
+    new_panes = {p for p in set(_panes(after)) - set(_panes(before)) if _screen_pane(after, p)}
     c0 = before.index.scroll_container(f0) if f0 is not None else None
     container_gone = c0 is not None and c0.key not in after.index.nodes
     kept = sum(1 for s in stops0 if s.key in by_key)
@@ -991,7 +1022,7 @@ def _focus_after(drv: Driver, cur: Snapshot, steps: List[Step], wait_s: float, l
         "before": {"top": top0, "windows": len(_windows(start)), "panes": _panes(start)},
         "after": {"top": top1, "windows": len(_windows(after)), "panes": _panes(after)},
         "timeline": _merge(events[:12], _said(log, t0)[:8]), "focus": _desc(after.focus, legacy),
-        "verdict": verdict, "why": why + (f": {ref} {spoken}" if ref else ""),
+        "verdict": verdict, "why": why,
     }
     res.update(_speech(log, t0, wait_s, acting[-1].kind, fx.tree_changed))
     if model is not None:

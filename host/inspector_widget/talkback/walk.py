@@ -1442,7 +1442,7 @@ def _seek_start(drv: Driver, cur: Snapshot, start: str, direction: str, max_pres
         if direction == "prev":  # prove the keymap, then back onto the target
             return drv.return_to(acted.key, drv.prove(acted.key).snap)
         return acted
-    return _seek_press(drv, cur, start, m)
+    return _seek_press(drv, cur, start, m, activate=activate)
 
 
 def _screen_name(drv: Driver) -> str:
@@ -1597,16 +1597,31 @@ def _seek_first(drv: Driver, cur: Snapshot) -> Snapshot:
     return snap
 
 
-def _seek_press(drv: Driver, cur: Snapshot, start: str, m: Optional[Any]) -> Snapshot:
+def _seek_press(drv: Driver, cur: Snapshot, start: str, m: Optional[Any], *,
+                activate: bool = False) -> Snapshot:
     """Press "next" until focus is on the stop ``m`` names (any of a tie), or a node ``start``
-    names, for at most one lap (:data:`SEEK_MAX_PRESSES`)."""
+    names, for at most one lap (:data:`SEEK_MAX_PRESSES`). Without ``m`` (the model could
+    not resolve it) the node focus reaches is vetted as a match would be: an activation
+    refuses one that ``start`` names only loosely."""
     from . import select
     want = {c.key for c in m.candidates} if m is not None else set()
 
     def hit(s: Snapshot) -> bool:
         if s.focus is None:
             return False
-        return s.key in want if want else _match(start, s.focus)
+        if want:
+            return s.key in want
+        if not _match(start, s.focus):
+            return False
+        if activate:
+            n = s.focus
+            one = select.Stop(key=n.key, order=0, speech=n.speech(400), label=n.label, cd=n.cd,
+                              text=n.text, cls=n.simple_cls, bounds=n.bounds, window=n.window,
+                              node={})
+            got = select.resolve([one], start)
+            if got is not None:
+                select.vet(got, activate=True, where=_screen_name(drv))
+        return True
 
     before = cur
     snap = drv.prove(cur.key).snap

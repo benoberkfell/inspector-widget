@@ -994,6 +994,13 @@ def _cut(s: Any, n: int) -> str:
 SPEECH_LEN = 72
 
 
+def _same_words(a: Any, b: Any) -> bool:
+    """What TalkBack said is what the node line already quotes (case, punctuation aside)."""
+    def w(x: Any) -> str:
+        return " ".join(re.findall(r"\w+", str(x or "").lower()))
+    return bool(w(a)) and w(a) == w(b)
+
+
 def _event_line(e: Mapping[str, Any], n: int = 40) -> str:
     """One timeline entry: ``853 n14``, ``120 windows 2``, ``531 said "Navigate up…"
     (initial)``, ``300 announced "1 selected"``."""
@@ -1062,11 +1069,11 @@ def scenario_result(rec: Mapping[str, Any], *, max_bytes: int = SCENARIO_MAX_BYT
         out["windows"] = f"{opened.get('windows')}->{back.get('windows')}"
         if opened.get("settled") is False:
             out["settled"] = False
-    if rec.get("speak_before"):
+    if rec.get("speak_before") and not _same_words(rec["speak_before"], (tgt or {}).get("speak")):
         out["speak_before"] = _cut(rec["speak_before"], SPEECH_LEN)
     out["timeline"] = [_event_line(e) for e in rec.get("timeline") or []]
     out["focus"] = _named(foc.get("ref"), foc) if foc else None
-    if rec.get("speak_after"):
+    if rec.get("speak_after") and not _same_words(rec["speak_after"], (foc or {}).get("speak")):
         out["speak_after"] = _cut(rec["speak_after"], SPEECH_LEN)
     if rec.get("announced"):
         out["announced"] = [_cut(a, 48) for a in rec["announced"]][:3]
