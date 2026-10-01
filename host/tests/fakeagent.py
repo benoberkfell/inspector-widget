@@ -1286,10 +1286,23 @@ class FakeApp:
     # attach-agent fails to load the library for this reason (ART's "Agent
     # attach failed" text); "" logs ActivityThread's lines without it.
     load_failure: Optional[str] = None
+    # When the process started, in device uptime seconds (/proc/<pid>/stat starttime).
+    started: Optional[float] = None
+    # The launcher activity (cmd package resolve-activity), None: <package>.MainActivity.
+    launcher: Optional[str] = None
+    # The launcher entry is an activity-alias: am start -n <package>/.MainActivity fails.
+    launcher_alias: bool = False
+    # What a start launches when the launcher activity is not the app's main screen (a
+    # splash activity finishing into it), else the launcher.
+    main_activity: Optional[str] = None
 
     @property
     def data_dir(self) -> str:
         return f"/data/user/0/{self.package}"
+
+    @property
+    def launcher_component(self) -> str:
+        return f"{self.package}/{self.launcher or self.package + '.MainActivity'}"
 
 
 @dataclass
@@ -1335,6 +1348,13 @@ class FakeDevice:
         # logcat: (time, pid, tid, level, tag, message line), in log order.
         self.logcat: List[Tuple[float, int, int, str, str, str]] = []
         self.clock: Callable[[], float] = time.time  # the device's wall clock
+        # /proc/uptime: an hour since boot when the device was made
+        self.boot = time.monotonic() - 3600.0
+        # Accessibility focus in the soft keyboard's window (its title), for dumpsys
+        # accessibility; None: in the app (or nowhere)
+        self.ime_focus: Optional[str] = None
+        self.force_stops: List[str] = []
+        self.starts: List[str] = []                 # components am start launched
         self.date_supports_nanos = True
         self._lock = threading.RLock()
         # ---- TalkBack side (see FakeTalkBack) ------------------------------ #
@@ -1363,8 +1383,13 @@ class FakeDevice:
     # ---- setup ------------------------------------------------------------- #
     def add_app(self, package: str, pid: Optional[int], debuggable: bool = True) -> FakeApp:
         app = FakeApp(package, pid, debuggable)
+        if pid is not None:
+            app.started = self.uptime() - 60.0  # running for a minute already
         self.apps[package] = app
         return app
+
+    def uptime(self) -> float:
+        return time.monotonic() - self.boot
 
     _SAME_BUILD = object()
 
@@ -1480,6 +1505,85 @@ class FakeDevice:
             agent.stop()
         app = self.apps[package]
         app.pid = new_pid if new_pid is not None else (app.pid or 0) + 1000
+        app.started = self.uptime()
+
+    def force_stop(self, package: str) -> None:
+        """``am force-stop``: the process and its agent die, its activities go."""
+        self.force_stops.append(package)
+        app = self.apps.get(package)
+        if app is None:
+            return
+        agent = self.agent(package)
+        if agent is not None:
+            agent.stop()
+        app.pid = None
+        self.activity_stack = [a for a in self.activity_stack
+                               if not a.startswith(package + "/")] or ["com.android.launcher3/.Launcher"]
+
+    def launch(self, comp: str) -> Tuple[int, str, str]:
+        """``am start -W -n comp``: start the process when it is not running (a new pid,
+        started now), put the activity on top; TalkBack, when on, focuses the new window
+        (its ``initial_focus``, else nothing)."""
+        return self._launch(comp)
+
+    def _launch(self, comp: str, by_intent: bool = False) -> Tuple[int, str, str]:
+        pkg, _, cls = comp.partition("/")
+        app = self.apps.get(pkg)
+        if app is not None and app.launcher_alias and not by_intent:
+            # an activity-alias starts through its intent filter only, never by name
+            return 0, (f"Starting: Intent {{ cmp={comp} }}\nError type 3\nError: Activity class "
+                       f"{{{comp}}} does not exist.\n"), ""
+        state = "HOT"
+        if app is not None and app.pid is None:
+            app.pid = 5000 + 100 * len(self.starts) + (len(self.force_stops) % 100)
+            app.started = self.uptime()
+            state = "COLD"
+        top = f"{pkg}/{app.main_activity}" if app is not None and app.main_activity else comp
+        if top in self.activity_stack:
+            self.activity_stack.remove(top)
+        self.activity_stack.append(top)
+        self.starts.append(comp)
+        tb = self.talkback
+        if tb is not None and tb.running and state == "COLD":
+            tb.set_focus(tb.initial_focus)
+        return 0, (f"Starting: Intent {{ cmp={comp} }}\nStatus: ok\nLaunchState: {state}\n"
+                   f"Activity: {top}\nTotalTime: 300\nWaitTime: 302\nComplete\n"), ""
+
+    def _proc_stat(self, pid: int) -> Optional[str]:
+        app = next((a for a in self.apps.values() if a.pid == pid), None)
+        tb = self.talkback
+        if app is None and not (tb is not None and tb.pid == pid):
+            return None
+        start = app.started if app is not None and app.started is not None else 1.0
+        name = (app.package if app is not None else FakeTalkBack.PACKAGE)[-15:]
+        fields = ["S", "1", "1", "0", "0", "-1", "4194624", "0", "0", "0", "0", "10", "5",
+                  "0", "0", "10", "-10", "40", "0", str(int(start * 100)), "1000", "200"]
+        return f"{pid} ({name}) " + " ".join(fields) + "\n"
+
+    def _dumpsys_accessibility(self) -> str:
+        """The parts of ``dumpsys accessibility`` the walk reads: which window holds
+        accessibility focus, and the window list (while TalkBack runs)."""
+        tb = self.talkback
+        running = tb is not None and tb.running
+        focused = -1
+        if running and self.ime_focus is not None:
+            focused = 9001
+        elif running and tb.focus is not None:
+            focused = 9000
+        out = ["ACCESSIBILITY MANAGER (dumpsys accessibility)", "",
+               f"     Accessibility Focused Window Id = {focused}", ""]
+        if running:
+            out.append("A11yWindow[AccessibilityWindowInfo[title=null, displayId=0, id=9002, "
+                       "taskId=-1, type=TYPE_SYSTEM, layer=2, bounds=Rect(0, 0 - 360, 24), "
+                       "focused=false, active=false]]")
+            if self.ime_focus is not None:
+                out.append(f"A11yWindow[AccessibilityWindowInfo[title={self.ime_focus}, "
+                           f"displayId=0, id=9001, taskId=-1, type=TYPE_INPUT_METHOD, layer=1, "
+                           f"bounds=Rect(0, 400 - 360, 640), focused=false, active=false]]")
+            out.append("A11yWindow[AccessibilityWindowInfo[title=App, displayId=0, id=9000, "
+                       "taskId=42, type=TYPE_APPLICATION, layer=0, bounds=Rect(0, 0 - 360, 640), "
+                       "focused=true, active=true]]")
+        return "\n".join(out) + "\n"
 
     # ---- wire / adb observation -------------------------------------------- #
     def _on_request(self, agent: FakeAgent, cid: int, req: Any) -> None:
@@ -1669,6 +1773,33 @@ class FakeDevice:
                 tb.set_focus(None)
             self.files[toks[2]] = tb.ui_xml() if tb is not None else "<hierarchy/>"
             return 0, f"UI hierchary dumped to: {toks[2]}\n", ""
+        if toks == ["cat", "/proc/uptime"]:
+            up = self.uptime()
+            return 0, f"{up:.2f} {up * 3.7:.2f}\n", ""
+        if toks[:1] == ["cat"] and len(toks) == 2 and re.fullmatch(r"/proc/\d+/stat", toks[1]):
+            stat = self._proc_stat(int(toks[1].split("/")[2]))
+            if stat is None:
+                return 1, "", f"cat: {toks[1]}: No such file or directory"
+            return 0, stat, ""
+        if toks == ["dumpsys", "accessibility"]:
+            return 0, self._dumpsys_accessibility(), ""
+        if toks[:2] == ["am", "force-stop"] and len(toks) == 3:
+            self.force_stop(toks[2])
+            return 0, "", ""
+        if toks[:3] == ["cmd", "package", "resolve-activity"]:
+            pkg = toks[-1]
+            app = self.apps.get(pkg)
+            if app is None or "android.intent.category.LAUNCHER" not in toks:
+                return 0, "No activity found\n", ""
+            return 0, ("priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 "
+                       f"isDefault=true\n{app.launcher_component}\n"), ""
+        if toks[:2] == ["am", "start"] and "-W" in toks and "-p" in toks and "-n" not in toks:
+            app = self.apps.get(toks[toks.index("-p") + 1])
+            if app is None:
+                return 0, "Error: Activity not started, unable to resolve Intent\n", ""
+            return self._launch(app.launcher_component, by_intent=True)
+        if toks[:2] == ["am", "start"] and "-W" in toks and "-n" in toks:
+            return self.launch(toks[toks.index("-n") + 1])
         if toks[:1] == ["cat"] and len(toks) == 2 and toks[1].startswith("/sdcard/"):
             if toks[1] not in self.files:
                 return 1, "", f"cat: {toks[1]}: No such file or directory"
@@ -2323,9 +2454,11 @@ class FakeTalkBack:
     def set_focus(self, target: Optional[Target]) -> None:
         self.focus = tuple(target) if target is not None else None  # type: ignore[assignment]
         self.device.set_a11y_focus(self.focus)
-        if target is not None:
+        # TalkBack's words for the stops a test gave words (``labels``); others are not
+        # logged, so the walk speaks them from its model
+        if target is not None and tuple(target) in self.labels:
             self.log(f"TalkBackFeedbackProvider:  TYPE_VIEW_ACCESSIBILITY_FOCUSED:  ttsOutput= "
-                     f"{self.labels.get(tuple(target), 'Item')}    queueMode=0")
+                     f"{self.labels[tuple(target)]}    queueMode=0")
 
     def log(self, msg: str) -> None:
         if not self.verbose_log:

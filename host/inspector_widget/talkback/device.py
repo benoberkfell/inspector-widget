@@ -280,6 +280,169 @@ INJECTOR_STATUS: Dict[str, Dict[str, str]] = {}
 
 
 # --------------------------------------------------------------------------- #
+# When TalkBack started, relative to the app (G1), and a TalkBack-first relaunch
+# --------------------------------------------------------------------------- #
+#: ``/proc/<pid>/stat`` starttime is in clock ticks (USER_HZ, 100 on Android).
+CLK_TCK = 100
+#: talkback_started: TalkBack was on before the app's process started (what a TalkBack
+#: user gets: RecyclerView rows carry "N of M", WebViews build their tree), after it
+#: (the walk turned it on: rows bound before it have no item info), or already on with
+#: no record of when.
+STARTED = ("before_app", "after_app", "before_walk")
+LAUNCH_WAIT_S = 15.0    # am start -W, then the app in front with a process
+LAUNCH_POLL_S = 0.25
+LAUNCHER = ("-a android.intent.action.MAIN -c android.intent.category.LAUNCHER")
+
+
+def uptime(serial: str) -> Optional[float]:
+    """The device's uptime in seconds (``/proc/uptime``), the clock /proc/<pid>/stat uses."""
+    out = adb.shell(serial, "cat /proc/uptime", check=False)
+    try:
+        return float(out.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_start(serial: str, pid: Optional[int]) -> Optional[float]:
+    """When process ``pid`` started, in device uptime seconds (``/proc/<pid>/stat`` field
+    22, starttime, after the parenthesised command name, which may hold spaces)."""
+    if not pid:
+        return None
+    out = adb.shell(serial, f"cat /proc/{int(pid)}/stat", check=False)
+    if ")" not in out:
+        return None
+    fields = out.rsplit(")", 1)[1].split()  # field 3 (state) onwards
+    try:
+        return int(fields[19]) / CLK_TCK
+    except (IndexError, ValueError):
+        return None
+
+
+def verbose_in(snap: Optional[Dict[str, Any]]) -> bool:
+    """Whether a pending snapshot says TalkBack's log level is VERBOSE now: set by
+    inspector-widget when it turned TalkBack on, or VERBOSE already before that."""
+    if not snap:
+        return False
+    if snap.get("log_level_now"):
+        return snap["log_level_now"] == "VERBOSE"
+    return snap.get("log_level") == "VERBOSE"
+
+
+def talkback_started(serial: str, package: str, on_uptime: Optional[float],
+                     pid: Optional[int] = None) -> Dict[str, Any]:
+    """``{"talkback_started": before_app | after_app | before_walk, "app_start_s",
+    "talkback_on_s"}``: the app's process start (``/proc/<pid>/stat``) against the uptime
+    at which TalkBack came on (``on_uptime``: :func:`enable`'s, or its snapshot's). Unknown
+    when TalkBack was turned on (by someone else) is ``before_walk``."""
+    if pid is None:
+        try:
+            pid = adb.pidof(serial, package)
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pid = None
+    app = process_start(serial, pid)
+    out: Dict[str, Any] = {"talkback_started": "before_walk", "app_start_s": app,
+                           "talkback_on_s": on_uptime}
+    if on_uptime is None or app is None:
+        return out
+    now = uptime(serial)
+    if now is not None and on_uptime > now + 1:
+        return out  # a snapshot from before the device rebooted
+    out["talkback_started"] = "before_app" if on_uptime <= app else "after_app"
+    return out
+
+
+def launcher_activity(serial: str, package: str) -> Optional[str]:
+    """``package``'s launcher component as the package manager resolves it
+    (``cmd package resolve-activity --brief``): alias-safe, so an app whose launcher entry
+    is an activity-alias (Thunderbird) starts with ``am start -n`` like any other."""
+    out = adb.shell(serial, f"cmd package resolve-activity --brief {LAUNCHER} "
+                            f"{shlex.quote(package)}", check=False)
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith(package + "/"):
+            return line
+    return None
+
+
+def relaunch(serial: str, package: str, wait_s: Optional[float] = None) -> Dict[str, Any]:
+    """Restart ``package`` from its launcher, the way a TalkBack user opens it with TalkBack
+    already running: ``am force-stop``, then ``am start -W`` with the launcher intent
+    (``-a MAIN -c LAUNCHER -p <package>``: alias-safe, where ``am start -n`` with an
+    activity-alias's name fails, as Thunderbird's does), else with the component the
+    package manager resolves (:func:`launcher_activity`); then wait until the app is in
+    front with a live process. Returns ``{"activity", "launcher", "pid", "started_at"
+    (device uptime s), "took_ms"}``; raises ``TalkBackError('app_left_foreground')`` when
+    it does not come up. The caller turns TalkBack on first and re-attaches afterwards
+    (the old process and its agent are gone)."""
+    wait_s = LAUNCH_WAIT_S if wait_s is None else wait_s
+    t0 = time.monotonic()
+    adb.shell(serial, f"am force-stop {shlex.quote(package)}", check=False)
+    comp = launcher_activity(serial, package)
+    out = adb.shell(serial, f"am start -W {LAUNCHER} -p {shlex.quote(package)}", check=False)
+    if _start_error(out) and comp is not None:
+        out = adb.shell(serial, f"am start -W -n {shlex.quote(comp)}", check=False)
+    err = _start_error(out)
+    if err:
+        raise TalkBackError("app_left_foreground",
+                            f"{package} could not be started on {serial}: {err}",
+                            hint=f"Check {package} is installed and has a launcher activity "
+                                 f"(cmd package resolve-activity), then retry.")
+    m = re.search(r"^Activity:\s*(\S+)", out, re.M)
+    activity = m.group(1) if m else None
+    deadline = time.monotonic() + wait_s
+    pid: Optional[int] = None
+    while True:
+        try:
+            pid = adb.pidof(serial, package)
+        except Exception:  # noqa: BLE001 - polled again
+            pid = None
+        top = top_package(serial)
+        if pid and top == package:
+            break
+        if time.monotonic() >= deadline:
+            raise TalkBackError(
+                "app_left_foreground",
+                f"{package} did not come to the front after a relaunch on {serial} "
+                f"(top: {top_activity(serial) or 'unknown'})",
+                hint=f"Dismiss what covers it (BACK), or start {package} by hand "
+                     f"(am start {LAUNCHER} -p {package}), then walk without relaunch.")
+        time.sleep(LAUNCH_POLL_S)
+    return {"activity": activity or top_activity(serial), "launcher": comp, "pid": pid,
+            "started_at": process_start(serial, pid), "took_ms": _ms(t0)}
+
+
+def _start_error(out: str) -> Optional[str]:
+    """``am start``'s failure line ("Error: Activity class {...} does not exist."), if any."""
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Error:") or line.startswith("Error type"):
+            nxt = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("Error:")]
+            return (nxt or [line])[0]
+    return None
+
+
+_A11Y_FOCUSED_WINDOW = re.compile(r"Accessibility Focused Window Id\s*=\s*(-?\d+)")
+_A11Y_WINDOW = re.compile(r"AccessibilityWindowInfo\[title=(.*?), displayId=-?\d+, id=(-?\d+),"
+                          r".*?type=(TYPE_\w+)")
+
+
+def a11y_focus_window(serial: str) -> Optional[Dict[str, Any]]:
+    """The window that holds accessibility focus, from ``dumpsys accessibility``:
+    ``{"id", "type" (TYPE_APPLICATION, TYPE_INPUT_METHOD ...), "title"}``, or None when no
+    window does (or the dump does not say)."""
+    out = adb.shell(serial, "dumpsys accessibility", check=False)
+    m = _A11Y_FOCUSED_WINDOW.search(out)
+    if m is None or int(m.group(1)) < 0:
+        return None
+    wid = int(m.group(1))
+    for w in _A11Y_WINDOW.finditer(out):
+        if int(w.group(2)) == wid:
+            title = w.group(1)
+            return {"id": wid, "type": w.group(3), "title": None if title == "null" else title}
+    return {"id": wid, "type": None, "title": None}
+
+
+# --------------------------------------------------------------------------- #
 # Locks: one TalkBack driver per device at a time (in-process and across processes)
 # --------------------------------------------------------------------------- #
 _LOCKS: Dict[str, threading.Lock] = {}
@@ -349,7 +512,7 @@ def _wait(pred, timeout_s: float, interval_s: float = 0.1) -> bool:
 
 
 def enable(serial: str, package: Optional[str] = None,
-           verbose_log: bool = False) -> Dict[str, Any]:
+           verbose_log: bool = False, verbose_required: bool = True) -> Dict[str, Any]:
     """Turn TalkBack on (snapshot first; append the component; wait for touch
     exploration; dismiss TalkBack's tutorial and permission dialog). Returns
     what it did.
@@ -359,7 +522,14 @@ def enable(serial: str, package: Optional[str] = None,
     back to the front (without recreating it) if TalkBack covered it. With
     ``verbose_log``, TalkBack's log level is set to VERBOSE first (TalkBack
     reads it when it binds); that needs TalkBack off, so an already-running
-    TalkBack keeps its level (``log_level`` says so).
+    TalkBack keeps its level (``log_level`` says so: ``{"kept": "VERBOSE"}`` when
+    the pending snapshot shows it was set, else ``{"unchanged": why}``). A level
+    that cannot be set fails the call when ``verbose_required``, else TalkBack
+    comes on without it (``log_level`` ``{"failed": why}``).
+
+    ``on_uptime`` is the device uptime (s) at which TalkBack came on (this call, or
+    the pending snapshot's for a TalkBack that was already on; None when unknown):
+    :func:`talkback_started` compares it with the app's process start.
     """
     t0 = time.monotonic()
     before = read_settings(serial)
@@ -371,8 +541,12 @@ def enable(serial: str, package: Optional[str] = None,
                                  "Android Accessibility Suite.")
     out: Dict[str, Any] = {"serial": serial, "talkback": "on", "version": version}
     if _on(before):
+        snap = load_snapshot(serial) or {}
+        out["on_uptime"] = snap.get("on_uptime")
         if verbose_log:
-            out["log_level"] = "unchanged: TalkBack was already on (the level can only change while it is off)"
+            out["log_level"] = ({"kept": "VERBOSE"} if verbose_in(snap) else
+                                {"unchanged": "TalkBack was already on (the level can only "
+                                              "change while it is off)"})
         out.update(changed=False, took_ms=_ms(t0))
         return out
     top_before = top_activity(serial)
@@ -383,10 +557,15 @@ def enable(serial: str, package: Optional[str] = None,
     if verbose_log and not talkback_in(before.get(SERVICES)):
         try:
             out["log_level"] = set_log_level(serial, "VERBOSE", record=True)
-        except Exception:
+        except Exception as exc:
+            if verbose_required:
+                with contextlib.suppress(Exception):
+                    restore(serial)
+                raise
+            # best effort (utterance auto): TalkBack still comes on, its words from the model
+            out["log_level"] = {"failed": f"{type(exc).__name__}: {exc}"[:120]}
             with contextlib.suppress(Exception):
-                restore(serial)
-            raise
+                _close_prefs(serial)
         top_before = top_activity(serial) if top_before is None else top_before
     services = before.get(SERVICES)
     if not talkback_in(services):
@@ -401,6 +580,10 @@ def enable(serial: str, package: Optional[str] = None,
                                 hint="Check `adb shell dumpsys accessibility` and that TalkBack "
                                      "is not disabled in Settings > Apps.")
         out["touch_exploration_ms"] = _ms(t0)
+        # when TalkBack came on, on the device's clock (talkback_started compares it
+        # with an app's process start); kept in the snapshot for later walks
+        out["on_uptime"] = uptime(serial)
+        _update_snapshot(serial, on_uptime=out["on_uptime"])
         time.sleep(START_SETTLE_S)
         out["dismissed"] = dismiss_talkback_activities(serial, top_before)
         if package:
@@ -691,6 +874,8 @@ def set_log_level(serial: str, level: str, record: bool = False) -> Dict[str, An
         after = _row_level(_ui_nodes(serial))
         if after != level:
             raise TalkBackError("log_level_failed", f"TalkBack's log level is {after}, not {level}")
+        if record:
+            _update_snapshot(serial, log_level_now=after)
         return {"before": before, "after": after}
     finally:
         _close_prefs(serial)
@@ -730,18 +915,21 @@ ACTIONS = ("status", "on", "off", "restore")
 
 
 def action(serial: str, what: str, package: Optional[str] = None,
-           verbose_log: bool = False) -> Dict[str, Any]:
+           verbose_log: bool = False, verbose_required: bool = True) -> Dict[str, Any]:
     """The ``talkback`` tool / subcommand: status | on | off | restore.
 
     ``verbose_log`` (on): set TalkBack's log level to VERBOSE first, so walks get
-    the exact announcements from logcat; restore puts the old level back."""
+    the exact announcements from logcat, also walks chained with leave_on (the level
+    stays until restore, which puts the old one back). ``verbose_required`` False: a
+    level that cannot be set is reported, not a failure."""
     if what == "status":
         return status(serial)
     if what not in ACTIONS:
         raise ValueError(f"unknown talkback action {what!r}; expected one of {', '.join(ACTIONS)}")
     with device_lock(serial, f"talkback {what}"):
         if what == "on":
-            out = enable(serial, package, verbose_log=verbose_log)
+            out = enable(serial, package, verbose_log=verbose_log,
+                         verbose_required=verbose_required)
         elif what == "off":
             out = disable(serial)
         else:
