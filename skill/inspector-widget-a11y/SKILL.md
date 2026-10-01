@@ -457,6 +457,48 @@ After `capture()`, the next three calls never touch the device and cost about
 17) is right far more often than not, and it explains *why*. Then confirm with
 `tb_walk` (about 0.2-0.4 s a step on an emulator, at most 5 KB for 60 steps).
 
+**Walk what a TalkBack user gets: `tb_walk(relaunch=true)`.** A user has TalkBack
+running before the app starts. A plain walk turns TalkBack on over an app that is
+already running, and some apps then expose a different tree: RecyclerView gives
+rows their "N of M" (CollectionItemInfo) and makes ViewPager2 pages stops only
+for rows bound while accessibility is on, and WebViews behave differently. So
+"2 of 6" positions, list counts, page stops, WebView walls and traps can differ
+between the two start orders. `relaunch=true` turns TalkBack on, force-stops the
+app, starts it from its launcher (resolved with `cmd package resolve-activity`,
+so activity-alias launchers such as Thunderbird's work), waits for TalkBack's
+first focus, then walks. It takes one call:
+
+```
+tb_walk(package="net.thunderbird.android.debug", relaunch=true, start="first")
+tb_scenario(kind="focus_after", relaunch=true, target="n14")       scenarios too
+```
+
+Every result says `talkback_started`: `before_app` (TalkBack was on before the
+app's process started, as for a user), `after_app` (the walk turned it on over the
+running app), or `before_walk` (TalkBack was already on, and nobody recorded
+when). On an `after_app` walk:
+
+- a note says `rows were bound before TalkBack started ...; rerun with
+  relaunch=true` when the start screen has rows without item info;
+- `tb.trap`, `tb.edge_stuck` and `tb.webview_block` are `info`, basis
+  `unverified: after_app`: a TalkBack user may never get stuck there. Rerun with
+  `relaunch=true` before you report them. `unverified: injector` means the
+  keyboard never moved focus in that walk, so the presses may not have reached
+  TalkBack at all.
+
+To start an app by hand the same way (alias launchers included):
+`adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p <pkg>`
+(`am start -n <pkg>/.MainActivity` fails where the launcher entry is an alias).
+
+**What TalkBack really said.** With `utterance="auto"` (the default) a walk or
+scenario that turns TalkBack on first sets its log level to VERBOSE (through
+TalkBack's own settings screen, about 10 s; restore puts it back), and every line
+is TalkBack's own words: `utterance: "logcat 22/22"` says how many moves were
+read from its log. When it falls back to the model, `notes` says why
+(`speech is the model's: ...`) and how to fix it. For several walks in a row, set
+the level once: `talkback(action="on")` (VERBOSE by default), then walks and
+scenarios with `leave_on=true`, then `talkback(action="restore")`.
+
 **`tb_walk` and `tb_scenario` are device-wide.** They turn TalkBack on for the
 whole device (the accessibility settings are snapshotted first and restored
 afterwards, at the server's exit, or by `talkback(action="restore")`; with
@@ -505,20 +547,18 @@ node is or is not a stop, and how focus gets there:
 ```
 
 - Each line is one press: `i. ref "what TalkBack says" via=... !finding`.
-  `via=autoscroll(n10)` (TalkBack scrolled n10 to get there), `via=window` (it
-  moved to another window), `via=wrap` (past the edge, back at the top),
+  A long utterance keeps its head and its tail (`"Localpart of email add… 2 of 6.
+  In list. 6 items"`): positions, counts, states and placeholder ids are at the
+  end. `via=autoscroll(n10)` (TalkBack scrolled n10 to get there), `via=window`
+  (it moved to another window), `via=wrap` (past the edge, back at the top),
   `via=stolen` (the app moved focus between presses), `via=screen` (the screen
   was replaced under the walk: another activity or window took its place; the
   model is compared with the steps before it only). `— edge` is a press that
   moved nothing; `?view:123 Button` is a node no capture holds.
-- RecyclerView items bound before TalkBack started carry no "N of M": a walk that
-  turns TalkBack on over a list already on screen hears no positions, while a
-  user who had TalkBack on before the app does (the walk's `notes` say so, and
-  the capture's model speaks what the user hears). To walk what they hear:
-  `talkback(action="on")`, restart the app, `tb_walk`, then
-  `talkback(action="restore")`.
 - `ended`: `wrap` (one full lap), `edge`, `loop` (a cycle that never reaches an
-  edge), `stuck` (two presses that move nothing), `lost` (no node holds focus),
+  edge: the same move with the same boxes, or for two more presses), `stuck` (two
+  presses that move nothing), `lost` (no node holds focus), `ime` (focus moved on
+  into the soft keyboard: hide it with BACK, or start past the text field),
   `left_app`, `max_steps`.
 - `diff` sorts what differs by class, by ref: `model` (how many moves the
   prediction got right, and the first it did not), `skip`, `unvisited`,
@@ -536,8 +576,14 @@ node is or is not a stop, and how focus gets there:
 - For the backward lap, `next` suggests `tb_walk(direction="prev", start=<the last
   stop>)`; a backward walk from the first stop meets the edge at once and compares
   the lap after the wrap.
-- The full record is stored: `captures(what="walks")` lists walks and
-  scenarios, `captures(action="show", id="wbz8enj")` shows every step.
+- Over its byte budget a result merges each finding code's repeats into one
+  (`"n": 5, "steps": "1-2,4-5,..."`) and shortens messages before it cuts lines;
+  it never drops a code, and cut lines keep the steps a finding marks.
+- The full record is stored. Page it with no device:
+  `tb_walk(show="wbz8enj", steps="17-42", speech="full")` lists those steps with
+  every word TalkBack said (and the findings that touch them);
+  `findings="all"` gives every finding in full. `captures(what="walks")` lists
+  walks and scenarios, `captures(action="show", id="wbz8enj")` shows every step.
 
 ### Bug → what shows it → the fix
 
@@ -577,6 +623,8 @@ Each `tb.*` rule, with its fix, is in **[rules.md](rules.md#talkback-navigation-
 ```
 
 The CLI has the same tools: `inspector-widget tb-walk --start n14 --json`,
+`inspector-widget tb-walk --relaunch --start first`,
+`inspector-widget tb-walk --show wbz8enj --steps 17-42 --speech full`,
 `inspector-widget captures --what walks`, `inspector-widget image --overlay walk`.
 
 ---

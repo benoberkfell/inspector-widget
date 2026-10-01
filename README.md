@@ -75,6 +75,26 @@ Tools (18): `list_devices`, `list_processes`, `attach`, `dump_tree`, `get_proper
 `a11y_overlay`, `inspect`, `inspect_node`, `component_image`, `detach`, and the device-wide
 TalkBack tools `talkback`, `tb_walk`, `tb_scenario`.
 
+TalkBack, the way its users have it (CLI; the MCP tools take the same arguments):
+```bash
+iw() { PYTHONPATH=host host/.venv/bin/python host/cli.py "$@"; }
+# TalkBack on first, the app restarted from its launcher, one lap read with TalkBack's
+# own words; TalkBack and its settings are restored afterwards
+iw tb-walk --serial emulator-5554 --package com.example.app --relaunch --start first
+# page the stored walk: steps 17-42 with every word TalkBack said (no device)
+iw tb-walk --show w3f9ak1 --steps 17-42 --speech full
+# several walks in a row: TalkBack on once (log level VERBOSE), then restore
+iw talkback on --serial emulator-5554
+iw tb-walk --serial emulator-5554 --package com.example.app --leave-on
+iw talkback restore --serial emulator-5554
+# start an app by hand as a launcher does (works for activity-alias launchers too)
+adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p com.example.app
+```
+Every walk says `talkback_started`: `before_app` is what a TalkBack user gets; on
+`after_app` (TalkBack turned on over the running app) list positions and page stops can
+differ, and stuck or trapped findings are marked unverified until a `--relaunch` walk
+confirms them.
+
 Compose (CLI):
 ```bash
 PYTHONPATH=host host/.venv/bin/python host/cli.py compose \

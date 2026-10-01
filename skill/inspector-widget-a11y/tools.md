@@ -155,32 +155,58 @@ named or its own default session (its last attach or capture), else
 `$ANDROID_SERIAL` or the only device: never on the store's shared default alone
 (another agent's). A walk or scenario on an app you did not name says which
 (`session`).
-- **`talkback(action=status|on|off|restore, serial?, package?, verbose_log=false)`**
-  → TalkBack state, or what changed (`on` snapshots the settings first).
+- **`talkback(action=status|on|off|restore, serial?, package?, verbose_log=true)`**
+  → TalkBack state, or what changed (`on` snapshots the settings first, then sets
+  TalkBack's log level to VERBOSE, so walks and scenarios chained after it with
+  `leave_on=true` read TalkBack's own words; `restore` puts the level back).
 - **`tb_walk(serial?, package?, start="current", direction="next", max_steps=60,
-  until="wrap", expect=[...], recapture="on_unknown", leave_on=false, ...)`** →
-  captures the screen with TalkBack on, presses the real TalkBack's
-  next/previous, and returns `{capture, walk, recaptured?, start, steps, ended,
-  lines, diff, findings, restore, next}` (at most 5 KB at 60 steps): one line
-  per step by ref (`3. n14 "Add to favorites, Button" via=autoscroll(n10)
-  !double_stop`), `diff` = actual vs model by class and ref (`model`, `skip`,
-  `double`, `out_of_order`, `loop`, `trap`, `escape`, `stuck`, `left_app` ...).
-  `start` and `expect` take refs, selectors (`@tag`, `#rid`, `Type"label"`) or
-  labels (a label that only looks like a selector, `@alice`, is matched as
-  spoken); a ref no capture holds fails before TalkBack is touched. Focus on a
-  node no capture holds (scrolled in) recaptures, at most once per 3 steps.
-  Stored as `<store>/walks/<id>.json`.
+  until="wrap", expect=[...], recapture="on_unknown", utterance="auto",
+  leave_on=false, relaunch=false, ...)`** → captures the screen with TalkBack on,
+  presses the real TalkBack's next/previous, and returns `{capture, walk,
+  recaptured?, talkback_started, start, steps, ended, utterance, lines, diff,
+  findings, notes?, restore, next}` (at most 5 KB at 60 steps): one line per
+  step by ref with what TalkBack said, head and tail of a long utterance
+  (`5. n14 "Localpart of em… 2 of 6. In list. 6 items" !double_stop`), `diff` =
+  actual vs model by class and ref (`model`, `skip`, `double`, `out_of_order`,
+  `loop`, `trap`, `escape`, `stuck`, `left_app` ...). `ended` also says `ime`
+  (focus moved on into the soft keyboard). `start` and `expect` take refs,
+  selectors (`@tag`, `#rid`, `Type"label"`) or labels (a label that only looks
+  like a selector, `@alice`, is matched as spoken); a ref no capture holds fails
+  before TalkBack is touched. Focus on a node no capture holds (scrolled in)
+  recaptures, at most once per 3 steps. Stored as `<store>/walks/<id>.json`.
+  - `relaunch=true`: TalkBack first, as its users have it: TalkBack on, the app
+    force-stopped and started from its launcher (`cmd package resolve-activity`:
+    alias launchers work), TalkBack's first focus awaited, then the walk.
+    `talkback_started` is `before_app`, `after_app` (TalkBack came on over the
+    running app: RecyclerView rows bound before it have no "N of M", and
+    `tb.trap` / `tb.edge_stuck` / `tb.webview_block` are info, basis
+    `unverified: after_app`) or `before_walk` (already on, nobody recorded when).
+    `injector_proven: false` (the keyboard never moved focus) makes them
+    `unverified: injector`.
+  - `utterance="auto"` sets VERBOSE while it turns TalkBack on (about 10 s, put
+    back by the restore): `utterance: "logcat 22/22"`; a fallback to the model
+    says why in `notes`. `"model"` skips it (faster, the model's words).
+  - Over its bytes a result merges each code's repeats (`"n": 5, "steps":
+    "1-2,4-5"`), shortens messages, drops the diff's ref lists, shortens speech
+    (heads first), then cuts plain lines; no finding code is ever dropped.
+  - **`tb_walk(show=<walk id>|latest, steps="17-42", speech="full",
+    findings="all")`** pages a stored walk with no device I/O: those steps with
+    every word, the findings that touch them (`findings="all"`: all, in full),
+    within `max_bytes`; a cut page names the next one.
 - **`tb_scenario(kind=focus_after|restore|survive, serial?, package?, target?,
-  action="activate", mutate?, wait_ms=2000, ...)`** → where real TalkBack focus
-  goes after an action (`activate`, `back`, `tap:<ref>`, `key:<combo>`), after
-  back, or after a list update (`mutate`); `{scenario, capture, after, target,
-  did, timeline, focus, verdict, finding?, cause?, restore}` (at most 1 KB;
-  `cause` from the before / after captures).
+  action="activate", mutate?, wait_ms=2000, relaunch=false, ...)`** → where real
+  TalkBack focus goes after an action (`activate`, `back`, `tap:<ref>`,
+  `key:<combo>`), after back, or after a list update (`mutate`); `{scenario,
+  kind, capture, talkback_started, after, target, did, timeline, focus, verdict,
+  finding?, cause?, restore}` (at most 1 KB; `cause` from the before / after
+  captures). `relaunch=true` as for `tb_walk`.
 - **`image(overlay="walk", walk=<id>)`** draws a walk on its capture (numbered
   arcs in TalkBack's order, the model's next stop dashed, mismatches red);
   **`captures(what="walks")`** lists the stored walks, `captures(action="show",
   id=<walk id>)` shows every step; with `what="walks"`, `show`, `export` and
   `drop` take a walk id or `latest` (never a capture).
+- Start an app the way a launcher does (alias launchers too):
+  `adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p <pkg>`.
 - The loop: `capture -> lint(rules=["tb"]) -> outline(view="reading",
   explain=true) -> node(ref, facets="tb") -> tb_walk(start=ref) ->
   image(overlay="walk")` (SKILL.md §5).
@@ -238,9 +264,10 @@ python host/cli.py a11y-lint  --serial SERIAL --package PKG [--json -] [--rule R
 python host/cli.py inspect    --serial SERIAL --package PKG [--json -] [--properties] [--overlay out.png]
 python host/cli.py inspect-node    --serial SERIAL --package PKG (--node-key KEY | --view-id ID | --semantics-id ID | --bounds x,y,w,h) [--json -] [--no-image]
 python host/cli.py component-image --serial SERIAL --package PKG (--node-key KEY | ...) --out out.png
-python host/cli.py talkback   [status|on|off|restore] [-s SERIAL] [--json]
-python host/cli.py tb-walk    [-s SERIAL] [-p PKG] [--start REF] [--prev] [--expect A,B ...] [--until edge] [--json]
-python host/cli.py tb-scenario focus-after|restore|survive [--target REF] [--action tap:REF] [--mutate ...] [--json]
+python host/cli.py talkback   [status|on|off|restore] [-s SERIAL] [--no-verbose-log] [--json]
+python host/cli.py tb-walk    [-s SERIAL] [-p PKG] [--start REF] [--prev] [--expect A,B ...] [--until edge] [--relaunch] [--json]
+python host/cli.py tb-walk    --show WALK_ID [--steps 17-42] [--speech full] [--findings all]   # no device
+python host/cli.py tb-scenario focus-after|restore|survive [--target REF] [--action tap:REF] [--mutate ...] [--relaunch] [--json]
 python host/cli.py capture    [-s SERIAL] [-p PKG] [--label L] [--json]      # prints the summary (-q: the id)
 python host/cli.py outline    [-c CAPTURE] [--view reading] [--root SEL] [--fields -bounds] [--json]
 python host/cli.py find       [-c CAPTURE] [--type T] [--tag T] [--flags click] [--max-dp 47] [--count] [--json]
