@@ -138,6 +138,8 @@ def test_real_app_lint_counts_now():
 # ids differ), aliases for toolbar menu items re-created between the dump and the walk, and
 # where the comparison stops (TalkBack auto-scrolls, the model does not).
 WALK_CASES = {
+    "antennapod_player_expanded": {},  # the walk ends stuck before the show notes WebView
+    "antennapod_home_player_collapsed": {"upto": 8},  # TalkBack auto-scrolls at step 9
     "antennapod_home": {},
     "antennapod_episodes": {},
     "antennapod_filter_sheet": {},
@@ -168,9 +170,12 @@ def test_model_walk_equals_talkback_17_press_for_press(name):
     order = tb.simulate(tree, start=_start(tree, case, walk), until="steps",
                         max_steps=len(steps), keyboard=True)
     aliases = case.get("aliases", {})
+    if order.ended == "trap":  # TalkBack stays put from here: every press is the same no-move
+        stuck = order.steps[-1]
+        order.steps.extend(dict(stuck) for _ in range(len(steps) - len(order.steps)))
     for (moved, key, _label, said), m in zip(steps, order.steps, strict=True):
         if not moved:
-            assert m.get("edge"), (name, key, m)
+            assert m.get("edge") or m.get("stuck"), (name, key, m)
             continue
         if case.get("match") != "label":
             assert m["key"] == aliases.get(key, key), (name, key, m["key"])
@@ -183,6 +188,49 @@ def test_the_message_body_webview_is_walked_like_talkback_does():
     keys = tb.simulate(tb.build(dump("thunderbird_message"))).keys()
     at = keys.index("virtual:894:4")
     assert keys[at:at + 3] == ["virtual:894:4", "virtual:894:7", "virtual:894:2"]
+
+
+def test_zero_size_web_content_is_read_like_talkback_17_does():
+    # Live, AntennaPod's home: after "You can download any episode..." TalkBack read the
+    # collapsed player's show notes, every element 0px tall below the screen (its WebView sits on
+    # the player pager's off-screen page): "Webview. In vertical pager", then each paragraph,
+    # heading and link in document order. The model reads the same, flags the page as hidden, and
+    # the lint of that walk calls it a ghost.
+    walk = WALKS["antennapod_home_player_collapsed"]
+    read = [(key, said) for moved, key, _label, said in walk["steps"]
+            if moved and key.startswith("virtual:695:")]
+    tree = tb.build(dump("antennapod_home_player_collapsed"))
+    order = tb.simulate(tree, keyboard=True)
+    keys = order.keys()
+    at = keys.index("virtual:695:23")
+    assert keys[at:at + len(read)] == [k for k, _ in read]
+    stops = order.stops[at:at + len(read)]
+    assert [s["speak"] for s in stops[1:]] == [said for _, said in read[1:]]
+    assert stops[0]["speak"].startswith("Webview")
+    assert stops[0]["hidden_page"] is True
+    hint = next(h for h in order.hints if h["kind"] == "web_hidden_page")
+    assert hint["trap"] is False and hint["web_root"] == "virtual:695:23"
+
+
+def test_the_antennapod_player_trap_is_named_and_explained():
+    # Live on TalkBack 17.0: after "Shownotes" every press stayed put. The next stop is the show
+    # notes WebView on the vertical pager's off-screen page: the model flags it, and a walk stuck
+    # there is a tb.trap (it used to be a bare tb.edge_stuck).
+    from inspector_widget.talkback import diff
+
+    tree = tb.build(dump("antennapod_player_expanded"))
+    hidden = tb.Navigator(tree).hidden_web_pages()
+    assert [(h["before"], h["web_root"]) for h in hidden] == [("view:350", "virtual:359:23")]
+    walk = WALKS["antennapod_player_expanded"]
+    steps = [{"i": 0, "key": walk["start"]["key"], "ref": walk["start"]["key"], "moved": True,
+              "via": "start"}]
+    for i, (moved, key, label, said) in enumerate(walk["steps"], 1):
+        steps.append({"i": i, "key": key, "ref": key, "label": label, "moved": moved,
+                      "via": "next" if moved else "edge", **({} if moved else {"edge": True})})
+    record = {"steps": steps, "ended": "stuck", "predicted": [], "direction": "next",
+              "web_traps": hidden}
+    codes = [f["code"] for f in diff.analyze(record)["findings"]]
+    assert codes[0] == "tb.trap"
 
 
 # ---------------------------------------------------------------- auto-scroll ahead (item 4)
