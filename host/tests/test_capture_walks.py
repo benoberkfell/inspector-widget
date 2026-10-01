@@ -330,6 +330,8 @@ def test_a_screen_replaced_mid_walk_is_not_read_as_talkback_navigation():
                   "bounds": [0, 257 + 137 * (k - 13), 2076, 137]} for k in range(13, 22)]
     predicted.insert(0, {"key": "view:2", "label": v12[0][1], "window": 4,
                          "bounds": v12[0][2]})
+    # the engine re-predicts the new screen and appends its stops (as live)
+    predicted += [{"key": k, "label": lab, "window": 1, "bounds": b} for k, lab, b in c2]
     rec = _record()
     rec.update(steps=steps, predicted=predicted, ended="wrap", findings=[])
     W.bind_walk(rec, W.Binding([(0, loaded("tb_v12_bad")), (5, loaded("tb_c2_bad"))]))

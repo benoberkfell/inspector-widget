@@ -236,7 +236,7 @@ def _check_model(walk: Dict[str, Any], lap: List[Dict[str, Any]]) -> Tuple[Dict[
                 first = (f"step {s['i']}: model " + (f"{exp['ref']} {_q(exp['label'])}" if exp else "(end)")
                          + f", actual {_name(s)}")
         pos = P.index(k) if k in P else None
-    visited = {_pk(s) for s in _moves(walk["steps"])}
+    visited = {_pk(s) for s in _moves(_first_screen(walk["steps"]))}
     unpredicted = [s for s in lap if _pk(s) not in P]
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     unvisited = _unvisited(walk, P, visited, covered)
@@ -291,7 +291,7 @@ def _unvisited(walk: Dict[str, Any], P: List[str], visited: set, covered_windows
 def _check_skipped(walk: Dict[str, Any]) -> List[Dict[str, Any]]:
     P = [p["key"] for p in walk.get("predicted") or []]
     pref = {p["key"]: p for p in walk.get("predicted") or []}
-    visited = {_pk(s) for s in _moves(walk["steps"])}
+    visited = {_pk(s) for s in _moves(_first_screen(walk["steps"]))}
     covered = {s.get("window") for s in walk["steps"] if s.get("window_covered_by") is not None}
     miss = _unvisited(walk, P, visited, covered)
     if not miss:
