@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import pytest
 
 from inspector_widget import a11y_lint as L
+from inspector_widget import output
 from inspector_widget.proto import view_inspection_pb2 as pb
 
 VIS = ("visible_to_user", "enabled")
@@ -1289,13 +1290,25 @@ def test_findings_under_a_modal_dialog_are_counted_apart():
     assert s["covered"] == {"error": 2, "warn": 0, "info": 0, "total": 2, "windows": [9]}
     out = rep.to_dict()
     assert [f["node_key"] for f in out["findings"]] == ["view:10"]
-    assert out["covered_by_rule"] == {"a11y.label.missing": {
-        "severity": "error", "message": rep.covered[0].message, "n": 2,
+    # the full form lists every covered finding in full (message, bounds, window, evidence)
+    assert out["covered_findings"] == [f.to_dict() for f in rep.covered]
+    assert all(f["window"]["covered_by"] == 9 for f in out["covered_findings"])
+    # the brief form groups them by rule, in the shape of by_rule
+    brief = output.slim("a11y_lint", out, {})
+    assert "covered_findings" not in brief
+    assert brief["covered_by_rule"] == {"a11y.label.missing": {
+        "sev": "error", "n": 2, "msg": rep.covered[0].message,
         "nodes": [f.node_key for f in rep.covered]}}
+    assert set(brief["by_rule"]["a11y.label.missing"]) == {"sev", "n", "msg", "nodes"}
+    listed = output.slim("a11y_lint", out, {"group_by": "none"})
+    assert listed["findings"] == out["findings"]
+    assert listed["covered_findings"] == out["covered_findings"]
     text = L.format_text(rep).splitlines()
     assert text[0].endswith("1 error, 0 warn, 0 info (+2 under an open dialog)")
     assert text[2].startswith("-- 2 finding(s) on window(s) under an open dialog")
-    assert "covered_by_rule" not in lint(screen(activity), enabled=["R1"]).to_dict()
+    plain = lint(screen(activity), enabled=["R1"]).to_dict()
+    assert "covered_findings" not in plain
+    assert "covered_by_rule" not in output.slim("a11y_lint", plain, {})
 
 
 def test_r12_does_not_pair_a_dialog_button_with_its_twin_behind_the_dialog():

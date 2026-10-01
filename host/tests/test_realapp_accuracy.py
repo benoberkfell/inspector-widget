@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from inspector_widget import a11y_lint as L
+from inspector_widget import output
 from inspector_widget import talkback as tb
 from inspector_widget.talkback import rules as R
 
@@ -98,8 +99,13 @@ def test_findings_under_an_open_sheet_are_counted_apart():
     out = rep.to_dict()
     assert out["summary"]["total"] == len(out["findings"]) == 1
     assert out["summary"]["covered"]["total"] == 9 == len(rep.covered)
-    assert sum(r["n"] for r in out["covered_by_rule"].values()) == 9
     assert all(f.window["covered_by"] is not None for f in rep.covered)
+    # every covered finding is in the JSON: in full, and grouped by rule when brief
+    assert [f["node_key"] for f in out["covered_findings"]] == [f.node_key for f in rep.covered]
+    brief = output.slim("a11y_lint", out, {})
+    assert sum(r["n"] for r in brief["covered_by_rule"].values()) == 9
+    listed = output.slim("a11y_lint", out, {"group_by": "none"})
+    assert {f["node_key"] for f in listed["covered_findings"]} == {f.node_key for f in rep.covered}
     text = L.format_text(rep)
     assert "(+9 under an open dialog)" in text.splitlines()[0]
     assert "-- 9 finding(s) on window(s) under an open dialog" in text
