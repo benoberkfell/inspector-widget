@@ -2691,6 +2691,11 @@ def _mcp_child(log_path: str, build_out: str, block_mcp: bool) -> None:
     # FAKEAGENT_TB_ORDER='[[1003,-1],[1004,-1]]': the fake TalkBack's traversal.
     if os.environ.get("FAKEAGENT_TB_ORDER") and dev.talkback is not None:
         dev.talkback.order = [tuple(t) for t in json.loads(os.environ["FAKEAGENT_TB_ORDER"])]
+    # The fake TalkBack's settings screen answers at once: no real waits between its
+    # taps (the in-process tests' tb_env does the same)
+    from inspector_widget.talkback import device as tbdevice
+    tbdevice.UI_WAIT_S = 0.0
+    tbdevice.DISMISS_WAIT_S = 0.01
 
     def _exit_record() -> None:
         dev._log({"event": "exit", "forwards": dev.forward_names(),
