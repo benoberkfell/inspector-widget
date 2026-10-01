@@ -2205,9 +2205,10 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
                 ancestors: bool, children: bool, props_fn: PropsFn | None, idx: int,
                 image: Any, issue_fmt: Callable[[Issue], str] | None,
                 multi_window: bool, implicit_props: bool = False,
-                tb_fn: Callable[[UNode], Any] | None = None
+                tb_fn: Callable[[UNode], Any] | None = None,
+                priority: Sequence[str] = FACET_PRIORITY
                 ) -> tuple[list[_Part], list[_Part]]:
-    """(core parts, optional parts in priority order) of one node's dossier."""
+    """(core parts, optional parts in ``priority`` order) of one node's dossier."""
     core: list[tuple[str, Any]] = [("ref", n.id)]
     if n.sel and n.sel != n.id:
         core.append(("sel", n.sel))
@@ -2275,7 +2276,7 @@ def _node_parts(ix: Index, n: UNode, *, facets: Sequence[str], props_mode: Any, 
         core_parts.append(_Part(idx, "core+", "image", image))
 
     opt: list[_Part] = []
-    for facet in FACET_PRIORITY:
+    for facet in priority:
         if facet == "core":
             continue
         if facet == "issues" and "issues" in facets and n.issues:
@@ -2388,8 +2389,10 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
 
     A dossier of one node, or ``{capture, nodes:[...]}`` for several (per-node
     errors are reported in place). Facets are added in priority order core >
-    issues > a11y > layout > compose > text > props > children until the budget is
-    used; the rest are listed in ``omitted`` with the call that fetches them.
+    issues > a11y (> tb, when named) > layout > compose > text > props > children
+    until the budget is used; the rest are listed in ``omitted`` with the call that
+    fetches them. ``facets="all"`` puts tb last, and leaves it out of a batch. A node's
+    issues go only once every other facet has: first cut to the worst one.
     ``tap_xy`` is the centre of the visible bounds. ``image`` is filled by
     ``image_fn(node)`` when the ops layer passes one."""
     _check_unknown("node", params, _NODE_ARGS)
@@ -2436,8 +2439,13 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
     cid = _cid(ix)
     multi_window = len(ix.windows()) > 1
     tb_fn = _tb_facet_fn(ix, loaded) if "tb" in facets else None
-    if tb_fn is None and "tb" in facets and "tb" not in _str_list("facets", raw_facets):
+    tb_named = raw_facets is not None and "tb" in _str_list("facets", raw_facets)
+    if (tb_fn is None or batch) and "tb" in facets and not tb_named:
         facets = [f for f in facets if f != "tb"]  # "all" without a model: no tb facet
+    # tb by name keeps its place after a11y; through "all" it comes last, so "all" still
+    # shows (and keeps under the budget) what it showed before the tb facet existed
+    priority = FACET_PRIORITY if tb_named else tuple(
+        f for f in FACET_PRIORITY if f != "tb") + ("tb",)
 
     resolved: list[tuple[str, UNode | None, OpError | None]] = []
     for s in sels:
@@ -2463,7 +2471,7 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
         c, o = _node_parts(ix, n, facets=facets, props_mode=props_mode, raw=raw,
                            ancestors=ancestors, children=children, props_fn=props_fn, idx=i,
                            image=image, issue_fmt=issue_fmt, multi_window=multi_window,
-                           implicit_props=implicit_props, tb_fn=tb_fn)
+                           implicit_props=implicit_props, tb_fn=tb_fn, priority=priority)
         docs.append({})
         cores.append(c)
         opts.append(o)
@@ -2507,7 +2515,7 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
     for i, parts in enumerate(cores):
         for p in parts:
             docs[i][p.key] = p.value
-    pending = [(i, p) for facet in FACET_PRIORITY[1:] for i, parts in enumerate(opts)
+    pending = [(i, p) for facet in priority[1:] for i, parts in enumerate(opts)
                for p in parts if p.facet == facet]
 
     def entry_cost(p: _Part) -> int:
@@ -2544,16 +2552,34 @@ def node(ix: Index, loaded: Any, refs: Any, **params: Any) -> dict[str, Any]:
             omitted[i].append(entry)
         else:
             shrunk.pop(id(p), None)
+    for i, parts in enumerate(opts):  # issues are never left out whole: the worst one shows
+        p = next((x for x in parts if x.facet == "issues"), None)
+        if p is not None and p.key not in docs[i] and isinstance(p.value, list) and p.value \
+                and any(q is p for q, _ in omitted[i]):
+            docs[i][p.key] = p.value[:1] + ([f"+{len(p.value) - 1} more"]
+                                            if len(p.value) > 1 else [])
     long_form, with_next = True, True
     if size(long_omitted=True) > max_bytes:
         long_form = False
-    for i in range(len(docs) - 1, -1, -1):
-        for p in reversed(opts[i]):
-            if p.key in docs[i] and size(long_omitted=long_form) > max_bytes:
-                del docs[i][p.key]
+    # over the budget still: drop facets from the last node up, its lowest-priority first;
+    # issues only once every other facet is gone, each node's down to its worst (+N more)
+    for i, p in [(i, p) for i in range(len(docs) - 1, -1, -1) for p in reversed(opts[i])
+                 if p.facet != "issues"] + \
+            [(i, p) for i in range(len(docs) - 1, -1, -1) for p in opts[i] if p.facet == "issues"]:
+        if p.key in docs[i] and size(long_omitted=long_form) > max_bytes:
+            v = p.value
+            if p.facet == "issues" and isinstance(v, list) and len(v) > 1 \
+                    and docs[i][p.key] != v[:1] + [f"+{len(v) - 1} more"]:
+                docs[i][p.key] = v[:1] + [f"+{len(v) - 1} more"]  # the most severe one
                 shrunk.pop(id(p), None)
                 if not any(q is p for q, _ in omitted[i]):
-                    omitted[i].append((p, max_bytes + _kv_cost(p.key, p.value) + 200))
+                    omitted[i].append((p, max_bytes + _kv_cost(p.key, v) + 200))
+                if size(long_omitted=long_form) <= max_bytes:
+                    continue
+            del docs[i][p.key]
+            shrunk.pop(id(p), None)
+            if not any(q is p for q, _ in omitted[i]):
+                omitted[i].append((p, max_bytes + _kv_cost(p.key, p.value) + 200))
     if size(long_omitted=long_form, with_next=with_next) > max_bytes:
         with_next = False
     for i in range(len(docs) - 1, -1, -1):
@@ -2587,9 +2613,12 @@ def _node_next(ix: Index, resolved: Sequence[tuple[str, UNode | None, OpError | 
         # (capture(slots="enable") is destructive: never a next hint; the compose
         # facet says how to get the slot table and what it costs)
         if omitted[i]:
-            part, need = omitted[i][0]
+            # a node's left-out issues first: they are what the caller must not miss
+            part, need = next((x for x in omitted[i] if x[0].facet == "issues"),
+                              omitted[i][0])
             hints.append(_call_for(n.id, part, props_mode, need))
-    return next_hints(hints)
+    issues_first = [h for h in hints if h and 'facets="issues"' in h]
+    return next_hints(issues_first + [h for h in hints if h not in issues_first])
 
 
 __all__ = [

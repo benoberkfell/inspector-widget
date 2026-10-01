@@ -1253,3 +1253,23 @@ def test_node_leaves_out_what_other_fields_already_say() -> None:
     assert q.node(ix, None, ["n3"])["a11y"]["res"] == "com.example:id/row_view"
     ix.nodes["n3"].facets["compose"]["attrs"]["Focused"] = "true"
     assert q.node(ix, None, ["n3"])["compose"]["sem"]["Focused"] == "true"
+
+
+@pytest.mark.parametrize("name", ["a11yprobe_view_defaults", "a11yprobe_all",
+                                  "thunderbird_list_views", "nia_foryou"])
+def test_a_batch_of_all_facets_never_drops_a_nodes_issues(name):
+    # node(refs, facets="all"): the tb facet (added to "all" with the TalkBack model) does
+    # not crowd out what "all" showed before, and an issue (an error among them) is never
+    # left out whole: the A11yProbe Switch with no label kept only "omitted: issues(2)"
+    import tb_capture_fixtures as F
+
+    ix, raw = F.fixture_capture(name)
+    refs = [k for k in ix.nodes if not k.startswith("slot:")][:60]
+    for j in range(0, len(refs), 10):
+        out = q.node(ix, raw, refs[j:j + 10], facets="all")
+        for d in out.get("nodes") or [out]:
+            n = ix.nodes.get(d.get("ref") or "")
+            if n is not None and n.issues:
+                assert d.get("issues"), (d["ref"], d.get("omitted"))
+                assert d["issues"][0].startswith(q._sorted_issues(n)[0].id)  # the worst first
+            assert "tb" not in d  # a batch "all" leaves the tb facet to facets="tb"
