@@ -69,7 +69,7 @@ class RuleSpec:
 
 RULE_SPECS: Tuple[RuleSpec, ...] = (
     RuleSpec("a11y.label.missing", "R1", "Actionable element has no accessible name",
-             ("error",), "SpeakableTextPresent"),
+             ("error", "info"), "SpeakableTextPresent"),
     RuleSpec("a11y.touch_target.small", "R2", "Touch target below the minimum size",
              ("error", "warn", "info"), "TouchTargetSize"),
     RuleSpec("a11y.contrast.low", "R3", "Text contrast below WCAG 1.4.3",
@@ -306,7 +306,7 @@ _HIDE_TREE = {"NO_HIDE_DESCENDANTS", 4}
 
 
 class _Win:
-    __slots__ = ("index", "root_view_id", "x", "y", "w", "h", "root", "covered_by")
+    __slots__ = ("index", "root_view_id", "x", "y", "w", "h", "root", "covered_by", "meta")
 
     def __init__(self, index: int, root_view_id: Optional[int], rect: Dict[str, int]):
         self.index = index
@@ -319,6 +319,8 @@ class _Win:
         # root_view_id of the modal window (dialog) above this one: TalkBack cannot reach
         # this window while it is open. Findings here are still real, but not reachable now.
         self.covered_by: Optional[int] = None
+        # The a11y dump's window dict (a11y input only): what the TalkBack model reads.
+        self.meta: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"index": self.index, "root_view_id": self.root_view_id}
@@ -408,6 +410,16 @@ class _Node:
         if k.startswith("virtual:"):
             return "virtual"
         return "compose"
+
+
+def _action_name(a: Dict[str, Any]) -> str:
+    """An action's name, decoded from its id when the id is a standard action (a dump from an
+    older host can carry ``CUSTOM_0x...`` names for the android.R.id-backed ones)."""
+    from .a11y import ACTION_NAMES
+    aid = a.get("id")
+    if isinstance(aid, int) and aid in ACTION_NAMES:
+        return ACTION_NAMES[aid]
+    return str(a.get("name"))
 
 
 def _clean(v: Any) -> str:
@@ -515,7 +527,8 @@ def _virtual_prefix(parent: Optional[_Node], host: int, compose_hosts: Set[int])
 def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]],
                 ctx: LintContext) -> Tuple[List[_Node], List[_Win], Dict[str, int]]:
     index, hosts, _ = _compose_index(compose_data)
-    stats = {"compose_joined": 0, "virtual_nodes": 0}
+    stats: Dict[str, Any] = {"compose_joined": 0, "virtual_nodes": 0,
+                             "a11y_diagnostics": a11y_data.get("diagnostics") or ""}
     windows: List[_Win] = []
     roots: List[_Node] = []
 
@@ -541,7 +554,7 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         n.hint = _clean(d.get("hint_text"))
         n.state = _clean(d.get("state_description"))
         n.flags = set(d.get("flags") or ())
-        n.actions = {str(a.get("name")) for a in (d.get("actions") or []) if isinstance(a, dict)}
+        n.actions = {_action_name(a) for a in (d.get("actions") or []) if isinstance(a, dict)}
         n.extras = dict(d.get("extras") or {})
         n.important = d.get("important_for_accessibility")
         why = _talkback_exclusion(d, parent.raw if parent is not None else None)
@@ -588,6 +601,7 @@ def _build_a11y(a11y_data: Dict[str, Any], compose_data: Optional[Dict[str, Any]
         if not root:
             continue
         win = _Win(i, w.get("root_view_id"), _rect_of(root))
+        win.meta = w
         if w.get("covered_by") is not None:
             win.covered_by = int(w["covered_by"])
         rn = mk(root, None, win, False)
@@ -795,6 +809,40 @@ def _is_image(n: _Node, role: Optional[str]) -> bool:
     return role == "Image" or n.simple_class in _IMAGE_CLASSES
 
 
+_WEBVIEW = "android.webkit.WebView"
+
+
+def _is_web(n: _Node) -> bool:
+    """Web content: a node of a WebView's virtual tree (it has the HTML navigation actions)."""
+    return n.kind == "virtual" and bool({"NEXT_HTML_ELEMENT", "PREVIOUS_HTML_ELEMENT"} & n.actions)
+
+
+def _fix(n: _Node, view: str, compose: str, web: str, provider: Optional[str] = None) -> str:
+    """The fix advice for ``n``'s toolkit: a View, a Compose node, web content in a WebView
+    (the page's HTML), or another provider's virtual node."""
+    if _is_web(n):
+        return web
+    if n.kind == "view":
+        return view
+    if n.kind == "virtual":
+        return provider or ("set it on the virtual node in the host's AccessibilityNodeProvider "
+                            "(ExploreByTouchHelper.onPopulateNodeForVirtualView)")
+    return compose
+
+
+def _web_inline(n: _Node) -> bool:
+    """A web target in a run of text (WCAG 2.5.8's inline exception): a sibling with words
+    shares its line, so the line height sets its size (a link in a sentence or a list)."""
+    if not _is_web(n) or n.parent is None or n.h <= 0:
+        return False
+    for sib in n.parent.children:
+        if sib is n or sib.h <= 0 or not (sib.text or sib.cd).strip():
+            continue
+        if sib.y < n.y + n.h and n.y < sib.y + sib.h:
+            return True
+    return False
+
+
 def _norm(s: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", (s or "").lower()).split())
 
@@ -808,12 +856,15 @@ def _norm_label(s: str) -> str:
 # --------------------------------------------------------------------------- #
 class _Run:
     def __init__(self, roots: List[_Node], windows: List[_Win], ctx: LintContext,
-                 enabled: Optional[Set[str]], mode: str):
+                 enabled: Optional[Set[str]], mode: str, source_diag: str = ""):
         self.roots = roots
         self.windows = windows
         self.ctx = ctx
         self.enabled = enabled
         self.mode = mode
+        self.source_diag = source_diag  # the dump's agent diagnostics (a11y-services=...)
+        self._tb: Any = None
+        self._selected_tabs: Dict[int, int] = {}
         self.nodes: List[_Node] = []
         self.by_id: Dict[int, _Node] = {}
         self.label_for_targets: Set[int] = set()
@@ -886,6 +937,44 @@ class _Run:
 
     def on(self, rid: str) -> bool:
         return self.enabled is None or rid in self.enabled
+
+    # -- the TalkBack model (talkback.tree / talkback.rules) ----------------- #
+    def talkback(self) -> Optional[Tuple[Any, Any]]:
+        """(TbTree, Rules) of the TalkBack model over this tree, built once; None for the
+        legacy Compose-semantics input or when the model cannot read the dump."""
+        if self._tb is None:
+            self._tb = False
+            metas = [w.meta for w in self.windows if w.meta is not None and w.meta.get("root")]
+            if self.mode == "a11y" and metas:
+                try:
+                    from .talkback.rules import Rules
+                    from .talkback.tree import build
+                    tree = build({"windows": metas, "diagnostics": self.source_diag})
+                    self._tb = (tree, Rules(tree))
+                except Exception as e:  # never abort the lint; the rules fall back
+                    self.ctx.diag("talkback.unavailable",
+                                  f"The TalkBack model could not read this dump "
+                                  f"({type(e).__name__}: {e}); rules that ask it fall back.",
+                                  level="warn")
+        return self._tb or None
+
+    def focus_decision(self, n: _Node) -> Optional[Tuple[bool, str]]:
+        """talkback.rules shouldFocusNode for ``n`` with the branch that decided it, or None
+        when the model has no node for it."""
+        tb = self.talkback()
+        tn = tb[0].by_raw.get(id(n.raw)) if tb is not None else None
+        return tb[1].focus_decision(tn) if tn is not None else None
+
+    def has_selected_tab(self, n: _Node) -> bool:
+        """A node with the Tab role other than ``n`` is selected in ``n``'s window."""
+        win = n.win
+        k = id(win)
+        if k not in self._selected_tabs:
+            self._selected_tabs[k] = sum(
+                1 for m in self.nodes if m.win is win and self.role(m) == "Tab"
+                and ("selected" in m.flags or (m.collection_item_info or {}).get("selected")))
+        own = 1 if ("selected" in n.flags or (n.collection_item_info or {}).get("selected")) else 0
+        return self._selected_tabs[k] - own > 0
 
     # -- derived facts ------------------------------------------------------ #
     def dp(self, px: float) -> float:
@@ -1086,33 +1175,67 @@ class _Run:
 def rule_missing_label(n: _Node, run: _Run) -> List[Finding]:
     if not _visible(n) or not _actionable(n) or _editable(n):
         return []
+    if n.class_name == _WEBVIEW:
+        return []  # TalkBack names a WebView by its role ("Webview"); the page is its content
     label, _ = run.effective_label(n, with_state=False)
     if label:
+        return []
+    silent = bool(n.children) and run.focus_decision(n) == (False, "silent_container")
+    clickable = "clickable" in n.flags or "CLICK" in n.actions
+    if silent and (not clickable or _is_collection(n) or "scrollable" in n.flags):
+        # TalkBack never stops on it (shouldFocusNode: focusable, nothing of its own to say,
+        # its children are the stops), so it is never announced, and a list's long-click
+        # belongs to its rows: AntennaPod's long-clickable RecyclerViews, measured on
+        # TalkBack 17.0.
+        run.stats_inc("r1_silent_containers")
         return []
     role = run.role(n)
     what = role or n.simple_class or "element"
     toggle = role in ("Checkbox", "Switch", "RadioButton") or "checkable" in n.flags
-    if n.kind == "view":
-        fix = ("give it android:text, or point its visible label at it with android:labelFor"
-               if toggle else
-               "set android:contentDescription (icon-only controls such as ImageButton) or give "
-               "it visible android:text")
-    else:
-        fix = ("make the Row holding its visible label toggleable/selectable (and pass "
-               "onCheckedChange = null to the control), or add "
-               "Modifier.semantics { contentDescription = \"...\" }"
-               if toggle else
-               "pass a contentDescription to the Icon/Image inside it, or add "
-               "Modifier.semantics { contentDescription = \"...\" }")
+    fix = _fix(
+        n,
+        view=("give it android:text, or point its visible label at it with android:labelFor"
+              if toggle else
+              "set android:contentDescription (icon-only controls such as ImageButton) or give "
+              "it visible android:text"),
+        compose=("make the Row holding its visible label toggleable/selectable (and pass "
+                 "onCheckedChange = null to the control), or add "
+                 "Modifier.semantics { contentDescription = \"...\" }"
+                 if toggle else
+                 "pass a contentDescription to the Icon/Image inside it, or add "
+                 "Modifier.semantics { contentDescription = \"...\" }"),
+        web=("give the element text in the page's HTML, an aria-label, or alt text for an "
+             "image"),
+        provider="set a contentDescription on the virtual node in the host's "
+                 "AccessibilityNodeProvider (ExploreByTouchHelper.onPopulateNodeForVirtualView)")
     reason = sorted({"clickable", "long_clickable"} & n.flags) or sorted({"CLICK", "LONG_CLICK"} & n.actions)
+    clipped = _clipped_axes(n, run)
+    if clipped:
+        # Partly scrolled out of view: Compose drops the children a list has scrolled away (and
+        # a View's may be off screen), so the label can be in the part not shown. TalkBack
+        # scrolls it in before it speaks (Now in Android's feed: an unnamed chip at the list's
+        # top edge reads "Android Auto is not followed. Button" once scrolled in).
+        return [run.finding(
+            "a11y.label.missing", "info", n,
+            f"Actionable {what} shows no accessible name, but it is clipped (at the edge of a "
+            f"scroll container that scrolls further, or laid out larger than it shows), so its "
+            f"label may be in the part out of view. Scroll it fully into view and re-lint "
+            f"before acting on this.",
+            {"role": role, "class_name": n.class_name, "actionable_reason": reason,
+             "clipped_axes": sorted(clipped)})]
+    if silent:
+        said = ("TalkBack never stops on it (it has nothing of its own to say and its children "
+                "are the stops), so its click cannot be reached with TalkBack")
+    else:
+        said = f"TalkBack announces it only as \"{(role or 'unlabelled').lower()}\""
     return [run.finding(
         "a11y.label.missing", "error", n,
         f"Actionable {what} has no accessible name (no text, contentDescription, "
         f"labeledBy or labelled non-focusable descendant; a stateDescription such as "
-        f"\"On\" says its state, not what it is); TalkBack announces it only as "
-        f"\"{(role or 'unlabelled').lower()}\". Fix: {fix}.",
+        f"\"On\" says its state, not what it is); {said}. Fix: {fix}.",
         {"role": role, "class_name": n.class_name, "actionable_reason": reason,
-         "checked": ["own", "descendants", "labeled_by", "compose_merged"]},
+         "checked": ["own", "descendants", "labeled_by", "compose_merged"],
+         **({"talkback": "silent_container"} if silent else {})},
     )]
 
 
@@ -1144,25 +1267,64 @@ def _scroll_axes(c: _Node) -> Set[str]:
     return {"h", "w"}
 
 
+_SCROLL_NAMES = {"SCROLL_UP", "SCROLL_DOWN", "SCROLL_LEFT", "SCROLL_RIGHT", "SCROLL_FORWARD",
+                 "SCROLL_BACKWARD"}
+
+
+def _scroll_edges(c: _Node) -> Optional[Set[str]]:
+    """The edges of scroll container ``c`` that more content lies beyond ("top", "bottom",
+    "left", "right"), from the scroll actions it offers; None when it offers none (then any
+    edge along its scroll axes may hide content)."""
+    acts = c.actions & _SCROLL_NAMES
+    if not acts:
+        return None
+    axes = _scroll_axes(c)
+    edges = {e for a, e in (("SCROLL_UP", "top"), ("SCROLL_DOWN", "bottom"),
+                            ("SCROLL_LEFT", "left"), ("SCROLL_RIGHT", "right")) if a in acts}
+    if "SCROLL_FORWARD" in acts:
+        edges |= ({"bottom"} if "h" in axes else set()) | ({"right"} if "w" in axes else set())
+    if "SCROLL_BACKWARD" in acts:
+        edges |= ({"top"} if "h" in axes else set()) | ({"left"} if "w" in axes else set())
+    return edges
+
+
 def _clipped_axes(n: _Node, run: _Run) -> Set[str]:
-    """Dimensions in which ``n`` touches the edge of a scroll container (along its
-    scroll axis) or runs into the window's right/bottom edge -- i.e. its bounds are
-    probably clipped."""
+    """Dimensions in which ``n``'s bounds are clipped, so its real size is not known.
+
+    Only on evidence: it touches an edge of a scroll container that can still scroll that
+    way (more content lies past that edge, so ``n`` may continue there; a container that
+    offers no scroll action counts for every edge of its axes), it reports clipped bounds
+    (``bounds_clipped``), or Compose laid it out larger than its bounds. Merely touching the
+    window's edge is not evidence: a 40dp overflow button sits flush with the screen's right
+    edge in every toolbar (Thunderbird, Now in Android, AntennaPod) and is really 40dp."""
     axes: Set[str] = set()
     c = n.clip
     while c is not None:
         can = _scroll_axes(c)
-        if "h" in can and (n.y <= c.y + _EDGE_TOL or n.y + n.h >= c.y + c.h - _EDGE_TOL):
+        edges = _scroll_edges(c)
+        more = (lambda e: True) if edges is None else (lambda e: e in edges)  # noqa: E731
+        # The item of ``c`` that holds ``n``: one that exactly fills ``c`` along an axis (a
+        # pager's page at rest) is wholly shown that way, whatever lies beyond the edge.
+        item = n
+        while item.parent is not None and item.parent is not c:
+            item = item.parent
+        fills_h = item.y == c.y and item.h == c.h
+        fills_w = item.x == c.x and item.w == c.w
+        if "h" in can and not fills_h and (
+                (n.y <= c.y + _EDGE_TOL and more("top"))
+                or (n.y + n.h >= c.y + c.h - _EDGE_TOL and more("bottom"))):
             axes.add("h")
-        if "w" in can and (n.x <= c.x + _EDGE_TOL or n.x + n.w >= c.x + c.w - _EDGE_TOL):
+        if "w" in can and not fills_w and (
+                (n.x <= c.x + _EDGE_TOL and more("left"))
+                or (n.x + n.w >= c.x + c.w - _EDGE_TOL and more("right"))):
             axes.add("w")
         c = c.clip
-    win = n.win
-    if win is not None and win.w > 0 and win.root is not n:
-        if n.y + n.h >= win.y + win.h - _EDGE_TOL:
-            axes.add("h")
-        if n.x + n.w >= win.x + win.w - _EDGE_TOL:
-            axes.add("w")
+    if "bounds_clipped" in n.flags:
+        axes |= {"w", "h"}
+    if n.layout_w and n.layout_w > n.w + 1:
+        axes.add("w")
+    if n.layout_h and n.layout_h > n.h + 1:
+        axes.add("h")
     return axes
 
 
@@ -1170,9 +1332,12 @@ def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
     if not _visible(n) or not _actionable(n) or not _enabled(n):
         return []
     role = run.role(n)
-    # WCAG 2.5.8 inline exception: an unroled link inside a run of text.
+    # WCAG 2.5.8 inline exception: an unroled link inside a run of text, or a web link on a
+    # line of text.
     p = n.parent
     if role is None and p is not None and p.text and n.own_label and n.own_label in p.text:
+        return []
+    if _web_inline(n):
         return []
     bx, bdp = run.bounds_pair(n)
     min_dp = 44 if run.ctx.wcag_mode else 48
@@ -1212,9 +1377,10 @@ def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
         ev["clipped_axes"] = sorted(clipped)
         return [run.finding(
             "a11y.touch_target.small", "info", n,
-            f"Touch target measures {w_dp}x{h_dp}dp but touches the edge of its scroll "
-            f"container/window, so it is probably clipped. Scroll it fully into view and "
-            f"re-lint before acting on this.", ev)]
+            f"Touch target measures {w_dp}x{h_dp}dp but its bounds are clipped (it reaches the "
+            f"edge of a scroll container that scrolls further that way, or the layout is "
+            f"larger than what is shown), so its real size is not known. Scroll it fully into "
+            f"view and re-lint before acting on this.", ev)]
     real = {"w": w_dp, "h": h_dp}
     unclipped_small = [real[ax] for ax in small - clipped]
     sev = "error" if any(v < 24 for v in unclipped_small) else "warn"
@@ -1222,15 +1388,22 @@ def rule_touch_target(n: _Node, run: _Run) -> List[Finding]:
     if small & clipped:
         ev["clipped_axes"] = sorted(clipped)
         floor += (" (its " + "/".join("width" if a == "w" else "height" for a in sorted(small & clipped))
-                  + " is clipped by a scroll edge and was not judged)")
-    if n.kind == "view":
-        fix = ("give the clickable View android:minWidth/android:minHeight of "
-               f"{min_dp}dp or more padding on the view itself (a TouchDelegate also works "
-               "for users but is not reflected in accessibility bounds)")
-    else:
-        fix = ("use Modifier.minimumInteractiveComponentSize() or "
-               f"Modifier.sizeIn(minWidth = {min_dp}.dp, minHeight = {min_dp}.dp); padding only "
-               "grows the target when it is applied after (inside) the clickable modifier")
+                  + " is clipped and was not judged)")
+    fix = _fix(
+        n,
+        view=("give the clickable View android:minWidth/android:minHeight of "
+              f"{min_dp}dp or more padding on the view itself (a TouchDelegate also works "
+              "for users but is not reflected in accessibility bounds)"),
+        compose=("use Modifier.minimumInteractiveComponentSize() or "
+                 f"Modifier.sizeIn(minWidth = {min_dp}.dp, minHeight = {min_dp}.dp); padding "
+                 "only grows the target when it is applied after (inside) the clickable "
+                 "modifier"),
+        web=(f"in the page's CSS give the link or button min-width/min-height of {min_dp}px "
+             "(CSS px are dp at the WebView's default zoom) or padding, or keep it inline in a "
+             "sentence (WCAG 2.5.8's inline exception)"),
+        provider=(f"report virtual node bounds of at least {min_dp}x{min_dp}dp from the host's "
+                  "AccessibilityNodeProvider (ExploreByTouchHelper.getVirtualViewAt / "
+                  "onPopulateNodeForVirtualView) and accept touches over that area"))
     return [run.finding(
         "a11y.touch_target.small", sev, n,
         f"Touch target is {w_dp}x{h_dp}dp (< {min_dp}dp{floor}). Make the touchable area at "
@@ -1558,13 +1731,16 @@ def rule_role_missing(n: _Node, run: _Run) -> List[Finding]:
         stack.extend(c.children)
     has_visible_text = bool(n.text) or run.desc_has_text(n)
     sev = "info" if has_visible_text else "warn"
-    if n.kind == "view":
-        fix = ("use a Button/ImageButton, or set the role via "
-               "ViewCompat.setAccessibilityDelegate (AccessibilityNodeInfoCompat.setClassName / "
-               "setRoleDescription)")
-    else:
-        fix = ("pass role = Role.Button to Modifier.clickable/selectable, or add "
-               "Modifier.semantics { role = Role.Button }")
+    fix = _fix(
+        n,
+        view=("use a Button/ImageButton, or set the role via "
+              "ViewCompat.setAccessibilityDelegate (AccessibilityNodeInfoCompat.setClassName / "
+              "setRoleDescription)"),
+        compose=("pass role = Role.Button to Modifier.clickable/selectable, or add "
+                 "Modifier.semantics { role = Role.Button }"),
+        web="use a <button> or <a href> in the page's HTML, or give the element role=\"button\"",
+        provider=("set the virtual node's className (android.widget.Button) in the host's "
+                  "AccessibilityNodeProvider"))
     return [run.finding(
         "a11y.role.missing_on_clickable", sev, n,
         f"Clickable element \"{label}\" exposes no role. TalkBack reads the label and "
@@ -1587,12 +1763,13 @@ def rule_image_no_desc(n: _Node, run: _Run) -> List[Finding]:
     owner = n.focus_ancestor
     if owner is not None and _actionable(owner) and run.effective_label(owner)[0]:
         return []  # part of a labelled control; TalkBack reads the control's label
-    if n.kind == "view":
-        fix = ("set android:contentDescription if it conveys meaning; if it is decorative set "
-               "android:importantForAccessibility=\"no\"")
-    else:
-        fix = ("pass a contentDescription if it conveys meaning; for a decorative image use "
-               "contentDescription = null (it then emits no semantics)")
+    fix = _fix(
+        n,
+        view=("set android:contentDescription if it conveys meaning; if it is decorative set "
+              "android:importantForAccessibility=\"no\""),
+        compose=("pass a contentDescription if it conveys meaning; for a decorative image use "
+                 "contentDescription = null (it then emits no semantics)"),
+        web="give the <img> alt text in the page's HTML (alt=\"\" for a decorative image)")
     return [run.finding(
         "a11y.image.no_description", "warn", n,
         f"Image is exposed to accessibility services with no contentDescription and is not "
@@ -1619,7 +1796,7 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
     reason = None
     sev = "warn"
     if role in _STATEFUL_ROLES:
-        if role == "Tab" and _tab_state_known(n):
+        if role == "Tab" and _tab_state_known(n, run):
             return []
         reason = "stateful_role"
     elif "toggle" in words:
@@ -1633,17 +1810,23 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
     if reason is None:
         return []
     if role == "Tab":
-        fix = ("mark the selected tab selected (View.setSelected(true), as TabLayout, "
-               "BottomNavigationView and NavigationRailView do)" if n.kind == "view" else
-               "use Tab(selected = ...) / NavigationBarItem(selected = ...), or "
-               "Modifier.selectable(selected = ..., role = Role.Tab)")
-    elif n.kind == "view":
-        fix = ("use a CompoundButton (Switch/CheckBox/ToggleButton), or set "
-               "AccessibilityNodeInfo checkable/checked or stateDescription "
-               "(ViewCompat.setStateDescription)")
+        fix = _fix(
+            n,
+            view=("mark the selected tab selected (View.setSelected(true), as TabLayout, "
+                  "BottomNavigationView and NavigationRailView do)"),
+            compose=("use Tab(selected = ...) / NavigationBarItem(selected = ...), or "
+                     "Modifier.selectable(selected = ..., role = Role.Tab)"),
+            web="mark the current tab aria-selected=\"true\" in the page's HTML")
     else:
-        fix = ("use Modifier.toggleable(value = ...) / selectable(selected = ...), or "
-               "Modifier.semantics { stateDescription = if (on) \"On\" else \"Off\" }")
+        fix = _fix(
+            n,
+            view=("use a CompoundButton (Switch/CheckBox/ToggleButton), or set "
+                  "AccessibilityNodeInfo checkable/checked or stateDescription "
+                  "(ViewCompat.setStateDescription)"),
+            compose=("use Modifier.toggleable(value = ...) / selectable(selected = ...), or "
+                     "Modifier.semantics { stateDescription = if (on) \"On\" else \"Off\" }"),
+            web=("expose the state in the page's HTML: aria-pressed / aria-checked / "
+                 "aria-selected, or a native <input type=\"checkbox\">"))
     lead = ("If this control toggles, it" if reason == "possible_toggle"
             else "This control looks stateful but")
     return [run.finding(
@@ -1654,17 +1837,18 @@ def rule_state_not_exposed(n: _Node, run: _Run) -> List[Finding]:
          "has_selected": False, "has_statedesc": False})]
 
 
-def _tab_state_known(n: _Node) -> bool:
+def _tab_state_known(n: _Node, run: _Run) -> bool:
     """A tab's state is its selection: TalkBack says "selected" on the selected tab and
     "Tab, 2 of 3" from CollectionItemInfo; an unselected tab carries no flag of its own.
-    Material TabLayout / BottomNavigationView and Compose Tab set exactly that."""
+    Material TabLayout / BottomNavigationView and Compose Tab / NavigationDrawerItem set
+    exactly that. So an unselected tab is fine when a tab it belongs with is selected: not
+    only a sibling. Each item of a lazy list has its own parent (Thunderbird's drawer: every
+    folder is a Tab in its own LazyColumn item, and its account actions sit in a second list
+    whose selection is the folder list's), so any selected tab in the window counts, as
+    TalkBack 17 confirms ("selected. Inbox. 7. Tab" then "Outbox. Tab")."""
     if n.collection_item_info is not None:
         return True
-    p = n.parent
-    if p is None:
-        return False
-    return any(("selected" in s.flags or (s.collection_item_info or {}).get("selected"))
-               for s in p.children if s is not n)
+    return run.has_selected_tab(n)
 
 
 # --------------------------------------------------------------------------- #
@@ -1678,13 +1862,15 @@ def rule_empty_focusable(n: _Node, run: _Run) -> List[Finding]:
     if "scrollable" in n.flags or _is_collection(n) or run.has_candidate_descendant(n):
         return []
     label, _ = run.effective_label(n)
-    if label or run.role(n) or n.range_info or n.hint:
+    if label or run.role(n) or n.range_info or n.hint or n.class_name == _WEBVIEW:
         return []
-    if n.kind == "view":
-        fix = "give it content, or set android:importantForAccessibility=\"no\" / focusable=false"
-    else:
-        fix = ("give it content, or remove it with Modifier.clearAndSetSemantics {} (or drop the "
-               "focusable/mergeDescendants modifier)")
+    fix = _fix(
+        n,
+        view="give it content, or set android:importantForAccessibility=\"no\" / focusable=false",
+        compose=("give it content, or remove it with Modifier.clearAndSetSemantics {} (or drop the "
+                 "focusable/mergeDescendants modifier)"),
+        web=("give the element text or an aria-label in the page's HTML, or drop its tabindex / "
+             "hide it with aria-hidden=\"true\""))
     return [run.finding(
         "a11y.node.empty_focusable", "warn", n,
         f"This element takes accessibility focus but announces nothing; {fix}.",
@@ -1750,12 +1936,13 @@ def rule_editable_content_desc(n: _Node, run: _Run) -> List[Finding]:
             f"{why} Material3's SearchBar input field (SearchBarDefaults.InputField) sets this "
             f"contentDescription itself; if this is that stock component there is nothing to "
             f"change. If you set it yourself, remove it and use the placeholder.", ev)]
-    if n.kind == "view":
-        fix = ("remove android:contentDescription and label the field with android:hint, "
-               "android:labelFor on a visible TextView, or TextInputLayout")
-    else:
-        fix = ("if you set this contentDescription yourself (Modifier.semantics), remove it and "
-               "use the TextField label/placeholder parameters")
+    fix = _fix(
+        n,
+        view=("remove android:contentDescription and label the field with android:hint, "
+              "android:labelFor on a visible TextView, or TextInputLayout"),
+        compose=("if you set this contentDescription yourself (Modifier.semantics), remove it "
+                 "and use the TextField label/placeholder parameters"),
+        web="label the <input> with a <label for=...> in the page's HTML instead of aria-label")
     return [run.finding(
         "a11y.editable.content_description", "error", n, f"{why} Fix: {fix}.", ev)]
 
@@ -1770,11 +1957,12 @@ def rule_form_label(n: _Node, run: _Run) -> List[Finding]:
         or parts or n.compose_label)
     if labelled:
         return []
-    if n.kind == "view":
-        fix = ("add android:hint, point a visible TextView at it with android:labelFor, or wrap "
-               "it in a TextInputLayout with a hint")
-    else:
-        fix = "pass label = { Text(...) } (or a placeholder) to the TextField"
+    fix = _fix(
+        n,
+        view=("add android:hint, point a visible TextView at it with android:labelFor, or wrap "
+              "it in a TextInputLayout with a hint"),
+        compose="pass label = { Text(...) } (or a placeholder) to the TextField",
+        web="give the <input> a <label for=...> (or aria-label) in the page's HTML")
     return [run.finding(
         "a11y.form.label_missing", "error", n,
         f"Form field has no label (no text, hint, labeledBy/labelFor or label child); TalkBack "
@@ -2230,8 +2418,8 @@ def lint_tree(roots: Any, ctx: LintContext, enabled: Optional[Iterable[str]] = N
     ``ctx.diagnostics``.
     """
     enabled_ids = resolve_rule_ids(enabled) if enabled else None
-    nodes, windows, mode, _ = _prepare(roots, ctx, compose_data)
-    run = _Run(nodes, windows, ctx, enabled_ids, mode)
+    nodes, windows, mode, bstats = _prepare(roots, ctx, compose_data)
+    run = _Run(nodes, windows, ctx, enabled_ids, mode, bstats.get("a11y_diagnostics") or "")
     return _execute(run)
 
 
@@ -2247,25 +2435,52 @@ class LintReport:
     compose_data: Optional[Dict[str, Any]] = None
 
     @property
+    def reachable(self) -> List[Finding]:
+        """The findings on windows TalkBack can reach now (not under an open modal window)."""
+        return [f for f in self.findings if not _covered(f)]
+
+    @property
+    def covered(self) -> List[Finding]:
+        """The findings on windows under an open modal window (a dialog or sheet): real, but
+        out of reach until it closes, and not part of what the user is looking at."""
+        return [f for f in self.findings if _covered(f)]
+
+    @property
     def summary(self) -> Dict[str, Any]:
-        s = summarize(self.findings)
+        """Counts over the reachable findings; ``covered`` counts the ones under a dialog."""
+        s = summarize(self.reachable)
         s["rule_errors"] = sum(1 for d in self.diagnostics if d.get("code") == "rule.error")
+        covered = self.covered
+        if covered:
+            c = summarize(covered)
+            c.pop("by_rule", None)
+            c["windows"] = sorted({int(f.window["covered_by"]) for f in covered})
+            s["covered"] = c
         return s
 
     def to_dict(self) -> Dict[str, Any]:
+        """``findings`` are the reachable ones; ``covered_findings`` (only when there are any)
+        the ones on windows under an open dialog, kept apart so they don't drown it."""
         out = {
             "density": self.density,
             "font_scale": self.font_scale,
             "wcag_mode": self.wcag_mode,
             "summary": self.summary,
-            "findings": [f.to_dict() for f in self.findings],
+            "findings": [f.to_dict() for f in self.reachable],
             "diagnostics": self.diagnostics,
             "stats": self.stats,
         }
+        covered = self.covered
+        if covered:
+            out["covered_findings"] = [f.to_dict() for f in covered]
         if (self.a11y_data or {}).get("generation"):
             # The generation of the dump the finding keys belong to (see a11y.generation).
             out["generation"] = self.a11y_data["generation"]
         return out
+
+
+def _covered(f: Finding) -> bool:
+    return (f.window or {}).get("covered_by") is not None
 
 
 def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
@@ -2275,7 +2490,7 @@ def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
     t0 = time.time()
     enabled_ids = resolve_rule_ids(enabled) if enabled else None
     nodes, windows, mode, bstats = _prepare(a11y_data, ctx, compose_data)
-    run = _Run(nodes, windows, ctx, enabled_ids, mode)
+    run = _Run(nodes, windows, ctx, enabled_ids, mode, bstats.get("a11y_diagnostics") or "")
     findings = _execute(run)
     rstats = run.stats
     text_nodes = [n for n in run.nodes if n.text and _visible(n)]
@@ -2296,12 +2511,24 @@ def lint_unified(a11y_data: Dict[str, Any], ctx: LintContext,
     if not run.nodes:
         ctx.diag("tree.empty", "The accessibility dump has no nodes; nothing was linted.",
                  level="warn")
-    covered = [f for f in findings if (f.window or {}).get("covered_by") is not None]
+    covered = [f for f in findings if _covered(f)]
     if covered:
         ctx.diag("window.covered",
                  f"{len(covered)} finding(s) are on window(s) under an open modal window (a "
-                 f"dialog); TalkBack cannot reach them until it closes (finding.window."
-                 f"covered_by names the dialog's root_view_id).", level="info")
+                 f"dialog or sheet); TalkBack cannot reach them until it closes. They are "
+                 f"listed apart (covered_findings; summary.covered) and left out of the "
+                 f"summary counts (finding.window.covered_by names the dialog's "
+                 f"root_view_id).", level="info")
+    if rstats.get("r1_silent_containers"):
+        ctx.diag("label.silent_containers",
+                 f"{rstats['r1_silent_containers']} actionable container(s) without a name "
+                 f"were not flagged: TalkBack never stops on them (nothing of their own to "
+                 f"say; their children are the stops), e.g. a long-clickable list.",
+                 level="info")
+    tb = run.talkback()
+    for d in (tb[0].diagnostics if tb is not None else []):
+        if d.get("kind") == "web_content_not_exposed":
+            ctx.diag("web.not_exposed", d["message"], level="warn", keys=d.get("keys"))
     if rstats.get("contrast_no_image"):
         ctx.diag("contrast.no_image",
                  f"{rstats['contrast_no_image']} text node(s) were not contrast-checked because "
@@ -2428,17 +2655,28 @@ def run_lint(conn: Any, *, density: Optional[int], font_scale: float = 1.0,
 
 
 def format_text(report: LintReport) -> str:
-    """Human-readable lint report for the CLI."""
+    """Human-readable lint report for the CLI: the reachable findings, then the ones under
+    an open dialog in a section of their own."""
     s = report.summary
-    lines = [f"density={report.density}dpi font_scale={report.font_scale} "
-             f"-> {s['error']} error, {s['warn']} warn, {s['info']} info"]
-    for f in report.findings:
+    head = (f"density={report.density}dpi font_scale={report.font_scale} "
+            f"-> {s['error']} error, {s['warn']} warn, {s['info']} info")
+    if s.get("covered"):
+        head += f" (+{s['covered']['total']} under an open dialog)"
+    lines = [head]
+
+    def line(f: Finding) -> str:
         bdp = f.bounds_dp
         lbl = f.node.get("label")
-        lines.append(
-            f"[{f.severity.upper():5}] {f.alias or ''} {f.rule} {f.node_key} "
-            f"({bdp['x']},{bdp['y']} {bdp['w']}x{bdp['h']}dp)"
-            + (f" \"{lbl}\"" if lbl else "") + f": {f.message}")
+        return (f"[{f.severity.upper():5}] {f.alias or ''} {f.rule} {f.node_key} "
+                f"({bdp['x']},{bdp['y']} {bdp['w']}x{bdp['h']}dp)"
+                + (f" \"{lbl}\"" if lbl else "") + f": {f.message}")
+
+    lines.extend(line(f) for f in report.reachable)
+    covered = report.covered
+    if covered:
+        lines.append(f"-- {len(covered)} finding(s) on window(s) under an open dialog "
+                     f"(TalkBack cannot reach them until it closes):")
+        lines.extend(line(f) for f in covered)
     for d in report.diagnostics:
         lines.append(f"({d.get('level', 'info')}) {d.get('code')}: {d.get('message')}")
     return "\n".join(lines)

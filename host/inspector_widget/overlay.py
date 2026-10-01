@@ -534,12 +534,18 @@ def render_a11y_overlay(base_png: str, a11y_dict: Dict[str, Any], out_png: str,
     at its own bounds. ``scale`` maps full-resolution bounds onto a base PNG captured at
     ``scale`` (<=1).
 
+    A window under an open modal window (``covered_by``: a dialog or sheet over the
+    activity) is not drawn, nor are findings on it: its boxes would sit on top of the dialog,
+    and TalkBack cannot reach it until the dialog closes.
+
     Returns ``{path, boxes, labels, flagged, flagged_nodes, flagged_by_bounds,
-    findings, findings_unplaced, labels_skipped, size}``; ``flagged`` counts every box
-    drawn in a severity colour.
+    findings, findings_unplaced, findings_covered, covered_windows, labels_skipped, size}``;
+    ``flagged`` counts every box drawn in a severity colour.
     """
     cv = _Canvas(base_png, scale)
-    roots = [w["root"] for w in (a11y_dict.get("windows") or []) if w.get("root")]
+    windows = [w for w in (a11y_dict.get("windows") or []) if w.get("root")]
+    covered_windows = [w for w in windows if w.get("covered_by") is not None]
+    roots = [w["root"] for w in windows if w.get("covered_by") is None]
     items = _a11y_collect_items(roots, a11y_dict.get("focus_order"))
 
     by_pair: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -555,9 +561,13 @@ def render_a11y_overlay(base_png: str, a11y_dict: Dict[str, Any], out_png: str,
     worst: Dict[int, str] = {}  # id(item) -> severity
     orphans: List[Dict[str, Any]] = []
     unplaced = 0
+    on_covered = 0
     for f in findings or []:
         sev = f.get("severity")
         if sev not in _SEVERITY_RANK:
+            continue
+        if (f.get("window") or {}).get("covered_by") is not None:
+            on_covered += 1
             continue
         it = _map_finding(f, by_pair, by_virtual)
         if it is not None:
@@ -605,7 +615,8 @@ def render_a11y_overlay(base_png: str, a11y_dict: Dict[str, Any], out_png: str,
     return {"path": out_png, "boxes": len(items) + len(orphans), "labels": drawn,
             "flagged": flagged_nodes + len(orphans), "flagged_nodes": flagged_nodes,
             "flagged_by_bounds": len(orphans), "findings": len(findings or []),
-            "findings_unplaced": unplaced, "labels_skipped": cv.labels_skipped,
+            "findings_unplaced": unplaced, "findings_covered": on_covered,
+            "covered_windows": len(covered_windows), "labels_skipped": cv.labels_skipped,
             "size": [cv.W, cv.H]}
 
 
