@@ -421,6 +421,9 @@ def keys_of(lc: Any) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Walk records: bind, re-analyse, classify
 # --------------------------------------------------------------------------- #
+_KEY_IN_TEXT = re.compile(r"\b(?:view:\d+|(?:compose|virtual):\d+:-?\d+)\b")
+
+
 def _bind_key(binding: Binding, key: Any, at: int | None) -> str | None:
     if not isinstance(key, str) or not key:
         return key
@@ -482,6 +485,10 @@ def bind_walk(record: dict[str, Any], binding: Binding,
     for o in record.get("orphans") or []:
         if o.get("key"):
             o["ref"] = _bind_key(binding, o["key"], None)
+    if record.get("notes"):  # the engine's notes name nodes by key: by ref here
+        record["notes"] = [_KEY_IN_TEXT.sub(lambda m: _bind_key(binding, m.group(0), None)
+                                            or m.group(0), str(n))
+                           for n in record["notes"]]
     old_vs = record.get("vs_model") or {}
     analysis = tbdiff.analyze(record, expect=expect)
     findings = analysis["findings"]

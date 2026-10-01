@@ -280,3 +280,19 @@ def test_a_bound_walk_takes_what_an_overlay_covers_from_its_capture():
     assert all(s["covered_by"]["overlay"] == "view:12" for s in bound["steps"]
                if s.get("covered_by"))
 
+
+def test_a_walks_notes_name_nodes_by_ref():
+    import copy
+
+    import tb_capture_fixtures as F
+    from inspector_widget.capture.index import apply_refs
+
+    rec, _ = F.load_walk("tb_v5-bad-walk")
+    ix, raw = F.corpus_capture("tb_v5-bad-walk")
+    rx = apply_refs(ix, {n.key: f"n{i + 1}" for i, n in enumerate(ix.nodes.values())})
+    rec = copy.deepcopy(rec)
+    rec["notes"] = ["A11yAct could not focus view:12: the node refused the action",
+                    "compose:99:4 is not in any capture"]
+    W.bind_walk(rec, W.Binding([(0, _Loaded(rx, raw))]))
+    assert rec["notes"][0].startswith("A11yAct could not focus n") and "view:" not in rec["notes"][0]
+    assert rec["notes"][1] == "compose:99:4 is not in any capture"  # unknown: kept as is
