@@ -2763,10 +2763,25 @@ def lint_a11y(
 
 
 def summarize_dicts(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Severity counts over finding DICTS (uses ``f["severity"]``)."""
-    counts = {"error": 0, "warn": 0, "info": 0}
-    for f in findings:
-        sev = f.get("severity")
-        if sev in counts:
-            counts[sev] += 1
-    return {**counts, "total": len(findings)}
+    """Severity counts over finding DICTS (uses ``f["severity"]``), split like
+    :attr:`LintReport.summary`: the counts are the reachable findings', and ``covered``
+    (only when there are any) counts those on a window under an open dialog
+    (``window.covered_by``), with the dialogs' window ids."""
+    def count(fs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        counts = {"error": 0, "warn": 0, "info": 0}
+        for f in fs:
+            sev = f.get("severity")
+            if sev in counts:
+                counts[sev] += 1
+        return {**counts, "total": len(fs)}
+
+    def by(f: Dict[str, Any]) -> Any:
+        return (f.get("window") or {}).get("covered_by")
+
+    covered = [f for f in findings if by(f) is not None]
+    out = count([f for f in findings if by(f) is None])
+    if covered:
+        c = count(covered)
+        c["windows"] = sorted({int(by(f)) for f in covered})
+        out["covered"] = c
+    return out

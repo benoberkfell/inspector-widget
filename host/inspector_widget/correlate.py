@@ -1716,7 +1716,8 @@ def inspect_node(session: Any, *, node_key: Optional[str] = None,
             include_contrast=include_contrast, a11y_data=a11y_data,
             compose_data={"windows": compose_windows}, focus_keys=_key_strings(keys))
         out = report.to_dict()
-        # Every finding, those on a window under a dialog included (to_dict counts those apart).
+        # Every finding, those on a window under a dialog included (to_dict counts those apart,
+        # and so does lint_summary: ``covered``, not the counts).
         dossier["lint"] = [f for f in (x.to_dict() for x in report.findings)
                            if _finding_matches(f, keys)]
         dossier["lint_summary"] = a11y_lint.summarize_dicts(dossier["lint"])

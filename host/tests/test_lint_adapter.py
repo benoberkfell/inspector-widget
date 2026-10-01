@@ -87,3 +87,12 @@ def test_summarize_dicts_counts_match():
 
 def test_summarize_dicts_empty():
     assert L.summarize_dicts([]) == {"error": 0, "warn": 0, "info": 0, "total": 0}
+
+
+def test_summarize_dicts_counts_findings_under_a_dialog_apart():
+    # As LintReport.summary does: a finding on a window under an open dialog is not live.
+    live = {"severity": "error", "window": {"index": 1, "root_view_id": 9}}
+    behind = {"severity": "warn", "window": {"index": 0, "root_view_id": 2, "covered_by": 9}}
+    assert L.summarize_dicts([live, behind, behind]) == {
+        "error": 1, "warn": 0, "info": 0, "total": 1,
+        "covered": {"error": 0, "warn": 2, "info": 0, "total": 2, "windows": [9]}}

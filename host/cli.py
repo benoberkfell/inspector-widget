@@ -273,6 +273,13 @@ def cmd_compose(args) -> int:
 # --------------------------------------------------------------------------- #
 # Accessibility subcommands
 # --------------------------------------------------------------------------- #
+def _covered_note(summary) -> str:
+    """`` (+N under an open dialog)`` for a lint summary that counts findings apart on a
+    window under a dialog, else ``""`` (as format_text's header says it)."""
+    n = (summary.get("covered") or {}).get("total")
+    return f" (+{n} under an open dialog)" if n else ""
+
+
 def cmd_a11y(args) -> int:
     from inspector_widget import a11y as a11ymod
     from inspector_widget import overlay as ovmod
@@ -293,8 +300,8 @@ def cmd_a11y(args) -> int:
                 wcag_mode=args.wcag, a11y_data=data)
             data["lint"] = report.to_dict()
             s = report.summary
-            print(f"a11y lint: {s['error']} error, {s['warn']} warn, {s['info']} info",
-                  file=sys.stderr)
+            print(f"a11y lint: {s['error']} error, {s['warn']} warn, {s['info']} info"
+                  f"{_covered_note(s)}", file=sys.stderr)
         # Remember its Compose keys so a later inspect-node can re-resolve them.
         from inspector_widget import correlate
         correlate.record_a11y(client, data, (report.compose_data or {}).get("windows")
@@ -317,7 +324,9 @@ def cmd_a11y(args) -> int:
                 print(f"a11y: reading order: {diag.get('message')}", file=sys.stderr)
 
         if args.overlay:
-            findings = data["lint"]["findings"] if report is not None else None
+            # the ones under an open dialog go in too: the overlay counts them, draws none
+            findings = (data["lint"]["findings"] + data["lint"].get("covered_findings", [])
+                        if report is not None else None)
             summary = _write_composed_overlay(
                 lambda base: ovmod.write_screen_png(client, data, base, scale=args.scale),
                 lambda base, scale: ovmod.render_a11y_overlay(
@@ -360,12 +369,12 @@ def cmd_a11y_lint(args) -> int:
                 lambda base: ovmod.write_screen_png(client, report.a11y_data, base,
                                                     scale=args.scale),
                 lambda base, scale: ovmod.render_a11y_overlay(
-                    base, report.a11y_data, args.overlay, findings=out["findings"],
-                    scale=scale))
+                    base, report.a11y_data, args.overlay,
+                    findings=out["findings"] + out.get("covered_findings", []), scale=scale))
             s = out["summary"]
             print(f"wrote a11y-lint overlay -> {args.overlay} ({ov['boxes']} boxes, "
                   f"{ov['flagged']} flagged; {s['error']} error, {s['warn']} warn, "
-                  f"{s['info']} info)", file=sys.stderr)
+                  f"{s['info']} info{_covered_note(s)})", file=sys.stderr)
     return rc
 
 

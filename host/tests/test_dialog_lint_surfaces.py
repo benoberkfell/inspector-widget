@@ -1,0 +1,100 @@
+"""Findings under an open dialog, on every surface that reports the lint.
+
+The recorded Now in Android Settings dialog (``tests/fixtures/captures/nia_settings``) is a
+Compose Dialog window over For you: all 6 lint findings (R12 on the For you topic rows) sit
+on the window the dialog covers, and none on the dialog. Each surface counts them apart from
+the reachable ones (``summary.covered``), lists them where the CLI text does, and never
+counts them as live: the legacy a11y_lint (CLI and MCP, brief and full), inspect_node's
+dossier, the overlays' counters, and the capture lint.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+from contextlib import redirect_stderr, redirect_stdout
+
+import capture_harness as ch
+import pytest
+from test_capture_replay import Replay, run
+
+NAME = "nia_settings"
+COVERED = 6
+DIALOG = 76  # the dialog window's root view id
+
+
+@pytest.fixture
+def nia(tmp_path):
+    with Replay(NAME, str(tmp_path)) as r:
+        yield r
+
+
+def _cli(*argv: str) -> tuple[int, str, str]:
+    import cli
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = cli.main(list(argv))
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _mcp(tool: str, r: Replay, **args) -> dict:
+    import mcp_server
+
+    text, is_error = mcp_server._call_tool_text(
+        tool, {"serial": ch.SERIAL, "package": r.rec.package, "include_contrast": False, **args})
+    assert not is_error, text
+    return json.loads(text)
+
+
+def _target(r: Replay) -> list[str]:
+    return ["--serial", ch.SERIAL, "--package", r.rec.package, "--no-contrast"]
+
+
+def test_a11y_lint_lists_every_covered_finding_in_json_as_the_cli_text_does(nia):
+    brief = _mcp("a11y_lint", nia)
+    assert brief["summary"]["total"] == 0 and brief["by_rule"] == {}
+    assert brief["summary"]["covered"] == {"error": 0, "warn": 0, "info": COVERED,
+                                           "total": COVERED, "windows": [DIALOG]}
+    dup = brief["covered_by_rule"]["a11y.duplicate.label"]
+    assert set(dup) == {"sev", "n", "msg", "nodes", "more"}  # by_rule's shape
+    assert (dup["sev"], dup["n"], len(dup["nodes"]), dup["more"]) == ("info", COVERED, 3, 3)
+    for args in ({"group_by": "none"}, {"detail": "full", "max_bytes": 0}):
+        full = _mcp("a11y_lint", nia, **args)
+        assert full["findings"] == []
+        cov = full["covered_findings"]
+        assert len(cov) == COVERED and all(f["window"]["covered_by"] == DIALOG for f in cov)
+        assert all(f["message"] and f["bounds"] for f in cov)
+    keys = sorted(f["node_key"] for f in full["covered_findings"])
+    rc, out, _err = _cli("a11y-lint", *_target(nia))
+    assert rc == 0
+    assert sorted(k for k in keys if k in out) == keys  # the text lists the same nodes
+    rc, out, _err = _cli("a11y-lint", *_target(nia), "--json", "-")
+    assert rc == 0 and json.loads(out)["covered_by_rule"] == brief["covered_by_rule"]
+
+
+def test_cli_summaries_and_overlays_count_the_covered_findings(nia, tmp_path):
+    rc, _out, err = _cli("a11y", *_target(nia), "--lint")
+    assert rc == 0
+    assert "a11y lint: 0 error, 0 warn, 0 info (+6 under an open dialog)" in err
+    rc, _out, err = _cli("a11y-lint", *_target(nia), "--overlay", str(tmp_path / "ov.png"))
+    assert rc == 0 and "0 flagged; 0 error, 0 warn, 0 info (+6 under an open dialog)" in err
+    ov = _mcp("a11y_overlay", nia)
+    assert (ov["finding_count"], ov["flagged"]) == (0, 0)
+    assert (ov["findings_covered"], ov["covered_windows"]) == (COVERED, 1)
+    assert ov["summary"]["covered"]["total"] == COVERED
+
+
+def test_inspect_node_counts_a_covered_finding_apart(nia):
+    import mcp_server
+
+    full = mcp_server._run_tool("a11y_lint", {"serial": ch.SERIAL, "package": nia.rec.package,
+                                              "include_contrast": False})
+    key = full["covered_findings"][0]["node_key"]
+    d = mcp_server._run_tool("inspect_node", {"serial": ch.SERIAL, "package": nia.rec.package,
+                                              "node_key": key, "include_image": False})
+    assert d["lint"] and all(f["window"]["covered_by"] == DIALOG for f in d["lint"])
+    s = d["lint_summary"]
+    assert (s["error"], s["warn"], s["info"], s["total"]) == (0, 0, 0, 0)
+    assert s["covered"] == {"error": 0, "warn": 0, "info": len(d["lint"]),
+                            "total": len(d["lint"]), "windows": [DIALOG]}

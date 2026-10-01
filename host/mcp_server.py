@@ -986,13 +986,15 @@ def tool_a11y_overlay(
         a11y_data=a11y_data)
     lint_out = report.to_dict()
     findings = lint_out["findings"]
+    # The ones under an open dialog go in too: the overlay counts them and draws none.
+    covered = lint_out.get("covered_findings") or []
     with _png_scratch(serial, package, "a11y_base") as base, \
             _png_output(serial, package, "a11y_overlay") as out:
         try:
             base_scale = ov.write_screen_png(session, a11y_data, base, scale=scale)
         except RuntimeError as exc:
             raise ToolError(str(exc)) from None
-        summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings,
+        summary = ov.render_a11y_overlay(base, a11y_data, out, findings=findings + covered,
                                          scale=base_scale)
     return {
         "serial": serial, "package": package,
@@ -1001,6 +1003,8 @@ def tool_a11y_overlay(
         "flagged": summary["flagged"], "flagged_by_bounds": summary.get("flagged_by_bounds"),
         "size": summary["size"],
         "finding_count": len(findings),
+        "findings_covered": summary.get("findings_covered", 0),
+        "covered_windows": summary.get("covered_windows", 0),
         "summary": lint_out["summary"],
         "lint_diagnostics": lint_out["diagnostics"],
         "diagnostics": a11y_data.get("diagnostics"),
