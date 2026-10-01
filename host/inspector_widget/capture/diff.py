@@ -83,7 +83,8 @@ STATE_WORDS = {
 }
 #: Flags compared under "a11y" (what a node does, rather than its state).
 BEHAVIOUR_FLAGS = tuple(f for f in FLAGS
-                        if f not in STATE_FLAGS and f not in ("hidden", "webview", "interop"))
+                        if f not in STATE_FLAGS
+                        and f not in ("hidden", "webview", "interop", "truncated", "redacted"))
 #: Properties that flicker with touch and never mean the UI changed.
 VOLATILE_PROPS = frozenset({"pressed", "hovered"})
 VISIBLE_EPS = 0.05

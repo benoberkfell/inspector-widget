@@ -282,7 +282,7 @@ def instructions(listed: Iterable[str]) -> str:
 
 
 _FLAGS_HELP = "click longclick focus focused scroll checkable checked selected disabled " \
-              "heading edit password hidden ..."
+              "heading edit password hidden truncated redacted ..."
 
 
 def _specs() -> list[ToolSpec]:

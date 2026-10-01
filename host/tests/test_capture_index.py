@@ -760,3 +760,70 @@ def test_view_a11y_rect_is_not_repeated_in_its_facet(wide, mixed):
         for n in ix.nodes.values():
             fa = n.facets.get("a11y") or {}
             assert "b" not in fa or fa["b"] != n.b, n.key
+
+
+# --------------------------------------------------------------------------- agent cuts
+def _cut_raw(raw: RawCapture) -> tuple[RawCapture, int, int]:
+    """``raw`` as a hardened agent reports a cut: depth-truncated / Compose / a11y
+    tokens in the facet diagnostics, CHILDREN_TRUNCATED on a View, TEXT_REDACTED
+    on another, children_truncated on an a11y node. Returns (raw, cut view id,
+    redacted view id)."""
+    import copy
+
+    out = copy.deepcopy(raw)
+    views = pb.DumpTreeResponse.FromString(raw.views)
+    views.diagnostics = ("depth-truncated=3 (children below 80 levels not sent); "
+                         "properties-failed=2")
+    root = views.roots[0]
+    cut, red = root.children[0], root.children[0].children[0] if root.children[0].children \
+        else root
+    cut.flags |= pb.ViewNode.CHILDREN_TRUNCATED
+    red.flags |= pb.ViewNode.TEXT_REDACTED
+    out.views = views.SerializeToString()
+    comp = pb.DumpComposeResponse.FromString(raw.compose_sem)
+    comp.diagnostics = (comp.diagnostics + "; semantics_truncated: view#7 depth>80 subtrees=2; "
+                        "semantics_failed: view#9 owner_unreachable")
+    out.compose_sem = comp.SerializeToString()
+    a11y = pb.DumpA11yResponse.FromString(raw.a11y)
+    a11y.diagnostics = (a11y.diagnostics or "nodes=1") + "; depth-truncated=4 (children below " \
+                                                         "80 levels not sent)"
+    out.a11y = a11y.SerializeToString()
+    return out, int(cut.id), int(red.id)
+
+
+def test_the_index_reports_what_the_agent_cut(viewscreen_raw):
+    """A capture never presents a cut tree as complete (backlog: agent-hardening):
+    the agent's tokens lead ix.diagnostics, and the flagged nodes carry
+    truncated / redacted (flags and view facet)."""
+    raw, cut, red = _cut_raw(viewscreen_raw)
+    ix = cx.build_index(raw)
+    assert ix.diagnostics[:6] == [
+        "views: depth-truncated=3 (children below 80 levels not sent)",
+        "views: properties-failed=2",
+        "compose: semantics_truncated: view#7 depth>80 subtrees=2",
+        "compose: semantics_failed: view#9 owner_unreachable",
+        "a11y: depth-truncated=4 (children below 80 levels not sent)",
+        'views: 1 View(s) have children the agent did not send (depth cap): '
+        'find(flags=["truncated"])']
+    cut_node, red_node = ix.nodes[f"view:{cut}"], ix.nodes[f"view:{red}"]
+    assert "truncated" in cut_node.flags and cut_node.facets["view"]["children_truncated"]
+    assert "redacted" in red_node.flags and red_node.facets["view"]["text_redacted"]
+    assert "truncated" in FLAGS and "redacted" in FLAGS
+    # an untouched capture says nothing of the kind
+    clean = cx.build_index(viewscreen_raw)
+    assert not any(d.startswith(("views: depth", "compose: sem")) for d in clean.diagnostics)
+    assert not any("truncated" in n.flags for n in clean.nodes.values())
+
+
+def test_a11y_children_truncated_is_a_flag(viewscreen_raw):
+    import copy
+
+    raw = copy.deepcopy(viewscreen_raw)
+    a11y = pb.DumpA11yResponse.FromString(raw.a11y)
+    node = a11y.windows[0].root
+    node.children_truncated = True
+    raw.a11y = a11y.SerializeToString()
+    ix = cx.build_index(raw)
+    flagged = [n for n in ix.nodes.values() if "truncated" in n.flags]
+    assert flagged and all("truncated" in (n.facets.get("a11y") or {}).get("flags", [])
+                           for n in flagged if "a11y" in n.facets)

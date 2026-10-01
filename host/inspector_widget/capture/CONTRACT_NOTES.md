@@ -774,7 +774,21 @@ with every consumer.
     `label`, `text`, `desc`, `state` and `hint` are capped at 1,000 chars.
   - `flags`: the union of a11y, Compose attr and View property flags, in `FLAGS`
     order. `focus` is dropped when `click` or `longclick` is set (clickable implies
-    focusable), matching the spec's outline examples.
+    focusable), matching the spec's outline examples. Two flags say what the
+    agent could not send: `truncated` (ViewNode `CHILDREN_TRUNCATED`, A11yNode
+    `children_truncated`: children cut at the wire depth cap; the view facet also
+    has `children_truncated: true`) and `redacted` (`TEXT_REDACTED`: a password
+    field's text is masked; view facet `text_redacted: true`). Neither is a
+    behaviour change in `diff`.
+  - `diagnostics` starts with the agent's own incomplete-data tokens, one
+    `facet: token` line each (`views: depth-truncated=3 (...)`, `compose:
+    semantics_failed: view#9 ...`, `a11y: node-cap=...`; the prefixes are
+    `index.INCOMPLETE_TOKENS`, the list correlate's `summary["incomplete"]` uses),
+    then a count of the `truncated` Views with the `find` call that lists them.
+    `fetch` marks the compose facet `unavailable` ("obfuscated: ...") when the
+    agent reports `compose_obfuscated`, or the first `semantics_failed` token
+    when no ComposeView produced semantics, and the slots facet the same way
+    (never the destructive "not populated" hint there).
 - **Anchors** (`anchors.py`).
   - Views: `Class#rid`, or `Class:k`. Semantics and a11y-only nodes: `@tag`, else
     `Type"label≤24"`, else `Type:k` / `:k`. A duplicate among siblings gets `:k`.

@@ -103,7 +103,7 @@ _A11Y_BOOLS = (
     "scrollable", "visible_to_user", "heading", "screen_reader_focusable", "dismissable",
     "editable", "multi_line", "content_invalid", "showing_hint_text", "text_entry_key",
     "text_selectable", "field_required", "can_open_popup", "a11y_data_sensitive",
-    "request_initial_focus", "is_virtual", "is_traversal_group",
+    "request_initial_focus", "is_virtual", "is_traversal_group", "children_truncated",
 )
 _A11Y_TEXTS = (
     "text", "content_description", "hint_text", "state_description", "error",
@@ -447,6 +447,7 @@ class _Builder:
         self.acvs: set[int] = set()
         self.webviews: set[int] = set()
         self.window_of_root: dict[int, str] = {}
+        self.cut_views = 0  # Views with CHILDREN_TRUNCATED
 
     # ------------------------------------------------------------------ views
     def build_views(self) -> None:
@@ -525,6 +526,15 @@ class _Builder:
         if n.flags & pb.ViewNode.IS_WEBVIEW:
             flags.add("webview")
             self.webviews.add(udid)
+        if n.flags & pb.ViewNode.CHILDREN_TRUNCATED:
+            # At the agent's depth cap: this View has children that were not sent.
+            flags.add("truncated")
+            facet["children_truncated"] = True
+            self.cut_views += 1
+        if n.flags & pb.ViewNode.TEXT_REDACTED:
+            # A password field: its text is one U+2022 per character.
+            flags.add("redacted")
+            facet["text_redacted"] = True
         fp = flag_props.get(udid) or {}
         vis = fp.get("visibility")
         if vis is not None and str(vis).lower() not in ("visible", "0"):
@@ -1155,6 +1165,8 @@ class _Builder:
             fs.add("hidden")
         if n.live_region:
             fs.add("live")
+        if "children_truncated" in a.bools:
+            fs.add("truncated")
         flags = [x for x in FLAGS if x in fs]  # as reported: focus stays beside click
         if flags:
             f["flags"] = flags
@@ -1429,6 +1441,8 @@ class _Builder:
                 fs.add("live")
             if "is_traversal_group" in b:
                 fs.add("tgroup")
+            if "children_truncated" in b:
+                fs.add("truncated")
         if attrs:
             if "OnClick" in attrs:
                 fs.add("click")
@@ -1648,8 +1662,49 @@ def _legacy_candidates(ix: Index) -> dict[str, list[str]]:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+#: Agent diagnostics tokens (by prefix) that say a facet is incomplete: a tree cut
+#: at the wire depth cap or the a11y node cap, Compose that could not be (fully)
+#: read, properties that are missing or describe a later UI state. The same list
+#: as correlate's (inspect's summary["incomplete"]).
+INCOMPLETE_TOKENS = (
+    "depth-truncated", "node-cap", "properties-incomplete", "properties-failed",
+    "properties-changed", "compose_obfuscated", "semantics_failed", "semantics_unmerged",
+    "semantics_partial", "semantics_truncated", "slot_failed", "slot_partial", "slot_truncated",
+)
+#: RawCapture field -> the facet name a token is reported under.
+_DIAG_FACETS = (("views", "views", pb.DumpTreeResponse),
+                ("compose_sem", "compose", pb.DumpComposeResponse),
+                ("slots", "slots", pb.DumpComposeResponse),
+                ("a11y", "a11y", pb.DumpA11yResponse))
+
+
+def agent_diagnostics(raw: RawCapture) -> list[str]:
+    """``facet: token`` for every token of the agent's per-facet diagnostics that
+    says the facet is incomplete (:data:`INCOMPLETE_TOKENS`), in facet order,
+    each once: a capture never presents a cut tree as a complete one."""
+    out: list[str] = []
+    for attr, facet, msg_type in _DIAG_FACETS:
+        data = getattr(raw, attr, None)
+        if not data:
+            continue
+        try:
+            text = msg_type.FromString(data).diagnostics or ""
+        except Exception:  # noqa: BLE001 - parse errors are reported by the builder
+            continue
+        for tok in text.split(";"):
+            tok = tok.strip()
+            if tok.startswith(INCOMPLETE_TOKENS):
+                line = f"{facet}: {tok}"
+                if line not in out:
+                    out.append(line)
+    return out
+
+
 def build_index(raw: RawCapture) -> Index:
-    """Build the unified, key-space index of one capture (every ``ref`` is None)."""
+    """Build the unified, key-space index of one capture (every ``ref`` is None).
+
+    ``diagnostics`` starts with what the agent says it could not send
+    (:func:`agent_diagnostics`) and how many Views it cut (flag ``truncated``)."""
     b = _Builder(raw)
     b.build_views()
     b.build_compose()
@@ -1658,7 +1713,14 @@ def build_index(raw: RawCapture) -> Index:
     b.build_a11y()
     b.link_slots()
     b.derive()
-    return b.assemble()
+    ix = b.assemble()
+    first = agent_diagnostics(raw)
+    if b.cut_views:
+        first.append(f"views: {b.cut_views} View(s) have children the agent did not send "
+                     f"(depth cap): find(flags=[\"truncated\"])")
+    if first:
+        ix.diagnostics[:0] = [d for d in first if d not in ix.diagnostics]
+    return ix
 
 
 def apply_refs(ix: Index, refmap: Mapping[str, str]) -> Index:

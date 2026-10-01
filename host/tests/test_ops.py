@@ -526,3 +526,43 @@ def test_the_mcp_metrics_probe_expires(tmp_path, monkeypatch):
         assert mcp_server._a11y_device_metrics(SERIAL)[1] == 1.3
         probes = [c for c in dev.shell_log() if "font_scale" in c]
         assert len(probes) == 2
+
+
+def test_a_capture_says_what_the_agent_could_not_send(tmp_path):
+    """Truncation, redaction and an obfuscated Compose reach the capture summary,
+    captures(show), outline lines and node() (backlog: agent-hardening)."""
+    from inspector_widget.capture import fetch
+    from inspector_widget.proto import view_inspection_pb2 as pb
+
+    with ch.harness("launcher", str(tmp_path)) as (dev, _scene):
+        inner = dev.behaviour
+
+        def behaviour(req):
+            delay, resp = inner(req)
+            cmd = req.WhichOneof("command")
+            if cmd == "dump_tree":
+                resp.dump_tree.diagnostics = "depth-truncated=3 (children below 80 levels " \
+                                             "not sent)"
+                resp.dump_tree.roots[0].children[0].flags |= pb.ViewNode.CHILDREN_TRUNCATED
+            elif cmd == "dump_compose":
+                resp.dump_compose.diagnostics += (
+                    "; compose_obfuscated: Compose present but classes are renamed "
+                    "(AndroidComposeView is a.b), semantics/slot table unavailable, a11y "
+                    "still works")
+            return delay, resp
+
+        dev.behaviour = behaviour
+        ctx = ch.ops_context()
+        doc = capture(ctx)
+        assert doc["facets"]["compose"] == fetch.COMPOSE_OBFUSCATED
+        assert doc["diagnostics"][0] == \
+            "views: depth-truncated=3 (children below 80 levels not sent)"
+        assert any(d.startswith("compose: compose_obfuscated") for d in doc["diagnostics"])
+        shown = ok(run(ctx, "captures", action="show"))
+        assert shown["facets"]["compose"].startswith("unavailable: obfuscated")
+        assert any("depth-truncated=3" in d for d in shown["diagnostics"])
+        found = ok(run(ctx, "find", flags=["truncated"]))
+        assert found["total"] == 1 and " truncated" in found["lines"][0]
+        ref = found["lines"][0].split()[0]
+        assert "truncated" in ok(run(ctx, "node", ref=ref))["flags"]
+        ctx.sessions.close_all()

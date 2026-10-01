@@ -702,7 +702,7 @@ def _facet_summary(ix: Index, lc: LoadedCapture) -> dict[str, Any]:
         return entry.get("reason") or st
 
     return {"views": kinds.get("view", 0), "props": status("props", kinds.get("view", 0)),
-            "compose": kinds.get("compose", 0), "a11y": status("a11y", a11y),
+            "compose": status("compose", kinds.get("compose", 0)), "a11y": status("a11y", a11y),
             "slots": status("slots", kinds.get("slot", 0)),
             "shots": len(lc.shot_roots()), "skp": status("skp", len(lc.skp_roots()))}
 
