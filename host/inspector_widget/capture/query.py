@@ -1314,10 +1314,13 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
 
     # prefix facts over the page range, so each footer() is O(1)
     span = items[offset:min(total, offset + max_lines)]
-    first_cut_at: list[_Item | None] = [None]
+    # the expand hint follows the cut that hides the most (+N), ties in tree
+    # order: the message list's +67, not the toolbar's +5 above it
+    biggest_cut_at: list[_Item | None] = [None]
     render_upto, a11y_upto = [False], [False]
     for it in span:
-        first_cut_at.append(first_cut_at[-1] or (it if it.cut else None))
+        best = biggest_cut_at[-1]
+        biggest_cut_at.append(it if it.cut and (best is None or it.plus > best.plus) else best)
         ids = [i.id for i in ix.nodes[it.anchor].issues]
         render_upto.append(render_upto[-1] or any(x.startswith("render.") for x in ids))
         a11y_upto.append(a11y_upto[-1] or any(x.startswith("a11y.") for x in ids))
@@ -1330,7 +1333,7 @@ def outline(ix: Index, **params: Any) -> dict[str, Any]:
             f["truncated"] = _truncated("outline", ix, h, offset, shown, total, why)
             hints.append(cursor_call("outline", user_args, page_args,
                                      f["truncated"]["cursor"]))
-        first_cut = first_cut_at[shown]
+        first_cut = biggest_cut_at[shown]
         if first_cut is not None:
             ref = ix.nodes[first_cut.anchor].id
             if first_cut.cut == "children":

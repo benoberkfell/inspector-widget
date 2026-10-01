@@ -1024,11 +1024,30 @@ def _subtree(ix: Index, node: UNode) -> set[str]:
     return {n.id for n, _ in ix.walk(tree, node.id)}
 
 
+_SEG_SPLIT = re.compile(r"(?<!\\)/")
+_LABEL_IN_SEG = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
 def _template(anchor: str | None) -> str | None:
+    """The collapse key of an anchor inside a collection: every item index
+    ``[i]`` becomes ``[*]``, and so does every label from the item segment down
+    to (not including) the node's own segment: a Compose list row's merged
+    label (an email subject) differs per row, while the unlabelled button inside
+    it is the same composable in every row. None outside a collection."""
     if not anchor or "[" not in anchor:
         return None
-    t = re.sub(r"\[\d+\]", "[*]", anchor)
-    return t if t != anchor else None
+    t = re.sub(r"(?<!\\)\[\d+\]", "[*]", anchor)
+    if t == anchor:
+        return None
+    segs = _SEG_SPLIT.split(t)
+    first = next((i for i, seg in enumerate(segs) if "[*]" in seg), None)
+    if first is None:
+        return t
+    last = len(segs) - 1
+    for i in range(first, len(segs)):
+        if i < last or i == first:
+            segs[i] = _LABEL_IN_SEG.sub('"*"', segs[i])
+    return "/".join(segs)
 
 
 def _lca(ix: Index, ids: list[str]) -> UNode | None:
@@ -1192,8 +1211,11 @@ def lint_view(ix: Index, loaded: Any, *, rules: Any = None, severity: str = "inf
 
     budget = Budget(max_bytes, reserve=FOOTER_RESERVE)
     budget.add(json_cost(out) + 40)  # the list key and the closing brace
+    more_scope = {k: v for k, v, default in (
+        ("within", within, None), ("severity", severity, "info"),
+        ("contrast", bool(contrast), False), ("wcag", bool(wcag), False)) if v != default}
     items, total, truncated_why = _render_groups(ix, kept, group, per_rule, limit, offset,
-                                                 budget)
+                                                 budget, more_scope)
     out["rules" if group == "rule" else "lines"] = items
     shown_end = offset + len(items)
     nxt: list[str] = []
@@ -1256,10 +1278,11 @@ def _focus_node(ix: Index, kept: list[tuple[str, Issue]]) -> str | None:
 
 
 def _render_groups(ix: Index, kept: list[tuple[str, Issue]], group: str, per_rule: int,
-                   limit: int, offset: int, budget: Budget) -> tuple[list[Any], int, str]:
+                   limit: int, offset: int, budget: Budget,
+                   scope: Mapping[str, Any] | None = None) -> tuple[list[Any], int, str]:
     """(items for this page, total items, why truncated)."""
     if group == "rule":
-        items = _rule_items(ix, kept, per_rule)
+        items = _rule_items(ix, kept, per_rule, scope)
     elif group == "node":
         items = _node_lines(ix, kept)
     else:
@@ -1301,8 +1324,13 @@ def _line(ix: Index, nid: str, iss: Issue) -> str:
     return _node_label(ix, nid) + (f" {d}" if d else "")
 
 
-def _rule_items(ix: Index, kept: list[tuple[str, Issue]], per_rule: int
-                ) -> list[dict[str, Any]]:
+def _rule_items(ix: Index, kept: list[tuple[str, Issue]], per_rule: int,
+                scope: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """One item per rule. ``scope``: the caller's non-default filter arguments
+    (within, severity, contrast, wcag), repeated in each "+N more" hint so
+    following it lists the rest of the same findings, not the whole capture's."""
+    from .query import call  # C6
+
     by_rule: dict[str, list[tuple[str, Issue]]] = {}
     for nid, iss in kept:
         by_rule.setdefault(iss.id, []).append((nid, iss))
@@ -1315,7 +1343,8 @@ def _rule_items(ix: Index, kept: list[tuple[str, Issue]], per_rule: int
         rest = sum(n for _, n in lines[per_rule:])
         nodes = [s for s, _ in shown]
         if rest:
-            nodes.append(f'+{rest} more: lint(rules=["{rule.label}"],group="node")')
+            nodes.append(f"+{rest} more: "
+                         + call("lint", rules=[rule.label], group="node", **(scope or {})))
         item: dict[str, Any] = {"rule": rid, "sev": sev, "n": len(members), "msg": rule.msg}
         if rule.fix:
             item["fix"] = rule.fix

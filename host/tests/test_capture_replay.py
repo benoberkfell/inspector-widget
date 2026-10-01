@@ -297,3 +297,41 @@ def test_the_screen_composite_shows_the_window_under_a_dialogs_transparent_edge(
         main = cr.load("nia_settings")
         shot = pb.Screenshot.FromString(main.shots[main.window_ids()[0]])
         assert shot.width == 1280  # the main window's full-screen screenshot
+
+
+def test_thunderbird_compose_rows_collapse_and_hints_keep_their_scope(tmp_path):
+    """Review (agent-ux), live Thunderbird Compose rows:
+    * the unlabelled favourite button of every row is ONE line per rule
+      (template collapse: the row's merged label, the subject, is wildcarded);
+    * lint(within=...)'s "+N more" hint keeps within (it re-linted everything);
+    * outline()'s expand hint follows the biggest cut (the message list), not
+      the first one (the toolbar's overflow)."""
+    with Replay("thunderbird_list_compose", str(tmp_path)) as r:
+        r.capture()
+        lst = run(r.ctx, "find", rid="message_list")["lines"][0].split()[0]
+        lint = run(r.ctx, "lint", within=lst)
+        by_rule = {it["rule"]: it["nodes"] for it in lint["rules"]}
+        star = by_rule["a11y.label.missing"]
+        assert len(star) == 1 and star[0].startswith("×6 in #message_list cells")
+        assert "@MessageItem_FavouriteButtonIcon" in star[0]
+        more = [x for nodes in by_rule.values() for x in nodes if "more: lint(" in x]
+        assert more and all(f'within="{lst}"' in x for x in more)
+        out = run(r.ctx, "outline")
+        expand = [h for h in out["next"] if h.startswith("outline(root=")]
+        assert expand == [f'outline(root="{lst}")'], out["next"]
+
+
+def test_template_keys_wildcard_row_labels_but_keep_the_nodes_own():
+    from inspector_widget.capture.analyzers import _template
+
+    a = 'DecorView/RecyclerView#list/ComposeView[0]/Row"Subject A"/Button'
+    b = 'DecorView/RecyclerView#list/ComposeView[1]/Row"Subject B"/Button'
+    assert _template(a) == _template(b) == \
+        'DecorView/RecyclerView#list/ComposeView[*]/Row"*"/Button'
+    # the node's own label is kept: two different buttons stay apart
+    c = 'DecorView/RecyclerView#list/ComposeView[0]/Button"Star"'
+    d = 'DecorView/RecyclerView#list/ComposeView[0]/Button"Flag"'
+    assert _template(c) != _template(d)
+    # an item whose own (merged) label differs per row is one template
+    assert _template('X/List#l/Row"Inbox 1"[0]') == _template('X/List#l/Row"Inbox 2"[1]')
+    assert _template("DecorView/LinearLayout#content") is None

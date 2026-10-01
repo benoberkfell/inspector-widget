@@ -1069,6 +1069,15 @@ with every consumer.
     in its smallest form (one example node, then no msg/fix), and the optional
     fields are shed to stay within `max_bytes` (500 at least).
   - `lint_summary(ix)` returns the `lint` and `issues` one-liners for `capture()`.
+  - Template collapse groups one rule's findings by `src`, else by the anchor
+    with every collection index `[i]` and every label from the item segment down
+    to (not including) the node's own segment wildcarded: a Compose row's merged
+    label (an email subject) differs per row, the unlabelled button in it does
+    not. A rule's `+N more: lint(rules=[...],group="node",...)` repeats the
+    caller's `within`, `severity`, `contrast` and `wcag`.
+- **Outline expand hint.** `outline(root=<ref>)` (or `max_children`) follows the
+  cut that hides the most descendants on the page (ties in tree order), not the
+  first cut.
 
 ## Images (C9, `capture/images.py`)
 
